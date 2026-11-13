@@ -582,6 +582,42 @@ if(REALSCRIPT_BUILD_TESTS)
                 REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/sprint2-jit-cache")
     endif()
     realscript_add_cpp_test(
+        realscript_flat_struct_and_inline_hotreload_tests
+        realscript.flat-struct-and-inline-hotreload
+        tests/flat_struct_and_inline_hotreload_tests.cpp)
+    realscript_add_cpp_test(
+        realscript_phase2_stackref_lvalue_jit_aot_tests
+        realscript.phase2.stackref-lvalue-jit-aot
+        tests/phase2_stackref_lvalue_jit_aot_tests.cpp)
+    if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
+        target_compile_definitions(
+            realscript_phase2_stackref_lvalue_jit_aot_tests
+            PRIVATE
+                REALSCRIPT_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
+                REALSCRIPT_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
+                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_frontend>"
+                REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/phase2-stackref-jit-cache")
+        set_target_properties(realscript_phase2_stackref_lvalue_jit_aot_tests PROPERTIES ENABLE_EXPORTS ON)
+    endif()
+    realscript_add_cpp_test(
+        realscript_phase3_jit_aot_large_flatstruct_fastpath_tests
+        realscript.phase3.jit-aot-large-flatstruct-fastpath
+        tests/phase3_jit_aot_large_flatstruct_fastpath_tests.cpp)
+    if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
+        target_compile_definitions(
+            realscript_phase3_jit_aot_large_flatstruct_fastpath_tests
+            PRIVATE
+                REALSCRIPT_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
+                REALSCRIPT_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
+                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_frontend>"
+                REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/phase3-flatstruct-jit-cache")
+        set_target_properties(realscript_phase3_jit_aot_large_flatstruct_fastpath_tests PROPERTIES ENABLE_EXPORTS ON)
+    endif()
+    realscript_add_cpp_test(
+        realscript_phase4_stencil_jit_arm64_tests
+        realscript.phase4.stencil-jit-arm64
+        tests/phase4_stencil_jit_arm64_tests.cpp)
+    realscript_add_cpp_test(
         realscript_v2_audit_regression_tests
         realscript.v2.audit-regressions
         tests/v2_audit_regression_tests.cpp)

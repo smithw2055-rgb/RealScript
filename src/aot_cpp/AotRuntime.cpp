@@ -153,13 +153,51 @@ FrameScope::FrameScope(
     ExecutionContext& context,
     const std::vector<runtime::Value>& arguments,
     const std::vector<runtime::Value>& locals,
-    const std::vector<runtime::Value>& registers)
-    : context_(&context) {
+    const std::vector<runtime::Value>& registers,
+    bool allowTransientStackSlices)
+    : context_(&context),
+      savedStackRefTop_(context.stackRefTop_),
+      allowTransientStackSlices_(allowTransientStackSlices) {
+    if (allowTransientStackSlices_) {
+        ++context.activeStackRefScopes_;
+    }
     context_->shadowStack().pushFrame(&arguments, &locals, &registers);
 }
 
 FrameScope::~FrameScope() {
-    if (context_) context_->shadowStack().popFrame();
+    if (!context_) return;
+    context_->shadowStack().popFrame();
+    if (allowTransientStackSlices_ && context_->activeStackRefScopes_ > 0) {
+        --context_->activeStackRefScopes_;
+    }
+    if (context_->stackRefTop_ > savedStackRefTop_) {
+        for (std::uint32_t i = savedStackRefTop_; i < context_->stackRefTop_ && i < context_->stackRefSlots_.size(); ++i) {
+            if (context_->stackRefSlots_[i].isTraceable()) {
+                context_->stackRefSlots_[i] = runtime::Value{};
+            }
+        }
+        context_->stackRefTop_ = savedStackRefTop_;
+    }
+}
+
+StackRefScope::StackRefScope(ExecutionContext& context) noexcept
+    : context_(&context), savedTop_(context.stackRefTop_) {
+    ++context.activeStackRefScopes_;
+}
+
+StackRefScope::~StackRefScope() noexcept {
+    if (!context_) return;
+    if (context_->activeStackRefScopes_ > 0) {
+        --context_->activeStackRefScopes_;
+    }
+    if (context_->stackRefTop_ > savedTop_) {
+        for (std::uint32_t i = savedTop_; i < context_->stackRefTop_ && i < context_->stackRefSlots_.size(); ++i) {
+            if (context_->stackRefSlots_[i].isTraceable()) {
+                context_->stackRefSlots_[i] = runtime::Value{};
+            }
+        }
+        context_->stackRefTop_ = savedTop_;
+    }
 }
 
 ExecutionContext::ExecutionContext(
@@ -232,6 +270,20 @@ ExecutionContext::ExecutionContext(
             ownedFunctions_.emplace(function.symbolId, &function);
         }
         functionsPtr_ = &ownedFunctions_;
+    }
+    stackRefBankId_ = runtime::detail::acquireFlatStackBank(&stackRefSlots_);
+    shadowStack_.pushFrame(&stackRefEmptyRoot_, &stackRefSlots_, &stackRefEmptyRoot_);
+    stackRefRootPushed_ = true;
+}
+
+ExecutionContext::~ExecutionContext() {
+    if (stackRefRootPushed_) {
+        shadowStack_.popFrame();
+        stackRefRootPushed_ = false;
+    }
+    if (stackRefBankId_ != 0u) {
+        runtime::detail::releaseFlatStackBank(stackRefBankId_);
+        stackRefBankId_ = 0u;
     }
 }
 
@@ -596,7 +648,14 @@ bool ExecutionContext::expectType(
     semantic::PrimitiveType type,
     std::string_view context) {
     if (const auto* reference = std::get_if<runtime::ObjectRef>(&value)) {
-        if (!heap_ || !heap_->isAlive(*reference)) {
+        if (reference->isStackSlotRef()) {
+            if (reference->generation != stackRefBankId_ || reference->slot >= stackRefTop_) {
+                return fail(
+                    runtime::ErrorCode::InvalidObjectReference,
+                    std::string(context) +
+                        " contains an expired AOT stack slot reference");
+            }
+        } else if (!heap_ || !heap_->isAlive(*reference)) {
             return fail(
                 runtime::ErrorCode::InvalidObjectReference,
                 std::string(context) +
@@ -631,6 +690,18 @@ bool ExecutionContext::expectSignatureType(
             return true;
         }
         const auto* reference = std::get_if<runtime::ObjectRef>(&value);
+        if (reference && reference->isStackSlotRef()) {
+            const auto* expType = findType(typeId);
+            if (reference->generation == stackRefBankId_ &&
+                reference->slot < stackRefTop_ &&
+                expType && expType->name &&
+                runtime::isSynthesizedRefWrapperTypeName(expType->name)) {
+                return true;
+            }
+            return fail(
+                runtime::ErrorCode::TypeMismatch,
+                std::string(context) + " has an incompatible AOT stack reference type");
+        }
         const auto actual = reference && heap_
             ? heap_->objectTypeId(*reference)
             : std::optional<semantic::SymbolId>{};
@@ -1925,6 +1996,68 @@ bool ExecutionContext::constantString(
     return true;
 }
 
+bool ExecutionContext::newStackRefObject(
+    semantic::SymbolId typeId,
+    runtime::Value& result) {
+    const auto* type = findType(typeId);
+    if (!type || type->kind != semantic::TypeKind::Class ||
+        type->interfaceType || type->delegateType) {
+        return fail(
+            runtime::ErrorCode::InvalidProgram,
+            "AOT object allocation references an invalid class descriptor");
+    }
+    if (activeStackRefScopes_ > 0 &&
+        stackRefBankId_ != 0u &&
+        type->fieldCount == 1 &&
+        type->fields != nullptr &&
+        type->name != nullptr &&
+        runtime::isSynthesizedRefWrapperTypeName(type->name)) {
+        const auto& fld = type->fields[0];
+        if (fld.type == semantic::PrimitiveType::Struct && fld.typeId != 0) {
+            if (const auto* sc = runtime::findFlatStructSchemaByTypeId(fld.typeId)) {
+                const std::uint32_t baseOff = stackRefTop_;
+                const std::size_t need = static_cast<std::size_t>(baseOff) + sc->flatSlotCount;
+                if (need > runtime::StructStorageHandle::FrameOffsetMask) {
+                    return fail(
+                        runtime::ErrorCode::OutOfMemory,
+                        "stack-ref slot capacity exceeded");
+                }
+                if (need > stackRefSlots_.size()) {
+                    if (need > stackRefSlots_.capacity()) {
+                        stackRefSlots_.reserve(std::max<std::size_t>(need, stackRefSlots_.capacity() * 2u + 64u));
+                    }
+                    stackRefSlots_.resize(need);
+                }
+                std::memcpy(
+                    static_cast<void*>(stackRefSlots_.data() + baseOff),
+                    static_cast<const void*>(sc->prototypeLeaves.data()),
+                    static_cast<std::size_t>(sc->flatSlotCount) * sizeof(runtime::Value));
+                stackRefTop_ = static_cast<std::uint32_t>(need);
+                result = runtime::ObjectRef::makeStackSlotRef(baseOff, stackRefBankId_, sc->schemaId);
+                return true;
+            }
+        }
+        const std::uint32_t slotOff = stackRefTop_;
+        const std::size_t need = static_cast<std::size_t>(slotOff) + 1u;
+        if (need > runtime::StructStorageHandle::FrameOffsetMask) {
+            return fail(
+                runtime::ErrorCode::OutOfMemory,
+                "stack-ref slot capacity exceeded");
+        }
+        if (need > stackRefSlots_.size()) {
+            if (need > stackRefSlots_.capacity()) {
+                stackRefSlots_.reserve(std::max<std::size_t>(need, stackRefSlots_.capacity() * 2u + 64u));
+            }
+            stackRefSlots_.resize(need);
+        }
+        stackRefSlots_[slotOff] = defaultValue(fld.type, fld.typeId);
+        stackRefTop_ = static_cast<std::uint32_t>(need);
+        result = runtime::ObjectRef::makeStackSlotRef(slotOff, stackRefBankId_, 0u);
+        return true;
+    }
+    return newObject(typeId, result);
+}
+
 bool ExecutionContext::newObject(
     semantic::SymbolId typeId,
     runtime::Value& result) {
@@ -1969,10 +2102,31 @@ bool ExecutionContext::newObject(
 bool ExecutionContext::newStruct(
     semantic::SymbolId typeId,
     runtime::Value& result) {
-    result = defaultValue(semantic::PrimitiveType::Struct, typeId);
-    if (runtime::makeDefaultInlineStructValue(typeId).has_value()) {
+    if (const auto inl = runtime::makeDefaultInlineStructValue(typeId); inl.has_value()) {
+        result = *inl;
         return true;
     }
+    constexpr std::size_t kMaxTransientStackSliceSlots = 65536u;
+    if (activeStackRefScopes_ > 0 && stackRefBankId_ != 0u) {
+        if (const auto* sc = runtime::findFlatStructSchemaByTypeId(typeId)) {
+            const std::uint32_t baseOff = stackRefTop_;
+            const std::size_t need = static_cast<std::size_t>(baseOff) + sc->flatSlotCount;
+            if (need <= kMaxTransientStackSliceSlots &&
+                need <= runtime::StructStorageHandle::FrameOffsetMask) {
+                if (need > stackRefSlots_.size()) {
+                    stackRefSlots_.resize(std::max<std::size_t>(need, stackRefSlots_.capacity() * 2u + 64u));
+                }
+                std::memcpy(
+                    static_cast<void*>(stackRefSlots_.data() + baseOff),
+                    static_cast<const void*>(sc->prototypeLeaves.data()),
+                    static_cast<std::size_t>(sc->flatSlotCount) * sizeof(runtime::Value));
+                stackRefTop_ = static_cast<std::uint32_t>(need);
+                result = runtime::StructValue::makeFrameSlice(typeId, stackRefBankId_, baseOff, sc->schemaId);
+                return true;
+            }
+        }
+    }
+    result = defaultValue(semantic::PrimitiveType::Struct, typeId);
     const auto* structure = std::get_if<runtime::StructValue>(&result);
     if (!structure || !structure->valid()) {
         return fail(
@@ -2001,13 +2155,20 @@ bool ExecutionContext::newArray(
         static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
         return fail(runtime::ErrorCode::OutOfMemory, "array length is too large");
     }
+    runtime::Value initElemVal =
+        (elementType == semantic::PrimitiveType::Struct &&
+         elementTypeId != 0 &&
+         (runtime::isBlittableStructType(elementTypeId) ||
+          runtime::findFlatStructSchemaByTypeId(elementTypeId) != nullptr))
+        ? runtime::Value{}
+        : defaultValue(elementType, elementTypeId);
     runtime::RuntimeError allocationError;
     const auto reference = heap_->allocateTypedArray(
         arrayTypeId,
         elementType,
         elementTypeId,
         static_cast<std::size_t>(size),
-        defaultValue(elementType, elementTypeId),
+        initElemVal,
         &allocationError);
     if (!reference) {
         return fail(
@@ -2160,6 +2321,35 @@ bool ExecutionContext::loadElement(
             runtime::ErrorCode::TypeMismatch,
             "array element metadata does not match the AOT operation");
     }
+    if (elementType == semantic::PrimitiveType::Struct &&
+        activeStackRefScopes_ > 0 &&
+        stackRefBankId_ != 0u) {
+        constexpr std::size_t kMaxTransientStackSliceSlots = 65536u;
+        if (const auto* sc = runtime::findFlatStructSchemaByTypeId(elementTypeId)) {
+            runtime::FlatStructArrayFastView fView{};
+            if ((heap_->tryBindFlatStructArrayFastView(reference, fView) && fView.elementTypeId == elementTypeId && fView.flatStride == sc->flatSlotCount) &&
+                fView.flatSchemaId == sc->schemaId) {
+                const std::uint32_t baseOff = stackRefTop_;
+                const std::size_t need = static_cast<std::size_t>(baseOff) + sc->flatSlotCount;
+                if (need <= kMaxTransientStackSliceSlots &&
+                    need <= runtime::StructStorageHandle::FrameOffsetMask) {
+                    if (need > stackRefSlots_.size()) {
+                        stackRefSlots_.resize(std::max<std::size_t>(need, stackRefSlots_.capacity() * 2u + 64u));
+                    }
+                    const runtime::Value* src =
+                        fView.data + static_cast<std::size_t>(numericIndex) * fView.flatStride;
+                    std::memcpy(
+                        static_cast<void*>(stackRefSlots_.data() + baseOff),
+                        static_cast<const void*>(src),
+                        static_cast<std::size_t>(sc->flatSlotCount) * sizeof(runtime::Value));
+                    stackRefTop_ = static_cast<std::uint32_t>(need);
+                    result = runtime::StructValue::makeFrameSlice(
+                        elementTypeId, stackRefBankId_, baseOff, sc->schemaId);
+                    return true;
+                }
+            }
+        }
+    }
     const auto value = heap_->arrayGet(
         reference,
         static_cast<std::size_t>(numericIndex));
@@ -2248,8 +2438,24 @@ bool ExecutionContext::loadField(
     }
     runtime::Value checked;
     if (!checkNotNull(typeId, receiver, checked)) return false;
+    const auto recvRef = std::get<runtime::ObjectRef>(checked);
+    if (recvRef.isStackSlotRef()) {
+        const auto& field = type->fields[fieldIndex];
+        runtime::Value sVal{};
+        if (recvRef.stackRefSchemaId() == 0u) {
+            sVal = stackRefSlots_[recvRef.slot];
+        } else {
+            sVal = runtime::StructValue::makeFrameSlice(
+                field.typeId, stackRefBankId_, recvRef.slot, recvRef.stackRefSchemaId());
+        }
+        if (!expectSignatureType(sVal, field.type, field.typeId, "field load value")) {
+            return false;
+        }
+        result = sVal;
+        return true;
+    }
     const auto value = heap_->fieldGet(
-        std::get<runtime::ObjectRef>(checked),
+        recvRef,
         fieldIndex);
     if (!value) {
         return fail(
@@ -2290,9 +2496,21 @@ bool ExecutionContext::storeField(
             "field store value")) {
         return false;
     }
+    const auto recvRef = std::get<runtime::ObjectRef>(checked);
+    if (recvRef.isStackSlotRef()) {
+        if (recvRef.stackRefSchemaId() == 0u) {
+            stackRefSlots_[recvRef.slot] = runtime::detachFrameSliceValue(value);
+            return true;
+        }
+        const auto* sc = runtime::getFlatStructSchema(recvRef.stackRefSchemaId());
+        if (!sc || !runtime::extractStructLeavesToBuffer(value, *sc, stackRefSlots_.data() + recvRef.slot)) {
+            return fail(runtime::ErrorCode::InvalidProgram, "AOT stack ref struct store failed");
+        }
+        return true;
+    }
     runtime::RuntimeError fieldError;
     if (!heap_->fieldSet(
-            std::get<runtime::ObjectRef>(checked),
+            recvRef,
             fieldIndex,
             value,
             &fieldError)) {
@@ -2335,20 +2553,40 @@ bool ExecutionContext::loadStructField(
         return true;
     }
     const auto& structure = std::get<runtime::StructValue>(receiver);
-    if (!structure.storage || fieldIndex >= structure.storage->fields.size()) {
+    if (structure.isFrameSlice()) {
+        if (const auto* sc = runtime::getFlatStructSchema(structure.frameSchemaId());
+            sc != nullptr && fieldIndex < sc->directFields.size()) {
+            const auto& fd = sc->directFields[fieldIndex];
+            const std::uint32_t subAbs = structure.storage.frameSliceOffset() + fd.leafOffset;
+            if (fd.subSchemaId != 0u && subAbs <= runtime::StructStorageHandle::FrameOffsetMask) {
+                result = runtime::StructValue::makeFrameSlice(
+                    field.typeId, structure.storage.frameSliceBank(), subAbs, fd.subSchemaId);
+                return true;
+            }
+            if (const runtime::Value* leaf = runtime::detail::lookupFlatStackSlice(
+                    structure.storage.frameSliceBank(), subAbs, 1u)) {
+                if (!expectSignatureType(*leaf, field.type, field.typeId, "struct field load value")) {
+                    return false;
+                }
+                result = *leaf;
+                return true;
+            }
+        }
+    }
+    const auto fieldVal = runtime::structValueFieldAt(structure, fieldIndex);
+    if (!fieldVal) {
         return fail(
             runtime::ErrorCode::InvalidProgram,
             "struct field load references an invalid field slot");
     }
-    const auto& value = structure.storage->fields[fieldIndex];
     if (!expectSignatureType(
-            value,
+            *fieldVal,
             field.type,
             field.typeId,
             "struct field load value")) {
         return false;
     }
-    result = value;
+    result = *fieldVal;
     return true;
 }
 
@@ -2379,6 +2617,36 @@ bool ExecutionContext::storeStructField(
     if (const auto updatedInline = runtime::storeInlineStructField(receiver, fieldIndex, value)) {
         result = *updatedInline;
         return true;
+    }
+    if (activeStackRefScopes_ > 0 && stackRefBankId_ != 0u) {
+        constexpr std::size_t kMaxTransientStackSliceSlots = 65536u;
+        if (const auto* sc = runtime::findFlatStructSchemaByTypeId(typeId);
+            sc != nullptr && fieldIndex < sc->directFields.size()) {
+            const std::uint32_t baseOff = stackRefTop_;
+            const std::size_t need = static_cast<std::size_t>(baseOff) + sc->flatSlotCount;
+            if (need <= kMaxTransientStackSliceSlots &&
+                need <= runtime::StructStorageHandle::FrameOffsetMask) {
+                if (need > stackRefSlots_.size()) {
+                    stackRefSlots_.resize(std::max<std::size_t>(need, stackRefSlots_.capacity() * 2u + 64u));
+                }
+                runtime::Value* dstLeaves = stackRefSlots_.data() + baseOff;
+                if (runtime::extractStructLeavesToBuffer(receiver, *sc, dstLeaves)) {
+                    const auto& fd = sc->directFields[fieldIndex];
+                    bool leafOk = false;
+                    if (fd.subSchemaId == 0u) {
+                        dstLeaves[fd.leafOffset] = runtime::detachFrameSliceValue(value);
+                        leafOk = true;
+                    } else if (const auto* subSc = runtime::getFlatStructSchema(fd.subSchemaId)) {
+                        leafOk = runtime::extractStructLeavesToBuffer(value, *subSc, dstLeaves + fd.leafOffset);
+                    }
+                    if (leafOk) {
+                        stackRefTop_ = static_cast<std::uint32_t>(need);
+                        result = runtime::StructValue::makeFrameSlice(typeId, stackRefBankId_, baseOff, sc->schemaId);
+                        return true;
+                    }
+                }
+            }
+        }
     }
     const auto& structure = std::get<runtime::StructValue>(receiver);
     if (!structure.storage || fieldIndex >= structure.storage->fields.size()) {
@@ -2724,6 +2992,40 @@ bool ExecutionContext::binary(
                         "string equality encountered an invalid managed reference");
                 }
                 equal = *a == *b;
+            }
+        } else if (runtime::valueType(left) == semantic::PrimitiveType::Struct) {
+            if (left == right) {
+                equal = true;
+            } else if (left.rawTag() == runtime::ValueTag::Struct &&
+                       right.rawTag() == runtime::ValueTag::Struct) {
+                const auto& ls = left.asStructUnchecked();
+                const auto& rs = right.asStructUnchecked();
+                if (ls.typeId == rs.typeId && ls.fieldCount() == rs.fieldCount()) {
+                    const auto count = ls.fieldCount();
+                    bool allEq = true;
+                    for (std::size_t i = 0; i < count; ++i) {
+                        const auto lf = runtime::structValueFieldAt(ls, i);
+                        const auto rf = runtime::structValueFieldAt(rs, i);
+                        runtime::Value fieldEqVal;
+                        if (!lf || !rf) {
+                            allEq = false;
+                            break;
+                        }
+                        if (!binary(BinaryOperation::Equal, checkedArithmetic, *lf, *rf, fieldEqVal)) {
+                            return false;
+                        }
+                        if (!std::holds_alternative<bool>(fieldEqVal) ||
+                            !std::get<bool>(fieldEqVal)) {
+                            allEq = false;
+                            break;
+                        }
+                    }
+                    equal = allEq;
+                } else {
+                    equal = false;
+                }
+            } else {
+                equal = false;
             }
         } else {
             if ((runtime::valueType(left) == semantic::PrimitiveType::Object ||
@@ -4135,6 +4437,9 @@ runtime::ExecutionResult Program::invoke(
         value);
     if (!execution.succeeded && context.hasPendingException()) {
         context.reportUnhandledScriptException();
+    }
+    if (execution.succeeded) {
+        value = runtime::detachFrameSliceValue(value);
     }
     execution.succeeded = context.finalizeDeterminism(
         execution.succeeded, value);

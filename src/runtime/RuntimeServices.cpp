@@ -1045,15 +1045,20 @@ HeapStructStoragePool& heapStructPool() {
 namespace detail {
 
 const std::string& emptyRuntimePoolString() noexcept {
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->emptyStringFn) {
+            if (const std::string* ptr = bridge->emptyStringFn()) {
+                return *ptr;
+            }
+        }
+    }
     return runtimeStringPool().empty();
 }
 
 StringValue internRuntimeString(std::string_view text, bool pinEntry) {
-    if (!pinEntry) {
-        if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
-            if (bridge->internStringFn) {
-                return bridge->internStringFn(text);
-            }
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->internStringFn) {
+            return bridge->internStringFn(text, pinEntry);
         }
     }
     return runtimeStringPool().intern(text, pinEntry);
@@ -1087,11 +1092,9 @@ const InlineStructArenaEntry& lookupInlineArenaEntry(std::uint32_t idx) noexcept
 std::uint32_t registerHeapStructStorage(
     std::shared_ptr<const StructStorage> store,
     bool pinEntry) {
-    if (!pinEntry) {
-        if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
-            if (bridge->registerHeapStructFn) {
-                return bridge->registerHeapStructFn(&store);
-            }
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->registerHeapStructFn) {
+            return bridge->registerHeapStructFn(&store, pinEntry);
         }
     }
     return heapStructPool().registerStorage(std::move(store), pinEntry);
@@ -2273,6 +2276,11 @@ bool tryExecuteRuntimeIntrinsic(
 
 
 bool hasAnyPinnedPoolValues() noexcept {
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->hasAnyPinnedPoolValuesFn) {
+            return bridge->hasAnyPinnedPoolValuesFn();
+        }
+    }
     return g_anyPoolHasPinnedSlots.load(std::memory_order_acquire);
 }
 
@@ -2310,8 +2318,11 @@ ArenaScalarOverflowTable& arenaScalarOverflowTable() noexcept {
     return table;
 }
 
-StringValue hostInternStringBridge(std::string_view text) {
-    return runtimeStringPool().intern(text);
+const std::string* hostEmptyStringBridge() noexcept {
+    return &runtimeStringPool().empty();
+}
+StringValue hostInternStringBridge(std::string_view text, bool pinEntry) {
+    return runtimeStringPool().intern(text, pinEntry);
 }
 StringValue hostStringByIdBridge(std::uint32_t id) noexcept {
     return runtimeStringPool().getById(id);
@@ -2322,12 +2333,36 @@ std::uint32_t hostInternInlineArenaBridge(const InlineStructArenaEntry& entry) n
 const InlineStructArenaEntry* hostLookupInlineArenaBridge(std::uint32_t idx) noexcept {
     return &inlineStructPool().get(idx);
 }
-std::uint32_t hostRegisterHeapStructBridge(const void* storeSharedPtrAddr) {
+std::uint32_t hostRegisterHeapStructBridge(const void* storeSharedPtrAddr, bool pinEntry) {
     const auto* sp = static_cast<const std::shared_ptr<const StructStorage>*>(storeSharedPtrAddr);
-    return sp ? heapStructPool().registerStorage(*sp) : 0u;
+    return sp ? heapStructPool().registerStorage(*sp, pinEntry) : 0u;
 }
 const void* hostLookupHeapStructBridge(std::uint32_t id) noexcept {
     return heapStructPool().get(id);
+}
+void hostPinValueInPoolsBridge(const void* valuePtr) noexcept {
+    if (valuePtr) {
+        pinValueInPools(*static_cast<const Value*>(valuePtr));
+    }
+}
+void hostMarkValueInPoolsBridge(const void* valuePtr) noexcept {
+    if (valuePtr) {
+        markValueInPools(*static_cast<const Value*>(valuePtr));
+    }
+}
+void hostMarkStackRootValueInPoolsBridge(const void* valuePtr) noexcept {
+    if (valuePtr) {
+        markStackRootValueInPools(*static_cast<const Value*>(valuePtr));
+    }
+}
+std::uint8_t hostAcquireFlatStackBankBridge(const void* stackVecPtr) noexcept {
+    return detail::acquireFlatStackBank(static_cast<const std::vector<Value>*>(stackVecPtr));
+}
+const void* hostLookupFlatStackSliceBridge(
+    std::uint8_t bankId,
+    std::uint32_t absOffset,
+    std::uint16_t slotCount) noexcept {
+    return detail::lookupFlatStackSlice(bankId, absOffset, slotCount);
 }
 } // namespace
 
@@ -2447,31 +2482,58 @@ semantic::SymbolId lookupNativeHandleTypeId(std::uint32_t typeIdx) noexcept {
     return nativeHandleTypeTable().lookup(typeIdx);
 }
 
+const SharedValuePoolBridge* externalValuePoolBridge() noexcept {
+    return g_externalPoolBridge.load(std::memory_order_acquire);
+}
+
 const SharedValuePoolBridge* hostValuePoolBridge() noexcept {
     if (const auto* existing = g_externalPoolBridge.load(std::memory_order_acquire)) {
         return existing;
     }
     static const SharedValuePoolBridge kHostBridge{
-        1u,
+        3u,
         &internArenaQuat,
         &lookupArenaQuat,
         &internArenaEnum,
         &lookupArenaEnum,
         &internNativeHandleTypeId,
         &lookupNativeHandleTypeId,
+        &hostEmptyStringBridge,
         &hostInternStringBridge,
         &hostStringByIdBridge,
         &hostInternInlineArenaBridge,
         &hostLookupInlineArenaBridge,
         &hostRegisterHeapStructBridge,
         &hostLookupHeapStructBridge,
+        &hostPinValueInPoolsBridge,
+        localFlatStructRegistryPtr(),
+        localBlittableRegistryPtr(),
+        localHeapPoolMarkerShardsPtr(),
+        localLiveStringHeapShardsPtr(),
+        localHeapStructAllocCounterPtr(),
+        &hostAcquireFlatStackBankBridge,
+        &releaseFlatStackBank,
+        &hostLookupFlatStackSliceBridge,
+        &hasAnyPinnedPoolValues,
+        &beginValuePoolGcMark,
+        &hostMarkValueInPoolsBridge,
+        &hostMarkStackRootValueInPoolsBridge,
+        &finishValuePoolGcSweep,
+        &hostReclaimPoolValuesBridge,
+        &hostRegisterShadowStackBridge,
+        &hostUnregisterShadowStackBridge,
+        &hostTransferShadowStackBridge,
+        &enterInterpreterMutator,
+        &leaveInterpreterMutator,
+        &hostEnterHeapSyncLockBridge,
+        &hostLeaveHeapSyncLockBridge,
     };
     return &kHostBridge;
 }
 
 void bindHostValuePoolBridge(const void* bridgePtr) noexcept {
     const auto* incoming = static_cast<const SharedValuePoolBridge*>(bridgePtr);
-    if (!incoming || incoming->version != 1u || incoming == hostValuePoolBridge()) {
+    if (!incoming || incoming->version != 3u || incoming == hostValuePoolBridge()) {
         return;
     }
     g_externalPoolBridge.store(incoming, std::memory_order_release);
@@ -2480,6 +2542,12 @@ void bindHostValuePoolBridge(const void* bridgePtr) noexcept {
 } // namespace detail
 
 void pinValueInPools(const Value& value) noexcept {
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->pinValueInPoolsFn) {
+            bridge->pinValueInPoolsFn(&value);
+            return;
+        }
+    }
     if (!value.isTraceable()) return;
     switch (value.rawTag()) {
     case ValueTag::String: {
@@ -2510,6 +2578,12 @@ void pinValueInPools(const Value& value) noexcept {
 }
 
 void beginValuePoolGcMark() noexcept {
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->beginValuePoolGcMarkFn) {
+            bridge->beginValuePoolGcMarkFn();
+            return;
+        }
+    }
     g_poolGcMarkInProgress.store(true, std::memory_order_release);
     g_anyPoolHasPinnedSlots.store(false, std::memory_order_relaxed);
     constexpr std::uint8_t clearMask =
@@ -2556,6 +2630,12 @@ void beginValuePoolGcMark() noexcept {
 }
 
 void markValueInPools(const Value& value) noexcept {
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->markValueInPoolsFn) {
+            bridge->markValueInPoolsFn(&value);
+            return;
+        }
+    }
     if (!value.isTraceable()) return;
     switch (value.rawTag()) {
     case ValueTag::String: {
@@ -2586,6 +2666,12 @@ void markValueInPools(const Value& value) noexcept {
 }
 
 void markStackRootValueInPools(const Value& value) noexcept {
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->markStackRootValueInPoolsFn) {
+            bridge->markStackRootValueInPoolsFn(&value);
+            return;
+        }
+    }
     if (!value.isTraceable()) return;
     switch (value.rawTag()) {
     case ValueTag::String: {
@@ -2616,6 +2702,11 @@ void markStackRootValueInPools(const Value& value) noexcept {
 }
 
 std::size_t finishValuePoolGcSweep() noexcept {
+    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
+        if (bridge->finishValuePoolGcSweepFn) {
+            return bridge->finishValuePoolGcSweepFn();
+        }
+    }
     std::size_t reclaimed = 0u;
     bool anyPoolPinned = false;
     constexpr std::uint8_t clearMarkBits =

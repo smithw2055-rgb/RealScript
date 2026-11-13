@@ -1,4 +1,4 @@
-#include "realscript/runtime/Runtime.h"
+#include "RuntimeInternal.h"
 
 #include <algorithm>
 #include <array>
@@ -88,14 +88,28 @@ struct alignas(64) HeapPoolMarkerShard {
 #pragma warning(pop)
 #endif
 
+std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>& localHeapPoolMarkerShards() noexcept {
+    static auto* shards = new std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>();
+    return *shards;
+}
+
 std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>& heapPoolMarkerShards() noexcept {
+    if (const auto* b = detail::externalValuePoolBridge(); b && b->heapPoolMarkerShardsPtr) {
+        return *static_cast<std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>*>(b->heapPoolMarkerShardsPtr);
+    }
+    return localHeapPoolMarkerShards();
+}
+
+std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>& localLiveStringHeapShards() noexcept {
     static auto* shards = new std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>();
     return *shards;
 }
 
 std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>& liveStringHeapShards() noexcept {
-    static auto* shards = new std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>();
-    return *shards;
+    if (const auto* b = detail::externalValuePoolBridge(); b && b->liveStringHeapShardsPtr) {
+        return *static_cast<std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>*>(b->liveStringHeapShardsPtr);
+    }
+    return localLiveStringHeapShards();
 }
 
 void registerHeapSyncInPoolShard(const std::shared_ptr<HeapSyncState>& sync) {
@@ -215,23 +229,39 @@ std::size_t reclaimPoolValuesInternal(
     const ShadowStack* activeShadowStack,
     bool waitIfBusy) noexcept;
 
+void enterHeapSyncLockLocal() noexcept {
+    if (const auto* b = detail::externalValuePoolBridge(); b && b->enterHeapSyncLockFn) {
+        b->enterHeapSyncLockFn();
+        return;
+    }
+    ++tlsHeapSyncLockDepthRef();
+}
+
+void leaveHeapSyncLockLocal(bool flushDeferred) noexcept {
+    if (const auto* b = detail::externalValuePoolBridge(); b && b->leaveHeapSyncLockFn) {
+        b->leaveHeapSyncLockFn(flushDeferred);
+        return;
+    }
+    auto& depth = tlsHeapSyncLockDepthRef();
+    if (depth > 0u && --depth == 0u && flushDeferred && tlsMutatorDepthRef() == 0u) {
+        if (mutatorSweepCoordinator().deferredSweepPending.exchange(
+                false, std::memory_order_acq_rel)) {
+            (void)reclaimPoolValuesInternal(nullptr, /*waitIfBusy=*/false);
+        }
+    }
+}
+
 class HeapSyncMutexGuard {
 public:
     explicit HeapSyncMutexGuard(std::mutex& m, bool flushDeferredOnUnlock = true)
         : mutex_(m), flushDeferred_(flushDeferredOnUnlock) {
         mutex_.lock();
-        ++tlsHeapSyncLockDepthRef();
+        enterHeapSyncLockLocal();
     }
 
     ~HeapSyncMutexGuard() noexcept {
         mutex_.unlock();
-        auto& depth = tlsHeapSyncLockDepthRef();
-        if (depth > 0u && --depth == 0u && flushDeferred_ && tlsMutatorDepthRef() == 0u) {
-            if (mutatorSweepCoordinator().deferredSweepPending.exchange(
-                    false, std::memory_order_acq_rel)) {
-                (void)reclaimPoolValuesInternal(nullptr, /*waitIfBusy=*/false);
-            }
-        }
+        leaveHeapSyncLockLocal(flushDeferred_);
     }
 
     HeapSyncMutexGuard(const HeapSyncMutexGuard&) = delete;
@@ -249,20 +279,14 @@ public:
           locked_(sync.parallelLockFreeDepth.load(std::memory_order_acquire) == 0u) {
         if (locked_) {
             sync_.mutex.lock();
-            ++tlsHeapSyncLockDepthRef();
+            enterHeapSyncLockLocal();
         }
     }
 
     ~HeapReadOrDisjointGuard() noexcept {
         if (locked_) {
             sync_.mutex.unlock();
-            auto& depth = tlsHeapSyncLockDepthRef();
-            if (depth > 0u && --depth == 0u && tlsMutatorDepthRef() == 0u) {
-                if (mutatorSweepCoordinator().deferredSweepPending.exchange(
-                        false, std::memory_order_acq_rel)) {
-                    (void)reclaimPoolValuesInternal(nullptr, /*waitIfBusy=*/false);
-                }
-            }
+            leaveHeapSyncLockLocal(/*flushDeferred=*/true);
         }
     }
 
@@ -321,6 +345,10 @@ ThreadShadowStackShard* currentThreadShadowStackShard() noexcept {
 } // namespace
 
 void registerActiveShadowStack(ShadowStack* stack) noexcept {
+    if (const auto* b = detail::externalValuePoolBridge(); b && b->registerShadowStackFn) {
+        b->registerShadowStackFn(stack);
+        return;
+    }
     if (!stack || stack->registryShard_ != nullptr) return;
     auto* shard = currentThreadShadowStackShard();
     std::lock_guard<std::mutex> lock(shard->mutex);
@@ -330,6 +358,10 @@ void registerActiveShadowStack(ShadowStack* stack) noexcept {
 }
 
 void unregisterActiveShadowStack(ShadowStack* stack) noexcept {
+    if (const auto* b = detail::externalValuePoolBridge(); b && b->unregisterShadowStackFn) {
+        b->unregisterShadowStackFn(stack);
+        return;
+    }
     if (!stack || !stack->registryShard_) return;
     auto* shard = static_cast<ThreadShadowStackShard*>(stack->registryShard_);
     std::lock_guard<std::mutex> lock(shard->mutex);
@@ -345,6 +377,10 @@ void unregisterActiveShadowStack(ShadowStack* stack) noexcept {
 }
 
 void transferActiveShadowStack(ShadowStack* from, ShadowStack* to) noexcept {
+    if (const auto* b = detail::externalValuePoolBridge(); b && b->transferShadowStackFn) {
+        b->transferShadowStackFn(from, to);
+        return;
+    }
     if (!from || !to || from == to) return;
     if (from->registryShard_ != nullptr) {
         auto* shard = static_cast<ThreadShadowStackShard*>(from->registryShard_);
@@ -543,6 +579,7 @@ enum class SlotStorage : std::uint8_t {
     PackedI32    = 8,  // 4 bytes/element (int, uint, float, enum -> 4x compression)
     PackedI64    = 9,  // 8 bytes/element (long, ulong, double, wide-int/enum -> 2x compression)
     PackedStruct = 10, // Contiguous flat math vectors & blittable user structs (0 GC scan)
+    FlatStruct   = 11, // Contiguous multi-Value-slot user structs (supports ObjectRef/String/Array + CardTable)
 };
 
 [[nodiscard]] constexpr bool isPackedStorage(SlotStorage st) noexcept {
@@ -685,9 +722,16 @@ struct BlittableStructRegistry {
     }
 };
 
-BlittableStructRegistry& globalBlittableRegistry() noexcept {
+BlittableStructRegistry& localBlittableRegistry() noexcept {
     static BlittableStructRegistry instance;
     return instance;
+}
+
+BlittableStructRegistry& globalBlittableRegistry() noexcept {
+    if (const auto* b = detail::externalValuePoolBridge(); b && b->blittableRegistryPtr) {
+        return *static_cast<BlittableStructRegistry*>(b->blittableRegistryPtr);
+    }
+    return localBlittableRegistry();
 }
 
 [[nodiscard]] inline bool isBuiltinMathStructId(semantic::SymbolId tid) noexcept {
@@ -1646,9 +1690,383 @@ struct PackedStorageSpec {
     return false;
 }
 
+namespace {
+
+bool decodeBlittableLeavesRecursive(
+    const BlittableStructRegistry& reg,
+    const std::uint8_t* elemBase,
+    const BlittableStructSchema& bSchema,
+    const FlatStructSchema& fSchema,
+    Value* dstLeaves) noexcept {
+    if (bSchema.fields.size() != fSchema.directFields.size()) return false;
+    for (std::size_t i = 0; i < bSchema.fields.size(); ++i) {
+        const auto& bf = bSchema.fields[i];
+        const auto& ff = fSchema.directFields[i];
+        const std::uint8_t* p = elemBase + bf.byteOffset;
+        Value& outLeaf = dstLeaves[ff.leafOffset];
+        switch (bf.kind) {
+        case BlittableLeafKind::Bool:
+            outLeaf = Value{p[0] != 0u};
+            break;
+        case BlittableLeafKind::Byte:
+            outLeaf = Value{ByteValue{p[0]}};
+            break;
+        case BlittableLeafKind::SByte:
+            outLeaf = Value{SByteValue{static_cast<std::int8_t>(p[0])}};
+            break;
+        case BlittableLeafKind::Short: {
+            std::int16_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            outLeaf = Value{ShortValue{v}};
+            break;
+        }
+        case BlittableLeafKind::UShort: {
+            std::uint16_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            outLeaf = Value{UShortValue{v}};
+            break;
+        }
+        case BlittableLeafKind::Char: {
+            std::uint16_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            outLeaf = Value{CharValue{v}};
+            break;
+        }
+        case BlittableLeafKind::Int32: {
+            std::int32_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            outLeaf = Value{static_cast<std::int64_t>(v)};
+            break;
+        }
+        case BlittableLeafKind::UInt32: {
+            std::uint32_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            outLeaf = Value{UIntValue{v}};
+            break;
+        }
+        case BlittableLeafKind::Float32: {
+            float v = 0.0f;
+            std::memcpy(&v, p, sizeof(v));
+            outLeaf = Value{FloatValue{v}};
+            break;
+        }
+        case BlittableLeafKind::Enum32: {
+            std::int32_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            outLeaf = Value{EnumValue{bf.fieldTypeId, static_cast<std::int64_t>(v)}};
+            break;
+        }
+        case BlittableLeafKind::Int64: {
+            std::int64_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            outLeaf = Value{LongValue{v}};
+            break;
+        }
+        case BlittableLeafKind::UInt64: {
+            std::uint64_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            outLeaf = Value{ULongValue{v}};
+            break;
+        }
+        case BlittableLeafKind::Float64: {
+            double v = 0.0;
+            std::memcpy(&v, p, sizeof(v));
+            outLeaf = Value{v};
+            break;
+        }
+        case BlittableLeafKind::Fixed24_8: {
+            std::int32_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            outLeaf = Value{FixedValue{v}};
+            break;
+        }
+        case BlittableLeafKind::Fixed48_16: {
+            std::int64_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            outLeaf = Value{Fixed16Value{v}};
+            break;
+        }
+        case BlittableLeafKind::Fixed32_32: {
+            std::int64_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            outLeaf = Value{Fixed64Value{v}};
+            break;
+        }
+        case BlittableLeafKind::Vec2: {
+            Vec2Value v{};
+            std::memcpy(&v, p, sizeof(v));
+            outLeaf = Value{v};
+            break;
+        }
+        case BlittableLeafKind::Vec3: {
+            Vec3Value v{};
+            std::memcpy(&v, p, sizeof(v));
+            outLeaf = Value{v};
+            break;
+        }
+        case BlittableLeafKind::Quat: {
+            QuatValue v{};
+            std::memcpy(&v, p, sizeof(v));
+            outLeaf = Value{v};
+            break;
+        }
+        case BlittableLeafKind::Vec2f: {
+            Vec2fValue v{};
+            std::memcpy(&v, p, sizeof(v));
+            outLeaf = Value{v};
+            break;
+        }
+        case BlittableLeafKind::Vec3f: {
+            Vec3fValue v{};
+            std::memcpy(&v, p, sizeof(v));
+            outLeaf = Value{v};
+            break;
+        }
+        case BlittableLeafKind::Quatf: {
+            QuatfValue v{};
+            std::memcpy(&v, p, sizeof(v));
+            outLeaf = Value{v};
+            break;
+        }
+        case BlittableLeafKind::NestedStruct: {
+            const auto* childB = reg.getByIdLockFree(bf.nestedSchemaId);
+            const auto* childF = getFlatStructSchema(ff.subSchemaId);
+            if (!childB || !childF ||
+                !decodeBlittableLeavesRecursive(reg, p, *childB, *childF, dstLeaves + ff.leafOffset)) {
+                return false;
+            }
+            break;
+        }
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+bool decodePackedStructToLeaves(
+    const void* basePtr,
+    std::size_t index,
+    std::uint32_t blittableSchemaId,
+    const FlatStructSchema& flatSchema,
+    Value* dstLeaves) noexcept {
+    if (!basePtr || !dstLeaves) return false;
+    const auto& reg = globalBlittableRegistry();
+    const auto* bSchema = reg.getByIdLockFree(blittableSchemaId);
+    if (!bSchema || bSchema->structTypeId != flatSchema.structTypeId) return false;
+    const auto* elemBytes = static_cast<const std::uint8_t*>(basePtr) +
+        index * static_cast<std::size_t>(bSchema->strideBytes);
+    if (bSchema->fields.empty()) {
+        dstLeaves[0] = Value{};
+        return true;
+    }
+    return decodeBlittableLeavesRecursive(reg, elemBytes, *bSchema, flatSchema, dstLeaves);
+}
+
+bool writePackedStructLeafSlice(
+    void* basePtr,
+    std::size_t index,
+    std::uint32_t blittableSchemaId,
+    const FlatStructSchema& flatSchema,
+    std::uint16_t targetLeafOffset,
+    std::uint16_t subSchemaId,
+    const Value& rhs,
+    bool& outNeedsDemote) noexcept {
+    outNeedsDemote = false;
+    if (!basePtr) return false;
+    const auto& reg = globalBlittableRegistry();
+    const auto* curB = reg.getByIdLockFree(blittableSchemaId);
+    const FlatStructSchema* curF = &flatSchema;
+    if (!curB || curB->structTypeId != curF->structTypeId || curB->strideBytes == 0u) return false;
+    std::uint8_t* ptr = static_cast<std::uint8_t*>(basePtr) +
+        index * static_cast<std::size_t>(curB->strideBytes);
+    std::uint16_t remLeaf = targetLeafOffset;
+
+    for (;;) {
+        if (curB->fields.size() != curF->directFields.size()) return false;
+        bool advanced = false;
+        for (std::size_t i = 0; i < curF->directFields.size(); ++i) {
+            const auto& ff = curF->directFields[i];
+            const auto& bf = curB->fields[i];
+            if (remLeaf < ff.leafOffset || remLeaf >= ff.leafOffset + ff.leafCount) {
+                continue;
+            }
+            ptr += bf.byteOffset;
+            remLeaf = static_cast<std::uint16_t>(remLeaf - ff.leafOffset);
+            if (remLeaf == 0u && ff.subSchemaId == subSchemaId) {
+                if (subSchemaId != 0u) {
+                    const auto* subB = reg.getByIdLockFree(bf.nestedSchemaId);
+                    if (!subB) return false;
+                    return encodeBlittableStructBytes(reg, ptr, *subB, rhs, outNeedsDemote);
+                }
+                // Scalar / inline-math leaf write directly into packed bytes
+                switch (bf.kind) {
+                case BlittableLeafKind::Bool: {
+                    bool bv = false;
+                    if (!rhs.tryGetBool(bv)) { outNeedsDemote = true; return false; }
+                    ptr[0] = bv ? 1u : 0u;
+                    return true;
+                }
+                case BlittableLeafKind::Byte: {
+                    const auto* v = std::get_if<ByteValue>(&rhs);
+                    if (!v) { outNeedsDemote = true; return false; }
+                    ptr[0] = v->value;
+                    return true;
+                }
+                case BlittableLeafKind::SByte: {
+                    const auto* v = std::get_if<SByteValue>(&rhs);
+                    if (!v) { outNeedsDemote = true; return false; }
+                    ptr[0] = static_cast<std::uint8_t>(v->value);
+                    return true;
+                }
+                case BlittableLeafKind::Short: {
+                    const auto* v = std::get_if<ShortValue>(&rhs);
+                    if (!v) { outNeedsDemote = true; return false; }
+                    std::memcpy(ptr, &v->value, sizeof(v->value));
+                    return true;
+                }
+                case BlittableLeafKind::UShort: {
+                    const auto* v = std::get_if<UShortValue>(&rhs);
+                    if (!v) { outNeedsDemote = true; return false; }
+                    std::memcpy(ptr, &v->value, sizeof(v->value));
+                    return true;
+                }
+                case BlittableLeafKind::Char: {
+                    const auto* v = std::get_if<CharValue>(&rhs);
+                    if (!v) { outNeedsDemote = true; return false; }
+                    std::memcpy(ptr, &v->value, sizeof(v->value));
+                    return true;
+                }
+                case BlittableLeafKind::Int32: {
+                    std::int64_t iv = 0;
+                    if (!rhs.tryGetInt64(iv) ||
+                        iv < std::numeric_limits<std::int32_t>::min() ||
+                        iv > std::numeric_limits<std::int32_t>::max()) {
+                        outNeedsDemote = true;
+                        return false;
+                    }
+                    const auto i32 = static_cast<std::int32_t>(iv);
+                    std::memcpy(ptr, &i32, sizeof(i32));
+                    return true;
+                }
+                case BlittableLeafKind::UInt32: {
+                    const auto* v = std::get_if<UIntValue>(&rhs);
+                    if (!v) { outNeedsDemote = true; return false; }
+                    std::memcpy(ptr, &v->value, sizeof(v->value));
+                    return true;
+                }
+                case BlittableLeafKind::Float32: {
+                    float fl = 0.0f;
+                    if (!rhs.tryGetFloat(fl)) { outNeedsDemote = true; return false; }
+                    std::memcpy(ptr, &fl, sizeof(fl));
+                    return true;
+                }
+                case BlittableLeafKind::Enum32: {
+                    EnumValue ev{};
+                    if (!rhs.tryGetEnum(ev) || ev.typeId != bf.fieldTypeId ||
+                        ev.value < std::numeric_limits<std::int32_t>::min() ||
+                        ev.value > std::numeric_limits<std::int32_t>::max()) {
+                        outNeedsDemote = true;
+                        return false;
+                    }
+                    const auto e32 = static_cast<std::int32_t>(ev.value);
+                    std::memcpy(ptr, &e32, sizeof(e32));
+                    return true;
+                }
+                case BlittableLeafKind::Int64: {
+                    std::int64_t lv = 0;
+                    if (!rhs.tryGetLong(lv)) { outNeedsDemote = true; return false; }
+                    std::memcpy(ptr, &lv, sizeof(lv));
+                    return true;
+                }
+                case BlittableLeafKind::UInt64: {
+                    const auto* v = std::get_if<ULongValue>(&rhs);
+                    if (!v) { outNeedsDemote = true; return false; }
+                    std::memcpy(ptr, &v->value, sizeof(v->value));
+                    return true;
+                }
+                case BlittableLeafKind::Float64: {
+                    double dv = 0.0;
+                    if (!rhs.tryGetDouble(dv)) { outNeedsDemote = true; return false; }
+                    std::memcpy(ptr, &dv, sizeof(dv));
+                    return true;
+                }
+                case BlittableLeafKind::Fixed24_8: {
+                    const auto* v = std::get_if<FixedValue>(&rhs);
+                    if (!v) { outNeedsDemote = true; return false; }
+                    std::memcpy(ptr, &v->raw, sizeof(v->raw));
+                    return true;
+                }
+                case BlittableLeafKind::Fixed48_16: {
+                    const auto* v = std::get_if<Fixed16Value>(&rhs);
+                    if (!v) { outNeedsDemote = true; return false; }
+                    std::memcpy(ptr, &v->raw, sizeof(v->raw));
+                    return true;
+                }
+                case BlittableLeafKind::Fixed32_32: {
+                    const auto* v = std::get_if<Fixed64Value>(&rhs);
+                    if (!v) { outNeedsDemote = true; return false; }
+                    std::memcpy(ptr, &v->raw, sizeof(v->raw));
+                    return true;
+                }
+                case BlittableLeafKind::Vec2: {
+                    const auto* v = std::get_if<Vec2Value>(&rhs);
+                    if (!v) { outNeedsDemote = true; return false; }
+                    std::memcpy(ptr, v, sizeof(*v));
+                    return true;
+                }
+                case BlittableLeafKind::Vec3: {
+                    const auto* v = std::get_if<Vec3Value>(&rhs);
+                    if (!v) { outNeedsDemote = true; return false; }
+                    std::memcpy(ptr, v, sizeof(*v));
+                    return true;
+                }
+                case BlittableLeafKind::Quat: {
+                    QuatValue qv{};
+                    if (!rhs.tryGetQuat(qv)) { outNeedsDemote = true; return false; }
+                    std::memcpy(ptr, &qv, sizeof(qv));
+                    return true;
+                }
+                case BlittableLeafKind::Vec2f: {
+                    const auto* v = std::get_if<Vec2fValue>(&rhs);
+                    if (!v) { outNeedsDemote = true; return false; }
+                    std::memcpy(ptr, v, sizeof(*v));
+                    return true;
+                }
+                case BlittableLeafKind::Vec3f: {
+                    const auto* v = std::get_if<Vec3fValue>(&rhs);
+                    if (!v) { outNeedsDemote = true; return false; }
+                    std::memcpy(ptr, v, sizeof(*v));
+                    return true;
+                }
+                case BlittableLeafKind::Quatf: {
+                    QuatfValue qv{};
+                    if (!rhs.tryGetQuatf(qv)) { outNeedsDemote = true; return false; }
+                    std::memcpy(ptr, &qv, sizeof(qv));
+                    return true;
+                }
+                case BlittableLeafKind::NestedStruct:
+                    return false;
+                }
+                return false;
+            }
+            if (bf.kind != BlittableLeafKind::NestedStruct || ff.subSchemaId == 0u) {
+                return false;
+            }
+            curB = reg.getByIdLockFree(bf.nestedSchemaId);
+            curF = getFlatStructSchema(ff.subSchemaId);
+            if (!curB || !curF) return false;
+            advanced = true;
+            break;
+        }
+        if (!advanced) return false;
+    }
+}
+
 void registerBlittableStructTypes(
     const std::vector<std::pair<semantic::SymbolId, std::vector<BlittableFieldInput>>>& structTypes) {
     if (structTypes.empty()) return;
+    detail::registerFlatStructTypes(structTypes);
     auto& reg = globalBlittableRegistry();
     std::lock_guard<std::mutex> lock(reg.mutex);
 
@@ -2296,6 +2714,10 @@ struct ManagedHeap::Impl {
         if (t == ValueTag::ObjectRef) return true;
         if (t == ValueTag::Struct) {
             const auto& s = value.asStructUnchecked();
+            if (s.isFrameSlice()) {
+                const auto* sc = getFlatStructSchema(s.frameSchemaId());
+                return sc ? sc->containsManagedReferences : true;
+            }
             return !s.isInline && s.storage != nullptr;
         }
         return false;
@@ -2311,7 +2733,11 @@ struct ManagedHeap::Impl {
     }
 
     [[nodiscard]] static bool isValuePoolBacked(const Value& value) noexcept {
-        return value.isTraceable() && value.rawTag() != ValueTag::ObjectRef;
+        if (!value.isTraceable() || value.rawTag() == ValueTag::ObjectRef) return false;
+        if (value.rawTag() == ValueTag::Struct && value.asStructUnchecked().isFrameSlice()) {
+            return false;
+        }
+        return true;
     }
 
     static bool markPoolCallback(void* rawImpl) {
@@ -2350,8 +2776,7 @@ struct ManagedHeap::Impl {
     }
 
     void noteMaybePoolBackedUnlocked() {
-        if (!mayContainPoolValues.load(std::memory_order_relaxed)) {
-            mayContainPoolValues.store(true, std::memory_order_release);
+        if (!mayContainPoolValues.exchange(true, std::memory_order_acq_rel)) {
             registerHeapSyncInPoolShard(syncState);
         }
     }
@@ -2367,6 +2792,10 @@ struct ManagedHeap::Impl {
         const auto st = slot.storage();
         if (st == SlotStorage::SlabValues || st == SlotStorage::HeapValues) {
             return slot.payload.s.length;
+        }
+        if (st == SlotStorage::FlatStruct) {
+            const auto* sc = getFlatStructSchema(slot.auxMeta);
+            return sc ? static_cast<std::size_t>(slot.payload.s.length) * sc->flatSlotCount : 0u;
         }
         return 0;
     }
@@ -2394,6 +2823,8 @@ struct ManagedHeap::Impl {
         case SlotStorage::SlabValues:
         case SlotStorage::HeapValues:
             return BaseObjectSizeBytes + static_cast<std::size_t>(slot.payload.s.length) * sizeof(Value);
+        case SlotStorage::FlatStruct:
+            return BaseObjectSizeBytes + slotValueCount(slot) * sizeof(Value);
         case SlotStorage::PackedB8:
         case SlotStorage::PackedB16:
         case SlotStorage::PackedI32:
@@ -2431,7 +2862,10 @@ struct ManagedHeap::Impl {
             slabPool.deallocate(slot.auxMeta, slot.payload.s.handle, slot.payload.s.length);
             break;
         case SlotStorage::HeapValues:
-            largeBuffers.release(slot.payload.s.handle);
+        case SlotStorage::FlatStruct:
+            if (slot.payload.s.handle != CompactSlot::kInvalidHandle) {
+                largeBuffers.release(slot.payload.s.handle);
+            }
             break;
         case SlotStorage::PackedB8:
         case SlotStorage::PackedB16:
@@ -2589,6 +3023,7 @@ struct ManagedHeap::Impl {
     std::uint64_t heapId = 0;
     std::shared_ptr<HeapSyncState> syncState;
     std::atomic<bool> mayContainPoolValues{false};
+    std::atomic<std::uint64_t> gcAndLayoutEpoch{1};
     std::vector<CompactSlot> slots;
     std::vector<std::uint32_t> freeSlots;
     std::vector<ObjectRef> markStack;
@@ -2782,6 +3217,7 @@ struct ManagedHeap::Impl {
             statistics.peakLiveBytes = std::max(statistics.peakLiveBytes, statistics.liveBytes);
         }
         (void)slotIndex;
+        gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
         return true;
     }
 
@@ -2859,6 +3295,7 @@ struct ManagedHeap::Impl {
                 statistics.bytesReclaimed += delta;
             }
         }
+        gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
         return true;
     }
 
@@ -2873,11 +3310,15 @@ struct ManagedHeap::Impl {
         bool* outReallocated = nullptr) {
         const std::uint32_t layoutId = internArrayLayout(arrayTypeId, elementType, elementTypeId);
         PackedStorageSpec packedSpec{};
+        const Value* packedInitSample =
+            (length > 0 && initialValue.rawTag() != ValueTag::Monostate)
+                ? &initialValue
+                : nullptr;
         if (length <= static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) &&
             tryClassifyPackedArray(
                 elementType,
                 elementTypeId,
-                length > 0 ? &initialValue : nullptr,
+                packedInitSample,
                 packedSpec) &&
             packedSpec.strideBytes > 0u &&
             length <= (std::numeric_limits<std::size_t>::max() - BaseObjectSizeBytes) /
@@ -2888,7 +3329,7 @@ struct ManagedHeap::Impl {
             if (!slotIndex) return std::nullopt;
             Value* alignedPtr = nullptr;
             const std::uint32_t bufHandle = packedBuffers.acquireZeroed(packedBytes, alignedPtr);
-            if (length > 0) {
+            if (packedInitSample != nullptr) {
                 bool dummyWiden = false;
                 Value zeroSample = readPackedElementValue(
                     alignedPtr, 0, packedSpec.encoding, elementTypeId, packedSpec.schemaId);
@@ -2915,6 +3356,54 @@ struct ManagedHeap::Impl {
                 packedSpec.schemaId,
             };
             return finalizeSlotAllocation(*slotIndex, ObjectKind::Array, packedSpec.storage, packedTotalBytes);
+        }
+        if (elementType == semantic::PrimitiveType::Struct &&
+            elementTypeId != 0 &&
+            length <= static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+            if (const auto* flatSchema = findFlatStructSchemaByTypeId(elementTypeId);
+                flatSchema != nullptr &&
+                flatSchema->schemaId != 0u &&
+                flatSchema->flatSlotCount >= 1u &&
+                length <= (std::numeric_limits<std::size_t>::max() - BaseObjectSizeBytes) /
+                    (static_cast<std::size_t>(flatSchema->flatSlotCount) * sizeof(Value))) {
+                const std::size_t stride = flatSchema->flatSlotCount;
+                const std::size_t totalVals = length * stride;
+                const std::size_t flatTotalBytes = BaseObjectSizeBytes + totalVals * sizeof(Value);
+                const auto slotIndex = acquireSlot(flatTotalBytes, error, outReallocated);
+                if (!slotIndex) return std::nullopt;
+                if (flatSchema->containsPoolValues) {
+                    noteMaybePoolBackedUnlocked();
+                }
+                Value* ptr = nullptr;
+                std::uint32_t bufHandle = CompactSlot::kInvalidHandle;
+                if (totalVals > 0) {
+                    std::vector<Value> elemProto(stride);
+                    if (!extractStructLeavesToBuffer(initialValue, *flatSchema, elemProto.data())) {
+                        elemProto = flatSchema->prototypeLeaves;
+                    }
+                    for (const auto& leaf : elemProto) {
+                        pinHeapValueIfNeededUnlocked(leaf);
+                    }
+                    std::vector<Value> initBuf(totalVals);
+                    for (std::size_t i = 0; i < length; ++i) {
+                        std::memcpy(
+                            static_cast<void*>(initBuf.data() + i * stride),
+                            static_cast<const void*>(elemProto.data()),
+                            stride * sizeof(Value));
+                    }
+                    bufHandle = largeBuffers.acquireMove(std::move(initBuf), ptr);
+                }
+                auto& slot = slots[*slotIndex];
+                slot.auxMeta = flatSchema->schemaId;
+                slot.payload.s = {
+                    layoutId,
+                    static_cast<std::uint32_t>(length),
+                    ptr,
+                    bufHandle,
+                    CompactSlot::kInvalidHandle,
+                };
+                return finalizeSlotAllocation(*slotIndex, ObjectKind::Array, SlotStorage::FlatStruct, flatTotalBytes);
+            }
         }
         const auto slotIndex = acquireSlot(sizeBytes, error, outReallocated);
         if (!slotIndex) return std::nullopt;
@@ -2973,7 +3462,10 @@ struct ManagedHeap::Impl {
         RuntimeError* error) {
         const auto slotIndex = acquireSlot(sizeBytes, error);
         if (!slotIndex) return std::nullopt;
-        for (const auto& v : vals) {
+        for (auto& v : vals) {
+            if (v.rawTag() == ValueTag::Struct && v.asStructUnchecked().isFrameSlice()) {
+                v = detachFrameSliceValue(v);
+            }
             pinHeapValueIfNeededUnlocked(v);
         }
         auto& slot = slots[*slotIndex];
@@ -3012,11 +3504,17 @@ struct ManagedHeap::Impl {
         slot.gcFlags &= static_cast<std::uint8_t>(~(GcFlag::InNursery | GcFlag::Marked));
         ++statistics.objectsPromoted;
         if (slot.kind() == ObjectKind::Array &&
-            slot.storage() == SlotStorage::HeapValues &&
+            (slot.storage() == SlotStorage::HeapValues || slot.storage() == SlotStorage::FlatStruct) &&
             slot.payload.s.length >= ManagedHeap::kCardTableMinLength &&
             !slot.hasFlag(GcFlag::HasCardTable)) {
             const auto& layout = typeLayouts[slot.payload.s.layoutId];
-            if (layout.mayContainReferences) {
+            bool needsCards = layout.mayContainReferences;
+            if (slot.storage() == SlotStorage::FlatStruct) {
+                if (const auto* sc = getFlatStructSchema(slot.auxMeta)) {
+                    needsCards = sc->containsManagedReferences;
+                }
+            }
+            if (needsCards) {
                 slot.payload.s.cardHandle = cardArena.allocate(slot.payload.s.length);
                 slot.gcFlags |= GcFlag::HasCardTable;
             }
@@ -3160,6 +3658,19 @@ struct ManagedHeap::Impl {
         const Value* data = slot->payload.s.data;
         const auto& layout = typeLayouts[slot->payload.s.layoutId];
         if (slot->kind() == ObjectKind::Array) {
+            if (slot->storage() == SlotStorage::FlatStruct) {
+                const auto* sc = getFlatStructSchema(slot->auxMeta);
+                if (!sc || !sc->containsManagedReferences) return;
+                const std::size_t elemCount = slot->payload.s.length;
+                const std::size_t stride = sc->flatSlotCount;
+                for (std::size_t e = 0; e < elemCount; ++e) {
+                    const Value* elemBase = data + e * stride;
+                    for (const auto refOff : sc->referenceLeafOffsets) {
+                        markValue(elemBase[refOff]);
+                    }
+                }
+                return;
+            }
             if (!layout.mayContainReferences) return;
             for (std::size_t i = 0; i < count; ++i) markValue(data[i]);
             return;
@@ -3200,6 +3711,31 @@ struct ManagedHeap::Impl {
         }
         if (phase == GcPhase::Idle || !slot->hasFlag(GcFlag::Marked)) return;
         markValue(value);
+        if (!markStack.empty()) {
+            reopenMarkFromSweep();
+        }
+    }
+
+    void writeBarrierFlatStructElement(ObjectRef owner, std::size_t elementIndex) noexcept {
+        auto* slot = getSlot(owner);
+        if (!slot || slot->storage() != SlotStorage::FlatStruct) return;
+        const auto* sc = getFlatStructSchema(slot->auxMeta);
+        if (!sc || !sc->containsManagedReferences || elementIndex >= slot->payload.s.length) return;
+        if (!slot->hasFlag(GcFlag::InNursery)) {
+            if (slot->hasFlag(GcFlag::HasCardTable)) {
+                auto* cardBytes = cardArena.get(slot->payload.s.cardHandle).bytePtr();
+                cardBytes[elementIndex >> ManagedHeap::kCardElementShift] = 1u;
+            }
+            if (!slot->hasFlag(GcFlag::InRememberedSet)) {
+                slot->gcFlags |= GcFlag::InRememberedSet;
+                rememberedSet.push_back(owner);
+            }
+        }
+        if (phase == GcPhase::Idle || !slot->hasFlag(GcFlag::Marked)) return;
+        const Value* elemBase = slot->payload.s.data + elementIndex * static_cast<std::size_t>(sc->flatSlotCount);
+        for (const auto refOff : sc->referenceLeafOffsets) {
+            markValue(elemBase[refOff]);
+        }
         if (!markStack.empty()) {
             reopenMarkFromSweep();
         }
@@ -3250,6 +3786,7 @@ struct ManagedHeap::Impl {
         }
         rememberedSet.clear();
         ++statistics.collectionsCompleted;
+        gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
         const auto doubled = statistics.liveBytes >
                 std::numeric_limits<std::size_t>::max() / 2
             ? config.maximumHeapBytes
@@ -3570,7 +4107,14 @@ std::optional<ObjectRef> ManagedHeap::allocateTypedArray(
             "managed array element type metadata is invalid");
         return std::nullopt;
     }
+    const auto* flatSchemaPre =
+        (elementType == semantic::PrimitiveType::Struct && elementTypeId != 0)
+            ? findFlatStructSchemaByTypeId(elementTypeId)
+            : nullptr;
+    const bool isDefaultFlatStructSentinel =
+        flatSchemaPre != nullptr && initialValue.rawTag() == ValueTag::Monostate;
     if (length > 0 &&
+        !isDefaultFlatStructSentinel &&
         elementType != semantic::PrimitiveType::Error &&
         valueType(initialValue) != elementType) {
         setHeapError(error, ErrorCode::TypeMismatch,
@@ -3579,13 +4123,23 @@ std::optional<ObjectRef> ManagedHeap::allocateTypedArray(
     }
     PackedStorageSpec preSpec{};
     std::size_t storage = 0;
+    const Value* preSample =
+        (length > 0 && initialValue.rawTag() != ValueTag::Monostate) ? &initialValue : nullptr;
     if (length <= static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) &&
-        tryClassifyPackedArray(elementType, elementTypeId, length > 0 ? &initialValue : nullptr, preSpec) &&
+        tryClassifyPackedArray(elementType, elementTypeId, preSample, preSpec) &&
         preSpec.strideBytes > 0u) {
         if (length > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(preSpec.strideBytes)) {
             storage = std::numeric_limits<std::size_t>::max();
         } else {
             storage = length * static_cast<std::size_t>(preSpec.strideBytes);
+        }
+    } else if (flatSchemaPre != nullptr &&
+               length <= static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+        const std::size_t elemBytes = static_cast<std::size_t>(flatSchemaPre->flatSlotCount) * sizeof(Value);
+        if (elemBytes > 0 && length > std::numeric_limits<std::size_t>::max() / elemBytes) {
+            storage = std::numeric_limits<std::size_t>::max();
+        } else {
+            storage = length * elemBytes;
         }
     } else {
         storage = estimateValueStorage(length);
@@ -4221,6 +4775,14 @@ std::optional<Value> ManagedHeap::arrayGet(ObjectRef reference, std::size_t inde
                 elemTid,
                 slot->payload.s.cardHandle);
         }
+        if (slot->storage() == SlotStorage::FlatStruct) {
+            if (index >= slot->payload.s.length) return std::nullopt;
+            const auto* sc = getFlatStructSchema(slot->auxMeta);
+            if (!sc) return std::nullopt;
+            return reconstructDetachedStructFromLeaves(
+                *sc,
+                slot->payload.s.data + index * static_cast<std::size_t>(sc->flatSlotCount));
+        }
         if (slot->storage() != SlotStorage::RawColumn) {
             if (index >= slot->payload.s.length) return std::nullopt;
             return slot->payload.s.data[index];
@@ -4253,6 +4815,23 @@ bool ManagedHeap::isPackedArray(ObjectRef reference) const noexcept {
     return slot && slot->kind() == ObjectKind::Array && isPackedStorage(slot->storage());
 }
 
+bool ManagedHeap::isFlatStructArray(ObjectRef reference) const noexcept {
+    HeapReadOrDisjointGuard heapLock(*impl_->syncState);
+    const auto* slot = impl_->getSlot(reference);
+    return slot && slot->kind() == ObjectKind::Array && slot->storage() == SlotStorage::FlatStruct;
+}
+
+std::optional<std::size_t> ManagedHeap::flatStructArrayStride(ObjectRef reference) const noexcept {
+    HeapReadOrDisjointGuard heapLock(*impl_->syncState);
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array || slot->storage() != SlotStorage::FlatStruct) {
+        return std::nullopt;
+    }
+    const auto* sc = getFlatStructSchema(slot->auxMeta);
+    if (!sc) return std::nullopt;
+    return static_cast<std::size_t>(sc->flatSlotCount);
+}
+
 std::optional<std::size_t> ManagedHeap::packedElementStrideBytes(ObjectRef reference) const noexcept {
     HeapReadOrDisjointGuard heapLock(*impl_->syncState);
     const auto* slot = impl_->getSlot(reference);
@@ -4279,6 +4858,7 @@ const Value* ManagedHeap::arrayGetFast(ObjectRef reference, std::size_t index) c
     const auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array ||
         slot->storage() == SlotStorage::RawColumn ||
+        slot->storage() == SlotStorage::FlatStruct ||
         isPackedStorage(slot->storage()) ||
         index >= slot->payload.s.length) {
         return nullptr;
@@ -4355,11 +4935,74 @@ bool ManagedHeap::tryBindPackedDoubleArray(
     return true;
 }
 
+bool ManagedHeap::tryBindFlatStructArrayFastView(
+    ObjectRef reference,
+    FlatStructArrayFastView& outView) const noexcept {
+    HeapReadOrDisjointGuard heapLock(*impl_->syncState);
+    auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array || slot->storage() != SlotStorage::FlatStruct) {
+        outView = {};
+        return false;
+    }
+    const std::uint32_t count = slot->payload.s.length;
+    if (count > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+        outView = {};
+        return false;
+    }
+    const auto* sc = getFlatStructSchema(slot->auxMeta);
+    if (!sc || sc->flatSlotCount == 0u) {
+        outView = {};
+        return false;
+    }
+    if (sc->containsPoolValues && !impl_->mayContainPoolValues.load(std::memory_order_relaxed)) {
+        impl_->noteMaybePoolBackedUnlocked();
+    }
+    const bool inNursery = slot->hasFlag(GcFlag::InNursery);
+    outView.data = slot->payload.s.data;
+    outView.dirtyCards = (!inNursery && slot->hasFlag(GcFlag::HasCardTable))
+        ? impl_->cardArena.get(slot->payload.s.cardHandle).bytePtr()
+        : nullptr;
+    outView.length = count;
+    outView.flatStride = sc->flatSlotCount;
+    outView.flatSchemaId = sc->schemaId;
+    outView.elementTypeId = impl_->typeLayouts[slot->payload.s.layoutId].elementTypeId;
+    outView.containsManagedReferences = sc->containsManagedReferences;
+    outView.containsPoolValues = sc->containsPoolValues;
+    outView.needsRememberedBarrier = (!inNursery && !slot->hasFlag(GcFlag::InRememberedSet));
+    return true;
+}
+
+void ManagedHeap::recordFlatStructArrayWriteBarrier(
+    ObjectRef arrayRef,
+    std::size_t elementIndex) noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    impl_->writeBarrierFlatStructElement(arrayRef, elementIndex);
+}
+
+std::uint64_t ManagedHeap::gcEpoch() const noexcept {
+    return impl_->gcAndLayoutEpoch.load(std::memory_order_acquire);
+}
+
+void ManagedHeap::pinFlatStructArrayElement(
+    ObjectRef arrayRef,
+    std::size_t elementIndex) noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    auto* slot = impl_->getSlot(arrayRef);
+    if (!slot || slot->kind() != ObjectKind::Array || slot->storage() != SlotStorage::FlatStruct) return;
+    const auto* sc = getFlatStructSchema(slot->auxMeta);
+    if (!sc || !sc->containsPoolValues || elementIndex >= slot->payload.s.length) return;
+    const Value* elemBase = slot->payload.s.data + elementIndex * static_cast<std::size_t>(sc->flatSlotCount);
+    for (std::uint16_t k = 0; k < sc->flatSlotCount; ++k) {
+        impl_->pinHeapValueIfNeededUnlocked(elemBase[k]);
+    }
+}
+
 bool ManagedHeap::tryBindArrayFastView(ObjectRef reference, ArrayFastView& outView) const noexcept {
     HeapReadOrDisjointGuard heapLock(*impl_->syncState);
     auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array ||
         slot->storage() == SlotStorage::RawColumn ||
+        slot->storage() == SlotStorage::FlatStruct ||
         isPackedStorage(slot->storage())) {
         return false;
     }
@@ -4521,11 +5164,31 @@ bool ManagedHeap::arraySetPrevalidated(
         }
         return false;
     }
-    if (mayBeReference) {
-        impl_->writeBarrierArrayElement(reference, index, value);
+    if (slot->storage() == SlotStorage::FlatStruct) {
+        const auto* sc = getFlatStructSchema(slot->auxMeta);
+        if (!sc) return false;
+        Value* elemDst = slot->payload.s.data + index * static_cast<std::size_t>(sc->flatSlotCount);
+        if (!extractStructLeavesToBuffer(value, *sc, elemDst)) {
+            return false;
+        }
+        if (sc->containsPoolValues) {
+            for (std::uint16_t k = 0; k < sc->flatSlotCount; ++k) {
+                impl_->pinHeapValueIfNeededUnlocked(elemDst[k]);
+            }
+        }
+        if (sc->containsManagedReferences) {
+            impl_->writeBarrierFlatStructElement(reference, index);
+        }
+        return true;
     }
-    impl_->pinHeapValueIfNeededUnlocked(value);
-    slot->payload.s.data[index] = value;
+    Value stored = (value.rawTag() == ValueTag::Struct && value.asStructUnchecked().isFrameSlice())
+        ? detachFrameSliceValue(value)
+        : value;
+    if (mayBeReference) {
+        impl_->writeBarrierArrayElement(reference, index, stored);
+    }
+    impl_->pinHeapValueIfNeededUnlocked(stored);
+    slot->payload.s.data[index] = std::move(stored);
     return true;
 }
 
@@ -4718,8 +5381,34 @@ bool ManagedHeap::arraySet(
             "managed array element type mismatch");
         return false;
     }
+    if (slot->storage() == SlotStorage::FlatStruct) {
+        const auto* sc = getFlatStructSchema(slot->auxMeta);
+        if (!sc) {
+            setHeapError(error, ErrorCode::InvalidProgram, "missing flat struct schema for array");
+            return false;
+        }
+        Value* elemDst = values + index * static_cast<std::size_t>(sc->flatSlotCount);
+        if (!extractStructLeavesToBuffer(value, *sc, elemDst)) {
+            setHeapError(error, ErrorCode::TypeMismatch, "managed array flat struct element mismatch");
+            return false;
+        }
+        if (sc->containsPoolValues) {
+            for (std::uint16_t k = 0; k < sc->flatSlotCount; ++k) {
+                impl_->pinHeapValueIfNeededUnlocked(elemDst[k]);
+            }
+        }
+        if (sc->containsManagedReferences) {
+            impl_->writeBarrierFlatStructElement(reference, index);
+        }
+        return true;
+    }
+    if (value.rawTag() == ValueTag::Struct && value.asStructUnchecked().isFrameSlice()) {
+        value = detachFrameSliceValue(value);
+    }
+    if (Impl::valueMayContainReferences(value)) {
+        impl_->writeBarrierArrayElement(reference, index, value);
+    }
     impl_->pinHeapValueIfNeededUnlocked(value);
-    impl_->writeBarrierArrayElement(reference, index, value);
     values[index] = std::move(value);
     return true;
 }
@@ -4788,6 +5477,9 @@ bool ManagedHeap::fieldSet(
             "managed field index is out of range");
         return false;
     }
+    if (value.rawTag() == ValueTag::Struct && value.asStructUnchecked().isFrameSlice()) {
+        value = detachFrameSliceValue(value);
+    }
     const auto& refFields = impl_->typeLayouts[slot->payload.s.layoutId].referenceFields;
     if (Impl::valueMayContainReferences(value) &&
         !refFields.empty() &&
@@ -4818,13 +5510,16 @@ bool ManagedHeap::fieldSetFast(
         childRef && !impl_->getSlot(*childRef)) {
         return false;
     }
-    if (Impl::valueMayContainReferences(value) &&
+    const Value stored = (value.rawTag() == ValueTag::Struct && value.asStructUnchecked().isFrameSlice())
+        ? detachFrameSliceValue(value)
+        : value;
+    if (Impl::valueMayContainReferences(stored) &&
         !layout.referenceFields.empty() &&
         std::binary_search(layout.referenceFields.begin(), layout.referenceFields.end(), index)) {
-        impl_->writeBarrierObject(reference, value);
+        impl_->writeBarrierObject(reference, stored);
     }
-    impl_->pinHeapValueIfNeededUnlocked(value);
-    slot->payload.s.data[index] = value;
+    impl_->pinHeapValueIfNeededUnlocked(stored);
+    slot->payload.s.data[index] = stored;
     return true;
 }
 
@@ -4833,6 +5528,9 @@ ManagedHeap::RootToken ManagedHeap::addPersistentRoot(ObjectRef reference) {
 }
 
 ManagedHeap::RootToken ManagedHeap::addPersistentRoot(Value value) {
+    if (value.rawTag() == ValueTag::Struct && value.asStructUnchecked().isFrameSlice()) {
+        value = detachFrameSliceValue(value);
+    }
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     if (!impl_->validRootValue(value)) return 0;
     if (impl_->phase != GcPhase::Idle) {
@@ -4897,6 +5595,9 @@ std::optional<Value> ManagedHeap::getStaticField(semantic::SymbolId id) const {
 }
 
 void ManagedHeap::setStaticField(semantic::SymbolId id, Value value) {
+    if (value.rawTag() == ValueTag::Struct && value.asStructUnchecked().isFrameSlice()) {
+        value = detachFrameSliceValue(value);
+    }
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     if (impl_->phase != GcPhase::Idle) {
         impl_->markValue(value);
@@ -4929,6 +5630,9 @@ bool ManagedHeap::setNativeEcsComponent(
     std::string_view canonicalTypeName,
     std::int64_t entityId,
     Value component) {
+    if (component.rawTag() == ValueTag::Struct && component.asStructUnchecked().isFrameSlice()) {
+        component = detachFrameSliceValue(component);
+    }
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     if (impl_->phase != GcPhase::Idle) {
         impl_->markValue(component);
@@ -5047,6 +5751,9 @@ bool ManagedHeap::setNativeEcsComponentByDenseIndex(
     std::string_view canonicalTypeName,
     std::size_t denseIndex,
     Value component) {
+    if (component.rawTag() == ValueTag::Struct && component.asStructUnchecked().isFrameSlice()) {
+        component = detachFrameSliceValue(component);
+    }
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto found = impl_->nativeEcsTables.find(std::string(canonicalTypeName));
     if (found == impl_->nativeEcsTables.end() || denseIndex >= found->second.values.size()) {
@@ -5408,6 +6115,40 @@ std::size_t ManagedHeap::collectYoung(
         const auto& layout = impl_->typeLayouts[oldSlot->payload.s.layoutId];
 
         if (oldSlot->kind() == ObjectKind::Array) {
+            if (oldSlot->storage() == SlotStorage::FlatStruct) {
+                const auto* sc = getFlatStructSchema(oldSlot->auxMeta);
+                if (!sc || !sc->containsManagedReferences) continue;
+                const std::size_t elemCount = oldSlot->payload.s.length;
+                const std::size_t stride = sc->flatSlotCount;
+                if (oldSlot->hasFlag(GcFlag::HasCardTable)) {
+                    auto& slice = impl_->cardArena.get(oldSlot->payload.s.cardHandle);
+                    for (std::uint32_t w = 0; w < slice.wordCount; ++w) {
+                        if (slice.words[w] == 0) continue;
+                        auto* cardBytes = reinterpret_cast<std::uint8_t*>(&slice.words[w]);
+                        for (std::uint32_t b = 0; b < 8; ++b) {
+                            if (cardBytes[b] == 0) continue;
+                            cardBytes[b] = 0;
+                            const std::size_t cardIdx = (static_cast<std::size_t>(w) << 3) + b;
+                            const std::size_t begin = cardIdx << ManagedHeap::kCardElementShift;
+                            const std::size_t end = std::min(elemCount, begin + ManagedHeap::kCardElements);
+                            for (std::size_t e = begin; e < end; ++e) {
+                                const Value* elemBase = data + e * stride;
+                                for (const auto refOff : sc->referenceLeafOffsets) {
+                                    markYoungValue(markYoungValue, elemBase[refOff]);
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                for (std::size_t e = 0; e < elemCount; ++e) {
+                    const Value* elemBase = data + e * stride;
+                    for (const auto refOff : sc->referenceLeafOffsets) {
+                        markYoungValue(markYoungValue, elemBase[refOff]);
+                    }
+                }
+                continue;
+            }
             if (!layout.mayContainReferences) continue;
             if (oldSlot->hasFlag(GcFlag::HasCardTable)) {
                 auto& slice = impl_->cardArena.get(oldSlot->payload.s.cardHandle);
@@ -5481,6 +6222,7 @@ std::size_t ManagedHeap::collectYoung(
     }
     impl_->rememberedSet.clear();
             ++impl_->statistics.youngCollections;
+            impl_->gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
             if (impl_->statistics.liveBytes < impl_->nextCollectionThreshold) {
                 impl_->requested = false;
             }
@@ -5857,6 +6599,18 @@ HeapSnapshot ManagedHeap::Impl::snapshotUnlocked(const ShadowStack* shadowStack)
                     info.values[i] = readPackedElementValue(
                         slot.payload.s.data, i, enc, layout.elementTypeId, slot.payload.s.cardHandle);
                 }
+            } else if (slot.storage() == SlotStorage::FlatStruct) {
+                const std::size_t elemCount = slot.payload.s.length;
+                const auto* sc = getFlatStructSchema(slot.auxMeta);
+                info.valueCount = elemCount;
+                info.values.resize(elemCount);
+                if (sc) {
+                    for (std::size_t i = 0; i < elemCount; ++i) {
+                        info.values[i] = reconstructDetachedStructFromLeaves(
+                            *sc,
+                            slot.payload.s.data + i * static_cast<std::size_t>(sc->flatSlotCount));
+                    }
+                }
             } else {
                 const auto count = Impl::slotValueCount(slot);
                 info.valueCount = count;
@@ -6190,6 +6944,42 @@ bool ManagedHeap::restore(
                     alignedPtr,
                     handle,
                     restorePacked.schemaId,
+                };
+            } else if (info.kind == ObjectKind::Array &&
+                       info.elementType == semantic::PrimitiveType::Struct &&
+                       info.elementTypeId != 0 &&
+                       count <= static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) &&
+                       findFlatStructSchemaByTypeId(info.elementTypeId) != nullptr) {
+                const auto* sc = findFlatStructSchemaByTypeId(info.elementTypeId);
+                const std::size_t stride = sc->flatSlotCount;
+                const std::size_t totalVals = count * stride;
+                Value* ptr = nullptr;
+                std::uint32_t handle = CompactSlot::kInvalidHandle;
+                if (totalVals > 0) {
+                    std::vector<Value> flatBuf(totalVals);
+                    for (std::size_t ei = 0; ei < count; ++ei) {
+                        if (!extractStructLeavesToBuffer(info.values[ei], *sc, flatBuf.data() + ei * stride)) {
+                            std::memcpy(
+                                static_cast<void*>(flatBuf.data() + ei * stride),
+                                static_cast<const void*>(sc->prototypeLeaves.data()),
+                                stride * sizeof(Value));
+                        }
+                    }
+                    handle = impl_->largeBuffers.acquireMove(std::move(flatBuf), ptr);
+                }
+                std::uint32_t cardHandle = CompactSlot::kInvalidHandle;
+                if (count >= ManagedHeap::kCardTableMinLength && sc->containsManagedReferences) {
+                    cardHandle = impl_->cardArena.allocate(count);
+                    slot.gcFlags |= GcFlag::HasCardTable;
+                }
+                slot.setKindAndStorage(ObjectKind::Array, SlotStorage::FlatStruct);
+                slot.auxMeta = sc->schemaId;
+                slot.payload.s = {
+                    layoutId,
+                    static_cast<std::uint32_t>(count),
+                    ptr,
+                    handle,
+                    cardHandle,
                 };
             } else if (count <= CompactSlot::kInlineValueCapacity) {
                 std::uint16_t cls = 0;
@@ -6673,22 +7463,20 @@ void detachValuePoolRootSyncOwner(const std::shared_ptr<void>& syncHandle) noexc
 void lockValuePoolRootSync(const std::shared_ptr<void>& syncHandle) {
     if (!syncHandle) return;
     static_cast<HeapSyncState*>(syncHandle.get())->mutex.lock();
-    ++tlsHeapSyncLockDepthRef();
+    enterHeapSyncLockLocal();
 }
 
 void unlockValuePoolRootSync(const std::shared_ptr<void>& syncHandle) noexcept {
     if (!syncHandle) return;
     static_cast<HeapSyncState*>(syncHandle.get())->mutex.unlock();
-    auto& depth = tlsHeapSyncLockDepthRef();
-    if (depth > 0u && --depth == 0u && tlsMutatorDepthRef() == 0u) {
-        if (mutatorSweepCoordinator().deferredSweepPending.exchange(
-                false, std::memory_order_acq_rel)) {
-            (void)reclaimPoolValuesInternal(nullptr, /*waitIfBusy=*/false);
-        }
-    }
+    leaveHeapSyncLockLocal(/*flushDeferred=*/true);
 }
 
 void enterInterpreterMutator() noexcept {
+    if (const auto* b = externalValuePoolBridge(); b && b->enterMutatorFn) {
+        b->enterMutatorFn();
+        return;
+    }
     auto& depth = tlsMutatorDepthRef();
     if (depth++ > 0u) {
         return;
@@ -6716,6 +7504,10 @@ void enterInterpreterMutator() noexcept {
 }
 
 void leaveInterpreterMutator() noexcept {
+    if (const auto* b = externalValuePoolBridge(); b && b->leaveMutatorFn) {
+        b->leaveMutatorFn();
+        return;
+    }
     auto& depth = tlsMutatorDepthRef();
     if (depth == 0u || --depth > 0u) {
         return;
@@ -6736,6 +7528,34 @@ void leaveInterpreterMutator() noexcept {
     }
 }
 
+std::size_t hostReclaimPoolValuesBridge(
+    const void* activeShadowStack,
+    bool waitIfBusy) noexcept {
+    return reclaimPoolValuesInternal(
+        static_cast<const ShadowStack*>(activeShadowStack),
+        waitIfBusy);
+}
+
+void hostRegisterShadowStackBridge(void* stack) noexcept {
+    registerActiveShadowStack(static_cast<ShadowStack*>(stack));
+}
+
+void hostUnregisterShadowStackBridge(void* stack) noexcept {
+    unregisterActiveShadowStack(static_cast<ShadowStack*>(stack));
+}
+
+void hostTransferShadowStackBridge(void* from, void* to) noexcept {
+    transferActiveShadowStack(static_cast<ShadowStack*>(from), static_cast<ShadowStack*>(to));
+}
+
+void hostEnterHeapSyncLockBridge() noexcept {
+    enterHeapSyncLockLocal();
+}
+
+void hostLeaveHeapSyncLockBridge(bool flushDeferred) noexcept {
+    leaveHeapSyncLockLocal(flushDeferred);
+}
+
 } // namespace detail
 
 namespace {
@@ -6743,6 +7563,9 @@ namespace {
 std::size_t reclaimPoolValuesInternal(
     const ShadowStack* activeShadowStack,
     bool waitIfBusy) noexcept {
+    if (const auto* b = detail::externalValuePoolBridge(); b && b->reclaimPoolValuesFn) {
+        return b->reclaimPoolValuesFn(activeShadowStack, waitIfBusy);
+    }
     if (!hasAnyPinnedPoolValues()) return 0u;
     auto& mc = mutatorSweepCoordinator();
     if (tlsHeapSyncLockDepthRef() > 0u) {
@@ -7602,6 +8425,80 @@ bool ManagedHeap::migrateTypeLayouts(
                 }
                 continue;
             }
+            if (slot.kind() == ObjectKind::Array && slot.storage() == SlotStorage::FlatStruct) {
+                const auto* oldSc = getFlatStructSchema(slot.auxMeta);
+                const auto& arrLayout = impl_->typeLayouts[slot.payload.s.layoutId];
+                const std::size_t elemCount = slot.payload.s.length;
+                if (oldSc && elemCount > 0) {
+                    std::vector<Value> elems(elemCount);
+                    bool anyElemChanged = false;
+                    for (std::size_t idx = 0; idx < elemCount; ++idx) {
+                        Value orig = reconstructDetachedStructFromLeaves(
+                            *oldSc,
+                            slot.payload.s.data + idx * static_cast<std::size_t>(oldSc->flatSlotCount));
+                        bool ch = false;
+                        elems[idx] = migrateEmbeddedValue(migrateEmbeddedValue, orig, 0, ch);
+                        anyElemChanged = anyElemChanged || ch;
+                    }
+                    const auto* newSc = findFlatStructSchemaByTypeId(arrLayout.elementTypeId);
+                    if (anyElemChanged || (newSc && newSc->schemaId != oldSc->schemaId)) {
+                        const std::size_t oldSlotBytes = impl_->slotSizeBytes(slotIdx, slot);
+                        if (newSc && newSc->schemaId != 0u) {
+                            const std::size_t newStride = newSc->flatSlotCount;
+                            const std::size_t totalVals = elemCount * newStride;
+                            std::vector<Value> newBuf(totalVals);
+                            const ObjectRef ownerRef{slotIdx, slot.generation, ObjectKind::Array, impl_->heapId};
+                            for (std::size_t idx = 0; idx < elemCount; ++idx) {
+                                if (!extractStructLeavesToBuffer(elems[idx], *newSc, newBuf.data() + idx * newStride)) {
+                                    std::memcpy(
+                                        static_cast<void*>(newBuf.data() + idx * newStride),
+                                        static_cast<const void*>(newSc->prototypeLeaves.data()),
+                                        newStride * sizeof(Value));
+                                }
+                                for (std::size_t k = 0; k < newStride; ++k) {
+                                    impl_->pinHeapValueIfNeededUnlocked(newBuf[idx * newStride + k]);
+                                }
+                            }
+                            Value* newPtr = nullptr;
+                            const std::uint32_t newHandle = impl_->largeBuffers.acquireMove(std::move(newBuf), newPtr);
+                            if (slot.payload.s.handle != CompactSlot::kInvalidHandle) {
+                                impl_->largeBuffers.release(slot.payload.s.handle);
+                            }
+                            slot.auxMeta = newSc->schemaId;
+                            slot.payload.s.data = newPtr;
+                            slot.payload.s.handle = newHandle;
+                            impl_->gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
+                            if (!slot.hasFlag(GcFlag::InNursery) && newSc->containsManagedReferences) {
+                                if (elemCount >= ManagedHeap::kCardTableMinLength &&
+                                    !slot.hasFlag(GcFlag::HasCardTable)) {
+                                    slot.payload.s.cardHandle = impl_->cardArena.allocate(elemCount);
+                                    slot.gcFlags |= GcFlag::HasCardTable;
+                                }
+                                for (std::size_t idx = 0; idx < elemCount; ++idx) {
+                                    impl_->writeBarrierFlatStructElement(ownerRef, idx);
+                                }
+                            }
+                            const std::size_t newSlotBytes = impl_->slotSizeBytes(slotIdx, slot);
+                            if (!slot.hasFlag(GcFlag::CustomSize)) {
+                                if (newSlotBytes >= oldSlotBytes) {
+                                    const std::size_t d = newSlotBytes - oldSlotBytes;
+                                    impl_->statistics.liveBytes += d;
+                                    impl_->statistics.bytesAllocated += d;
+                                    impl_->statistics.peakLiveBytes = std::max(
+                                        impl_->statistics.peakLiveBytes, impl_->statistics.liveBytes);
+                                } else {
+                                    const std::size_t d = oldSlotBytes - newSlotBytes;
+                                    impl_->statistics.liveBytes = (impl_->statistics.liveBytes >= d)
+                                        ? (impl_->statistics.liveBytes - d)
+                                        : 0;
+                                    impl_->statistics.bytesReclaimed += d;
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             const std::size_t count = Impl::slotValueCount(slot);
             if (count == 0) continue;
             Value* data = slot.payload.s.data;
@@ -7792,6 +8689,22 @@ bool ManagedHeap::migrateTypeLayouts(
     if (outStats) *outStats = localStats;
     return true;
 }
+
+namespace detail {
+
+void* localBlittableRegistryPtr() noexcept {
+    return &localBlittableRegistry();
+}
+
+void* localHeapPoolMarkerShardsPtr() noexcept {
+    return &localHeapPoolMarkerShards();
+}
+
+void* localLiveStringHeapShardsPtr() noexcept {
+    return &localLiveStringHeapShards();
+}
+
+} // namespace detail
 
 std::size_t reclaimUnreferencedPoolValues(
     const ShadowStack* activeShadowStack) noexcept {

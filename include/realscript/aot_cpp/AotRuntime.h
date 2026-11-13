@@ -85,6 +85,21 @@ struct TypedPackedDoubleArrayCache {
     std::int64_t count = -1;
 };
 
+struct TypedStructArrayCache {
+    runtime::Value* flatData = nullptr;
+    std::uint8_t* packedData = nullptr;
+    std::uint8_t* dirtyCards = nullptr;
+    std::int64_t count = -1;
+    std::uint64_t gcEpoch = 0;
+    std::uint32_t blittableSchemaId = 0;
+    std::uint16_t flatStride = 0;
+    std::uint16_t flatSchemaId = 0;
+    runtime::ObjectRef arrayRef{};
+    bool containsManagedReferences = false;
+    bool containsPoolValues = false;
+    bool needsRememberedBarrier = false;
+};
+
 [[nodiscard]] inline bool packedBuffersDisjoint(
     const void* aBase,
     std::size_t aByteLength,
@@ -501,13 +516,28 @@ public:
         ExecutionContext& context,
         const std::vector<runtime::Value>& arguments,
         const std::vector<runtime::Value>& locals,
-        const std::vector<runtime::Value>& registers);
+        const std::vector<runtime::Value>& registers,
+        bool allowTransientStackSlices = true);
     ~FrameScope();
     FrameScope(const FrameScope&) = delete;
     FrameScope& operator=(const FrameScope&) = delete;
 
 private:
     ExecutionContext* context_ = nullptr;
+    std::uint32_t savedStackRefTop_ = 0;
+    bool allowTransientStackSlices_ = true;
+};
+
+class StackRefScope {
+public:
+    explicit StackRefScope(ExecutionContext& context) noexcept;
+    ~StackRefScope() noexcept;
+    StackRefScope(const StackRefScope&) = delete;
+    StackRefScope& operator=(const StackRefScope&) = delete;
+
+private:
+    ExecutionContext* context_ = nullptr;
+    std::uint32_t savedTop_ = 0;
 };
 
 class ExecutionContext {
@@ -720,6 +750,7 @@ public:
         runtime::ExecutionOptions options = {},
         const std::unordered_map<semantic::SymbolId, const TypeDescriptor*>* prebuiltTypes = nullptr,
         const std::unordered_map<semantic::SymbolId, const FunctionDescriptor*>* prebuiltFunctions = nullptr);
+    ~ExecutionContext();
 
     [[nodiscard]] bool invoke(
         semantic::SymbolId symbolId,
@@ -788,6 +819,8 @@ public:
         }
     }
     [[nodiscard]] bool hasFunction(semantic::SymbolId symbolId) const noexcept;
+    [[nodiscard]] std::uint32_t stackRefTop() const noexcept { return stackRefTop_; }
+    [[nodiscard]] std::size_t stackRefSlotCapacity() const noexcept { return stackRefSlots_.size(); }
 
     [[nodiscard]] bool consume(std::string_view operation);
     [[nodiscard]] bool consume(
@@ -943,6 +976,9 @@ public:
         std::string_view value,
         runtime::Value& result);
     [[nodiscard]] bool newObject(
+        semantic::SymbolId typeId,
+        runtime::Value& result);
+    [[nodiscard]] bool newStackRefObject(
         semantic::SymbolId typeId,
         runtime::Value& result);
     [[nodiscard]] bool newStruct(
@@ -1119,32 +1155,187 @@ public:
         std::size_t fieldIndex,
         const runtime::Value& receiver,
         std::int64_t& result) {
-        if (receiver.rawTag() == runtime::ValueTag::ObjectRef && heap_) {
-            runtime::ObjectFastView view{};
-            if (heap_->tryBindObjectFastView(receiver.asObjectRefUnchecked(), view) &&
-                fieldIndex < view.fieldCount &&
-                (view.typeId == typeId || isAssignable(view.typeId, typeId)) &&
-                view.fields[fieldIndex].tryGetInt64(result)) {
-                return true;
+        if (receiver.rawTag() == runtime::ValueTag::ObjectRef) {
+            const auto ref = receiver.asObjectRefUnchecked();
+            if (ref.isStackSlotRef()) {
+                if (RS_AOT_LIKELY(fieldIndex == 0 &&
+                                  ref.generation == stackRefBankId_ &&
+                                  ref.stackRefSchemaId() == 0u &&
+                                  ref.slot < stackRefTop_ &&
+                                  stackRefSlots_[ref.slot].tryGetInt64(result))) {
+                    return true;
+                }
+            } else if (heap_) {
+                runtime::ObjectFastView view{};
+                if (heap_->tryBindObjectFastView(ref, view) &&
+                    fieldIndex < view.fieldCount &&
+                    (view.typeId == typeId || isAssignable(view.typeId, typeId)) &&
+                    view.fields[fieldIndex].tryGetInt64(result)) {
+                    return true;
+                }
             }
         }
         runtime::Value boxed;
         if (!loadField(typeId, fieldIndex, receiver, boxed)) return false;
         return boxed.tryGetInt64(result);
     }
+    template <typename T, typename = std::enable_if_t<T::kIsGeneratedAotStruct>>
+    [[nodiscard]] bool storeFieldCustomStructFast(
+        semantic::SymbolId typeId,
+        std::size_t fieldIndex,
+        const runtime::Value& receiver,
+        const T& value) {
+        if (RS_AOT_LIKELY(receiver.rawTag() == runtime::ValueTag::ObjectRef)) {
+            const auto ref = receiver.asObjectRefUnchecked();
+            if (ref.isStackSlotRef() &&
+                fieldIndex == 0 &&
+                ref.generation == stackRefBankId_ &&
+                ref.stackRefSchemaId() != 0u) {
+                if (const auto* sc = runtime::getFlatStructSchema(ref.stackRefSchemaId());
+                    sc != nullptr && sc->structTypeId == T::kTypeId &&
+                    ref.slot + sc->flatSlotCount <= stackRefTop_) {
+                    runtime::Value* cur = stackRefSlots_.data() + ref.slot;
+                    T::storeToFlatLeaves(cur, value);
+                    return true;
+                }
+            }
+        }
+        return storeField(typeId, fieldIndex, receiver, value.boxToValue());
+    }
+    template <typename T, typename = std::enable_if_t<T::kIsGeneratedAotStruct>>
+    [[nodiscard]] bool loadElementStructFast(
+        semantic::SymbolId elementTypeId,
+        const runtime::Value& receiver,
+        std::int64_t index,
+        T& out) {
+        if (RS_AOT_LIKELY(receiver.rawTag() == runtime::ValueTag::ObjectRef && heap_ != nullptr)) {
+            const auto ref = receiver.asObjectRefUnchecked();
+            runtime::FlatStructArrayFastView fView{};
+            if (heap_->tryBindFlatStructArrayFastView(ref, fView) && fView.elementTypeId == elementTypeId) {
+                if (RS_AOT_UNLIKELY(static_cast<std::uint64_t>(index) >= fView.length)) {
+                    return fail(runtime::ErrorCode::IndexOutOfRange, "array element index is out of range");
+                }
+                const runtime::Value* cur =
+                    fView.data + static_cast<std::size_t>(index) * fView.flatStride;
+                if (RS_AOT_LIKELY(T::loadFromFlatLeaves(cur, out))) {
+                    return true;
+                }
+            }
+            runtime::PackedArrayFastView pView{};
+            if (heap_->tryBindPackedArrayFastView(ref, pView) &&
+                pView.encoding == runtime::PackedElemEncoding::BlittableStruct &&
+                pView.elementTypeId == elementTypeId) {
+                if (RS_AOT_UNLIKELY(static_cast<std::uint64_t>(index) >= pView.length)) {
+                    return fail(runtime::ErrorCode::IndexOutOfRange, "array element index is out of range");
+                }
+                if (const auto* sc = runtime::findFlatStructSchemaByTypeId(elementTypeId)) {
+                    std::array<runtime::Value, 64> stackLeaves{};
+                    std::vector<runtime::Value> heapLeaves;
+                    runtime::Value* buf = sc->flatSlotCount <= stackLeaves.size()
+                        ? stackLeaves.data()
+                        : (heapLeaves.resize(sc->flatSlotCount), heapLeaves.data());
+                    if (runtime::decodePackedStructToLeaves(
+                            pView.rawData, static_cast<std::size_t>(index), pView.blittableSchemaId, *sc, buf)) {
+                        const runtime::Value* cur = buf;
+                        if (RS_AOT_LIKELY(T::loadFromFlatLeaves(cur, out))) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        runtime::Value boxed;
+        if (!loadElement(semantic::PrimitiveType::Struct, elementTypeId, receiver, runtime::Value{index}, boxed)) {
+            return false;
+        }
+        if (!T::unboxFromValue(boxed, out)) {
+            return fail(runtime::ErrorCode::TypeMismatch, "array struct element unbox failed");
+        }
+        return true;
+    }
+    template <typename T, typename = std::enable_if_t<T::kIsGeneratedAotStruct>>
+    [[nodiscard]] bool storeElementStructFast(
+        semantic::SymbolId elementTypeId,
+        const runtime::Value& receiver,
+        std::int64_t index,
+        const T& value) {
+        if (RS_AOT_LIKELY(receiver.rawTag() == runtime::ValueTag::ObjectRef && heap_ != nullptr)) {
+            const auto ref = receiver.asObjectRefUnchecked();
+            runtime::FlatStructArrayFastView fView{};
+            if (heap_->tryBindFlatStructArrayFastView(ref, fView) && fView.elementTypeId == elementTypeId) {
+                if (RS_AOT_UNLIKELY(static_cast<std::uint64_t>(index) >= fView.length)) {
+                    return fail(runtime::ErrorCode::IndexOutOfRange, "array element index is out of range");
+                }
+                const auto uIdx = static_cast<std::size_t>(index);
+                runtime::Value* cur = fView.data + uIdx * fView.flatStride;
+                if (fView.containsPoolValues) {
+                    T::storeToFlatLeavesPinned(cur, value);
+                } else {
+                    T::storeToFlatLeaves(cur, value);
+                }
+                if (fView.containsManagedReferences) {
+                    if (fView.dirtyCards != nullptr) {
+                        fView.dirtyCards[uIdx >> runtime::ManagedHeap::kCardElementShift] = 1u;
+                    }
+                    if (fView.needsRememberedBarrier || heap_->phase() != runtime::GcPhase::Idle) {
+                        heap_->recordFlatStructArrayWriteBarrier(ref, uIdx);
+                    }
+                }
+                return true;
+            }
+            if (const auto* sc = runtime::findFlatStructSchemaByTypeId(elementTypeId);
+                sc != nullptr && stackRefBankId_ != 0u) {
+                if (RS_AOT_UNLIKELY(index < 0)) {
+                    return fail(runtime::ErrorCode::IndexOutOfRange, "array element index is out of range");
+                }
+                const std::uint32_t baseOff = stackRefTop_;
+                const std::size_t need = static_cast<std::size_t>(baseOff) + sc->flatSlotCount;
+                if (need <= runtime::StructStorageHandle::FrameOffsetMask) {
+                    if (need > stackRefSlots_.size()) {
+                        stackRefSlots_.resize(std::max<std::size_t>(need, stackRefSlots_.capacity() * 2u + 64u));
+                    }
+                    runtime::Value* cur = stackRefSlots_.data() + baseOff;
+                    T::storeToFlatLeaves(cur, value);
+                    const runtime::Value sliceVal{runtime::StructValue::makeFrameSlice(
+                        elementTypeId, stackRefBankId_, baseOff, sc->schemaId)};
+                    const bool ok = storeElement(
+                        semantic::PrimitiveType::Struct, elementTypeId, receiver, runtime::Value{index}, sliceVal);
+                    for (std::uint16_t k = 0; k < sc->flatSlotCount; ++k) {
+                        if (cur[k].isTraceable()) {
+                            cur[k] = runtime::Value{};
+                        }
+                    }
+                    return ok;
+                }
+            }
+        }
+        return storeElement(
+            semantic::PrimitiveType::Struct, elementTypeId, receiver, runtime::Value{index}, value.boxToValue());
+    }
     [[nodiscard]] bool storeFieldInt64Fast(
         semantic::SymbolId typeId,
         std::size_t fieldIndex,
         const runtime::Value& receiver,
         std::int64_t value) {
-        if (receiver.rawTag() == runtime::ValueTag::ObjectRef && heap_) {
-            runtime::ObjectFastView view{};
-            if (heap_->tryBindObjectFastView(receiver.asObjectRefUnchecked(), view) &&
-                fieldIndex < view.fieldCount &&
-                (view.typeId == typeId || isAssignable(view.typeId, typeId)) &&
-                view.fields[fieldIndex].rawTag() == runtime::ValueTag::Int64) {
-                view.fields[fieldIndex].storeInt64(value);
-                return true;
+        if (receiver.rawTag() == runtime::ValueTag::ObjectRef) {
+            const auto ref = receiver.asObjectRefUnchecked();
+            if (ref.isStackSlotRef()) {
+                if (RS_AOT_LIKELY(fieldIndex == 0 &&
+                                  ref.generation == stackRefBankId_ &&
+                                  ref.stackRefSchemaId() == 0u &&
+                                  ref.slot < stackRefTop_)) {
+                    stackRefSlots_[ref.slot].storeInt64(value);
+                    return true;
+                }
+            } else if (heap_) {
+                runtime::ObjectFastView view{};
+                if (heap_->tryBindObjectFastView(ref, view) &&
+                    fieldIndex < view.fieldCount &&
+                    (view.typeId == typeId || isAssignable(view.typeId, typeId)) &&
+                    view.fields[fieldIndex].rawTag() == runtime::ValueTag::Int64) {
+                    view.fields[fieldIndex].storeInt64(value);
+                    return true;
+                }
             }
         }
         return storeField(typeId, fieldIndex, receiver, runtime::Value{value});
@@ -1209,6 +1400,188 @@ public:
             cache.count = static_cast<std::int64_t>(len);
         }
         return cache;
+    }
+
+    [[nodiscard]] TypedStructArrayCache acquireStructArrayCache(
+        semantic::SymbolId elementTypeId,
+        const runtime::Value& arrayValue) const noexcept {
+        TypedStructArrayCache cache{};
+        if (arrayValue.rawTag() != runtime::ValueTag::ObjectRef || heap_ == nullptr) {
+            return cache;
+        }
+        const auto ref = arrayValue.asObjectRefUnchecked();
+        runtime::FlatStructArrayFastView fView{};
+        if (heap_->tryBindFlatStructArrayFastView(ref, fView) &&
+            fView.elementTypeId == elementTypeId) {
+            cache.flatData = fView.data;
+            cache.dirtyCards = fView.dirtyCards;
+            cache.count = static_cast<std::int64_t>(fView.length);
+            cache.gcEpoch = heap_->gcEpoch();
+            cache.flatStride = fView.flatStride;
+            cache.flatSchemaId = fView.flatSchemaId;
+            cache.arrayRef = ref;
+            cache.containsManagedReferences = fView.containsManagedReferences;
+            cache.containsPoolValues = fView.containsPoolValues;
+            cache.needsRememberedBarrier = fView.needsRememberedBarrier;
+            return cache;
+        }
+        runtime::PackedArrayFastView pView{};
+        if (heap_->tryBindPackedArrayFastView(ref, pView) &&
+            pView.encoding == runtime::PackedElemEncoding::BlittableStruct &&
+            pView.elementTypeId == elementTypeId) {
+            cache.packedData = static_cast<std::uint8_t*>(pView.rawData);
+            cache.count = static_cast<std::int64_t>(pView.length);
+            cache.gcEpoch = heap_->gcEpoch();
+            cache.blittableSchemaId = pView.blittableSchemaId;
+            cache.arrayRef = ref;
+            return cache;
+        }
+        return cache;
+    }
+
+    template <typename T, typename = std::enable_if_t<T::kIsGeneratedAotStruct>>
+    [[nodiscard]] bool loadElementStructCached(
+        semantic::SymbolId elementTypeId,
+        TypedStructArrayCache& cache,
+        const runtime::Value& receiver,
+        std::int64_t index,
+        T& out) {
+        if (RS_AOT_UNLIKELY((cache.flatData != nullptr || cache.packedData != nullptr) &&
+                            heap_ != nullptr && cache.gcEpoch != heap_->gcEpoch())) {
+            cache = acquireStructArrayCache(elementTypeId, receiver);
+        }
+        if (RS_AOT_LIKELY(cache.flatData != nullptr)) {
+            if (RS_AOT_UNLIKELY(static_cast<std::uint64_t>(index) >= static_cast<std::uint64_t>(cache.count))) {
+                return fail(runtime::ErrorCode::IndexOutOfRange, "array element index is out of range");
+            }
+            const runtime::Value* cur =
+                cache.flatData + static_cast<std::size_t>(index) * cache.flatStride;
+            if (RS_AOT_LIKELY(T::loadFromFlatLeaves(cur, out))) {
+                return true;
+            }
+        } else if (RS_AOT_LIKELY(cache.packedData != nullptr)) {
+            if (RS_AOT_UNLIKELY(static_cast<std::uint64_t>(index) >= static_cast<std::uint64_t>(cache.count))) {
+                return fail(runtime::ErrorCode::IndexOutOfRange, "array element index is out of range");
+            }
+            if (const auto* sc = runtime::findFlatStructSchemaByTypeId(elementTypeId)) {
+                std::array<runtime::Value, 64> stackLeaves{};
+                std::vector<runtime::Value> heapLeaves;
+                runtime::Value* buf = sc->flatSlotCount <= stackLeaves.size()
+                    ? stackLeaves.data()
+                    : (heapLeaves.resize(sc->flatSlotCount), heapLeaves.data());
+                if (runtime::decodePackedStructToLeaves(
+                        cache.packedData, static_cast<std::size_t>(index), cache.blittableSchemaId, *sc, buf)) {
+                    const runtime::Value* cur = buf;
+                    if (RS_AOT_LIKELY(T::loadFromFlatLeaves(cur, out))) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return loadElementStructFast(elementTypeId, receiver, index, out);
+    }
+
+    template <typename T, typename = std::enable_if_t<T::kIsGeneratedAotStruct>>
+    [[nodiscard]] bool storeElementStructCached(
+        semantic::SymbolId elementTypeId,
+        TypedStructArrayCache& cache,
+        const runtime::Value& receiver,
+        std::int64_t index,
+        const T& value) {
+        if (RS_AOT_UNLIKELY((cache.flatData != nullptr || cache.packedData != nullptr) &&
+                            heap_ != nullptr && cache.gcEpoch != heap_->gcEpoch())) {
+            cache = acquireStructArrayCache(elementTypeId, receiver);
+        }
+        if (RS_AOT_LIKELY(cache.flatData != nullptr)) {
+            if (RS_AOT_UNLIKELY(static_cast<std::uint64_t>(index) >= static_cast<std::uint64_t>(cache.count))) {
+                return fail(runtime::ErrorCode::IndexOutOfRange, "array element index is out of range");
+            }
+            const auto uIdx = static_cast<std::size_t>(index);
+            runtime::Value* cur = cache.flatData + uIdx * cache.flatStride;
+            if (cache.containsPoolValues) {
+                T::storeToFlatLeavesPinned(cur, value);
+            } else {
+                T::storeToFlatLeaves(cur, value);
+            }
+            if (cache.containsManagedReferences && heap_ != nullptr) {
+                const std::size_t cardIdx = uIdx >> runtime::ManagedHeap::kCardElementShift;
+                const bool cardWasClean = (cache.dirtyCards != nullptr) && (cache.dirtyCards[cardIdx] == 0u);
+                if (cache.dirtyCards != nullptr) {
+                    cache.dirtyCards[cardIdx] = 1u;
+                }
+                if (cardWasClean || cache.needsRememberedBarrier || heap_->phase() != runtime::GcPhase::Idle) {
+                    heap_->recordFlatStructArrayWriteBarrier(cache.arrayRef, uIdx);
+                    cache.needsRememberedBarrier = false;
+                }
+            }
+            return true;
+        }
+        return storeElementStructFast(elementTypeId, receiver, index, value);
+    }
+
+    template <bool TrustedRelease = false, bool Negate = false>
+    [[nodiscard]] bool compareStringsFast(
+        const runtime::Value& left,
+        const runtime::Value& right,
+        bool& outResult) {
+        if (std::holds_alternative<runtime::NullString>(left) ||
+            std::holds_alternative<runtime::NullString>(right)) {
+            const bool eq = std::holds_alternative<runtime::NullString>(left) &&
+                std::holds_alternative<runtime::NullString>(right);
+            outResult = Negate ? !eq : eq;
+            return true;
+        }
+        const auto extractText = [&](const runtime::Value& value)
+            -> std::optional<std::string_view> {
+            const auto tag = value.rawTag();
+            if (tag == runtime::ValueTag::String) {
+                return std::string_view(value.asStringUnchecked().str());
+            }
+            if (tag == runtime::ValueTag::ObjectRef) {
+                return heap_
+                    ? heap_->stringView(value.asObjectRefUnchecked())
+                    : std::nullopt;
+            }
+            return std::nullopt;
+        };
+        const auto a = extractText(left);
+        const auto b = extractText(right);
+        if (RS_AOT_UNLIKELY(!a || !b)) {
+            if constexpr (TrustedRelease) {
+                outResult = Negate;
+                return true;
+            } else {
+                return fail(
+                    runtime::ErrorCode::InvalidObjectReference,
+                    "string equality encountered an invalid managed reference");
+            }
+        }
+        const bool eq = (*a == *b);
+        outResult = Negate ? !eq : eq;
+        return true;
+    }
+
+    template <bool TrustedRelease = false, bool Negate = false>
+    [[nodiscard]] bool compareReferencesFast(
+        const runtime::Value& left,
+        const runtime::Value& right,
+        bool& outResult) {
+        if constexpr (!TrustedRelease) {
+            const auto isValidRefOperand = [&](const runtime::Value& value) noexcept {
+                if (value.rawTag() != runtime::ValueTag::ObjectRef) return true;
+                const auto& ref = value.asObjectRefUnchecked();
+                if (ref.isStackSlotRef()) return true;
+                return heap_ != nullptr && heap_->isAlive(ref);
+            };
+            if (RS_AOT_UNLIKELY(!isValidRefOperand(left) || !isValidRefOperand(right))) {
+                return fail(
+                    runtime::ErrorCode::InvalidObjectReference,
+                    "reference equality encountered an invalid managed reference");
+            }
+        }
+        const bool eq = (left == right);
+        outResult = Negate ? !eq : eq;
+        return true;
     }
 
     [[nodiscard]] bool loadElementInt32Fast(
@@ -1762,6 +2135,7 @@ public:
 
 private:
     friend class FrameScope;
+    friend class StackRefScope;
     [[nodiscard]] const TypeDescriptor* findType(semantic::SymbolId typeId) const;
     [[nodiscard]] const FunctionDescriptor* findFunction(
         semantic::SymbolId symbolId) const;
@@ -1844,6 +2218,12 @@ private:
     std::shared_ptr<void> resumeEnv_;
     runtime::CoroutineFrameHandle resumingCoroutine_{};
     runtime::CoroutineFrame* resumingFramePtr_ = nullptr;
+    std::vector<runtime::Value> stackRefEmptyRoot_;
+    std::vector<runtime::Value> stackRefSlots_;
+    std::uint32_t stackRefTop_ = 0;
+    std::uint32_t activeStackRefScopes_ = 0;
+    std::uint8_t stackRefBankId_ = 0;
+    bool stackRefRootPushed_ = false;
 };
 
 class Program {
@@ -2242,6 +2622,9 @@ template <bool Checked>
         if (type == semantic::PrimitiveType::Array) {
             return runtime::Value{runtime::NullArray{}};
         }
+        if (type == semantic::PrimitiveType::String) {
+            return runtime::Value{runtime::NullString{}};
+        }
     }
     return value;
 }
@@ -2252,12 +2635,75 @@ inline void retainTypedGcSlot(
     runtime::ManagedHeap* rawH,
     runtime::PersistentRoot& slot,
     const runtime::Value& value) {
-    if (rawH != nullptr && std::holds_alternative<runtime::ObjectRef>(value)) {
+    if (rawH != nullptr &&
+        (std::holds_alternative<runtime::ObjectRef>(value) ||
+         value.rawTag() == runtime::ValueTag::String)) {
+        if (std::holds_alternative<runtime::ObjectRef>(value) &&
+            std::get<runtime::ObjectRef>(value).isStackSlotRef()) {
+            if (slot.valid()) slot.reset();
+            return;
+        }
         if (!slot.valid() || !slot.update(value)) {
             slot = rawH->retain(value);
         }
     } else if (slot.valid()) {
         slot.reset();
+    }
+}
+
+inline void retainTypedGcSlot(
+    runtime::ManagedHeap* rawH,
+    runtime::PersistentRoot* firstSlot,
+    const runtime::Value& value) {
+    if (firstSlot != nullptr) {
+        retainTypedGcSlot(rawH, *firstSlot, value);
+    }
+}
+
+template <typename T, typename = std::enable_if_t<T::kIsGeneratedAotStruct>>
+inline void retainTypedGcSlot(
+    runtime::ManagedHeap* rawH,
+    runtime::PersistentRoot* firstSlot,
+    const T& value) {
+    if constexpr (T::kGcSlotCount > 0) {
+        if (rawH != nullptr && firstSlot != nullptr) {
+            T::retainGcSlots(rawH, firstSlot, value);
+        }
+    } else {
+        (void)rawH;
+        (void)firstSlot;
+        (void)value;
+    }
+}
+
+[[nodiscard]] inline bool equalStringValuesNoThrow(
+    const runtime::ManagedHeap* rawH,
+    const runtime::Value& left,
+    const runtime::Value& right) noexcept {
+    if (std::holds_alternative<runtime::NullString>(left) ||
+        std::holds_alternative<runtime::NullString>(right)) {
+        return std::holds_alternative<runtime::NullString>(left) &&
+            std::holds_alternative<runtime::NullString>(right);
+    }
+    try {
+        const auto extractText = [&](const runtime::Value& value)
+            -> std::optional<std::string_view> {
+            const auto tag = value.rawTag();
+            if (tag == runtime::ValueTag::String) {
+                return std::string_view(value.asStringUnchecked().str());
+            }
+            if (tag == runtime::ValueTag::ObjectRef) {
+                return rawH
+                    ? rawH->stringView(value.asObjectRefUnchecked())
+                    : std::nullopt;
+            }
+            return std::nullopt;
+        };
+        const auto a = extractText(left);
+        const auto b = extractText(right);
+        return a && b && (*a == *b);
+    } catch (...) {
+        return false;
     }
 }
 
@@ -2524,6 +2970,14 @@ template <typename T, typename = std::enable_if_t<T::kIsGeneratedAotStruct>>
         }
         if (const auto* ref = std::get_if<runtime::ObjectRef>(&value);
             ref && ref->kind == runtime::ObjectKind::Array) {
+            out = value;
+            return true;
+        }
+        return false;
+    }
+    if (type == semantic::PrimitiveType::String) {
+        if (std::holds_alternative<runtime::NullString>(value) ||
+            runtime::valueType(value) == semantic::PrimitiveType::String) {
             out = value;
             return true;
         }

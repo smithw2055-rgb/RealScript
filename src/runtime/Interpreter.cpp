@@ -3,6 +3,7 @@
 #include "realscript/runtime/AsyncRuntime.h"
 
 #include "ExecutionMirror.h"
+#include "RuntimeInternal.h"
 #include "realscript/debug/Debugger.h"
 #include "realscript/diagnostics/Diagnostic.h"
 
@@ -133,7 +134,64 @@ struct State {
     Value suspendedReturnValue{};
     FrameTelemetryCollector* telemetry = activeFrameTelemetry();
     std::uint64_t telemetryChildExecuted = 0;
+    std::uint8_t flatBankId = 0;
 };
+
+struct FlatStackBankScope {
+    State& state;
+    explicit FlatStackBankScope(State& st) noexcept : state(st) {
+        state.flatBankId = detail::acquireFlatStackBank(&state.values);
+    }
+    ~FlatStackBankScope() noexcept {
+        if (state.flatBankId != 0u) {
+            detail::releaseFlatStackBank(state.flatBankId);
+            state.flatBankId = 0u;
+        }
+    }
+    FlatStackBankScope(const FlatStackBankScope&) = delete;
+    FlatStackBankScope& operator=(const FlatStackBankScope&) = delete;
+};
+
+inline void storeValueIntoFlatFrameSlot(
+    State& state,
+    const detail::ExecutionFunction& execution,
+    std::size_t frameOffset,
+    Value* frameBase,
+    std::uint16_t slot,
+    const Value& srcVal) {
+    if (execution.hasStructPayloads &&
+        state.flatBankId != 0u &&
+        slot < execution.slotStructSchemaIds.size()) {
+        const std::uint16_t sid = execution.slotStructSchemaIds[slot];
+        if (sid != 0u) {
+            const std::uint16_t payOff = execution.slotPayloadOffsets[slot];
+            const auto* sc = getFlatStructSchema(sid);
+            if (payOff != detail::InvalidCompactReg && sc != nullptr) {
+                if (extractStructLeavesToBuffer(srcVal, *sc, frameBase + payOff)) {
+                    frameBase[slot] = StructValue::makeFrameSlice(
+                        sc->structTypeId,
+                        state.flatBankId,
+                        static_cast<std::uint32_t>(frameOffset + payOff),
+                        sid);
+                    return;
+                }
+                if (srcVal.rawTag() == ValueTag::Monostate) {
+                    std::memcpy(
+                        static_cast<void*>(frameBase + payOff),
+                        static_cast<const void*>(sc->prototypeLeaves.data()),
+                        static_cast<std::size_t>(sc->flatSlotCount) * sizeof(Value));
+                    frameBase[slot] = StructValue::makeFrameSlice(
+                        sc->structTypeId,
+                        state.flatBankId,
+                        static_cast<std::uint32_t>(frameOffset + payOff),
+                        sid);
+                    return;
+                }
+            }
+        }
+    }
+    frameBase[slot] = srcVal;
+}
 
 struct InterpreterResumeEnv {
     std::shared_ptr<const ProgramImage> program;
@@ -806,7 +864,13 @@ bool expectType(
     semantic::PrimitiveType type,
     std::string_view context) {
     if (const auto* reference = std::get_if<ObjectRef>(&value)) {
-        if (!state.heap || !state.heap->isAlive(*reference)) {
+        if (reference->isStackSlotRef()) {
+            if (reference->generation != state.flatBankId ||
+                reference->slot >= state.values.size()) {
+                return fail(state, ErrorCode::InvalidObjectReference,
+                    std::string(context) + " contains an expired stack slot reference");
+            }
+        } else if (!state.heap || !state.heap->isAlive(*reference)) {
             return fail(state, ErrorCode::InvalidObjectReference,
                 std::string(context) + " contains an invalid managed object reference");
         }
@@ -952,6 +1016,15 @@ bool expectObject(
         return fail(state, ErrorCode::TypeMismatch,
             context + " expected object '" + semantic::canonicalTypeName(type) + "'");
     }
+    if (reference->isStackSlotRef()) {
+        if (reference->generation == state.flatBankId &&
+            reference->slot < state.values.size() &&
+            isSynthesizedRefWrapperTypeName(type.name)) {
+            return true;
+        }
+        return fail(state, ErrorCode::InvalidObjectReference,
+            context + " contains an invalid stack slot reference");
+    }
     if (!state.heap || !state.heap->isAlive(*reference)) {
         return fail(state, ErrorCode::InvalidObjectReference,
             context + " contains an invalid managed object reference");
@@ -974,6 +1047,19 @@ bool expectSignatureType(
     if (type == semantic::PrimitiveType::Object) {
         if (std::holds_alternative<NullObject>(value) || typeId == 0) return true;
         const auto* reference = std::get_if<ObjectRef>(&value);
+        if (reference && reference->isStackSlotRef()) {
+            if (reference->generation == state.flatBankId &&
+                reference->slot < state.values.size() &&
+                state.program) {
+                const auto& mirror = detail::executionMirror(*state.program);
+                if (mirror.stackRefTemplateByTypeId.find(typeId) !=
+                    mirror.stackRefTemplateByTypeId.end()) {
+                    return true;
+                }
+            }
+            return fail(state, ErrorCode::TypeMismatch,
+                std::string(context) + " has an incompatible stack reference type");
+        }
         const auto actual = reference && state.heap
             ? state.heap->objectTypeId(*reference)
             : std::optional<semantic::SymbolId>{};
@@ -1102,6 +1188,38 @@ bool valuesEqual(State& state, const Value& left, const Value& right, bool& equa
                 "reference equality encountered an invalid managed reference");
         }
         equal = left == right;
+        return true;
+    }
+    if (valueType(left) == semantic::PrimitiveType::Struct) {
+        if (left == right) {
+            equal = true;
+            return true;
+        }
+        if (left.rawTag() == ValueTag::Struct &&
+            right.rawTag() == ValueTag::Struct) {
+            const auto& ls = left.asStructUnchecked();
+            const auto& rs = right.asStructUnchecked();
+            if (ls.typeId == rs.typeId && ls.fieldCount() == rs.fieldCount()) {
+                const auto count = ls.fieldCount();
+                for (std::size_t i = 0; i < count; ++i) {
+                    const auto lf = structValueFieldAt(ls, i);
+                    const auto rf = structValueFieldAt(rs, i);
+                    if (!lf || !rf) {
+                        equal = false;
+                        return true;
+                    }
+                    bool fieldEq = false;
+                    if (!valuesEqual(state, *lf, *rf, fieldEq)) return false;
+                    if (!fieldEq) {
+                        equal = false;
+                        return true;
+                    }
+                }
+                equal = true;
+                return true;
+            }
+        }
+        equal = false;
         return true;
     }
     if (valueType(left) != semantic::PrimitiveType::String) {
@@ -1240,7 +1358,9 @@ bool executeFunction(
     const ArgumentSource& arguments,
     Value& result,
     const detail::ExecutionFunction* cachedExecution = nullptr,
-    bool argumentsPrevalidated = false);
+    bool argumentsPrevalidated = false,
+    std::uint32_t callerStructReturnAbsOffset = detail::InvalidStreamOffset,
+    std::uint16_t callerStructReturnSchemaId = 0);
 
 bool executeCall(
     State& state,
@@ -1515,13 +1635,72 @@ bool executeCall(
         state.externalResolver && *state.externalResolver
         ? state.externalResolver
         : nullptr;
-    if (!state.determinism.invokeExternal(
-            state.bindings,
-            fallback,
-            reference,
-            argSpan,
-            externalResult,
-            externalError)) {
+    struct ExternalStackRefBridge {
+        std::size_t argIdx = 0;
+        ObjectRef stackRef{};
+        ObjectRef tempHeapRef{};
+    };
+    std::vector<ExternalStackRefBridge> extRefBridges;
+    std::vector<Value> detachedExtArgs;
+    bool needsExtArgRewrite = false;
+    for (std::size_t idx = 0; idx < argSpan.size(); ++idx) {
+        if ((argSpan[idx].rawTag() == ValueTag::Struct &&
+             argSpan[idx].asStructUnchecked().isFrameSlice()) ||
+            (argSpan[idx].rawTag() == ValueTag::ObjectRef &&
+             argSpan[idx].u_.objectRef.isStackSlotRef())) {
+            needsExtArgRewrite = true;
+            break;
+        }
+    }
+    if (needsExtArgRewrite) {
+        detachedExtArgs.resize(argSpan.size());
+        for (std::size_t k = 0; k < argSpan.size(); ++k) {
+            if (argSpan[k].rawTag() == ValueTag::ObjectRef &&
+                argSpan[k].u_.objectRef.isStackSlotRef() &&
+                state.heap &&
+                k < reference.parameterTypeIds.size()) {
+                const ObjectRef sRef = argSpan[k].u_.objectRef;
+                const semantic::SymbolId wTid = reference.parameterTypeIds[k];
+                Value boxedField{};
+                if (sRef.stackRefSchemaId() == 0u) {
+                    boxedField = detachFrameSliceValue(state.values[sRef.slot]);
+                } else if (const auto* sc = getFlatStructSchema(sRef.stackRefSchemaId())) {
+                    boxedField = reconstructDetachedStructFromLeaves(*sc, state.values.data() + sRef.slot);
+                }
+                std::vector<std::size_t> refFlds;
+                if (boxedField.isTraceable()) refFlds.push_back(0);
+                RuntimeError allocErr;
+                const auto tempObj = state.heap->allocateObject(
+                    wTid, std::vector<Value>{boxedField}, std::move(refFlds), &allocErr);
+                if (tempObj) {
+                    detachedExtArgs[k] = *tempObj;
+                    extRefBridges.push_back(ExternalStackRefBridge{k, sRef, *tempObj});
+                    continue;
+                }
+            }
+            detachedExtArgs[k] = detachFrameSliceValue(argSpan[k]);
+        }
+        argSpan = ValueSpan(detachedExtArgs);
+    }
+    const bool extOk = state.determinism.invokeExternal(
+        state.bindings,
+        fallback,
+        reference,
+        argSpan,
+        externalResult,
+        externalError);
+    if (extOk && !extRefBridges.empty() && state.heap) {
+        for (const auto& br : extRefBridges) {
+            if (const auto updated = state.heap->fieldGet(br.tempHeapRef, 0)) {
+                if (br.stackRef.stackRefSchemaId() == 0u) {
+                    state.values[br.stackRef.slot] = *updated;
+                } else if (const auto* sc = getFlatStructSchema(br.stackRef.stackRefSchemaId())) {
+                    (void)extractStructLeavesToBuffer(*updated, *sc, state.values.data() + br.stackRef.slot);
+                }
+            }
+        }
+    }
+    if (!extOk) {
         state.error = std::move(externalError);
         if (state.error.code == ErrorCode::None) {
             state.error.code = ErrorCode::ExternalFunctionUnresolved;
@@ -2581,13 +2760,31 @@ bool suspendInterpreterCoroutine(
         }
     }
 
+    const auto detachSliceArrayIfNeeded = [](const Value* src, std::size_t cnt, std::vector<Value>& buf) -> const Value* {
+        if (!src || cnt == 0) return src;
+        for (std::size_t i = 0; i < cnt; ++i) {
+            if (src[i].rawTag() == ValueTag::Struct && src[i].asStructUnchecked().isFrameSlice()) {
+                buf.resize(cnt);
+                for (std::size_t k = 0; k < cnt; ++k) {
+                    buf[k] = detachFrameSliceValue(src[k]);
+                }
+                return buf.data();
+            }
+        }
+        return src;
+    };
+    std::vector<Value> detachedArgs, detachedLocals, detachedRegs;
+    const Value* safeArgsPtr = detachSliceArrayIfNeeded(argsPtr, argCount, detachedArgs);
+    const Value* safeLocalsPtr = detachSliceArrayIfNeeded(localsPtr, localCount, detachedLocals);
+    const Value* safeRegsPtr = detachSliceArrayIfNeeded(regsPtr, regCount, detachedRegs);
+
     if (!state.asyncRuntime->coroutines().suspendFrame(
             ioActiveCoroutine,
-            argsPtr,
+            safeArgsPtr,
             argCount,
-            localsPtr,
+            safeLocalsPtr,
             localCount,
-            regsPtr,
+            safeRegsPtr,
             regCount,
             resumeBlockId,
             awaitedHandle,
@@ -2652,7 +2849,7 @@ bool resolveInterpreterCoroutine(
             return fail(state, ErrorCode::InvalidProgram, "async.resolve coroutine frame is invalid");
         }
         frame->completed = true;
-        const Value val = optionalPayload ? *optionalPayload : Value{};
+        const Value val = optionalPayload ? detachFrameSliceValue(*optionalPayload) : Value{};
         (void)state.asyncRuntime->awaitables().trySetResult(frame->completionHandle, val);
         outWrappedStruct = makeAwaitableStructValue(returnStructTypeId, frame->completionHandle);
         return true;
@@ -2661,7 +2858,7 @@ bool resolveInterpreterCoroutine(
     if (!optionalPayload) {
         h = AwaitableHandle::completedVoid();
     } else {
-        h = state.asyncRuntime->awaitables().fromResult(*optionalPayload);
+        h = state.asyncRuntime->awaitables().fromResult(detachFrameSliceValue(*optionalPayload));
     }
     outWrappedStruct = makeAwaitableStructValue(returnStructTypeId, h);
     return true;
@@ -2907,7 +3104,11 @@ bool executeInstruction(
             instruction.elementType,
             instruction.elementTypeId,
             static_cast<std::size_t>(length),
-            defaultValue(module, instruction.elementType, instruction.elementTypeId),
+            (instruction.elementType == semantic::PrimitiveType::Struct &&
+             instruction.elementTypeId != 0 &&
+             findFlatStructSchemaByTypeId(instruction.elementTypeId) != nullptr)
+                ? Value{}
+                : defaultValue(module, instruction.elementType, instruction.elementTypeId),
             &allocationError);
         if (!reference) {
             return fail(state,
@@ -3127,6 +3328,28 @@ bool executeInstruction(
             return false;
         }
         const auto reference = std::get<ObjectRef>(*receiver);
+        if (reference.isStackSlotRef()) {
+            const auto& field = type->fields[instruction.index];
+            Value stackVal{};
+            if (reference.stackRefSchemaId() == 0u) {
+                stackVal = state.values[reference.slot];
+            } else {
+                stackVal = StructValue::makeFrameSlice(
+                    exactTypeId(field.type, field.typeName),
+                    state.flatBankId,
+                    reference.slot,
+                    reference.stackRefSchemaId());
+            }
+            if (!expectSignatureType(
+                    state,
+                    stackVal,
+                    field.type,
+                    exactTypeId(field.type, field.typeName),
+                    "field load value")) {
+                return false;
+            }
+            return storeResult(stackVal);
+        }
         const auto value = state.heap->fieldGet(reference, instruction.index);
         if (!value) {
             return fail(state, ErrorCode::InvalidProgram,
@@ -3160,9 +3383,21 @@ bool executeInstruction(
                 "field store value")) {
             return false;
         }
+        const auto recvRef = std::get<ObjectRef>(*receiver);
+        if (recvRef.isStackSlotRef()) {
+            if (recvRef.stackRefSchemaId() == 0u) {
+                state.values[recvRef.slot] = detachFrameSliceValue(*value);
+                return true;
+            }
+            const auto* sc = getFlatStructSchema(recvRef.stackRefSchemaId());
+            if (!sc || !extractStructLeavesToBuffer(*value, *sc, state.values.data() + recvRef.slot)) {
+                return fail(state, ErrorCode::InvalidProgram, "stack ref struct store failed");
+            }
+            return true;
+        }
         RuntimeError fieldError;
         if (!state.heap->fieldSet(
-                std::get<ObjectRef>(*receiver),
+                recvRef,
                 instruction.index,
                 *value,
                 &fieldError)) {
@@ -3194,16 +3429,16 @@ bool executeInstruction(
             return storeResult(*inlinedField);
         }
         const auto& structure = std::get<StructValue>(*receiver);
-        if (!structure.storage || instruction.index >= structure.storage->fields.size()) {
+        const auto fieldValOpt = structValueFieldAt(structure, instruction.index);
+        if (!fieldValOpt) {
             return fail(state, ErrorCode::InvalidProgram,
                 "struct field load references an invalid field slot");
         }
-        const auto& value = structure.storage->fields[instruction.index];
-        if (!expectSignatureType(state, value, field.type,
+        if (!expectSignatureType(state, *fieldValOpt, field.type,
                 exactTypeId(field.type, field.typeName), "struct field load value")) {
             return false;
         }
-        return storeResult(value);
+        return storeResult(*fieldValOpt);
     }
     case bytecode::Opcode::StoreStructField: {
         const auto* receiver = operand(0);
@@ -3220,16 +3455,31 @@ bool executeInstruction(
                 exactTypeId(field.type, field.typeName), "struct field store value")) {
             return false;
         }
-        if (const auto updatedInline = storeInlineStructField(*receiver, instruction.index, *value)) {
+        const Value cleanVal = detachFrameSliceValue(*value);
+        if (const auto updatedInline = storeInlineStructField(*receiver, instruction.index, cleanVal)) {
             return storeResult(*updatedInline);
         }
         const auto& structure = std::get<StructValue>(*receiver);
+        if (structure.isFrameSlice()) {
+            const std::size_t fCount = structure.fieldCount();
+            if (instruction.index >= fCount) {
+                return fail(state, ErrorCode::InvalidProgram,
+                    "struct field store references an invalid field slot");
+            }
+            std::vector<Value> fields(fCount);
+            for (std::size_t fIdx = 0; fIdx < fCount; ++fIdx) {
+                fields[fIdx] = fIdx == instruction.index
+                    ? cleanVal
+                    : detachFrameSliceValue(structValueFieldAt(structure, fIdx).value_or(Value{}));
+            }
+            return storeResult(makeStructValueFromFields(type->id, std::move(fields)));
+        }
         if (!structure.storage || instruction.index >= structure.storage->fields.size()) {
             return fail(state, ErrorCode::InvalidProgram,
                 "struct field store references an invalid field slot");
         }
         auto storage = std::make_shared<StructStorage>(*structure.storage);
-        storage->fields[instruction.index] = *value;
+        storage->fields[instruction.index] = cleanVal;
         return storeResult(StructValue{type->id, std::move(storage)});
     }
     case bytecode::Opcode::NewDelegate: {
@@ -3883,7 +4133,9 @@ bool executeFunction(
     const ArgumentSource& arguments,
     Value& result,
     const detail::ExecutionFunction* cachedExecution,
-    bool argumentsPrevalidated) {
+    bool argumentsPrevalidated,
+    std::uint32_t callerStructReturnAbsOffset,
+    std::uint16_t callerStructReturnSchemaId) {
     const auto& function = *location.function;
     struct TelemetrySelfInstructionsScope {
         State& state;
@@ -4010,6 +4262,18 @@ bool executeFunction(
             state.externalResolver && *state.externalResolver
             ? state.externalResolver
             : nullptr;
+        std::vector<Value> detachedNativeArgs;
+        for (std::size_t idx = 0; idx < argSpan.size(); ++idx) {
+            if (argSpan[idx].rawTag() == ValueTag::Struct &&
+                argSpan[idx].asStructUnchecked().isFrameSlice()) {
+                detachedNativeArgs.resize(argSpan.size());
+                for (std::size_t k = 0; k < argSpan.size(); ++k) {
+                    detachedNativeArgs[k] = detachFrameSliceValue(argSpan[k]);
+                }
+                argSpan = ValueSpan(detachedNativeArgs);
+                break;
+            }
+        }
         if (!state.determinism.invokeExternal(
                 state.bindings,
                 fallback,
@@ -4091,19 +4355,32 @@ bool executeFunction(
         std::uint32_t initialEntryOffset = execution->entryStreamOffset;
         std::uint64_t prologueSpanBonus = 0;
         if (activeCoroutineFrame != nullptr) {
+            const std::size_t dirtyEnd = std::min(frameEnd, previousSize);
+            if (frameOffset < dirtyEnd) {
+                std::memset(static_cast<void*>(frameBase), 0, (dirtyEnd - frameOffset) * sizeof(Value));
+            }
             const std::size_t nArgs = std::min(argCount, function.parameterTypes.size());
             for (std::size_t i = 0; i < nArgs; ++i) {
-                frameBase[execution->paramOffset + i] = activeCoroutineFrame->savedArguments[i];
+                storeValueIntoFlatFrameSlot(
+                    state, *execution, frameOffset, frameBase,
+                    static_cast<std::uint16_t>(execution->paramOffset + i),
+                    activeCoroutineFrame->savedArguments[i]);
             }
             const std::size_t nLocs = std::min(
                 activeCoroutineFrame->savedLocals.size(), function.localTypes.size());
             for (std::size_t i = 0; i < nLocs; ++i) {
-                frameBase[execution->localOffset + i] = activeCoroutineFrame->savedLocals[i];
+                storeValueIntoFlatFrameSlot(
+                    state, *execution, frameOffset, frameBase,
+                    static_cast<std::uint16_t>(execution->localOffset + i),
+                    activeCoroutineFrame->savedLocals[i]);
             }
             const std::size_t nRegs = std::min(
                 activeCoroutineFrame->savedRegisters.size(), function.registerTypes.size());
             for (std::size_t i = 0; i < nRegs; ++i) {
-                frameBase[execution->registerOffset + i] = activeCoroutineFrame->savedRegisters[i];
+                storeValueIntoFlatFrameSlot(
+                    state, *execution, frameOffset, frameBase,
+                    static_cast<std::uint16_t>(execution->registerOffset + i),
+                    activeCoroutineFrame->savedRegisters[i]);
             }
             const auto foundResumeBlk = execution->blockIndices.find(
                 activeCoroutineFrame->resumeBlockId);
@@ -4129,6 +4406,43 @@ bool executeFunction(
             }
             prologueSpanBonus = 2u * argCount;
             initialEntryOffset = static_cast<std::uint32_t>(argCount);
+        } else if (RS_FLAT_UNLIKELY(execution->hasStructPayloads && state.flatBankId != 0u)) {
+            // Note: Copy incoming arguments BEFORE zeroing dirty slots, or copy from caller frame (< frameOffset)
+            for (std::size_t i = 0; i < argCount; ++i) {
+                frameBase[i] = arguments[i];
+            }
+            const std::size_t dirtyEnd = std::min(frameEnd, previousSize);
+            if (frameOffset + argCount < dirtyEnd) {
+                std::memset(static_cast<void*>(frameBase + argCount), 0,
+                    (dirtyEnd - (frameOffset + argCount)) * sizeof(Value));
+            }
+            for (std::size_t i = 0; i < argCount; ++i) {
+                const auto pSlot = static_cast<std::uint16_t>(execution->paramOffset + i);
+                if (execution->slotStructSchemaIds[pSlot] != 0u) {
+                    const Value incoming = frameBase[pSlot];
+                    storeValueIntoFlatFrameSlot(state, *execution, frameOffset, frameBase, pSlot, incoming);
+                }
+            }
+            const std::size_t nLocals = function.localTypes.size();
+            for (std::size_t l = 0; l < nLocals; ++l) {
+                const auto lSlot = static_cast<std::uint16_t>(execution->localOffset + l);
+                const std::uint16_t sid = execution->slotStructSchemaIds[lSlot];
+                if (sid != 0u) {
+                    const std::uint16_t payOff = execution->slotPayloadOffsets[lSlot];
+                    const auto* sc = getFlatStructSchema(sid);
+                    if (payOff != detail::InvalidCompactReg && sc != nullptr) {
+                        std::memcpy(
+                            static_cast<void*>(frameBase + payOff),
+                            static_cast<const void*>(sc->prototypeLeaves.data()),
+                            static_cast<std::size_t>(sc->flatSlotCount) * sizeof(Value));
+                        frameBase[lSlot] = StructValue::makeFrameSlice(
+                            sc->structTypeId,
+                            state.flatBankId,
+                            static_cast<std::uint32_t>(frameOffset + payOff),
+                            sid);
+                    }
+                }
+            }
         } else {
             for (std::size_t i = 0; i < argCount; ++i) {
                 frameBase[i] = arguments[i];
@@ -4182,7 +4496,9 @@ bool executeFunction(
             ObjectRef ref{};
             ArrayFastView view{};
             PackedArrayFastView packedView{};
+            FlatStructArrayFastView flatStructView{};
             bool isPacked = false;
+            bool isFlatStruct = false;
             bool valid = false;
         };
         struct FlatObjectCacheEntry {
@@ -4219,6 +4535,18 @@ bool executeFunction(
                 ce.view.elementType = ce.packedView.elementType;
                 ce.view.elementTypeId = ce.packedView.elementTypeId;
                 ce.isPacked = true;
+                ce.isFlatStruct = false;
+                ce.valid = true;
+                return true;
+            }
+            if (state.heap->tryBindFlatStructArrayFastView(ref, ce.flatStructView)) {
+                ce.ref = ref;
+                ce.view = {};
+                ce.view.length = ce.flatStructView.length;
+                ce.view.elementType = semantic::PrimitiveType::Struct;
+                ce.view.elementTypeId = ce.flatStructView.elementTypeId;
+                ce.isPacked = false;
+                ce.isFlatStruct = true;
                 ce.valid = true;
                 return true;
             }
@@ -4227,6 +4555,7 @@ bool executeFunction(
             }
             ce.ref = ref;
             ce.isPacked = false;
+            ce.isFlatStruct = false;
             ce.valid = true;
             return true;
         };
@@ -4456,6 +4785,19 @@ bool executeFunction(
             &&L_AddFloatTrusted,
             &&L_SubFloatTrusted,
             &&L_MulFloatTrusted,
+            &&L_InitStructSlice,
+            &&L_AliasStructSlice,
+            &&L_CopyStructSlice,
+            &&L_LoadStructSliceField,
+            &&L_StoreStructSliceField,
+            &&L_StoreLocalStructFieldInPlace,
+            &&L_StoreElementStructFieldInPlace,
+            &&L_InitStackRefCell,
+            &&L_BindLocalStackRef,
+            &&L_WritebackLocalStackRef,
+            &&L_LoadStackRefCell,
+            &&L_StoreStackRefCell,
+            &&L_StoreStackRefStructFieldInPlace,
             &&L_GenericBytecode,
             &&L_TermJumpNoArgs,
             &&L_TermBranchBoolNoArgs,
@@ -5034,7 +5376,9 @@ bool executeFunction(
                 if (RS_FLAT_LIKELY(val.rawTag() == ValueTag::ObjectRef)) {
                     const ObjectRef ref = val.u_.objectRef;
                     auto& oce = objectCache[ref.slot & 3u];
-                    if (RS_FLAT_LIKELY((oce.valid && oce.ref == ref) || bindObjectCacheEntry(ref, oce))) {
+                    if (RS_FLAT_LIKELY((oce.valid && oce.ref == ref) ||
+                                       bindObjectCacheEntry(ref, oce) ||
+                                       (ref.isStackSlotRef() && ref.generation == state.flatBankId))) {
                         RS_FLAT_SPAN_CHECK();
                         localExecuted += spanCost;
                         frameBase[ip->dstSlot] = val;
@@ -5162,22 +5506,48 @@ bool executeFunction(
                 RS_FLAT_DISPATCH_NEXT();
             }
 
+            #define RS_RESOLVE_CALLER_STRUCT_RETURN(dstSlotExpr, outAbsOff, outSchemaId) \
+                std::uint32_t outAbsOff = detail::InvalidStreamOffset; \
+                std::uint16_t outSchemaId = 0u; \
+                if (RS_FLAT_UNLIKELY(execution->hasStructPayloads && state.flatBankId != 0u && \
+                                     (dstSlotExpr) < execution->slotStructSchemaIds.size())) { \
+                    outSchemaId = execution->slotStructSchemaIds[(dstSlotExpr)]; \
+                    if (outSchemaId != 0u) { \
+                        const std::uint16_t payOff = execution->slotPayloadOffsets[(dstSlotExpr)]; \
+                        if (payOff != detail::InvalidCompactReg) { \
+                            outAbsOff = static_cast<std::uint32_t>(frameOffset + payOff); \
+                        } else { \
+                            outSchemaId = 0u; \
+                        } \
+                    } \
+                }
+
+            #define RS_COMMIT_CALL_RESULT(dstSlotExpr, callResVar, retSchemaIdVar) \
+                if ((dstSlotExpr) != detail::InvalidCompactReg) { \
+                    if (RS_FLAT_UNLIKELY((retSchemaIdVar) != 0u && \
+                        !((callResVar).rawTag() == ValueTag::Struct && \
+                          (callResVar).asStructUnchecked().isFrameSlice()))) { \
+                        storeValueIntoFlatFrameSlot(state, *execution, frameOffset, frameBase, (dstSlotExpr), (callResVar)); \
+                    } else { \
+                        frameBase[(dstSlotExpr)] = std::move(callResVar); \
+                    } \
+                }
+
             RS_FLAT_CASE(CallDirect0) {
                 if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 state.executed = localExecuted;
                 const auto& cold = flatColdBase[ip - streamBase];
                 Value callResult;
+                RS_RESOLVE_CALLER_STRUCT_RETURN(ip->dstSlot, retAbsOff, retSid);
                 const ValueWindow regWin{&state.values, frameOffset + execution->registerOffset, function.registerTypes.size()};
                 const bool ok = executeFunction(
                     state, *cold.directTarget, ArgumentSource(regWin),
-                    callResult, cold.directExecution, true);
+                    callResult, cold.directExecution, true, retAbsOff, retSid);
                 frameBase = state.values.data() + frameOffset;
                 syncAfterFlatSubcall();
                 if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
-                if (ip->dstSlot != detail::InvalidCompactReg) {
-                    frameBase[ip->dstSlot] = std::move(callResult);
-                }
+                RS_COMMIT_CALL_RESULT(ip->dstSlot, callResult, retSid);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
@@ -5187,17 +5557,16 @@ bool executeFunction(
                 state.executed = localExecuted;
                 const auto& cold = flatColdBase[ip - streamBase];
                 Value callResult;
+                RS_RESOLVE_CALLER_STRUCT_RETURN(ip->dstSlot, retAbsOff, retSid);
                 const ValueWindow singleWin{&state.values, frameOffset + ip->src0Slot, 1};
                 const bool ok = executeFunction(
                     state, *cold.directTarget,
                     ArgumentSource(singleWin, static_cast<bytecode::Register>(0)),
-                    callResult, cold.directExecution, true);
+                    callResult, cold.directExecution, true, retAbsOff, retSid);
                 frameBase = state.values.data() + frameOffset;
                 syncAfterFlatSubcall();
                 if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
-                if (ip->dstSlot != detail::InvalidCompactReg) {
-                    frameBase[ip->dstSlot] = std::move(callResult);
-                }
+                RS_COMMIT_CALL_RESULT(ip->dstSlot, callResult, retSid);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
@@ -5207,6 +5576,7 @@ bool executeFunction(
                 state.executed = localExecuted;
                 const auto& cold = flatColdBase[ip - streamBase];
                 Value callResult;
+                RS_RESOLVE_CALLER_STRUCT_RETURN(ip->dstSlot, retAbsOff, retSid);
                 const ValueWindow baseWin{&state.values, frameOffset, execution->totalFrameSlots};
                 const bool ok = executeFunction(
                     state, *cold.directTarget,
@@ -5214,13 +5584,11 @@ bool executeFunction(
                         baseWin,
                         static_cast<bytecode::Register>(ip->src0Slot),
                         static_cast<bytecode::Register>(ip->src1Slot)),
-                    callResult, cold.directExecution, true);
+                    callResult, cold.directExecution, true, retAbsOff, retSid);
                 frameBase = state.values.data() + frameOffset;
                 syncAfterFlatSubcall();
                 if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
-                if (ip->dstSlot != detail::InvalidCompactReg) {
-                    frameBase[ip->dstSlot] = std::move(callResult);
-                }
+                RS_COMMIT_CALL_RESULT(ip->dstSlot, callResult, retSid);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
@@ -5230,17 +5598,16 @@ bool executeFunction(
                 state.executed = localExecuted;
                 const auto& cold = flatColdBase[ip - streamBase];
                 Value callResult;
+                RS_RESOLVE_CALLER_STRUCT_RETURN(ip->dstSlot, retAbsOff, retSid);
                 const ValueWindow regWin{&state.values, frameOffset + execution->registerOffset, function.registerTypes.size()};
                 const bool ok = executeFunction(
                     state, *cold.directTarget,
                     ArgumentSource(regWin, cold.bytecode->operands),
-                    callResult, cold.directExecution, true);
+                    callResult, cold.directExecution, true, retAbsOff, retSid);
                 frameBase = state.values.data() + frameOffset;
                 syncAfterFlatSubcall();
                 if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
-                if (ip->dstSlot != detail::InvalidCompactReg) {
-                    frameBase[ip->dstSlot] = std::move(callResult);
-                }
+                RS_COMMIT_CALL_RESULT(ip->dstSlot, callResult, retSid);
                 RS_FLAT_DISPATCH_NEXT();
             }
 
@@ -5415,13 +5782,14 @@ bool executeFunction(
                             if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                             state.executed = localExecuted;
                             Value callResult;
+                            RS_RESOLVE_CALLER_STRUCT_RETURN(ip->dstSlot, retAbsOff, retSid);
                             const ValueWindow baseWin{&state.values, frameOffset, execution->totalFrameSlots};
                             bool ok = false;
                             if (ip->inlineArgCount == 1u) {
                                 ok = executeFunction(
                                     state, *hit->target,
                                     ArgumentSource(baseWin, static_cast<bytecode::Register>(ip->src0Slot)),
-                                    callResult, calleeExec, true);
+                                    callResult, calleeExec, true, retAbsOff, retSid);
                             } else if (ip->inlineArgCount == 2u) {
                                 ok = executeFunction(
                                     state, *hit->target,
@@ -5429,7 +5797,7 @@ bool executeFunction(
                                         baseWin,
                                         static_cast<bytecode::Register>(ip->src0Slot),
                                         static_cast<bytecode::Register>(ip->src1Slot)),
-                                    callResult, calleeExec, true);
+                                    callResult, calleeExec, true, retAbsOff, retSid);
                             } else if (ip->inlineArgCount == 3u) {
                                 ok = executeFunction(
                                     state, *hit->target,
@@ -5438,7 +5806,7 @@ bool executeFunction(
                                         static_cast<bytecode::Register>(ip->src0Slot),
                                         static_cast<bytecode::Register>(ip->src1Slot),
                                         static_cast<bytecode::Register>(ip->src2Slot)),
-                                    callResult, calleeExec, true);
+                                    callResult, calleeExec, true, retAbsOff, retSid);
                             } else {
                                 const auto& cold = flatColdBase[ip - streamBase];
                                 const ValueWindow regWin{
@@ -5448,7 +5816,7 @@ bool executeFunction(
                                 ok = executeFunction(
                                     state, *hit->target,
                                     ArgumentSource(regWin, cold.bytecode->operands),
-                                    callResult, calleeExec, true);
+                                    callResult, calleeExec, true, retAbsOff, retSid);
                             }
                             frameBase = state.values.data() + frameOffset;
                             if (RS_FLAT_LIKELY(calleeExec->isSmallLeafInlineCandidate && !gcBudgetEnabled)) {
@@ -5458,9 +5826,7 @@ bool executeFunction(
                                 syncAfterFlatSubcall();
                             }
                             if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
-                            if (ip->dstSlot != detail::InvalidCompactReg) {
-                                frameBase[ip->dstSlot] = std::move(callResult);
-                            }
+                            RS_COMMIT_CALL_RESULT(ip->dstSlot, callResult, retSid);
                             RS_FLAT_DISPATCH_NEXT();
                         }
                     }
@@ -5477,7 +5843,7 @@ bool executeFunction(
                 syncAfterFlatSubcall();
                 if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
                 if (ip->dstSlot != detail::InvalidCompactReg) {
-                    frameBase[ip->dstSlot] = std::move(callResult);
+                    storeValueIntoFlatFrameSlot(state, *execution, frameOffset, frameBase, ip->dstSlot, callResult);
                 }
                 RS_FLAT_DISPATCH_NEXT();
             }
@@ -5658,7 +6024,13 @@ bool executeFunction(
                                 if (RS_FLAT_LIKELY(fieldOk)) {
                                     RS_FLAT_SPAN_CHECK();
                                     localExecuted += spanCost;
-                                    frameBase[ip->dstSlot] = val;
+                                    if (RS_FLAT_UNLIKELY(fk == detail::FastFieldKind::UserStruct &&
+                                                         execution->hasStructPayloads)) {
+                                        storeValueIntoFlatFrameSlot(
+                                            state, *execution, frameOffset, frameBase, ip->dstSlot, val);
+                                    } else {
+                                        frameBase[ip->dstSlot] = val;
+                                    }
                                     RS_FLAT_DISPATCH_NEXT();
                                 }
                             }
@@ -5786,6 +6158,23 @@ bool executeFunction(
                                 }
                                 if (RS_FLAT_LIKELY(rhsOk)) {
                                     RS_FLAT_SPAN_CHECK();
+                                    if (RS_FLAT_UNLIKELY(fk == detail::FastFieldKind::UserStruct &&
+                                                         rhs.u_.structVal.isFrameSlice())) {
+                                        Value detached = detachFrameSliceValue(rhs);
+                                        pinValueInPools(detached);
+                                        const bool detBarrier =
+                                            detached.rawTag() == ValueTag::Struct &&
+                                            !detached.u_.structVal.isInline &&
+                                            detached.u_.structVal.storage != nullptr;
+                                        if (detBarrier &&
+                                            (oce.view.needsRememberedBarrier || gcActive || state.heap->phase() != GcPhase::Idle)) {
+                                            state.heap->recordObjectWriteBarrier(oce.ref, detached);
+                                            oce.view.needsRememberedBarrier = false;
+                                        }
+                                        localExecuted += spanCost;
+                                        oce.view.fields[fIdx] = std::move(detached);
+                                        RS_FLAT_DISPATCH_NEXT();
+                                    }
                                     if (needsPin) pinValueInPools(rhs);
                                     if (needsBarrier &&
                                         (oce.view.needsRememberedBarrier || gcActive || state.heap->phase() != GcPhase::Idle)) {
@@ -6072,6 +6461,9 @@ bool executeFunction(
                         case 9: initVal = Vec3fValue{}; break;
                         default: initVal = QuatfValue{}; break;
                         }
+                    } else if (ip->aux0Slot == 11) {
+                        elemTid = flatColdBase[ip - streamBase].bytecode->elementTypeId;
+                        initVal = Value{};
                     } else {
                         const auto& inst = *flatColdBase[ip - streamBase].bytecode;
                         elemTid = inst.elementTypeId;
@@ -6108,9 +6500,19 @@ bool executeFunction(
                             ce.view.elementTypeId = ce.packedView.elementTypeId;
                             ce.isPacked = true;
                             ce.valid = true;
+                        } else if (state.heap->tryBindFlatStructArrayFastView(*ref, ce.flatStructView)) {
+                            ce.ref = *ref;
+                            ce.view = {};
+                            ce.view.length = ce.flatStructView.length;
+                            ce.view.elementType = semantic::PrimitiveType::Struct;
+                            ce.view.elementTypeId = ce.flatStructView.elementTypeId;
+                            ce.isPacked = false;
+                            ce.isFlatStruct = true;
+                            ce.valid = true;
                         } else if (state.heap->tryBindArrayFastView(*ref, ce.view)) {
                             ce.ref = *ref;
                             ce.isPacked = false;
+                            ce.isFlatStruct = false;
                             ce.valid = true;
                         }
                         RS_FLAT_DISPATCH_NEXT();
@@ -8099,7 +8501,28 @@ bool executeFunction(
                         frameBase[ip->dstSlot] = v;
                         break;
                     }
-                    case PackedElemEncoding::BlittableStruct:
+                    case PackedElemEncoding::BlittableStruct: {
+                        if (execution->hasStructPayloads &&
+                            state.flatBankId != 0u &&
+                            ip->dstSlot < execution->slotStructSchemaIds.size()) {
+                            const std::uint16_t sid = execution->slotStructSchemaIds[ip->dstSlot];
+                            const std::uint16_t payOff = execution->slotPayloadOffsets[ip->dstSlot];
+                            const auto* sc = sid != 0u ? getFlatStructSchema(sid) : nullptr;
+                            if (sc != nullptr && payOff != detail::InvalidCompactReg &&
+                                decodePackedStructToLeaves(
+                                    rawBytes,
+                                    uIdx,
+                                    ce.packedView.blittableSchemaId,
+                                    *sc,
+                                    frameBase + payOff)) {
+                                frameBase[ip->dstSlot] = StructValue::makeFrameSlice(
+                                    expectedTid,
+                                    state.flatBankId,
+                                    static_cast<std::uint32_t>(frameOffset + payOff),
+                                    sid);
+                                break;
+                            }
+                        }
                         frameBase[ip->dstSlot] = readPackedStructElement(
                             rawBytes,
                             uIdx,
@@ -8107,11 +8530,61 @@ bool executeFunction(
                             expectedTid,
                             ce.packedView.blittableSchemaId);
                         break;
+                    }
                     default:
                         goto L_FlatMathFallback;
                     }
                     localExecuted += spanCost;
                     RS_FLAT_DISPATCH_NEXT();
+                }
+                if (ce.isFlatStruct) {
+                    if (RS_FLAT_UNLIKELY(expectedType != semantic::PrimitiveType::Struct ||
+                                         ce.flatStructView.elementTypeId != expectedTid)) {
+                        goto L_FlatMathFallback;
+                    }
+                    const std::uint64_t spanCost = ip->span;
+                    if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) {
+                        if (spanCost > 1u) goto L_FlatSuperFallback;
+                        goto L_FlatBudgetExceeded;
+                    }
+                    std::size_t uIdx = 0;
+                    if ((ip->arithFlags & detail::FlatInstruction::FlagArrayNoBoundsCheck) != 0u) {
+                        uIdx = static_cast<std::size_t>(frameBase[ip->src1Slot].asInt64Unchecked());
+                    } else {
+                        std::int64_t idx = 0;
+                        if (RS_FLAT_UNLIKELY(!frameBase[ip->src1Slot].tryGetInt64(idx) ||
+                                             static_cast<std::uint64_t>(idx) >= ce.flatStructView.length)) {
+                            goto L_FlatMathFallback;
+                        }
+                        uIdx = static_cast<std::size_t>(idx);
+                    }
+                    const std::size_t stride = ce.flatStructView.flatStride;
+                    const Value* elemSrc = ce.flatStructView.data + uIdx * stride;
+                    if (RS_FLAT_LIKELY(execution->hasStructPayloads &&
+                                       state.flatBankId != 0u &&
+                                       ip->dstSlot < execution->slotStructSchemaIds.size() &&
+                                       execution->slotStructSchemaIds[ip->dstSlot] == ce.flatStructView.flatSchemaId)) {
+                        const std::uint16_t payOff = execution->slotPayloadOffsets[ip->dstSlot];
+                        if (RS_FLAT_LIKELY(payOff != detail::InvalidCompactReg)) {
+                            std::memcpy(
+                                static_cast<void*>(frameBase + payOff),
+                                static_cast<const void*>(elemSrc),
+                                stride * sizeof(Value));
+                            frameBase[ip->dstSlot] = StructValue::makeFrameSlice(
+                                expectedTid,
+                                state.flatBankId,
+                                static_cast<std::uint32_t>(frameOffset + payOff),
+                                ce.flatStructView.flatSchemaId);
+                            localExecuted += spanCost;
+                            RS_FLAT_DISPATCH_NEXT();
+                        }
+                    }
+                    if (const auto* sc = getFlatStructSchema(ce.flatStructView.flatSchemaId)) {
+                        frameBase[ip->dstSlot] = reconstructDetachedStructFromLeaves(*sc, elemSrc);
+                        localExecuted += spanCost;
+                        RS_FLAT_DISPATCH_NEXT();
+                    }
+                    goto L_FlatMathFallback;
                 }
                 if (RS_FLAT_UNLIKELY(ce.view.elementType != expectedType ||
                                      ce.view.elementTypeId != expectedTid)) {
@@ -8296,6 +8769,68 @@ bool executeFunction(
                     localExecuted += spanCost;
                     RS_FLAT_DISPATCH_NEXT();
                 }
+                if (ce.isFlatStruct) {
+                    if (RS_FLAT_UNLIKELY(ce.flatStructView.elementTypeId != expectedTid)) {
+                        goto L_FlatMathFallback;
+                    }
+                    const Value& storeVal = frameBase[ip->src2Slot];
+                    if (RS_FLAT_UNLIKELY(storeVal.rawTag() != ValueTag::Struct ||
+                                         !storeVal.u_.structVal.valid() ||
+                                         storeVal.u_.structVal.typeId != expectedTid)) {
+                        goto L_FlatMathFallback;
+                    }
+                    const std::uint64_t spanCost = ip->span;
+                    if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) {
+                        if (spanCost > 1u) goto L_FlatSuperFallback;
+                        goto L_FlatBudgetExceeded;
+                    }
+                    std::size_t uIdx = 0;
+                    if ((ip->arithFlags & detail::FlatInstruction::FlagArrayNoBoundsCheck) != 0u) {
+                        uIdx = static_cast<std::size_t>(frameBase[ip->src1Slot].asInt64Unchecked());
+                    } else {
+                        std::int64_t idx = 0;
+                        if (RS_FLAT_UNLIKELY(!frameBase[ip->src1Slot].tryGetInt64(idx) ||
+                                             static_cast<std::uint64_t>(idx) >= ce.flatStructView.length)) {
+                            goto L_FlatMathFallback;
+                        }
+                        uIdx = static_cast<std::size_t>(idx);
+                    }
+                    const std::size_t stride = ce.flatStructView.flatStride;
+                    Value* dstElem = ce.flatStructView.data + uIdx * stride;
+                    const auto& sv = storeVal.u_.structVal;
+                    if (RS_FLAT_LIKELY(sv.isFrameSlice() &&
+                                       sv.frameSchemaId() == ce.flatStructView.flatSchemaId &&
+                                       sv.storage.frameSliceBank() == state.flatBankId)) {
+                        const std::uint32_t srcAbs = sv.storage.frameSliceOffset();
+                        std::memcpy(
+                            static_cast<void*>(dstElem),
+                            static_cast<const void*>(state.values.data() + srcAbs),
+                            stride * sizeof(Value));
+                    } else {
+                        const auto* sc = getFlatStructSchema(ce.flatStructView.flatSchemaId);
+                        if (RS_FLAT_UNLIKELY(!sc || !extractStructLeavesToBuffer(storeVal, *sc, dstElem))) {
+                            goto L_FlatMathFallback;
+                        }
+                    }
+                    if (ce.flatStructView.containsPoolValues) {
+                        for (std::size_t k = 0; k < stride; ++k) {
+                            pinValueInPools(dstElem[k]);
+                        }
+                    }
+                    if (ce.flatStructView.containsManagedReferences) {
+                        if (ce.flatStructView.dirtyCards != nullptr) {
+                            ce.flatStructView.dirtyCards[uIdx >> ManagedHeap::kCardElementShift] = 1u;
+                        }
+                        if (RS_FLAT_UNLIKELY(ce.flatStructView.needsRememberedBarrier ||
+                                             gcActive ||
+                                             state.heap->phase() != GcPhase::Idle)) {
+                            state.heap->recordFlatStructArrayWriteBarrier(ce.ref, uIdx);
+                            ce.flatStructView.needsRememberedBarrier = false;
+                        }
+                    }
+                    localExecuted += spanCost;
+                    RS_FLAT_DISPATCH_NEXT();
+                }
                 if (RS_FLAT_UNLIKELY(ce.view.elementType != semantic::PrimitiveType::Struct ||
                                      ce.view.elementTypeId != expectedTid)) {
                     goto L_FlatMathFallback;
@@ -8370,7 +8905,20 @@ bool executeFunction(
                     }
                 }
                 localExecuted += spanCost;
-                ce.view.data[uIdx] = storeVal;
+                if (RS_FLAT_UNLIKELY(vtag == ValueTag::Struct && storeVal.u_.structVal.isFrameSlice())) {
+                    Value detached = detachFrameSliceValue(storeVal);
+                    pinValueInPools(detached);
+                    if (ce.view.dirtyCards != nullptr) {
+                        ce.view.dirtyCards[uIdx >> ManagedHeap::kCardElementShift] = 1u;
+                    }
+                    if (RS_FLAT_UNLIKELY(ce.view.needsRememberedBarrier || gcActive || state.heap->phase() != GcPhase::Idle)) {
+                        state.heap->recordArrayWriteBarrier(ce.ref, uIdx, detached);
+                        ce.view.needsRememberedBarrier = false;
+                    }
+                    ce.view.data[uIdx] = std::move(detached);
+                } else {
+                    ce.view.data[uIdx] = storeVal;
+                }
                 RS_FLAT_DISPATCH_NEXT();
             }
 
@@ -8932,6 +9480,12 @@ bool executeFunction(
                             if (vt == ValueTag::NullObject) {
                                 // ok
                             } else if (vt == ValueTag::ObjectRef) {
+                                if (userArgsPtr[k].u_.objectRef.isStackSlotRef()) {
+                                    if (RS_FLAT_UNLIKELY(userArgsPtr[k].u_.objectRef.generation != state.flatBankId)) {
+                                        userArgsValid = false;
+                                        break;
+                                    }
+                                } else {
                                 const auto actTid = state.heap->objectTypeIdFast(userArgsPtr[k].u_.objectRef);
                                 if (actTid == 0) {
                                     userArgsValid = false;
@@ -8945,6 +9499,7 @@ bool executeFunction(
                                     }
                                     cachedAssignableSubTid = actTid;
                                     cachedAssignableBaseTid = ptId;
+                                }
                                 }
                             } else {
                                 userArgsValid = false;
@@ -9297,7 +9852,7 @@ bool executeFunction(
                 }
                 frameBase = state.values.data() + frameOffset;
                 if (ip->dstSlot != detail::InvalidCompactReg) {
-                    frameBase[ip->dstSlot] = std::move(lastResult);
+                    storeValueIntoFlatFrameSlot(state, *execution, frameOffset, frameBase, ip->dstSlot, lastResult);
                 }
                 RS_FLAT_DISPATCH_NEXT();
             }
@@ -9366,7 +9921,7 @@ bool executeFunction(
                 frameBase = state.values.data() + frameOffset;
                 syncAfterFlatSubcall();
                 if (hasRes) {
-                    frameBase[ip->dstSlot] = std::move(resumedVal);
+                    storeValueIntoFlatFrameSlot(state, *execution, frameOffset, frameBase, ip->dstSlot, resumedVal);
                 }
                 RS_FLAT_DISPATCH_NEXT();
             }
@@ -9552,6 +10107,476 @@ bool executeFunction(
                 RS_FLAT_DISPATCH_NEXT();
             }
 
+            RS_FLAT_CASE(InitStructSlice) {
+                RS_TRUSTED_SPAN_CHECK();
+                const std::uint16_t sid = ip->aux0Slot;
+                const auto* sc = getFlatStructSchema(sid);
+                const std::uint32_t payOff = ip->auxImm32;
+                if (RS_FLAT_UNLIKELY(sc == nullptr || state.flatBankId == 0u ||
+                                     payOff >= execution->totalFrameSlots ||
+                                     frameOffset + payOff > StructStorageHandle::FrameOffsetMask)) {
+                    goto L_FlatMathFallback;
+                }
+                std::memcpy(
+                    static_cast<void*>(frameBase + payOff),
+                    static_cast<const void*>(sc->prototypeLeaves.data()),
+                    static_cast<std::size_t>(ip->aux1Slot) * sizeof(Value));
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot] = StructValue::makeFrameSlice(
+                    static_cast<semantic::SymbolId>(ip->integerImmediate),
+                    state.flatBankId,
+                    static_cast<std::uint32_t>(frameOffset + payOff),
+                    sid);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(AliasStructSlice) {
+                if (RS_FLAT_UNLIKELY(++localExecuted > budgetLimit)) goto L_FlatBudgetExceeded;
+                frameBase[ip->dstSlot] = frameBase[ip->src0Slot];
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(CopyStructSlice) {
+                RS_TRUSTED_SPAN_CHECK();
+                const std::uint16_t sid = ip->aux0Slot;
+                const std::uint16_t leafCnt = ip->aux1Slot;
+                const std::uint32_t dstPayOff = ip->auxImm32;
+                if (RS_FLAT_UNLIKELY(state.flatBankId == 0u ||
+                                     dstPayOff >= execution->totalFrameSlots ||
+                                     frameOffset + dstPayOff > StructStorageHandle::FrameOffsetMask)) {
+                    goto L_FlatMathFallback;
+                }
+                const Value& srcVal = frameBase[ip->src0Slot];
+                const std::uint32_t dstAbs = static_cast<std::uint32_t>(frameOffset + dstPayOff);
+                if (RS_FLAT_LIKELY(srcVal.rawTag() == ValueTag::Struct &&
+                                   srcVal.u_.structVal.isFrameSlice() &&
+                                   srcVal.u_.structVal.frameSchemaId() == sid &&
+                                   srcVal.u_.structVal.storage.frameSliceBank() == state.flatBankId)) {
+                    const std::uint32_t srcAbs = srcVal.u_.structVal.storage.frameSliceOffset();
+                    if (srcAbs != dstAbs) {
+                        std::memmove(
+                            static_cast<void*>(state.values.data() + dstAbs),
+                            static_cast<const void*>(state.values.data() + srcAbs),
+                            static_cast<std::size_t>(leafCnt) * sizeof(Value));
+                    }
+                } else {
+                    const auto* sc = getFlatStructSchema(sid);
+                    if (RS_FLAT_UNLIKELY(!sc || !extractStructLeavesToBuffer(srcVal, *sc, frameBase + dstPayOff))) {
+                        goto L_FlatMathFallback;
+                    }
+                }
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot] = StructValue::makeFrameSlice(
+                    static_cast<semantic::SymbolId>(ip->integerImmediate),
+                    state.flatBankId,
+                    dstAbs,
+                    sid);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(LoadStructSliceField) {
+                if (RS_FLAT_UNLIKELY(localExecuted >= budgetLimit)) goto L_FlatBudgetExceeded;
+                const Value& recv = frameBase[ip->src0Slot];
+                if (RS_FLAT_LIKELY(recv.rawTag() == ValueTag::Struct &&
+                                   recv.u_.structVal.isFrameSlice() &&
+                                   recv.u_.structVal.storage.frameSliceBank() == state.flatBankId)) {
+                    const std::uint32_t baseAbs =
+                        recv.u_.structVal.storage.frameSliceOffset() + ip->aux0Slot;
+                    const std::uint16_t subSid = ip->aux1Slot;
+                    if (subSid == 0u) {
+                        ++localExecuted;
+                        frameBase[ip->dstSlot] = state.values[baseAbs];
+                        RS_FLAT_DISPATCH_NEXT();
+                    }
+                    const auto subTid = static_cast<semantic::SymbolId>(ip->integerImmediate);
+                    if (ip->auxImm32 == detail::InvalidStreamOffset) {
+                        if (RS_FLAT_UNLIKELY(baseAbs > StructStorageHandle::FrameOffsetMask)) {
+                            goto L_FlatGenericFallback;
+                        }
+                        ++localExecuted;
+                        frameBase[ip->dstSlot] = StructValue::makeFrameSlice(
+                            subTid, state.flatBankId, baseAbs, subSid);
+                        RS_FLAT_DISPATCH_NEXT();
+                    }
+                    const auto* subSc = getFlatStructSchema(subSid);
+                    if (RS_FLAT_LIKELY(subSc != nullptr && ip->auxImm32 < execution->totalFrameSlots &&
+                                       frameOffset + ip->auxImm32 <= StructStorageHandle::FrameOffsetMask)) {
+                        const std::uint32_t dstAbs = static_cast<std::uint32_t>(frameOffset + ip->auxImm32);
+                        if (dstAbs != baseAbs) {
+                            std::memmove(
+                                static_cast<void*>(state.values.data() + dstAbs),
+                                static_cast<const void*>(state.values.data() + baseAbs),
+                                static_cast<std::size_t>(subSc->flatSlotCount) * sizeof(Value));
+                        }
+                        ++localExecuted;
+                        frameBase[ip->dstSlot] = StructValue::makeFrameSlice(
+                            subTid, state.flatBankId, dstAbs, subSid);
+                        RS_FLAT_DISPATCH_NEXT();
+                    }
+                }
+                goto L_FlatGenericFallback;
+            }
+
+            RS_FLAT_CASE(StoreStructSliceField) {
+                if (RS_FLAT_UNLIKELY(localExecuted >= budgetLimit)) goto L_FlatBudgetExceeded;
+                const std::uint16_t sid = ip->aux0Slot;
+                const std::uint16_t fIdx = ip->aux1Slot;
+                const std::uint32_t dstPayOff = ip->auxImm32;
+                const auto* sc = getFlatStructSchema(sid);
+                if (RS_FLAT_UNLIKELY(!sc || fIdx >= sc->directFields.size() ||
+                                     state.flatBankId == 0u || dstPayOff >= execution->totalFrameSlots ||
+                                     frameOffset + dstPayOff > StructStorageHandle::FrameOffsetMask)) {
+                    goto L_FlatGenericFallback;
+                }
+                const Value& recv = frameBase[ip->src0Slot];
+                const Value& rhs = frameBase[ip->src1Slot];
+                Value* dstLeaves = frameBase + dstPayOff;
+                const std::uint32_t dstAbs = static_cast<std::uint32_t>(frameOffset + dstPayOff);
+                if (RS_FLAT_LIKELY(recv.rawTag() == ValueTag::Struct &&
+                                   recv.u_.structVal.isFrameSlice() &&
+                                   recv.u_.structVal.frameSchemaId() == sid &&
+                                   recv.u_.structVal.storage.frameSliceBank() == state.flatBankId)) {
+                    const std::uint32_t srcAbs = recv.u_.structVal.storage.frameSliceOffset();
+                    if (srcAbs != dstAbs) {
+                        std::memmove(
+                            static_cast<void*>(dstLeaves),
+                            static_cast<const void*>(state.values.data() + srcAbs),
+                            static_cast<std::size_t>(sc->flatSlotCount) * sizeof(Value));
+                    }
+                } else if (!extractStructLeavesToBuffer(recv, *sc, dstLeaves)) {
+                    goto L_FlatGenericFallback;
+                }
+                const auto& fd = sc->directFields[fIdx];
+                if (fd.subSchemaId == 0u) {
+                    dstLeaves[fd.leafOffset] = rhs;
+                } else {
+                    const auto* subSc = getFlatStructSchema(fd.subSchemaId);
+                    if (RS_FLAT_UNLIKELY(!subSc ||
+                                         !extractStructLeavesToBuffer(rhs, *subSc, dstLeaves + fd.leafOffset))) {
+                        goto L_FlatGenericFallback;
+                    }
+                }
+                ++localExecuted;
+                frameBase[ip->dstSlot] = StructValue::makeFrameSlice(
+                    static_cast<semantic::SymbolId>(ip->integerImmediate),
+                    state.flatBankId,
+                    dstAbs,
+                    sid);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(StoreLocalStructFieldInPlace) {
+                RS_TRUSTED_SPAN_CHECK();
+                const std::uint32_t locPayOff = ip->auxImm32;
+                const std::uint16_t leafOff = ip->aux0Slot;
+                const std::uint16_t subSid = ip->aux1Slot;
+                const Value& rhs = frameBase[ip->src1Slot];
+                if (subSid == 0u) {
+                    frameBase[locPayOff + leafOff] = rhs;
+                    localExecuted += spanCost;
+                    RS_FLAT_DISPATCH_NEXT();
+                }
+                const auto* subSc = getFlatStructSchema(subSid);
+                if (RS_FLAT_LIKELY(subSc != nullptr)) {
+                    if (RS_FLAT_LIKELY(rhs.rawTag() == ValueTag::Struct &&
+                                       rhs.u_.structVal.isFrameSlice() &&
+                                       rhs.u_.structVal.frameSchemaId() == subSid &&
+                                       rhs.u_.structVal.storage.frameSliceBank() == state.flatBankId)) {
+                        const std::uint32_t srcAbs = rhs.u_.structVal.storage.frameSliceOffset();
+                        const std::uint32_t dstAbs = static_cast<std::uint32_t>(frameOffset + locPayOff + leafOff);
+                        if (srcAbs != dstAbs) {
+                            std::memmove(
+                                static_cast<void*>(state.values.data() + dstAbs),
+                                static_cast<const void*>(state.values.data() + srcAbs),
+                                static_cast<std::size_t>(subSc->flatSlotCount) * sizeof(Value));
+                        }
+                        localExecuted += spanCost;
+                        RS_FLAT_DISPATCH_NEXT();
+                    }
+                    if (extractStructLeavesToBuffer(rhs, *subSc, frameBase + locPayOff + leafOff)) {
+                        localExecuted += spanCost;
+                        RS_FLAT_DISPATCH_NEXT();
+                    }
+                }
+                goto L_FlatSuperFallback;
+            }
+
+            RS_FLAT_CASE(StoreElementStructFieldInPlace) {
+                auto& ce = arrayCache[ip->src0Slot & 3u];
+                const Value& arrVal = frameBase[ip->src0Slot];
+                if (RS_FLAT_UNLIKELY(!ce.valid ||
+                                     arrVal.rawTag() != ValueTag::ObjectRef ||
+                                     arrVal.u_.objectRef != ce.ref)) {
+                    if (!bindArrayCacheSlot(arrVal, ce)) goto L_FlatSuperFallback;
+                }
+                const auto expectedTid = static_cast<semantic::SymbolId>(ip->integerImmediate);
+                if (ce.isPacked) {
+                    if (RS_FLAT_UNLIKELY(ce.packedView.encoding != PackedElemEncoding::BlittableStruct ||
+                                         ce.packedView.elementType != semantic::PrimitiveType::Struct ||
+                                         ce.packedView.elementTypeId != expectedTid)) {
+                        goto L_FlatSuperFallback;
+                    }
+                    const std::uint64_t spanCost = ip->span;
+                    if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) {
+                        goto L_FlatSuperFallback;
+                    }
+                    std::int64_t idx = 0;
+                    if (RS_FLAT_UNLIKELY(!frameBase[ip->src1Slot].tryGetInt64(idx) ||
+                                         static_cast<std::uint64_t>(idx) >= ce.packedView.length)) {
+                        goto L_FlatSuperFallback;
+                    }
+                    const auto* rootSc = getFlatStructSchema(static_cast<std::uint16_t>(ip->auxImm32));
+                    bool needsDemote = false;
+                    if (RS_FLAT_UNLIKELY(!rootSc ||
+                                         !writePackedStructLeafSlice(
+                                             ce.packedView.rawData,
+                                             static_cast<std::size_t>(idx),
+                                             ce.packedView.blittableSchemaId,
+                                             *rootSc,
+                                             ip->aux0Slot,
+                                             ip->aux1Slot,
+                                             frameBase[ip->src2Slot],
+                                             needsDemote))) {
+                        ce.valid = false;
+                        goto L_FlatSuperFallback;
+                    }
+                    localExecuted += spanCost;
+                    RS_FLAT_DISPATCH_NEXT();
+                }
+                if (RS_FLAT_UNLIKELY(!ce.isFlatStruct ||
+                                     ce.flatStructView.elementTypeId != expectedTid ||
+                                     ce.flatStructView.flatSchemaId != static_cast<std::uint16_t>(ip->auxImm32))) {
+                    goto L_FlatSuperFallback;
+                }
+                const std::uint64_t spanCost = ip->span;
+                if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) {
+                    goto L_FlatSuperFallback;
+                }
+                std::int64_t idx = 0;
+                if (RS_FLAT_UNLIKELY(!frameBase[ip->src1Slot].tryGetInt64(idx) ||
+                                     static_cast<std::uint64_t>(idx) >= ce.flatStructView.length)) {
+                    goto L_FlatSuperFallback;
+                }
+                const auto uIdx = static_cast<std::size_t>(idx);
+                const std::size_t stride = ce.flatStructView.flatStride;
+                const std::uint16_t leafOff = ip->aux0Slot;
+                const std::uint16_t subSid = ip->aux1Slot;
+                if (RS_FLAT_UNLIKELY(leafOff >= stride)) {
+                    goto L_FlatSuperFallback;
+                }
+                Value* dstLeaf = ce.flatStructView.data + uIdx * stride + leafOff;
+                const Value& rhs = frameBase[ip->src2Slot];
+                std::size_t writtenCount = 1;
+                if (subSid == 0u) {
+                    *dstLeaf = detachFrameSliceValue(rhs);
+                } else {
+                    const auto* subSc = getFlatStructSchema(subSid);
+                    if (RS_FLAT_UNLIKELY(!subSc ||
+                                         leafOff + subSc->flatSlotCount > stride ||
+                                         !extractStructLeavesToBuffer(rhs, *subSc, dstLeaf))) {
+                        goto L_FlatSuperFallback;
+                    }
+                    writtenCount = subSc->flatSlotCount;
+                }
+                if (ce.flatStructView.containsPoolValues) {
+                    for (std::size_t k = 0; k < writtenCount; ++k) {
+                        pinValueInPools(dstLeaf[k]);
+                    }
+                }
+                if (ce.flatStructView.containsManagedReferences) {
+                    if (ce.flatStructView.dirtyCards != nullptr) {
+                        ce.flatStructView.dirtyCards[uIdx >> ManagedHeap::kCardElementShift] = 1u;
+                    }
+                    if (RS_FLAT_UNLIKELY(ce.flatStructView.needsRememberedBarrier ||
+                                         gcActive ||
+                                         state.heap->phase() != GcPhase::Idle)) {
+                        state.heap->recordFlatStructArrayWriteBarrier(ce.ref, uIdx);
+                        ce.flatStructView.needsRememberedBarrier = false;
+                    }
+                }
+                localExecuted += spanCost;
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(InitStackRefCell) {
+                if (RS_FLAT_UNLIKELY(localExecuted >= budgetLimit)) goto L_FlatBudgetExceeded;
+                const auto& mirror = detail::executionMirror(*state.program);
+                if (RS_FLAT_UNLIKELY(state.flatBankId == 0u ||
+                                     ip->aux0Slot >= mirror.stackRefTemplates.size() ||
+                                     ip->auxImm32 >= execution->totalFrameSlots)) {
+                    goto L_FlatGenericFallback;
+                }
+                const auto& srt = mirror.stackRefTemplates[ip->aux0Slot];
+                const std::uint32_t cellOff = ip->auxImm32;
+                if (srt.flatSchemaId == 0u) {
+                    frameBase[cellOff] = srt.scalarDefaultValue;
+                } else {
+                    const auto* sc = getFlatStructSchema(srt.flatSchemaId);
+                    if (RS_FLAT_UNLIKELY(!sc || cellOff + sc->flatSlotCount > execution->totalFrameSlots)) {
+                        goto L_FlatGenericFallback;
+                    }
+                    std::memcpy(
+                        static_cast<void*>(frameBase + cellOff),
+                        static_cast<const void*>(sc->prototypeLeaves.data()),
+                        static_cast<std::size_t>(sc->flatSlotCount) * sizeof(Value));
+                }
+                ++localExecuted;
+                frameBase[ip->dstSlot] = ObjectRef::makeStackSlotRef(
+                    static_cast<std::uint32_t>(frameOffset + cellOff),
+                    state.flatBankId,
+                    srt.flatSchemaId);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(BindLocalStackRef) {
+                RS_TRUSTED_SPAN_CHECK();
+                if (RS_FLAT_UNLIKELY(state.flatBankId == 0u || ip->auxImm32 >= execution->totalFrameSlots)) {
+                    goto L_FlatSuperFallback;
+                }
+                localExecuted += spanCost;
+                frameBase[ip->dstSlot] = ObjectRef::makeStackSlotRef(
+                    static_cast<std::uint32_t>(frameOffset + ip->auxImm32),
+                    state.flatBankId,
+                    ip->aux0Slot);
+                RS_FLAT_DISPATCH_NEXT();
+            }
+
+            RS_FLAT_CASE(WritebackLocalStackRef) {
+                RS_TRUSTED_SPAN_CHECK();
+                const Value& wrapVal = frameBase[ip->src0Slot];
+                if (RS_FLAT_LIKELY(wrapVal.rawTag() == ValueTag::ObjectRef &&
+                                   wrapVal.u_.objectRef.isStackSlotRef() &&
+                                   wrapVal.u_.objectRef.generation == state.flatBankId &&
+                                   wrapVal.u_.objectRef.slot ==
+                                       static_cast<std::uint32_t>(frameOffset + ip->auxImm32))) {
+                    localExecuted += spanCost;
+                    RS_FLAT_DISPATCH_NEXT();
+                }
+                goto L_FlatSuperFallback;
+            }
+
+            RS_FLAT_CASE(LoadStackRefCell) {
+                if (RS_FLAT_UNLIKELY(localExecuted >= budgetLimit)) goto L_FlatBudgetExceeded;
+                const Value& recvVal = frameBase[ip->src0Slot];
+                if (RS_FLAT_LIKELY(recvVal.rawTag() == ValueTag::ObjectRef &&
+                                   recvVal.u_.objectRef.isStackSlotRef() &&
+                                   recvVal.u_.objectRef.generation == state.flatBankId)) {
+                    const ObjectRef ref = recvVal.u_.objectRef;
+                    const std::uint16_t sid = ip->aux0Slot;
+                    if (sid == 0u) {
+                        ++localExecuted;
+                        frameBase[ip->dstSlot] = state.values[ref.slot];
+                        RS_FLAT_DISPATCH_NEXT();
+                    }
+                    const auto innerTid = static_cast<semantic::SymbolId>(ip->integerImmediate);
+                    if (ip->auxImm32 == detail::InvalidStreamOffset) {
+                        if (RS_FLAT_UNLIKELY(ref.slot > StructStorageHandle::FrameOffsetMask)) {
+                            goto L_FlatMathFallback;
+                        }
+                        ++localExecuted;
+                        frameBase[ip->dstSlot] = StructValue::makeFrameSlice(
+                            innerTid, state.flatBankId, ref.slot, sid);
+                        RS_FLAT_DISPATCH_NEXT();
+                    }
+                    const auto* sc = getFlatStructSchema(sid);
+                    if (RS_FLAT_LIKELY(sc != nullptr && ip->auxImm32 < execution->totalFrameSlots &&
+                                       frameOffset + ip->auxImm32 <= StructStorageHandle::FrameOffsetMask)) {
+                        const std::uint32_t dstAbs = static_cast<std::uint32_t>(frameOffset + ip->auxImm32);
+                        if (dstAbs != ref.slot) {
+                            std::memmove(
+                                static_cast<void*>(state.values.data() + dstAbs),
+                                static_cast<const void*>(state.values.data() + ref.slot),
+                                static_cast<std::size_t>(sc->flatSlotCount) * sizeof(Value));
+                        }
+                        ++localExecuted;
+                        frameBase[ip->dstSlot] = StructValue::makeFrameSlice(
+                            innerTid, state.flatBankId, dstAbs, sid);
+                        RS_FLAT_DISPATCH_NEXT();
+                    }
+                }
+                goto L_FlatMathFallback;
+            }
+
+            RS_FLAT_CASE(StoreStackRefCell) {
+                if (RS_FLAT_UNLIKELY(localExecuted >= budgetLimit)) goto L_FlatBudgetExceeded;
+                const Value& recvVal = frameBase[ip->src0Slot];
+                if (RS_FLAT_LIKELY(recvVal.rawTag() == ValueTag::ObjectRef &&
+                                   recvVal.u_.objectRef.isStackSlotRef() &&
+                                   recvVal.u_.objectRef.generation == state.flatBankId)) {
+                    const ObjectRef ref = recvVal.u_.objectRef;
+                    const Value& rhs = frameBase[ip->src1Slot];
+                    const std::uint16_t sid = ip->aux0Slot;
+                    if (sid == 0u) {
+                        state.values[ref.slot] = detachFrameSliceValue(rhs);
+                        ++localExecuted;
+                        RS_FLAT_DISPATCH_NEXT();
+                    }
+                    const auto* sc = getFlatStructSchema(sid);
+                    if (RS_FLAT_LIKELY(sc != nullptr)) {
+                        if (RS_FLAT_LIKELY(rhs.rawTag() == ValueTag::Struct &&
+                                           rhs.u_.structVal.isFrameSlice() &&
+                                           rhs.u_.structVal.frameSchemaId() == sid &&
+                                           rhs.u_.structVal.storage.frameSliceBank() == state.flatBankId)) {
+                            const std::uint32_t srcAbs = rhs.u_.structVal.storage.frameSliceOffset();
+                            if (srcAbs != ref.slot) {
+                                std::memmove(
+                                    static_cast<void*>(state.values.data() + ref.slot),
+                                    static_cast<const void*>(state.values.data() + srcAbs),
+                                    static_cast<std::size_t>(sc->flatSlotCount) * sizeof(Value));
+                            }
+                            ++localExecuted;
+                            RS_FLAT_DISPATCH_NEXT();
+                        }
+                        if (extractStructLeavesToBuffer(rhs, *sc, state.values.data() + ref.slot)) {
+                            ++localExecuted;
+                            RS_FLAT_DISPATCH_NEXT();
+                        }
+                    }
+                }
+                goto L_FlatMathFallback;
+            }
+
+            RS_FLAT_CASE(StoreStackRefStructFieldInPlace) {
+                RS_TRUSTED_SPAN_CHECK();
+                const Value& recvVal = frameBase[ip->src0Slot];
+                if (RS_FLAT_LIKELY(recvVal.rawTag() == ValueTag::ObjectRef &&
+                                   recvVal.u_.objectRef.isStackSlotRef() &&
+                                   recvVal.u_.objectRef.generation == state.flatBankId &&
+                                   recvVal.u_.objectRef.stackRefSchemaId() ==
+                                       static_cast<std::uint16_t>(ip->auxImm32))) {
+                    const std::uint32_t dstAbs = recvVal.u_.objectRef.slot + ip->aux0Slot;
+                    const std::uint16_t subSid = ip->aux1Slot;
+                    const Value& rhs = frameBase[ip->src1Slot];
+                    if (subSid == 0u) {
+                        state.values[dstAbs] = detachFrameSliceValue(rhs);
+                        localExecuted += spanCost;
+                        RS_FLAT_DISPATCH_NEXT();
+                    }
+                    const auto* subSc = getFlatStructSchema(subSid);
+                    if (RS_FLAT_LIKELY(subSc != nullptr)) {
+                        if (RS_FLAT_LIKELY(rhs.rawTag() == ValueTag::Struct &&
+                                           rhs.u_.structVal.isFrameSlice() &&
+                                           rhs.u_.structVal.frameSchemaId() == subSid &&
+                                           rhs.u_.structVal.storage.frameSliceBank() == state.flatBankId)) {
+                            const std::uint32_t srcAbs = rhs.u_.structVal.storage.frameSliceOffset();
+                            if (srcAbs != dstAbs) {
+                                std::memmove(
+                                    static_cast<void*>(state.values.data() + dstAbs),
+                                    static_cast<const void*>(state.values.data() + srcAbs),
+                                    static_cast<std::size_t>(subSc->flatSlotCount) * sizeof(Value));
+                            }
+                            localExecuted += spanCost;
+                            RS_FLAT_DISPATCH_NEXT();
+                        }
+                        if (extractStructLeavesToBuffer(rhs, *subSc, state.values.data() + dstAbs)) {
+                            localExecuted += spanCost;
+                            RS_FLAT_DISPATCH_NEXT();
+                        }
+                    }
+                }
+                goto L_FlatSuperFallback;
+            }
+
             RS_FLAT_CASE(GenericBytecode) {
             L_FlatMathFallback:
                 if (RS_FLAT_UNLIKELY(ip->span > 1)) goto L_FlatSuperFallback;
@@ -9607,6 +10632,15 @@ bool executeFunction(
                 frameBase = state.values.data() + frameOffset;
                 syncAfterFlatSubcall();
                 if (RS_FLAT_UNLIKELY(!ok)) goto L_FlatError;
+                if (RS_FLAT_UNLIKELY(execution->hasStructPayloads && cold.bytecode != nullptr &&
+                                     cold.bytecode->result < function.registerTypes.size())) {
+                    const auto rSlot = static_cast<std::uint16_t>(execution->registerOffset + cold.bytecode->result);
+                    if (execution->slotStructSchemaIds[rSlot] != 0u &&
+                        execution->slotPayloadOffsets[rSlot] != detail::InvalidCompactReg) {
+                        const Value cur = frameBase[rSlot];
+                        storeValueIntoFlatFrameSlot(state, *execution, frameOffset, frameBase, rSlot, cur);
+                    }
+                }
                 RS_FLAT_DISPATCH_NEXT();
             }
 
@@ -9683,16 +10717,54 @@ bool executeFunction(
                     Value* const regPtr = frameBase + execution->registerOffset;
                     Value* const scratchPtr = frameBase + execution->scratchOffset;
                     const std::size_t regLimit = function.registerTypes.size();
-                    for (std::size_t idx = 0; idx < sources.size(); ++idx) {
-                        if (RS_FLAT_UNLIKELY(sources[idx] >= regLimit || destinations[idx].target >= regLimit)) {
-                            state.executed = localExecuted;
-                            fail(state, ErrorCode::InvalidProgram, "branch argument register is invalid");
-                            goto L_FlatError;
+                    if (RS_FLAT_UNLIKELY(execution->hasStructPayloads &&
+                                         execution->edgeStructScratchOffset != detail::InvalidCompactReg &&
+                                         state.flatBankId != 0u)) {
+                        std::size_t edgePayCursor = execution->edgeStructScratchOffset;
+                        for (std::size_t idx = 0; idx < sources.size(); ++idx) {
+                            if (RS_FLAT_UNLIKELY(sources[idx] >= regLimit || destinations[idx].target >= regLimit)) {
+                                state.executed = localExecuted;
+                                fail(state, ErrorCode::InvalidProgram, "branch argument register is invalid");
+                                goto L_FlatError;
+                            }
+                            const auto dstSlot = static_cast<std::uint16_t>(execution->registerOffset + destinations[idx].target);
+                            const std::uint16_t sid = execution->slotStructSchemaIds[dstSlot];
+                            if (sid != 0u) {
+                                const auto* sc = getFlatStructSchema(sid);
+                                if (sc != nullptr) {
+                                    (void)extractStructLeavesToBuffer(regPtr[sources[idx]], *sc, frameBase + edgePayCursor);
+                                    scratchPtr[idx] = StructValue::makeFrameSlice(
+                                        sc->structTypeId,
+                                        state.flatBankId,
+                                        static_cast<std::uint32_t>(frameOffset + edgePayCursor),
+                                        sid);
+                                    edgePayCursor += sc->flatSlotCount;
+                                    continue;
+                                }
+                            }
+                            scratchPtr[idx] = regPtr[sources[idx]];
                         }
-                        scratchPtr[idx] = regPtr[sources[idx]];
-                    }
-                    for (std::size_t idx = 0; idx < sources.size(); ++idx) {
-                        regPtr[destinations[idx].target] = std::move(scratchPtr[idx]);
+                        for (std::size_t idx = 0; idx < sources.size(); ++idx) {
+                            const auto dstSlot = static_cast<std::uint16_t>(execution->registerOffset + destinations[idx].target);
+                            if (execution->slotStructSchemaIds[dstSlot] != 0u) {
+                                storeValueIntoFlatFrameSlot(
+                                    state, *execution, frameOffset, frameBase, dstSlot, scratchPtr[idx]);
+                            } else {
+                                regPtr[destinations[idx].target] = std::move(scratchPtr[idx]);
+                            }
+                        }
+                    } else {
+                        for (std::size_t idx = 0; idx < sources.size(); ++idx) {
+                            if (RS_FLAT_UNLIKELY(sources[idx] >= regLimit || destinations[idx].target >= regLimit)) {
+                                state.executed = localExecuted;
+                                fail(state, ErrorCode::InvalidProgram, "branch argument register is invalid");
+                                goto L_FlatError;
+                            }
+                            scratchPtr[idx] = regPtr[sources[idx]];
+                        }
+                        for (std::size_t idx = 0; idx < sources.size(); ++idx) {
+                            regPtr[destinations[idx].target] = std::move(scratchPtr[idx]);
+                        }
                     }
                 }
                 ip = streamBase + nextStreamOffset;
@@ -9734,7 +10806,23 @@ bool executeFunction(
                 if (RS_FLAT_UNLIKELY(!expectSignatureType(state, retVal, function.returnType, function.returnTypeId, "return value"))) {
                     goto L_FlatError;
                 }
-                result = retVal;
+                if (callerStructReturnSchemaId != 0u &&
+                    callerStructReturnAbsOffset != detail::InvalidStreamOffset &&
+                    state.flatBankId != 0u) {
+                    if (const auto* sc = getFlatStructSchema(callerStructReturnSchemaId);
+                        sc != nullptr &&
+                        extractStructLeavesToBuffer(retVal, *sc, state.values.data() + callerStructReturnAbsOffset)) {
+                        result = StructValue::makeFrameSlice(
+                            sc->structTypeId,
+                            state.flatBankId,
+                            callerStructReturnAbsOffset,
+                            callerStructReturnSchemaId);
+                        state.valueTop = frameOffset;
+                        state.stack.pop_back();
+                        return true;
+                    }
+                }
+                result = detachFrameSliceValue(retVal);
                 state.valueTop = frameOffset;
                 state.stack.pop_back();
                 return true;
@@ -9809,6 +10897,24 @@ L_FlatSuperFallback: {
                 ? executeInstruction(state, *activeLoc.module, activeFunc, *singleDec.bytecode, argWin, locWin, regWin)
                 : executeQuickInstruction(state, *activeLoc.module, singleDec, argWin, locWin, regWin);
             frameBase = state.values.data() + frameOffset;
+            if (ok && activeExec.hasStructPayloads && singleDec.bytecode != nullptr) {
+                Value* activeFrameBase = state.values.data() + activeFrameOff;
+                if (singleDec.bytecode->opcode == bytecode::Opcode::StoreLocal &&
+                    singleDec.bytecode->index < activeFunc.localTypes.size()) {
+                    const auto lSlot = static_cast<std::uint16_t>(activeExec.localOffset + singleDec.bytecode->index);
+                    if (activeExec.slotStructSchemaIds[lSlot] != 0u) {
+                        const Value cur = activeFrameBase[lSlot];
+                        storeValueIntoFlatFrameSlot(state, activeExec, activeFrameOff, activeFrameBase, lSlot, cur);
+                    }
+                } else if (singleDec.result < activeFunc.registerTypes.size()) {
+                    const auto rSlot = static_cast<std::uint16_t>(activeExec.registerOffset + singleDec.result);
+                    if (activeExec.slotStructSchemaIds[rSlot] != 0u &&
+                        activeExec.slotPayloadOffsets[rSlot] != detail::InvalidCompactReg) {
+                        const Value cur = activeFrameBase[rSlot];
+                        storeValueIntoFlatFrameSlot(state, activeExec, activeFrameOff, activeFrameBase, rSlot, cur);
+                    }
+                }
+            }
             if (!ok) {
                 syncAfterFlatSubcall();
                 if (isInlined) {
@@ -10603,6 +11709,7 @@ void resumeInterpreterCoroutineCallback(
         ~RestoreBridge() noexcept { ctx.setActiveInterpreterState(prev); }
     } restoreBridge{asyncContext, prevBridge};
 
+    FlatStackBankScope flatBankScope(state);
     ShadowFrameScope roots(
         state.shadowStack, nullptr, nullptr, &state.values, &state.valueTop);
     if (state.traceEventsEnabled && state.heap && state.heap->isWallClockCycleActive()) {
@@ -10611,6 +11718,7 @@ void resumeInterpreterCoroutineCallback(
     Value ignoredResult{};
     const ArgumentSource emptyArgs{};
     const bool ok = executeFunction(state, *found, emptyArgs, ignoredResult);
+    ignoredResult = detachFrameSliceValue(ignoredResult);
     if (!ok) {
         faultUnresolvedFrame(state.error);
     }
@@ -10847,12 +11955,16 @@ ExecutionResult Interpreter::invoke(
     }
     Value value;
     ExecutionResult execution;
-    ShadowFrameScope roots(
-        state.shadowStack, nullptr, nullptr, &state.values, &state.valueTop);
-    if (state.traceEventsEnabled && state.heap && state.heap->isWallClockCycleActive()) {
-        state.heap->finishWallClockCycleForDeterminism(state.shadowStack);
+    {
+        FlatStackBankScope flatBankScope(state);
+        ShadowFrameScope roots(
+            state.shadowStack, nullptr, nullptr, &state.values, &state.valueTop);
+        if (state.traceEventsEnabled && state.heap && state.heap->isWallClockCycleActive()) {
+            state.heap->finishWallClockCycleForDeterminism(state.shadowStack);
+        }
+        execution.succeeded = executeFunction(state, *found, arguments, value);
+        value = detachFrameSliceValue(value);
     }
-    execution.succeeded = executeFunction(state, *found, arguments, value);
     state.statistics.instructionsExecuted = state.executed;
     if (!execution.succeeded && state.pendingException &&
         state.error.code == ErrorCode::None) {

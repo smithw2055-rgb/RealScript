@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <limits>
 #include <unordered_set>
 #include <utility>
@@ -1797,6 +1798,368 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
                 syntaxTree.nameToken.span);
             return makeError(syntaxTree.span());
         }
+        if (!field->staticField && type->second.kind == TypeKind::Struct) {
+            std::vector<StructAssignmentHop> hopsRev;
+            std::unique_ptr<BoundExpression> cursor = std::move(receiver);
+            while (cursor && cursor->kind() == BoundNodeKind::StructFieldAccessExpression) {
+                auto& sHop = static_cast<BoundStructFieldAccessExpression&>(*cursor);
+                if (sHop.field.constField ||
+                    (sHop.field.readonlyField &&
+                     !isReadonlyFieldWritable(
+                         sHop.field, currentConstructor_, currentStaticMethod_, currentOwnerType_))) {
+                    diagnostics_.report(
+                        "RS2483",
+                        std::string("cannot assign to field of ") +
+                            (sHop.field.constField ? "const" : "readonly") +
+                            " struct '" + sHop.field.name + "'",
+                        syntaxTree.receiver->span());
+                    return makeError(syntaxTree.span());
+                }
+                hopsRev.push_back(StructAssignmentHop{sHop.ownerType, sHop.field});
+                cursor = std::move(sHop.receiver);
+            }
+            std::vector<StructAssignmentHop> intermediateHops(hopsRev.rbegin(), hopsRev.rend());
+
+            auto result = std::make_unique<BoundStructFieldAssignmentExpression>();
+            result->span = syntaxTree.span();
+            result->type = field->type;
+            result->typeName = field->typeName;
+            result->ownerType = type->second;
+            result->field = *field;
+
+            const bool needsOldRead =
+                compoundOp.has_value() ||
+                (!isInsideResourceHandleImplementation() &&
+                 isManagedResourceHandleType(field->type, field->typeName));
+
+            const VariableSymbol* rootVar = nullptr;
+            if (cursor && cursor->kind() == BoundNodeKind::VariableExpression) {
+                rootVar = &static_cast<const BoundVariableExpression&>(*cursor).variable;
+            } else if (cursor && cursor->kind() == BoundNodeKind::MemberAccessExpression) {
+                const auto& mRecv = static_cast<const BoundMemberAccessExpression&>(*cursor);
+                if (mRecv.receiver && mRecv.receiver->kind() == BoundNodeKind::VariableExpression) {
+                    const auto& candVar = static_cast<const BoundVariableExpression&>(*mRecv.receiver).variable;
+                    if (const auto* origVar = lookupVariable(candVar.name);
+                        origVar && (storageTypeOf(*origVar) != origVar->type || storageTypeNameOf(*origVar) != origVar->typeName)) {
+                        rootVar = origVar;
+                    }
+                }
+            }
+
+            std::function<std::unique_ptr<BoundExpression>()> makeRootReadExpr;
+            if (rootVar) {
+                if (rootVar->isConst || rootVar->modifier == ParameterModifier::In) {
+                    diagnostics_.report(
+                        "RS8702",
+                        "cannot assign to field of read-only 'in' or 'Read<T>' variable '" +
+                            rootVar->name + "'",
+                        syntaxTree.receiver->span());
+                    return makeError(syntaxTree.span());
+                }
+                if (rootVar->isUsingResource) {
+                    diagnostics_.report(
+                        "RS2651",
+                        "cannot modify members of '" + rootVar->name +
+                            "' because it is a 'using' variable",
+                        syntaxTree.receiver->span());
+                    return makeError(syntaxTree.span());
+                }
+                const VariableSymbol capturedRootVar = *rootVar;
+                result->rootKind = StructAssignmentRootKind::Variable;
+                result->variable = capturedRootVar;
+                if (storageTypeOf(capturedRootVar) != capturedRootVar.type ||
+                    storageTypeNameOf(capturedRootVar) != capturedRootVar.typeName) {
+                    const auto wrapper = visibleTypes_.find(storageTypeNameOf(capturedRootVar));
+                    if (wrapper == visibleTypes_.end() || wrapper->second.fields.empty()) {
+                        diagnostics_.report(
+                            "RS8705",
+                            "mutable struct receiver storage descriptor is unavailable",
+                            syntaxTree.receiver->span());
+                        return makeError(syntaxTree.span());
+                    }
+                    result->wrappedVariable = true;
+                    result->wrapperType = wrapper->second;
+                    result->wrapperValueField = wrapper->second.fields.front();
+                }
+                makeRootReadExpr = [this, capturedRootVar, &syntaxTree]() {
+                    return makeVariableAccess(capturedRootVar, syntaxTree.receiver->span());
+                };
+            } else if (cursor && cursor->kind() == BoundNodeKind::MemberAccessExpression) {
+                auto& memberRecv = static_cast<BoundMemberAccessExpression&>(*cursor);
+                if (memberRecv.nullConditional) {
+                    diagnostics_.report("RS2482", "struct field assignment requires a variable receiver", syntaxTree.receiver->span());
+                    return makeError(syntaxTree.span());
+                }
+                if (memberRecv.field.constField) {
+                    diagnostics_.report(
+                        "RS2483",
+                        "cannot assign to field of const struct '" +
+                            memberRecv.field.name + "'",
+                        syntaxTree.receiver->span());
+                    return makeError(syntaxTree.span());
+                }
+                if (memberRecv.field.readonlyField &&
+                    !isReadonlyFieldWritable(
+                        memberRecv.field, currentConstructor_, currentStaticMethod_, currentOwnerType_)) {
+                    diagnostics_.report(
+                        "RS2483",
+                        "cannot assign to field of readonly struct '" +
+                            memberRecv.field.name + "'",
+                        syntaxTree.receiver->span());
+                    return makeError(syntaxTree.span());
+                }
+                if (memberRecv.field.isUsingResource) {
+                    diagnostics_.report(
+                        "RS2651",
+                        "cannot modify members of '" + memberRecv.field.name +
+                            "' because it is a 'using' variable",
+                        syntaxTree.receiver->span());
+                    return makeError(syntaxTree.span());
+                }
+                const TypeSymbol mOwner = memberRecv.ownerType;
+                const FieldSymbol mField = memberRecv.field;
+                if (mField.staticField) {
+                    result->rootKind = StructAssignmentRootKind::StaticField;
+                    result->staticFieldReceiver = true;
+                    result->staticReceiverOwnerType = mOwner;
+                    result->staticReceiverField = mField;
+                    result->staticReceiverInitializer = std::move(memberRecv.staticInitializer);
+                    makeRootReadExpr = [mOwner, mField, &syntaxTree]() {
+                        auto r = std::make_unique<BoundMemberAccessExpression>();
+                        r->span = syntaxTree.receiver->span();
+                        r->type = mField.type;
+                        r->typeName = mField.typeName;
+                        r->ownerType = mOwner;
+                        r->field = mField;
+                        return r;
+                    };
+                } else if (memberRecv.receiver && mOwner.kind == TypeKind::Class) {
+                    result->rootKind = StructAssignmentRootKind::ObjectField;
+                    result->objectOwnerType = mOwner;
+                    result->objectField = mField;
+                    if (needsOldRead) {
+                        if (memberRecv.receiver->kind() == BoundNodeKind::VariableExpression) {
+                            const VariableSymbol rv =
+                                static_cast<const BoundVariableExpression&>(*memberRecv.receiver).variable;
+                            result->objectReceiver = std::move(memberRecv.receiver);
+                            makeRootReadExpr = [this, rv, mOwner, mField, &syntaxTree]() {
+                                auto r = std::make_unique<BoundMemberAccessExpression>();
+                                r->span = syntaxTree.receiver->span();
+                                r->type = mField.type;
+                                r->typeName = mField.typeName;
+                                r->receiver = variableExpression(rv, syntaxTree.receiver->span());
+                                r->ownerType = mOwner;
+                                r->field = mField;
+                                return r;
+                            };
+                        } else {
+                            const VariableSymbol recvTemp = allocateTempVariable(
+                                "struct_obj_recv",
+                                memberRecv.receiver->type,
+                                memberRecv.receiver->typeName,
+                                memberRecv.receiver->span);
+                            auto recvAssign = std::make_unique<BoundAssignmentExpression>();
+                            recvAssign->span = memberRecv.receiver->span;
+                            recvAssign->type = recvTemp.type;
+                            recvAssign->typeName = recvTemp.typeName;
+                            recvAssign->variable = recvTemp;
+                            recvAssign->expression = std::move(memberRecv.receiver);
+                            result->objectReceiver = std::move(recvAssign);
+                            makeRootReadExpr = [this, recvTemp, mOwner, mField, &syntaxTree]() {
+                                auto r = std::make_unique<BoundMemberAccessExpression>();
+                                r->span = syntaxTree.receiver->span();
+                                r->type = mField.type;
+                                r->typeName = mField.typeName;
+                                r->receiver = makeVariableAccess(recvTemp, syntaxTree.receiver->span());
+                                r->ownerType = mOwner;
+                                r->field = mField;
+                                return r;
+                            };
+                        }
+                    } else {
+                        result->objectReceiver = std::move(memberRecv.receiver);
+                    }
+                } else {
+                    diagnostics_.report("RS2482", "struct field assignment requires a variable receiver", syntaxTree.receiver->span());
+                    return makeError(syntaxTree.span());
+                }
+            } else if (cursor && cursor->kind() == BoundNodeKind::ElementAccessExpression) {
+                auto& elemRecv = static_cast<BoundElementAccessExpression&>(*cursor);
+                const PrimitiveType eType = elemRecv.elementType;
+                const std::string eTypeName = elemRecv.elementTypeName;
+                result->rootKind = StructAssignmentRootKind::ArrayElement;
+                result->elementType = eType;
+                result->elementTypeName = eTypeName;
+                if (needsOldRead) {
+                    std::function<std::unique_ptr<BoundExpression>()> makeArrRead;
+                    if (elemRecv.receiver->kind() == BoundNodeKind::VariableExpression) {
+                        const VariableSymbol av =
+                            static_cast<const BoundVariableExpression&>(*elemRecv.receiver).variable;
+                        result->elementReceiver = std::move(elemRecv.receiver);
+                        makeArrRead = [this, av, &syntaxTree]() {
+                            return variableExpression(av, syntaxTree.receiver->span());
+                        };
+                    } else {
+                        const VariableSymbol arrTemp = allocateTempVariable(
+                            "struct_arr_recv",
+                            elemRecv.receiver->type,
+                            elemRecv.receiver->typeName,
+                            elemRecv.receiver->span);
+                        auto arrAssign = std::make_unique<BoundAssignmentExpression>();
+                        arrAssign->span = elemRecv.receiver->span;
+                        arrAssign->type = arrTemp.type;
+                        arrAssign->typeName = arrTemp.typeName;
+                        arrAssign->variable = arrTemp;
+                        arrAssign->expression = std::move(elemRecv.receiver);
+                        result->elementReceiver = std::move(arrAssign);
+                        makeArrRead = [this, arrTemp, &syntaxTree]() {
+                            return makeVariableAccess(arrTemp, syntaxTree.receiver->span());
+                        };
+                    }
+
+                    std::function<std::unique_ptr<BoundExpression>()> makeIdxRead;
+                    if (elemRecv.index->kind() == BoundNodeKind::VariableExpression) {
+                        const VariableSymbol iv =
+                            static_cast<const BoundVariableExpression&>(*elemRecv.index).variable;
+                        result->elementIndex = std::move(elemRecv.index);
+                        makeIdxRead = [this, iv, &syntaxTree]() {
+                            return variableExpression(iv, syntaxTree.receiver->span());
+                        };
+                    } else if (elemRecv.index->kind() == BoundNodeKind::LiteralExpression) {
+                        const auto& lit = static_cast<const BoundLiteralExpression&>(*elemRecv.index);
+                        const auto litVal = lit.value;
+                        const auto litType = lit.type;
+                        const auto litTypeName = lit.typeName;
+                        const auto litSpan = lit.span;
+                        result->elementIndex = std::move(elemRecv.index);
+                        makeIdxRead = [litVal, litType, litTypeName, litSpan]() {
+                            auto copy = std::make_unique<BoundLiteralExpression>();
+                            copy->span = litSpan;
+                            copy->type = litType;
+                            copy->typeName = litTypeName;
+                            copy->value = litVal;
+                            return copy;
+                        };
+                    } else {
+                        const VariableSymbol idxTemp = allocateTempVariable(
+                            "struct_arr_idx",
+                            elemRecv.index->type,
+                            elemRecv.index->typeName,
+                            elemRecv.index->span);
+                        auto idxAssign = std::make_unique<BoundAssignmentExpression>();
+                        idxAssign->span = elemRecv.index->span;
+                        idxAssign->type = idxTemp.type;
+                        idxAssign->typeName = idxTemp.typeName;
+                        idxAssign->variable = idxTemp;
+                        idxAssign->expression = std::move(elemRecv.index);
+                        result->elementIndex = std::move(idxAssign);
+                        makeIdxRead = [this, idxTemp, &syntaxTree]() {
+                            return makeVariableAccess(idxTemp, syntaxTree.receiver->span());
+                        };
+                    }
+
+                    makeRootReadExpr = [makeArrRead, makeIdxRead, eType, eTypeName, &syntaxTree]() {
+                        auto r = std::make_unique<BoundElementAccessExpression>();
+                        r->span = syntaxTree.receiver->span();
+                        r->type = eType;
+                        r->typeName = eTypeName;
+                        r->receiver = makeArrRead();
+                        r->index = makeIdxRead();
+                        r->elementType = eType;
+                        r->elementTypeName = eTypeName;
+                        return r;
+                    };
+                } else {
+                    result->elementReceiver = std::move(elemRecv.receiver);
+                    result->elementIndex = std::move(elemRecv.index);
+                }
+            } else {
+                diagnostics_.report("RS2482", "struct field assignment requires a variable receiver", syntaxTree.receiver->span());
+                return makeError(syntaxTree.span());
+            }
+
+            const auto makeFullReceiverReadExpr = [&]() -> std::unique_ptr<BoundExpression> {
+                auto expr = makeRootReadExpr();
+                for (const auto& hop : intermediateHops) {
+                    auto next = std::make_unique<BoundStructFieldAccessExpression>();
+                    next->span = syntaxTree.receiver->span();
+                    next->type = hop.field.type;
+                    next->typeName = hop.field.typeName;
+                    next->receiver = std::move(expr);
+                    next->ownerType = hop.ownerType;
+                    next->field = hop.field;
+                    expr = std::move(next);
+                }
+                return expr;
+            };
+
+            std::unique_ptr<BoundExpression> structAssignedValue;
+            if (compoundOp) {
+                auto lhsValue = std::make_unique<BoundStructFieldAccessExpression>();
+                lhsValue->span = syntaxTree.nameToken.span;
+                lhsValue->type = field->type;
+                lhsValue->typeName = field->typeName;
+                lhsValue->receiver = makeFullReceiverReadExpr();
+                lhsValue->ownerType = type->second;
+                lhsValue->field = *field;
+                auto rhsValue = bindExpression(*syntaxTree.expression);
+                auto combined = bindBinaryOperation(
+                    std::move(lhsValue),
+                    syntaxTree.nameToken.span,
+                    *compoundOp,
+                    std::move(rhsValue),
+                    syntaxTree.expression->span(),
+                    syntaxTree.span());
+                structAssignedValue = convertExpression(
+                    std::move(combined),
+                    field->type,
+                    syntaxTree.span(),
+                    "field assignment",
+                    field->typeName);
+            } else {
+                structAssignedValue = bindTargetExpression(
+                    *syntaxTree.expression, field->type, field->typeName,
+                    "field assignment");
+            }
+            if (!isInsideResourceHandleImplementation() &&
+                isManagedResourceHandleType(field->type, field->typeName)) {
+                auto oldAccess = std::make_unique<BoundStructFieldAccessExpression>();
+                oldAccess->span = syntaxTree.nameToken.span;
+                oldAccess->type = field->type;
+                oldAccess->typeName = field->typeName;
+                oldAccess->receiver = makeFullReceiverReadExpr();
+                oldAccess->ownerType = type->second;
+                oldAccess->field = *field;
+                structAssignedValue = wrapResourceHandleOverwriteRelease(
+                    std::move(oldAccess), std::move(structAssignedValue), syntaxTree.span());
+            }
+            result->intermediateHops = std::move(intermediateHops);
+            result->expression = std::move(structAssignedValue);
+            return result;
+        }
+
+        const bool needsFieldRhRelease =
+            !field->staticField &&
+            !isInsideResourceHandleImplementation() &&
+            isManagedResourceHandleType(field->type, field->typeName);
+        std::optional<VariableSymbol> sharedFieldRecvVar;
+        if (!field->staticField && (compoundOp.has_value() || needsFieldRhRelease)) {
+            if (receiver->kind() == BoundNodeKind::VariableExpression) {
+                sharedFieldRecvVar = static_cast<const BoundVariableExpression&>(*receiver).variable;
+            } else {
+                const auto recvTemp = allocateTempVariable(
+                    "field_recv", receiver->type, receiver->typeName, syntaxTree.receiver->span());
+                auto recvAssign = std::make_unique<BoundAssignmentExpression>();
+                recvAssign->span = syntaxTree.receiver->span();
+                recvAssign->type = receiver->type;
+                recvAssign->typeName = receiver->typeName;
+                recvAssign->variable = recvTemp;
+                recvAssign->expression = std::move(receiver);
+                receiver = std::move(recvAssign);
+                sharedFieldRecvVar = recvTemp;
+            }
+        }
+
         std::unique_ptr<BoundExpression> value;
         if (compoundOp) {
             std::unique_ptr<BoundExpression> lhsValue;
@@ -1813,21 +2176,12 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
                         type->second, *field);
                 }
                 lhsValue = std::move(access);
-            } else if (type->second.kind == TypeKind::Struct) {
-                auto access = std::make_unique<BoundStructFieldAccessExpression>();
-                access->span = syntaxTree.nameToken.span;
-                access->type = field->type;
-                access->typeName = field->typeName;
-                access->receiver = bindReceiverAccess();
-                access->ownerType = type->second;
-                access->field = *field;
-                lhsValue = std::move(access);
             } else {
                 auto access = std::make_unique<BoundMemberAccessExpression>();
                 access->span = syntaxTree.nameToken.span;
                 access->type = field->type;
                 access->typeName = field->typeName;
-                access->receiver = bindReceiverAccess();
+                access->receiver = makeVariableAccess(*sharedFieldRecvVar, syntaxTree.receiver->span());
                 access->ownerType = type->second;
                 access->field = *field;
                 lhsValue = std::move(access);
@@ -1868,161 +2222,13 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
                 std::move(oldAccess), std::move(value), syntaxTree.span());
             return result;
         }
-        if (type->second.kind == TypeKind::Struct) {
-            const VariableSymbol* variable = nullptr;
-            if (receiver->kind() == BoundNodeKind::VariableExpression) {
-                variable = &static_cast<const BoundVariableExpression&>(*receiver).variable;
-            } else if (receiver->kind() == BoundNodeKind::MemberAccessExpression) {
-                const auto& mRecv = static_cast<const BoundMemberAccessExpression&>(*receiver);
-                if (mRecv.receiver && mRecv.receiver->kind() == BoundNodeKind::VariableExpression) {
-                    const auto& candVar = static_cast<const BoundVariableExpression&>(*mRecv.receiver).variable;
-                    if (const auto* origVar = lookupVariable(candVar.name);
-                        origVar && (storageTypeOf(*origVar) != origVar->type || storageTypeNameOf(*origVar) != origVar->typeName)) {
-                        variable = origVar;
-                    }
-                }
-            }
-            if (!variable) {
-                if (receiver->kind() == BoundNodeKind::MemberAccessExpression) {
-                    auto& memberRecv = static_cast<BoundMemberAccessExpression&>(*receiver);
-                    if (memberRecv.field.constField) {
-                        diagnostics_.report(
-                            "RS2483",
-                            "cannot assign to field of const struct '" +
-                                memberRecv.field.name + "'",
-                            syntaxTree.receiver->span());
-                        return makeError(syntaxTree.span());
-                    }
-                    if (memberRecv.field.readonlyField &&
-                        !isReadonlyFieldWritable(
-                            memberRecv.field, currentConstructor_, currentStaticMethod_, currentOwnerType_)) {
-                        diagnostics_.report(
-                            "RS2483",
-                            "cannot assign to field of readonly struct '" +
-                                memberRecv.field.name + "'",
-                            syntaxTree.receiver->span());
-                        return makeError(syntaxTree.span());
-                    }
-                    if (memberRecv.field.staticField) {
-                        auto oldStaticRecv = std::make_unique<BoundMemberAccessExpression>();
-                        oldStaticRecv->span = syntaxTree.receiver->span();
-                        oldStaticRecv->type = memberRecv.field.type;
-                        oldStaticRecv->typeName = memberRecv.field.typeName;
-                        oldStaticRecv->ownerType = memberRecv.ownerType;
-                        oldStaticRecv->field = memberRecv.field;
-                        auto oldAccess = std::make_unique<BoundStructFieldAccessExpression>();
-                        oldAccess->span = syntaxTree.nameToken.span;
-                        oldAccess->type = field->type;
-                        oldAccess->typeName = field->typeName;
-                        oldAccess->receiver = std::move(oldStaticRecv);
-                        oldAccess->ownerType = type->second;
-                        oldAccess->field = *field;
-                        auto result = std::make_unique<BoundStructFieldAssignmentExpression>();
-                        result->span = syntaxTree.span();
-                        result->type = field->type;
-                        result->typeName = field->typeName;
-                        result->ownerType = type->second;
-                        result->field = *field;
-                        result->expression = wrapResourceHandleOverwriteRelease(
-                            std::move(oldAccess), std::move(value), syntaxTree.span());
-                        result->staticFieldReceiver = true;
-                        result->staticReceiverOwnerType = memberRecv.ownerType;
-                        result->staticReceiverField = memberRecv.field;
-                        result->staticReceiverInitializer = std::move(memberRecv.staticInitializer);
-                        return result;
-                    }
-                } else if (receiver->kind() == BoundNodeKind::StructFieldAccessExpression) {
-                    auto& structRecv = static_cast<BoundStructFieldAccessExpression&>(*receiver);
-                    if (structRecv.field.constField ||
-                        (structRecv.field.readonlyField &&
-                         !isReadonlyFieldWritable(
-                             structRecv.field, currentConstructor_, currentStaticMethod_, currentOwnerType_))) {
-                        diagnostics_.report(
-                            "RS2483",
-                            std::string("cannot assign to field of ") +
-                                (structRecv.field.constField ? "const" : "readonly") +
-                                " struct '" + structRecv.field.name + "'",
-                            syntaxTree.receiver->span());
-                        return makeError(syntaxTree.span());
-                    }
-                }
-                diagnostics_.report("RS2482", "struct field assignment requires a variable receiver", syntaxTree.receiver->span());
-                return makeError(syntaxTree.span());
-            }
-            if (variable->isConst || variable->modifier == ParameterModifier::In) {
-                diagnostics_.report(
-                    "RS8702",
-                    "cannot assign to field of read-only 'in' or 'Read<T>' variable '" +
-                        variable->name + "'",
-                    syntaxTree.receiver->span());
-                return makeError(syntaxTree.span());
-            }
-            if (variable->isUsingResource) {
-                diagnostics_.report(
-                    "RS2651",
-                    "cannot modify members of '" + variable->name +
-                        "' because it is a 'using' variable",
-                    syntaxTree.receiver->span());
-                return makeError(syntaxTree.span());
-            }
-            auto oldAccess = std::make_unique<BoundStructFieldAccessExpression>();
-            oldAccess->span = syntaxTree.nameToken.span;
-            oldAccess->type = field->type;
-            oldAccess->typeName = field->typeName;
-            oldAccess->receiver = makeVariableAccess(*variable, syntaxTree.receiver->span());
-            oldAccess->ownerType = type->second;
-            oldAccess->field = *field;
-            auto result = std::make_unique<BoundStructFieldAssignmentExpression>();
-            result->span = syntaxTree.span();
-            result->type = field->type;
-            result->typeName = field->typeName;
-            result->variable = *variable;
-            result->ownerType = type->second;
-            result->field = *field;
-            result->expression = wrapResourceHandleOverwriteRelease(
-                std::move(oldAccess), std::move(value), syntaxTree.span());
-            if (storageTypeOf(*variable) != variable->type || storageTypeNameOf(*variable) != variable->typeName) {
-                const auto wrapper = visibleTypes_.find(
-                    storageTypeNameOf(*variable));
-                if (wrapper == visibleTypes_.end() ||
-                    wrapper->second.fields.empty()) {
-                    diagnostics_.report(
-                        "RS8705",
-                        "mutable struct receiver storage descriptor is unavailable",
-                        syntaxTree.receiver->span());
-                    return makeError(syntaxTree.span());
-                }
-                result->wrappedVariable = true;
-                result->wrapperType = wrapper->second;
-                result->wrapperValueField =
-                    wrapper->second.fields.front();
-            }
-            return result;
-        }
         std::unique_ptr<BoundExpression> wrappedExpr = std::move(value);
-        if (!isInsideResourceHandleImplementation() &&
-            isManagedResourceHandleType(field->type, field->typeName)) {
-            std::unique_ptr<BoundExpression> oldRecv;
-            if (receiver->kind() == BoundNodeKind::VariableExpression) {
-                const auto& rv = static_cast<const BoundVariableExpression&>(*receiver).variable;
-                oldRecv = variableExpression(rv, syntaxTree.receiver->span());
-            } else {
-                const auto recvTemp = allocateTempVariable(
-                    "rh_recv", receiver->type, receiver->typeName, syntaxTree.receiver->span());
-                auto recvAssign = std::make_unique<BoundAssignmentExpression>();
-                recvAssign->span = syntaxTree.receiver->span();
-                recvAssign->type = receiver->type;
-                recvAssign->typeName = receiver->typeName;
-                recvAssign->variable = recvTemp;
-                recvAssign->expression = std::move(receiver);
-                receiver = std::move(recvAssign);
-                oldRecv = makeVariableAccess(recvTemp, syntaxTree.receiver->span());
-            }
+        if (needsFieldRhRelease) {
             auto oldAccess = std::make_unique<BoundMemberAccessExpression>();
             oldAccess->span = syntaxTree.nameToken.span;
             oldAccess->type = field->type;
             oldAccess->typeName = field->typeName;
-            oldAccess->receiver = std::move(oldRecv);
+            oldAccess->receiver = makeVariableAccess(*sharedFieldRecvVar, syntaxTree.receiver->span());
             oldAccess->ownerType = type->second;
             oldAccess->field = *field;
             wrappedExpr = wrapResourceHandleOverwriteRelease(
@@ -2085,46 +2291,47 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
                 return makeError(syntaxTree.span());
             }
         }
-        const auto bindPropertyAssignedValue = [&]() -> std::unique_ptr<BoundExpression> {
-            if (!compoundOp) {
-                return bindTargetExpression(
-                    *syntaxTree.expression, property->type,
-                    property->typeName, "property assignment");
-            }
-            if (!property->getter) {
-                diagnostics_.report(
-                    "RS2481",
-                    "property '" + property->name + "' is write-only",
-                    syntaxTree.nameToken.span);
-                return makeError(syntaxTree.span());
-            }
-            auto lhsValue = std::make_unique<BoundCallExpression>();
-            lhsValue->span = syntaxTree.nameToken.span;
-            lhsValue->type = property->type;
-            lhsValue->typeName = property->typeName;
-            lhsValue->function = *property->getter;
-            lhsValue->arguments.push_back(bindReceiverAccess());
-            auto rhsValue = bindExpression(*syntaxTree.expression);
-            auto combined = bindBinaryOperation(
-                std::move(lhsValue),
-                syntaxTree.nameToken.span,
-                *compoundOp,
-                std::move(rhsValue),
-                syntaxTree.expression->span(),
-                syntaxTree.span());
-            return convertExpression(
-                std::move(combined),
-                property->type,
-                syntaxTree.span(),
-                "property assignment",
-                property->typeName);
-        };
         if (type->second.kind == TypeKind::Struct && property->backingFieldIndex != std::numeric_limits<std::size_t>::max()) {
+            std::vector<StructAssignmentHop> hopsRev;
+            std::unique_ptr<BoundExpression> cursor = std::move(receiver);
+            while (cursor && cursor->kind() == BoundNodeKind::StructFieldAccessExpression) {
+                auto& sHop = static_cast<BoundStructFieldAccessExpression&>(*cursor);
+                if (sHop.field.constField ||
+                    (sHop.field.readonlyField &&
+                     !isReadonlyFieldWritable(
+                         sHop.field, currentConstructor_, currentStaticMethod_, currentOwnerType_))) {
+                    diagnostics_.report(
+                        "RS2483",
+                        std::string("cannot assign to field of ") +
+                            (sHop.field.constField ? "const" : "readonly") +
+                            " struct '" + sHop.field.name + "'",
+                        syntaxTree.receiver->span());
+                    return makeError(syntaxTree.span());
+                }
+                hopsRev.push_back(StructAssignmentHop{sHop.ownerType, sHop.field});
+                cursor = std::move(sHop.receiver);
+            }
+            std::vector<StructAssignmentHop> intermediateHops(hopsRev.rbegin(), hopsRev.rend());
+
+            const auto& field = type->second.fields[property->backingFieldIndex];
+            auto result = std::make_unique<BoundStructFieldAssignmentExpression>();
+            result->span = syntaxTree.span();
+            result->type = property->type;
+            result->typeName = property->typeName;
+            result->ownerType = type->second;
+            result->field = field;
+
+            const bool needsResourceRelease =
+                !isInsideResourceHandleImplementation() &&
+                isManagedResourceHandleType(field.type, field.typeName);
+            const bool needsOldRead = compoundOp.has_value() || needsResourceRelease;
+            std::function<std::unique_ptr<BoundExpression>()> makeRootReadExpr;
+
             const VariableSymbol* variable = nullptr;
-            if (receiver->kind() == BoundNodeKind::VariableExpression) {
-                variable = &static_cast<const BoundVariableExpression&>(*receiver).variable;
-            } else if (receiver->kind() == BoundNodeKind::MemberAccessExpression) {
-                const auto& mRecv = static_cast<const BoundMemberAccessExpression&>(*receiver);
+            if (cursor && cursor->kind() == BoundNodeKind::VariableExpression) {
+                variable = &static_cast<const BoundVariableExpression&>(*cursor).variable;
+            } else if (cursor && cursor->kind() == BoundNodeKind::MemberAccessExpression) {
+                const auto& mRecv = static_cast<const BoundMemberAccessExpression&>(*cursor);
                 if (mRecv.receiver && mRecv.receiver->kind() == BoundNodeKind::VariableExpression) {
                     const auto& candVar = static_cast<const BoundVariableExpression&>(*mRecv.receiver).variable;
                     if (const auto* origVar = lookupVariable(candVar.name);
@@ -2133,37 +2340,352 @@ std::unique_ptr<BoundExpression> Binder::bindMemberAssignmentExpression(
                     }
                 }
             }
-            if (!variable) {
+            if (variable) {
+                if (intermediateHops.empty() && variable->name == "this" && !currentConstructor_) {
+                    diagnostics_.report(
+                        "RS2486",
+                        "struct properties cannot be assigned through an instance method in the Phase 3E value model",
+                        syntaxTree.receiver->span());
+                    return makeError(syntaxTree.span());
+                }
+                if (variable->isConst || variable->modifier == ParameterModifier::In) {
+                    diagnostics_.report(
+                        "RS8702",
+                        "cannot assign to field of read-only 'in' or 'Read<T>' variable '" +
+                            variable->name + "'",
+                        syntaxTree.receiver->span());
+                    return makeError(syntaxTree.span());
+                }
+                if (variable->isUsingResource) {
+                    diagnostics_.report(
+                        "RS2651",
+                        "cannot modify members of '" + variable->name +
+                            "' because it is a 'using' variable",
+                        syntaxTree.receiver->span());
+                    return makeError(syntaxTree.span());
+                }
+                const VariableSymbol capturedRootVar = *variable;
+                result->rootKind = StructAssignmentRootKind::Variable;
+                result->variable = capturedRootVar;
+                if (storageTypeOf(capturedRootVar) != capturedRootVar.type ||
+                    storageTypeNameOf(capturedRootVar) != capturedRootVar.typeName) {
+                    const auto wrapper = visibleTypes_.find(storageTypeNameOf(capturedRootVar));
+                    if (wrapper == visibleTypes_.end() || wrapper->second.fields.empty()) {
+                        diagnostics_.report(
+                            "RS8705",
+                            "mutable struct receiver storage descriptor is unavailable",
+                            syntaxTree.receiver->span());
+                        return makeError(syntaxTree.span());
+                    }
+                    result->wrappedVariable = true;
+                    result->wrapperType = wrapper->second;
+                    result->wrapperValueField = wrapper->second.fields.front();
+                }
+                makeRootReadExpr = [this, capturedRootVar, &syntaxTree]() {
+                    return makeVariableAccess(capturedRootVar, syntaxTree.receiver->span());
+                };
+            } else if (cursor && cursor->kind() == BoundNodeKind::MemberAccessExpression) {
+                auto& memberRecv = static_cast<BoundMemberAccessExpression&>(*cursor);
+                if (memberRecv.nullConditional) {
+                    diagnostics_.report("RS2482", "struct property assignment requires a variable receiver", syntaxTree.receiver->span());
+                    return makeError(syntaxTree.span());
+                }
+                if (memberRecv.field.constField ||
+                    (memberRecv.field.readonlyField &&
+                     !isReadonlyFieldWritable(
+                         memberRecv.field, currentConstructor_, currentStaticMethod_, currentOwnerType_))) {
+                    diagnostics_.report(
+                        "RS2483",
+                        std::string("cannot assign to property of ") +
+                            (memberRecv.field.constField ? "const" : "readonly") +
+                            " struct '" + memberRecv.field.name + "'",
+                        syntaxTree.receiver->span());
+                    return makeError(syntaxTree.span());
+                }
+                if (memberRecv.field.isUsingResource) {
+                    diagnostics_.report(
+                        "RS2651",
+                        "cannot modify members of '" + memberRecv.field.name +
+                            "' because it is a 'using' variable",
+                        syntaxTree.receiver->span());
+                    return makeError(syntaxTree.span());
+                }
+                const TypeSymbol mOwner = memberRecv.ownerType;
+                const FieldSymbol mField = memberRecv.field;
+                if (mField.staticField) {
+                    result->rootKind = StructAssignmentRootKind::StaticField;
+                    result->staticFieldReceiver = true;
+                    result->staticReceiverOwnerType = mOwner;
+                    result->staticReceiverField = mField;
+                    result->staticReceiverInitializer = std::move(memberRecv.staticInitializer);
+                    makeRootReadExpr = [mOwner, mField, &syntaxTree]() {
+                        auto r = std::make_unique<BoundMemberAccessExpression>();
+                        r->span = syntaxTree.receiver->span();
+                        r->type = mField.type;
+                        r->typeName = mField.typeName;
+                        r->ownerType = mOwner;
+                        r->field = mField;
+                        return r;
+                    };
+                } else if (memberRecv.receiver && mOwner.kind == TypeKind::Class) {
+                    result->rootKind = StructAssignmentRootKind::ObjectField;
+                    result->objectOwnerType = mOwner;
+                    result->objectField = mField;
+                    if (needsOldRead) {
+                        if (memberRecv.receiver->kind() == BoundNodeKind::VariableExpression) {
+                            const VariableSymbol rv =
+                                static_cast<const BoundVariableExpression&>(*memberRecv.receiver).variable;
+                            result->objectReceiver = std::move(memberRecv.receiver);
+                            makeRootReadExpr = [this, rv, mOwner, mField, &syntaxTree]() {
+                                auto r = std::make_unique<BoundMemberAccessExpression>();
+                                r->span = syntaxTree.receiver->span();
+                                r->type = mField.type;
+                                r->typeName = mField.typeName;
+                                r->receiver = variableExpression(rv, syntaxTree.receiver->span());
+                                r->ownerType = mOwner;
+                                r->field = mField;
+                                return r;
+                            };
+                        } else {
+                            const VariableSymbol recvTemp = allocateTempVariable(
+                                "struct_obj_recv",
+                                memberRecv.receiver->type,
+                                memberRecv.receiver->typeName,
+                                memberRecv.receiver->span);
+                            auto recvAssign = std::make_unique<BoundAssignmentExpression>();
+                            recvAssign->span = memberRecv.receiver->span;
+                            recvAssign->type = recvTemp.type;
+                            recvAssign->typeName = recvTemp.typeName;
+                            recvAssign->variable = recvTemp;
+                            recvAssign->expression = std::move(memberRecv.receiver);
+                            result->objectReceiver = std::move(recvAssign);
+                            makeRootReadExpr = [this, recvTemp, mOwner, mField, &syntaxTree]() {
+                                auto r = std::make_unique<BoundMemberAccessExpression>();
+                                r->span = syntaxTree.receiver->span();
+                                r->type = mField.type;
+                                r->typeName = mField.typeName;
+                                r->receiver = makeVariableAccess(recvTemp, syntaxTree.receiver->span());
+                                r->ownerType = mOwner;
+                                r->field = mField;
+                                return r;
+                            };
+                        }
+                    } else {
+                        result->objectReceiver = std::move(memberRecv.receiver);
+                    }
+                } else {
+                    diagnostics_.report("RS2482", "struct property assignment requires a variable receiver", syntaxTree.receiver->span());
+                    return makeError(syntaxTree.span());
+                }
+            } else if (cursor && cursor->kind() == BoundNodeKind::ElementAccessExpression) {
+                auto& elemRecv = static_cast<BoundElementAccessExpression&>(*cursor);
+                const PrimitiveType eType = elemRecv.elementType;
+                const std::string eTypeName = elemRecv.elementTypeName;
+                result->rootKind = StructAssignmentRootKind::ArrayElement;
+                result->elementType = eType;
+                result->elementTypeName = eTypeName;
+                if (needsOldRead) {
+                    std::function<std::unique_ptr<BoundExpression>()> makeArrRead;
+                    if (elemRecv.receiver->kind() == BoundNodeKind::VariableExpression) {
+                        const VariableSymbol av =
+                            static_cast<const BoundVariableExpression&>(*elemRecv.receiver).variable;
+                        result->elementReceiver = std::move(elemRecv.receiver);
+                        makeArrRead = [this, av, &syntaxTree]() {
+                            return variableExpression(av, syntaxTree.receiver->span());
+                        };
+                    } else {
+                        const VariableSymbol arrTemp = allocateTempVariable(
+                            "struct_arr_recv",
+                            elemRecv.receiver->type,
+                            elemRecv.receiver->typeName,
+                            elemRecv.receiver->span);
+                        auto arrAssign = std::make_unique<BoundAssignmentExpression>();
+                        arrAssign->span = elemRecv.receiver->span;
+                        arrAssign->type = arrTemp.type;
+                        arrAssign->typeName = arrTemp.typeName;
+                        arrAssign->variable = arrTemp;
+                        arrAssign->expression = std::move(elemRecv.receiver);
+                        result->elementReceiver = std::move(arrAssign);
+                        makeArrRead = [this, arrTemp, &syntaxTree]() {
+                            return makeVariableAccess(arrTemp, syntaxTree.receiver->span());
+                        };
+                    }
+
+                    std::function<std::unique_ptr<BoundExpression>()> makeIdxRead;
+                    if (elemRecv.index->kind() == BoundNodeKind::VariableExpression) {
+                        const VariableSymbol iv =
+                            static_cast<const BoundVariableExpression&>(*elemRecv.index).variable;
+                        result->elementIndex = std::move(elemRecv.index);
+                        makeIdxRead = [this, iv, &syntaxTree]() {
+                            return variableExpression(iv, syntaxTree.receiver->span());
+                        };
+                    } else if (elemRecv.index->kind() == BoundNodeKind::LiteralExpression) {
+                        const auto& lit = static_cast<const BoundLiteralExpression&>(*elemRecv.index);
+                        const auto litVal = lit.value;
+                        const auto litType = lit.type;
+                        const auto litTypeName = lit.typeName;
+                        const auto litSpan = lit.span;
+                        result->elementIndex = std::move(elemRecv.index);
+                        makeIdxRead = [litVal, litType, litTypeName, litSpan]() {
+                            auto copy = std::make_unique<BoundLiteralExpression>();
+                            copy->span = litSpan;
+                            copy->type = litType;
+                            copy->typeName = litTypeName;
+                            copy->value = litVal;
+                            return copy;
+                        };
+                    } else {
+                        const VariableSymbol idxTemp = allocateTempVariable(
+                            "struct_arr_idx",
+                            elemRecv.index->type,
+                            elemRecv.index->typeName,
+                            elemRecv.index->span);
+                        auto idxAssign = std::make_unique<BoundAssignmentExpression>();
+                        idxAssign->span = elemRecv.index->span;
+                        idxAssign->type = idxTemp.type;
+                        idxAssign->typeName = idxTemp.typeName;
+                        idxAssign->variable = idxTemp;
+                        idxAssign->expression = std::move(elemRecv.index);
+                        result->elementIndex = std::move(idxAssign);
+                        makeIdxRead = [this, idxTemp, &syntaxTree]() {
+                            return makeVariableAccess(idxTemp, syntaxTree.receiver->span());
+                        };
+                    }
+
+                    makeRootReadExpr = [makeArrRead, makeIdxRead, eType, eTypeName, &syntaxTree]() {
+                        auto r = std::make_unique<BoundElementAccessExpression>();
+                        r->span = syntaxTree.receiver->span();
+                        r->type = eType;
+                        r->typeName = eTypeName;
+                        r->receiver = makeArrRead();
+                        r->index = makeIdxRead();
+                        r->elementType = eType;
+                        r->elementTypeName = eTypeName;
+                        return r;
+                    };
+                } else {
+                    result->elementReceiver = std::move(elemRecv.receiver);
+                    result->elementIndex = std::move(elemRecv.index);
+                }
+            } else {
                 diagnostics_.report("RS2482", "struct property assignment requires a variable receiver", syntaxTree.receiver->span());
                 return makeError(syntaxTree.span());
             }
-            if (variable->name == "this" && !currentConstructor_) {
-                diagnostics_.report(
-                    "RS2486",
-                    "struct properties cannot be assigned through an instance method in the Phase 3E value model",
-                    syntaxTree.receiver->span());
-                return makeError(syntaxTree.span());
+
+            const auto makeFullReceiverReadExpr = [&]() -> std::unique_ptr<BoundExpression> {
+                auto expr = makeRootReadExpr();
+                for (const auto& hop : intermediateHops) {
+                    auto next = std::make_unique<BoundStructFieldAccessExpression>();
+                    next->span = syntaxTree.receiver->span();
+                    next->type = hop.field.type;
+                    next->typeName = hop.field.typeName;
+                    next->receiver = std::move(expr);
+                    next->ownerType = hop.ownerType;
+                    next->field = hop.field;
+                    expr = std::move(next);
+                }
+                return expr;
+            };
+
+            std::unique_ptr<BoundExpression> structAssignedValue;
+            if (compoundOp) {
+                if (!property->getter) {
+                    diagnostics_.report(
+                        "RS2481",
+                        "property '" + property->name + "' is write-only",
+                        syntaxTree.nameToken.span);
+                    return makeError(syntaxTree.span());
+                }
+                auto lhsValue = std::make_unique<BoundCallExpression>();
+                lhsValue->span = syntaxTree.nameToken.span;
+                lhsValue->type = property->type;
+                lhsValue->typeName = property->typeName;
+                lhsValue->function = *property->getter;
+                lhsValue->arguments.push_back(makeFullReceiverReadExpr());
+                auto rhsValue = bindExpression(*syntaxTree.expression);
+                auto combined = bindBinaryOperation(
+                    std::move(lhsValue),
+                    syntaxTree.nameToken.span,
+                    *compoundOp,
+                    std::move(rhsValue),
+                    syntaxTree.expression->span(),
+                    syntaxTree.span());
+                structAssignedValue = convertExpression(
+                    std::move(combined),
+                    property->type,
+                    syntaxTree.span(),
+                    "property assignment",
+                    property->typeName);
+            } else {
+                structAssignedValue = bindTargetExpression(
+                    *syntaxTree.expression, property->type,
+                    property->typeName, "property assignment");
             }
-            const auto& field = type->second.fields[property->backingFieldIndex];
-            auto oldAccess = std::make_unique<BoundStructFieldAccessExpression>();
-            oldAccess->span = syntaxTree.nameToken.span;
-            oldAccess->type = field.type;
-            oldAccess->typeName = field.typeName;
-            oldAccess->receiver = makeVariableAccess(*variable, syntaxTree.receiver->span());
-            oldAccess->ownerType = type->second;
-            oldAccess->field = field;
-            auto result = std::make_unique<BoundStructFieldAssignmentExpression>();
-            result->span = syntaxTree.span();
-            result->type = property->type;
-            result->typeName = property->typeName;
-            result->variable = *variable;
-            result->ownerType = type->second;
-            result->field = field;
-            result->expression = wrapResourceHandleOverwriteRelease(
-                std::move(oldAccess), bindPropertyAssignedValue(), syntaxTree.span());
+            if (needsResourceRelease) {
+                auto oldAccess = std::make_unique<BoundStructFieldAccessExpression>();
+                oldAccess->span = syntaxTree.nameToken.span;
+                oldAccess->type = field.type;
+                oldAccess->typeName = field.typeName;
+                oldAccess->receiver = makeFullReceiverReadExpr();
+                oldAccess->ownerType = type->second;
+                oldAccess->field = field;
+                structAssignedValue = wrapResourceHandleOverwriteRelease(
+                    std::move(oldAccess), std::move(structAssignedValue), syntaxTree.span());
+            }
+
+            result->intermediateHops = std::move(intermediateHops);
+            result->expression = std::move(structAssignedValue);
             return result;
         }
-        auto assigned = bindPropertyAssignedValue();
+        std::unique_ptr<BoundExpression> assigned;
+        if (!compoundOp) {
+            assigned = bindTargetExpression(
+                *syntaxTree.expression, property->type,
+                property->typeName, "property assignment");
+        } else if (!property->getter) {
+            diagnostics_.report(
+                "RS2481",
+                "property '" + property->name + "' is write-only",
+                syntaxTree.nameToken.span);
+            assigned = makeError(syntaxTree.span());
+        } else {
+            std::unique_ptr<BoundExpression> getterRecv;
+            if (receiver->kind() == BoundNodeKind::VariableExpression) {
+                const auto& rv = static_cast<const BoundVariableExpression&>(*receiver).variable;
+                getterRecv = makeVariableAccess(rv, syntaxTree.receiver->span());
+            } else {
+                const auto recvTemp = allocateTempVariable(
+                    "prop_recv", receiver->type, receiver->typeName, syntaxTree.receiver->span());
+                auto recvAssign = std::make_unique<BoundAssignmentExpression>();
+                recvAssign->span = syntaxTree.receiver->span();
+                recvAssign->type = receiver->type;
+                recvAssign->typeName = receiver->typeName;
+                recvAssign->variable = recvTemp;
+                recvAssign->expression = std::move(receiver);
+                receiver = std::move(recvAssign);
+                getterRecv = makeVariableAccess(recvTemp, syntaxTree.receiver->span());
+            }
+            auto lhsValue = std::make_unique<BoundCallExpression>();
+            lhsValue->span = syntaxTree.nameToken.span;
+            lhsValue->type = property->type;
+            lhsValue->typeName = property->typeName;
+            lhsValue->function = *property->getter;
+            lhsValue->arguments.push_back(std::move(getterRecv));
+            auto rhsValue = bindExpression(*syntaxTree.expression);
+            auto combined = bindBinaryOperation(
+                std::move(lhsValue),
+                syntaxTree.nameToken.span,
+                *compoundOp,
+                std::move(rhsValue),
+                syntaxTree.expression->span(),
+                syntaxTree.span());
+            assigned = convertExpression(
+                std::move(combined),
+                property->type,
+                syntaxTree.span(),
+                "property assignment",
+                property->typeName);
+        }
         if (writableBackingField) {
             const auto& thisVar = static_cast<const BoundVariableExpression&>(*receiver).variable;
             auto oldAccess = std::make_unique<BoundMemberAccessExpression>();

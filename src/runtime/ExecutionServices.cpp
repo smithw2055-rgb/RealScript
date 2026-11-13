@@ -193,6 +193,14 @@ bool replayStable(const Value& value) noexcept {
         return false;
     }
     if (const auto* structure = std::get_if<StructValue>(&value)) {
+        if (structure->isFrameSlice()) {
+            const std::size_t cnt = structure->fieldCount();
+            for (std::size_t i = 0; i < cnt; ++i) {
+                const auto fv = structValueFieldAt(*structure, i);
+                if (fv && !replayStable(*fv)) return false;
+            }
+            return true;
+        }
         if (structure->isInline || !structure->storage) return true;
         return std::all_of(
             structure->storage->fields.begin(),

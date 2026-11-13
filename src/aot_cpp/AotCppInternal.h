@@ -210,7 +210,8 @@ void emitTypedTransfer(
     const std::vector<mir::ValueId>& arguments,
     const std::string& prefix,
     const std::string& indent,
-    const std::vector<std::size_t>* regGuardSlot = nullptr);
+    const std::vector<std::size_t>* regGuardSlot = nullptr,
+    const std::string& gcGuardCond = "!FastAccounting && !DeterminismAccounting && !TrustedRelease");
 void emitTypedRawConsume(
     Emitter& output,
     std::uint64_t count,
@@ -268,6 +269,10 @@ void emitVectorizedPackedArrayLoop(
 [[nodiscard]] bool aotTypeAssignable(
     semantic::SymbolId actual,
     semantic::SymbolId expected,
+    const std::map<semantic::SymbolId, TypeView>& allTypes) noexcept;
+[[nodiscard]] bool isNonEscapingMirStackRefAlloc(
+    const mir::Function& function,
+    const mir::Instruction& allocInst,
     const std::map<semantic::SymbolId, TypeView>& allTypes) noexcept;
 void emitTypedPrimitiveFunction(
     Emitter& source,

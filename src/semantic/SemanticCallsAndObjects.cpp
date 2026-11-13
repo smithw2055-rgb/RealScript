@@ -648,36 +648,146 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
             return true;
         }
         if (value->kind() == BoundNodeKind::StructFieldAccessExpression) {
-            auto& member = static_cast<
-                BoundStructFieldAccessExpression&>(*value);
-            if ((member.field.constField || member.field.readonlyField) &&
+            auto& leafMember = static_cast<BoundStructFieldAccessExpression&>(*value);
+            if ((leafMember.field.constField || leafMember.field.readonlyField) &&
                 argument.modifier != ParameterModifier::In &&
                 !isReadonlyFieldWritable(
-                    member.field, currentConstructor_, currentStaticMethod_, currentOwnerType_)) {
+                    leafMember.field, currentConstructor_, currentStaticMethod_, currentOwnerType_)) {
                 diagnostics_.report(
                     "RS2483",
                     std::string("cannot pass ") +
-                        (member.field.constField ? "const" : "readonly") +
-                        " field '" + member.field.name + "' as ref or out",
+                        (leafMember.field.constField ? "const" : "readonly") +
+                        " field '" + leafMember.field.name + "' as ref or out",
                     targetSpan);
                 argument.value = std::move(value);
                 return false;
             }
-            if (member.receiver->kind() !=
-                BoundNodeKind::VariableExpression) {
-                diagnostics_.report(
-                    "RS8821",
-                    "nested struct reference target requires a variable owner",
-                    targetSpan);
-                return false;
+            const TypeSymbol leafOwnerType = leafMember.ownerType;
+            const FieldSymbol leafField = leafMember.field;
+            std::vector<StructAssignmentHop> hopsRev;
+            std::unique_ptr<BoundExpression> cursor = std::move(leafMember.receiver);
+            while (cursor && cursor->kind() == BoundNodeKind::StructFieldAccessExpression) {
+                auto& sHop = static_cast<BoundStructFieldAccessExpression&>(*cursor);
+                if ((sHop.field.constField || sHop.field.readonlyField) &&
+                    argument.modifier != ParameterModifier::In &&
+                    !isReadonlyFieldWritable(
+                        sHop.field, currentConstructor_, currentStaticMethod_, currentOwnerType_)) {
+                    diagnostics_.report(
+                        "RS2483",
+                        std::string("cannot pass field of ") +
+                            (sHop.field.constField ? "const" : "readonly") +
+                            " struct '" + sHop.field.name + "' as ref or out",
+                        targetSpan);
+                    return false;
+                }
+                hopsRev.push_back(StructAssignmentHop{sHop.ownerType, sHop.field});
+                cursor = std::move(sHop.receiver);
             }
+
+            const VariableSymbol* rootVar = nullptr;
+            if (cursor && cursor->kind() == BoundNodeKind::VariableExpression) {
+                rootVar = &static_cast<const BoundVariableExpression&>(*cursor).variable;
+            } else if (cursor && cursor->kind() == BoundNodeKind::MemberAccessExpression) {
+                const auto& mRecv = static_cast<const BoundMemberAccessExpression&>(*cursor);
+                if (mRecv.receiver && mRecv.receiver->kind() == BoundNodeKind::VariableExpression) {
+                    const auto& candVar = static_cast<const BoundVariableExpression&>(*mRecv.receiver).variable;
+                    if (const auto* origVar = lookupVariable(candVar.name);
+                        origVar && (storageTypeOf(*origVar) != origVar->type || storageTypeNameOf(*origVar) != origVar->typeName)) {
+                        rootVar = origVar;
+                    }
+                }
+            }
+
             argument.targetKind = ReferenceTargetKind::StructField;
-            argument.variable = static_cast<const
-                BoundVariableExpression&>(*member.receiver).variable;
-            argument.targetReceiver = std::move(member.receiver);
-            argument.targetOwnerType = member.ownerType;
-            argument.targetField = member.field;
-            return true;
+            argument.targetOwnerType = leafOwnerType;
+            argument.targetField = leafField;
+            argument.intermediateHops.assign(hopsRev.rbegin(), hopsRev.rend());
+
+            if (rootVar) {
+                if (rootVar->isConst && argument.modifier != ParameterModifier::In) {
+                    diagnostics_.report(
+                        "RS2483",
+                        "cannot pass const variable '" + rootVar->name + "' as ref or out",
+                        targetSpan);
+                    return false;
+                }
+                if (rootVar->modifier == ParameterModifier::In &&
+                    argument.modifier != ParameterModifier::In) {
+                    diagnostics_.report(
+                        "RS8703",
+                        "an in parameter cannot be forwarded as ref or out",
+                        targetSpan);
+                    return false;
+                }
+                if (!isImplicitReceiver && rootVar->isUsingResource &&
+                    argument.modifier != ParameterModifier::In) {
+                    diagnostics_.report(
+                        "RS2651",
+                        "cannot pass '" + rootVar->name +
+                            "' as a ref or out argument because it is a 'using' variable",
+                        targetSpan);
+                    return false;
+                }
+                argument.structRootKind = StructAssignmentRootKind::Variable;
+                argument.variable = *rootVar;
+                if (storageTypeOf(*rootVar) != rootVar->type ||
+                    storageTypeNameOf(*rootVar) != rootVar->typeName) {
+                    const auto wrapper = visibleTypes_.find(storageTypeNameOf(*rootVar));
+                    if (wrapper != visibleTypes_.end() && !wrapper->second.fields.empty()) {
+                        argument.wrappedStructRootVariable = true;
+                        argument.structRootWrapperType = wrapper->second;
+                        argument.structRootWrapperValueField = wrapper->second.fields.front();
+                    }
+                }
+                return true;
+            }
+            if (cursor && cursor->kind() == BoundNodeKind::MemberAccessExpression) {
+                auto& mRecv = static_cast<BoundMemberAccessExpression&>(*cursor);
+                if (mRecv.nullConditional) {
+                    diagnostics_.report("RS8821", "nested struct reference target requires a variable owner", targetSpan);
+                    return false;
+                }
+                if ((mRecv.field.constField || mRecv.field.readonlyField) &&
+                    argument.modifier != ParameterModifier::In &&
+                    !isReadonlyFieldWritable(
+                        mRecv.field, currentConstructor_, currentStaticMethod_, currentOwnerType_)) {
+                    diagnostics_.report(
+                        "RS2483",
+                        std::string("cannot pass ") +
+                            (mRecv.field.constField ? "const" : "readonly") +
+                            " field '" + mRecv.field.name + "' as ref or out",
+                        targetSpan);
+                    return false;
+                }
+                if (mRecv.field.staticField) {
+                    argument.structRootKind = StructAssignmentRootKind::StaticField;
+                    argument.structRootOwnerType = mRecv.ownerType;
+                    argument.structRootField = mRecv.field;
+                    argument.structRootStaticInitializer = std::move(mRecv.staticInitializer);
+                    return true;
+                }
+                if (mRecv.receiver && mRecv.ownerType.kind == TypeKind::Class) {
+                    argument.structRootKind = StructAssignmentRootKind::ObjectField;
+                    argument.structRootOwnerType = mRecv.ownerType;
+                    argument.structRootField = mRecv.field;
+                    argument.targetReceiver = std::move(mRecv.receiver);
+                    return true;
+                }
+            }
+            if (cursor && cursor->kind() == BoundNodeKind::ElementAccessExpression) {
+                auto& elemRecv = static_cast<BoundElementAccessExpression&>(*cursor);
+                argument.structRootKind = StructAssignmentRootKind::ArrayElement;
+                argument.targetReceiver = std::move(elemRecv.receiver);
+                argument.targetIndex = std::move(elemRecv.index);
+                argument.targetElementType = elemRecv.elementType;
+                argument.targetElementTypeName = elemRecv.elementTypeName;
+                return true;
+            }
+            diagnostics_.report(
+                "RS8821",
+                "nested struct reference target requires a variable owner",
+                targetSpan);
+            return false;
         }
         diagnostics_.report(
             "RS8703",
@@ -692,25 +802,45 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
         receiverArgument.modifier = self.modifier;
         if (self.modifier == ParameterModifier::Ref) {
             const auto receiverSpan = receiver->span;
-            bool readonlyReceiver = false;
-            if (receiver->kind() == BoundNodeKind::MemberAccessExpression) {
-                const auto& mem = static_cast<const BoundMemberAccessExpression&>(*receiver);
-                readonlyReceiver = (mem.field.constField || mem.field.readonlyField) &&
-                    !isReadonlyFieldWritable(
-                        mem.field, currentConstructor_, currentStaticMethod_, currentOwnerType_);
-            } else if (receiver->kind() == BoundNodeKind::StructFieldAccessExpression) {
-                const auto& mem = static_cast<const BoundStructFieldAccessExpression&>(*receiver);
-                readonlyReceiver = (mem.field.constField || mem.field.readonlyField) &&
-                    !isReadonlyFieldWritable(
-                        mem.field, currentConstructor_, currentStaticMethod_, currentOwnerType_);
-            }
-            const bool directWritebackTarget = !readonlyReceiver && (
-                receiver->kind() == BoundNodeKind::VariableExpression ||
-                receiver->kind() == BoundNodeKind::MemberAccessExpression ||
-                receiver->kind() == BoundNodeKind::ElementAccessExpression ||
-                (receiver->kind() == BoundNodeKind::StructFieldAccessExpression &&
-                 static_cast<const BoundStructFieldAccessExpression&>(*receiver)
-                         .receiver->kind() == BoundNodeKind::VariableExpression));
+            const auto canMutateStructChainInPlace = [&](const BoundExpression* expr) -> bool {
+                const BoundExpression* cur = expr;
+                while (cur && cur->kind() == BoundNodeKind::StructFieldAccessExpression) {
+                    const auto& sf = static_cast<const BoundStructFieldAccessExpression&>(*cur);
+                    if ((sf.field.constField || sf.field.readonlyField) &&
+                        !isReadonlyFieldWritable(
+                            sf.field, currentConstructor_, currentStaticMethod_, currentOwnerType_)) {
+                        return false;
+                    }
+                    cur = sf.receiver.get();
+                }
+                if (!cur) return false;
+                if (cur->kind() == BoundNodeKind::VariableExpression) {
+                    const auto& v = static_cast<const BoundVariableExpression&>(*cur).variable;
+                    return !v.isConst && v.modifier != ParameterModifier::In;
+                }
+                if (cur->kind() == BoundNodeKind::ElementAccessExpression) {
+                    return true;
+                }
+                if (cur->kind() == BoundNodeKind::MemberAccessExpression) {
+                    const auto& m = static_cast<const BoundMemberAccessExpression&>(*cur);
+                    if (m.nullConditional) return false;
+                    if (m.receiver && m.receiver->kind() == BoundNodeKind::VariableExpression) {
+                        const auto& cv = static_cast<const BoundVariableExpression&>(*m.receiver).variable;
+                        if (const auto* ov = lookupVariable(cv.name);
+                            ov && (storageTypeOf(*ov) != ov->type || storageTypeNameOf(*ov) != ov->typeName)) {
+                            return !ov->isConst && ov->modifier != ParameterModifier::In;
+                        }
+                    }
+                    if ((m.field.constField || m.field.readonlyField) &&
+                        !isReadonlyFieldWritable(
+                            m.field, currentConstructor_, currentStaticMethod_, currentOwnerType_)) {
+                        return false;
+                    }
+                    return m.field.staticField || (m.receiver && m.ownerType.kind == TypeKind::Class);
+                }
+                return false;
+            };
+            const bool directWritebackTarget = canMutateStructChainInPlace(receiver.get());
             if (!directWritebackTarget) {
                 receiverArgument.targetKind = ReferenceTargetKind::None;
                 receiverArgument.defensiveCopy = true;

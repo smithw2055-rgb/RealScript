@@ -822,6 +822,18 @@ enum class ReferenceTargetKind {
     StructField
 };
 
+enum class StructAssignmentRootKind {
+    Variable,
+    StaticField,
+    ObjectField,
+    ArrayElement
+};
+
+struct StructAssignmentHop {
+    TypeSymbol ownerType;
+    FieldSymbol field;
+};
+
 struct BoundReferenceCallArgument {
     ParameterModifier modifier = ParameterModifier::None;
     std::unique_ptr<BoundExpression> value;
@@ -838,6 +850,14 @@ struct BoundReferenceCallArgument {
     FieldSymbol targetField;
     PrimitiveType targetElementType = PrimitiveType::Error;
     std::string targetElementTypeName;
+    StructAssignmentRootKind structRootKind = StructAssignmentRootKind::Variable;
+    bool wrappedStructRootVariable = false;
+    TypeSymbol structRootWrapperType;
+    FieldSymbol structRootWrapperValueField;
+    TypeSymbol structRootOwnerType;
+    FieldSymbol structRootField;
+    std::unique_ptr<BoundExpression> structRootStaticInitializer;
+    std::vector<StructAssignmentHop> intermediateHops;
 };
 
 struct BoundReferenceCallExpression final : BoundExpression {
@@ -906,6 +926,7 @@ struct BoundStructFieldAccessExpression final : BoundExpression {
 };
 
 struct BoundStructFieldAssignmentExpression final : BoundExpression {
+    StructAssignmentRootKind rootKind = StructAssignmentRootKind::Variable;
     VariableSymbol variable;
     TypeSymbol ownerType;
     FieldSymbol field;
@@ -917,6 +938,14 @@ struct BoundStructFieldAssignmentExpression final : BoundExpression {
     TypeSymbol staticReceiverOwnerType;
     FieldSymbol staticReceiverField;
     std::unique_ptr<BoundExpression> staticReceiverInitializer;
+    std::unique_ptr<BoundExpression> objectReceiver;
+    TypeSymbol objectOwnerType;
+    FieldSymbol objectField;
+    std::unique_ptr<BoundExpression> elementReceiver;
+    std::unique_ptr<BoundExpression> elementIndex;
+    PrimitiveType elementType = PrimitiveType::Struct;
+    std::string elementTypeName;
+    std::vector<StructAssignmentHop> intermediateHops;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
         return BoundNodeKind::StructFieldAssignmentExpression;
     }

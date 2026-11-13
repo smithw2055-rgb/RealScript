@@ -1009,7 +1009,14 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                      instructionIndex < instructions.size();) {
                     auto& first = instructions[instructionIndex];
                     // Pattern 1: LoadParameter + StoreLocal (span 2)
-                    if (instructionIndex + 1 < instructions.size() &&
+                    const bool isCustomStructParamMove =
+                        first.opcode == QuickOpcode::LoadParameter &&
+                        first.auxReg1 < function.parameterTypes.size() &&
+                        function.parameterTypes[first.auxReg1] == semantic::PrimitiveType::Struct &&
+                        first.auxReg1 < function.parameterTypeIds.size() &&
+                        findFlatStructSchemaByTypeId(function.parameterTypeIds[first.auxReg1]) != nullptr;
+                    if (!isCustomStructParamMove &&
+                        instructionIndex + 1 < instructions.size() &&
                         first.opcode == QuickOpcode::LoadParameter &&
                         instructions[instructionIndex + 1].opcode ==
                             QuickOpcode::StoreLocal &&
@@ -1654,6 +1661,72 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
         }
     }
 
+    // Build zero-heap-allocation StackRefTemplates for synthesized __RsRef__* wrapper classes
+    for (const auto& module : modules) {
+        for (const auto& type : module.types) {
+            if (type.id == 0 ||
+                type.kind != semantic::TypeKind::Class ||
+                type.interfaceType ||
+                type.delegateType ||
+                type.fields.size() != 1 ||
+                (type.fields[0].name != "Value" && type.fields[0].name != "value") ||
+                !isSynthesizedRefWrapperTypeName(type.name) ||
+                mirror->stackRefTemplateByTypeId.find(type.id) != mirror->stackRefTemplateByTypeId.end() ||
+                mirror->stackRefTemplates.size() >= InvalidCompactReg) {
+                continue;
+            }
+            const auto innerType = type.fields[0].type;
+            const auto innerTid = exactTypeId(innerType, type.fields[0].typeName);
+            StackRefTemplate srt{};
+            srt.wrapperTypeId = type.id;
+            srt.innerType = innerType;
+            srt.innerTypeId = innerTid;
+            bool supported = true;
+            if (innerType == semantic::PrimitiveType::Struct && innerTid != 0) {
+                if (const auto* sc = findFlatStructSchemaByTypeId(innerTid)) {
+                    srt.flatSchemaId = sc->schemaId;
+                    srt.slotCount = sc->flatSlotCount;
+                } else if (const auto inl = makeDefaultInlineStructValue(innerTid); inl.has_value()) {
+                    srt.scalarDefaultValue = *inl;
+                } else {
+                    supported = false;
+                }
+            } else {
+                switch (innerType) {
+                case semantic::PrimitiveType::Bool: srt.scalarDefaultValue = false; break;
+                case semantic::PrimitiveType::Byte: srt.scalarDefaultValue = ByteValue{}; break;
+                case semantic::PrimitiveType::SByte: srt.scalarDefaultValue = SByteValue{}; break;
+                case semantic::PrimitiveType::Short: srt.scalarDefaultValue = ShortValue{}; break;
+                case semantic::PrimitiveType::UShort: srt.scalarDefaultValue = UShortValue{}; break;
+                case semantic::PrimitiveType::Int: srt.scalarDefaultValue = std::int64_t{0}; break;
+                case semantic::PrimitiveType::UInt: srt.scalarDefaultValue = UIntValue{}; break;
+                case semantic::PrimitiveType::Long: srt.scalarDefaultValue = LongValue{}; break;
+                case semantic::PrimitiveType::ULong: srt.scalarDefaultValue = ULongValue{}; break;
+                case semantic::PrimitiveType::Float: srt.scalarDefaultValue = FloatValue{}; break;
+                case semantic::PrimitiveType::Double: srt.scalarDefaultValue = 0.0; break;
+                case semantic::PrimitiveType::Char: srt.scalarDefaultValue = CharValue{}; break;
+                case semantic::PrimitiveType::String: srt.scalarDefaultValue = NullString{}; break;
+                case semantic::PrimitiveType::Object: srt.scalarDefaultValue = NullObject{}; break;
+                case semantic::PrimitiveType::Array: srt.scalarDefaultValue = NullArray{}; break;
+                case semantic::PrimitiveType::Enum: srt.scalarDefaultValue = EnumValue{innerTid, 0}; break;
+                case semantic::PrimitiveType::Handle: {
+                    NativeHandle h{};
+                    h.typeId = innerTid;
+                    srt.scalarDefaultValue = h;
+                    break;
+                }
+                default:
+                    supported = false;
+                    break;
+                }
+            }
+            if (!supported) continue;
+            const auto srtIdx = static_cast<std::uint16_t>(mirror->stackRefTemplates.size());
+            mirror->stackRefTemplates.push_back(srt);
+            mirror->stackRefTemplateByTypeId.emplace(type.id, srtIdx);
+        }
+    }
+
     const auto internFieldMeta = [&](semantic::SymbolId ownerTid, semantic::SymbolId fieldTid) -> std::uint32_t {
         for (std::size_t m = 0; m < mirror->fieldMetas.size(); ++m) {
             if (mirror->fieldMetas[m].ownerTypeId == ownerTid &&
@@ -1814,9 +1887,9 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
             const std::size_t paramCount = function.parameterTypes.size();
             const std::size_t localCount = function.localTypes.size();
             const std::size_t regCount = function.registerTypes.size();
-            const std::size_t totalSlots =
+            const std::size_t singleSlots =
                 paramCount + localCount + regCount + execFunc.edgeScratchCount;
-            if (totalSlots >= InvalidCompactReg ||
+            if (singleSlots >= InvalidCompactReg ||
                 execFunc.entry == InvalidBlockIndex) {
                 execFunc.canUseFlatFastPath = false;
                 continue;
@@ -1825,7 +1898,8 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
             execFunc.localOffset = static_cast<std::uint16_t>(paramCount);
             execFunc.registerOffset = static_cast<std::uint16_t>(paramCount + localCount);
             execFunc.scratchOffset = static_cast<std::uint16_t>(paramCount + localCount + regCount);
-            execFunc.totalFrameSlots = static_cast<std::uint32_t>(totalSlots);
+            execFunc.singleZoneSlots = static_cast<std::uint16_t>(singleSlots);
+            execFunc.payloadOffset = static_cast<std::uint16_t>(singleSlots);
 
             const auto paramSlot = [&](std::uint16_t idx) noexcept -> std::uint16_t {
                 return idx < paramCount
@@ -1866,6 +1940,1099 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     if (arg < regCount) ++globalRegReads[arg];
                 }
             }
+
+            // Detect user-defined custom Struct slots and run SSA Liveness-Interval Linear-Scan Payload Reuse
+            const auto resolveSlotSchema = [](semantic::PrimitiveType pt, semantic::SymbolId tid) noexcept
+                -> const FlatStructSchema* {
+                if (pt != semantic::PrimitiveType::Struct || tid == 0) return nullptr;
+                return findFlatStructSchemaByTypeId(tid);
+            };
+            bool anyFlatStructs = false;
+            for (std::size_t p = 0; p < paramCount && !anyFlatStructs; ++p) {
+                const auto tid = p < function.parameterTypeIds.size() ? function.parameterTypeIds[p] : 0;
+                if (resolveSlotSchema(function.parameterTypes[p], tid)) anyFlatStructs = true;
+            }
+            for (std::size_t l = 0; l < localCount && !anyFlatStructs; ++l) {
+                const auto tid = l < function.localTypeIds.size() ? function.localTypeIds[l] : 0;
+                if (resolveSlotSchema(function.localTypes[l], tid)) anyFlatStructs = true;
+            }
+            for (std::size_t r = 0; r < regCount && !anyFlatStructs; ++r) {
+                const auto tid = r < function.registerTypeIds.size() ? function.registerTypeIds[r] : 0;
+                if (resolveSlotSchema(function.registerTypes[r], tid)) anyFlatStructs = true;
+            }
+
+            // Per-instruction flat-struct lowering classification tags
+            enum class StructRegMode : std::uint8_t {
+                None = 0,
+                OwnedPayload = 1,
+                AliasSlice = 2,
+                ElidedPrologueOrInPlace = 3,
+            };
+            bool anyStackRefOps = false;
+            if (!execFunc.isAsyncFunction) {
+                for (const auto& bb : function.blocks) {
+                    for (const auto& bcInst : bb.instructions) {
+                        if ((bcInst.opcode == bytecode::Opcode::NewObject ||
+                             bcInst.opcode == bytecode::Opcode::LoadField ||
+                             bcInst.opcode == bytecode::Opcode::StoreField) &&
+                            bcInst.typeIndex < module.types.size() &&
+                            mirror->stackRefTemplateByTypeId.find(module.types[bcInst.typeIndex].id) !=
+                                mirror->stackRefTemplateByTypeId.end()) {
+                            anyStackRefOps = true;
+                            break;
+                        }
+                    }
+                    if (anyStackRefOps) break;
+                }
+            }
+
+            struct FusedNestedStoreMeta {
+                bool valid = false;
+                std::uint8_t rootMode = 0; // 0 = Local, 1 = ArrayElement, 2 = StackRef
+                std::uint8_t span = 0;
+                std::uint16_t localIdx = InvalidCompactReg;
+                std::uint16_t arrReg = InvalidCompactReg;
+                std::uint16_t idxReg = InvalidCompactReg;
+                std::uint16_t rhsReg = InvalidCompactReg;
+                std::uint16_t totalLeafOffset = 0;
+                std::uint16_t leafSubSchemaId = 0;
+                std::uint16_t rootSchemaId = 0;
+                semantic::SymbolId rootTypeId = 0;
+            };
+            struct FusedLocalStackRefSite {
+                bool isBind = false;
+                bool isWriteback = false;
+                std::uint8_t span = 0;
+                std::uint16_t wrapReg = InvalidCompactReg;
+                std::uint16_t localIdx = InvalidCompactReg;
+                std::uint16_t flatSchemaId = 0;
+            };
+            std::vector<StructRegMode> regStructMode(regCount, StructRegMode::None);
+            std::vector<std::vector<std::uint16_t>> blockInPlaceStoreTarget; // [bIdx][i] -> localIdx or InvalidCompactReg
+            std::vector<std::vector<FusedNestedStoreMeta>> blockFusedNestedStore;
+            std::vector<std::vector<FusedLocalStackRefSite>> blockLocalStackRefSites;
+            std::vector<std::vector<std::uint16_t>> blockStackRefCellOffsets; // [bIdx][i] -> frame payload offset
+
+            if (anyStackRefOps && !execFunc.isAsyncFunction) {
+                blockLocalStackRefSites.resize(execFunc.blocks.size());
+                blockStackRefCellOffsets.resize(execFunc.blocks.size());
+                for (std::size_t bIdx = 0; bIdx < execFunc.blocks.size(); ++bIdx) {
+                    const std::size_t nInst = execFunc.blocks[bIdx].instructions.size();
+                    blockLocalStackRefSites[bIdx].resize(nInst);
+                    blockStackRefCellOffsets[bIdx].assign(nInst, InvalidCompactReg);
+                }
+            }
+
+            std::size_t totalSlots = singleSlots;
+            if (anyFlatStructs || (anyStackRefOps && !execFunc.isAsyncFunction)) {
+                if (anyFlatStructs) {
+                    execFunc.slotPayloadOffsets.assign(singleSlots, InvalidCompactReg);
+                    execFunc.slotStructSchemaIds.assign(singleSlots, 0u);
+                    blockInPlaceStoreTarget.resize(execFunc.blocks.size());
+                    blockFusedNestedStore.resize(execFunc.blocks.size());
+                }
+
+                std::size_t payloadCursor = singleSlots;
+                bool payloadOverflow = false;
+                const auto allocPayloadBlock = [&](std::size_t slotsNeeded) noexcept -> std::uint16_t {
+                    if (slotsNeeded == 0) slotsNeeded = 1;
+                    if (payloadCursor + slotsNeeded >= InvalidCompactReg) {
+                        payloadOverflow = true;
+                        return InvalidCompactReg;
+                    }
+                    const auto off = static_cast<std::uint16_t>(payloadCursor);
+                    payloadCursor += slotsNeeded;
+                    return off;
+                };
+
+                // 0) Zero-copy BindLocalStackRef + WritebackLocalStackRef detection for non-async blocks without exception handlers
+                if (anyStackRefOps && !execFunc.isAsyncFunction && !execFunc.hasExceptionHandlers) {
+                    for (std::size_t bIdx = 0; bIdx < execFunc.blocks.size(); ++bIdx) {
+                        const auto& blk = execFunc.blocks[bIdx];
+                        const std::size_t nInst = blk.instructions.size();
+                        for (std::size_t i = 0; i + 4 < nInst; ++i) {
+                            const auto& ldInit = blk.instructions[i];
+                            const auto& newWrap = blk.instructions[i + 1];
+                            const auto& stInit = blk.instructions[i + 2];
+                            if (!ldInit.bytecode || !newWrap.bytecode || !stInit.bytecode) continue;
+                            if (ldInit.opcode != QuickOpcode::LoadLocal ||
+                                ldInit.auxReg1 >= localCount ||
+                                ldInit.result >= regCount ||
+                                globalRegReads[ldInit.result] != 1) {
+                                continue;
+                            }
+                            if (newWrap.bytecode->opcode != bytecode::Opcode::NewObject ||
+                                !newWrap.bytecode->operands.empty() ||
+                                newWrap.result >= regCount ||
+                                newWrap.bytecode->typeIndex >= module.types.size() ||
+                                globalRegReads[newWrap.result] != 3) {
+                                continue;
+                            }
+                            const auto srtIt = mirror->stackRefTemplateByTypeId.find(
+                                module.types[newWrap.bytecode->typeIndex].id);
+                            if (srtIt == mirror->stackRefTemplateByTypeId.end()) continue;
+                            const auto& srt = mirror->stackRefTemplates[srtIt->second];
+                            const std::uint16_t locIdx = ldInit.auxReg1;
+                            if (stInit.bytecode->opcode != bytecode::Opcode::StoreField ||
+                                stInit.bytecode->typeIndex != newWrap.bytecode->typeIndex ||
+                                stInit.bytecode->index != 0 ||
+                                stInit.bytecode->operands.size() != 2 ||
+                                stInit.bytecode->operands[0] != newWrap.result ||
+                                stInit.bytecode->operands[1] != ldInit.result) {
+                                continue;
+                            }
+                            // Verify local type matches wrapper inner type
+                            const auto locTid = locIdx < function.localTypeIds.size() ? function.localTypeIds[locIdx] : 0;
+                            if (function.localTypes[locIdx] != srt.innerType || locTid != srt.innerTypeId) {
+                                continue;
+                            }
+                            // Scan forward to matching Call instruction in the same block without touching locIdx or calling functions
+                            std::size_t callIdx = nInst;
+                            bool cleanPreCall = true;
+                            for (std::size_t k = i + 3; k < nInst; ++k) {
+                                const auto& mid = blk.instructions[k];
+                                if (!mid.bytecode) { cleanPreCall = false; break; }
+                                const auto mop = mid.bytecode->opcode;
+                                if ((mop == bytecode::Opcode::LoadLocal || mop == bytecode::Opcode::StoreLocal) &&
+                                    mid.bytecode->index == locIdx) {
+                                    cleanPreCall = false;
+                                    break;
+                                }
+                                if (mop == bytecode::Opcode::Call) {
+                                    std::size_t wrapUsesInCall = 0;
+                                    for (const auto opReg : mid.bytecode->operands) {
+                                        if (opReg == newWrap.result) ++wrapUsesInCall;
+                                    }
+                                    if (wrapUsesInCall == 1) {
+                                        callIdx = k;
+                                    } else {
+                                        cleanPreCall = false;
+                                    }
+                                    break;
+                                }
+                                if (mop == bytecode::Opcode::InvokeDelegate ||
+                                    mop == bytecode::Opcode::AwaitSuspend ||
+                                    mop == bytecode::Opcode::NewObject) {
+                                    cleanPreCall = false;
+                                    break;
+                                }
+                            }
+                            if (!cleanPreCall || callIdx + 2 >= nInst) continue;
+
+                            // Verify post-call LoadField(rWrap, 0) + StoreLocal(locIdx, rAfter)
+                            const auto& ldAfter = blk.instructions[callIdx + 1];
+                            const auto& stAfter = blk.instructions[callIdx + 2];
+                            if (!ldAfter.bytecode || !stAfter.bytecode) continue;
+                            if (ldAfter.bytecode->opcode != bytecode::Opcode::LoadField ||
+                                ldAfter.bytecode->typeIndex != newWrap.bytecode->typeIndex ||
+                                ldAfter.bytecode->index != 0 ||
+                                ldAfter.bytecode->operands.size() != 1 ||
+                                ldAfter.bytecode->operands[0] != newWrap.result ||
+                                ldAfter.result >= regCount ||
+                                globalRegReads[ldAfter.result] != 1) {
+                                continue;
+                            }
+                            if (stAfter.opcode != QuickOpcode::StoreLocal ||
+                                stAfter.auxReg1 != locIdx ||
+                                stAfter.op0 != ldAfter.result) {
+                                continue;
+                            }
+
+                            // Safe to bind rWrap directly to locIdx in-place!
+                            auto& bindSite = blockLocalStackRefSites[bIdx][i];
+                            bindSite.isBind = true;
+                            bindSite.span = 3;
+                            bindSite.wrapReg = newWrap.result;
+                            bindSite.localIdx = locIdx;
+                            bindSite.flatSchemaId = srt.flatSchemaId;
+
+                            auto& wbSite = blockLocalStackRefSites[bIdx][callIdx + 1];
+                            wbSite.isWriteback = true;
+                            wbSite.span = 2;
+                            wbSite.wrapReg = newWrap.result;
+                            wbSite.localIdx = locIdx;
+                            wbSite.flatSchemaId = srt.flatSchemaId;
+
+                            regStructMode[ldInit.result] = StructRegMode::ElidedPrologueOrInPlace;
+                            regStructMode[ldAfter.result] = StructRegMode::ElidedPrologueOrInPlace;
+                        }
+                    }
+                }
+
+                const auto isNonEscapingBytecodeStackRef = [&](std::uint16_t initWrapReg) noexcept -> bool {
+                    bytecode::Register aliases[64]{};
+                    std::size_t aliasCount = 1;
+                    aliases[0] = static_cast<bytecode::Register>(initWrapReg);
+                    const auto isAlias = [&](bytecode::Register r) noexcept -> bool {
+                        for (std::size_t aIdx = 0; aIdx < aliasCount; ++aIdx) {
+                            if (aliases[aIdx] == r) return true;
+                        }
+                        return false;
+                    };
+                    bool expanded = true;
+                    while (expanded) {
+                        expanded = false;
+                        for (const auto& checkBlk : function.blocks) {
+                            for (const auto& uInst : checkBlk.instructions) {
+                                if (uInst.opcode == bytecode::Opcode::CheckNotNull &&
+                                    uInst.operands.size() == 1 &&
+                                    isAlias(uInst.operands[0]) &&
+                                    uInst.result != bytecode::InvalidRegister &&
+                                    !isAlias(uInst.result)) {
+                                    if (aliasCount >= 64u) return false;
+                                    aliases[aliasCount++] = uInst.result;
+                                    expanded = true;
+                                }
+                            }
+                        }
+                    }
+                    for (const auto& checkBlk : function.blocks) {
+                        const auto& term = checkBlk.terminator;
+                        if ((term.kind == bytecode::TerminatorKind::Branch && isAlias(term.condition)) ||
+                            ((term.kind == bytecode::TerminatorKind::ReturnValue ||
+                              term.kind == bytecode::TerminatorKind::Throw) &&
+                             isAlias(term.value))) {
+                            return false;
+                        }
+                        for (const auto arg : term.arguments) {
+                            if (isAlias(arg)) return false;
+                        }
+                        for (const auto arg : term.falseArguments) {
+                            if (isAlias(arg)) return false;
+                        }
+                        for (const auto& uInst : checkBlk.instructions) {
+                            bool usesWrap = false;
+                            for (const auto opReg : uInst.operands) {
+                                if (isAlias(opReg)) {
+                                    usesWrap = true;
+                                    break;
+                                }
+                            }
+                            if (!usesWrap) continue;
+                            if (uInst.opcode == bytecode::Opcode::CheckNotNull &&
+                                uInst.operands.size() == 1 &&
+                                isAlias(uInst.operands[0])) {
+                                continue;
+                            }
+                            if (uInst.opcode == bytecode::Opcode::LoadField &&
+                                uInst.index == 0 &&
+                                uInst.operands.size() == 1 &&
+                                isAlias(uInst.operands[0])) {
+                                continue;
+                            }
+                            if (uInst.opcode == bytecode::Opcode::StoreField &&
+                                uInst.index == 0 &&
+                                uInst.operands.size() == 2 &&
+                                isAlias(uInst.operands[0]) &&
+                                !isAlias(uInst.operands[1])) {
+                                continue;
+                            }
+                            if (uInst.opcode == bytecode::Opcode::Call ||
+                                (uInst.opcode == bytecode::Opcode::InvokeDelegate &&
+                                 uInst.operands.size() >= 2 &&
+                                 !isAlias(uInst.operands[0]))) {
+                                const bool returnsRefWrapper =
+                                    uInst.result != bytecode::InvalidRegister &&
+                                    uInst.result < function.registerTypeIds.size() &&
+                                    mirror->stackRefTemplateByTypeId.find(
+                                        function.registerTypeIds[uInst.result]) !=
+                                        mirror->stackRefTemplateByTypeId.end();
+                                if (!returnsRefWrapper) continue;
+                            }
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+
+                if (anyFlatStructs) {
+                // 1) Dedicated payload slices for flat-struct parameters and locals
+                for (std::size_t p = 0; p < paramCount; ++p) {
+                    const auto tid = p < function.parameterTypeIds.size() ? function.parameterTypeIds[p] : 0;
+                    if (const auto* sc = resolveSlotSchema(function.parameterTypes[p], tid)) {
+                        const std::uint16_t sl = paramSlot(static_cast<std::uint16_t>(p));
+                        execFunc.slotStructSchemaIds[sl] = sc->schemaId;
+                        execFunc.slotPayloadOffsets[sl] = allocPayloadBlock(sc->flatSlotCount);
+                    }
+                }
+                for (std::size_t l = 0; l < localCount; ++l) {
+                    const auto tid = l < function.localTypeIds.size() ? function.localTypeIds[l] : 0;
+                    if (const auto* sc = resolveSlotSchema(function.localTypes[l], tid)) {
+                        const std::uint16_t sl = localSlot(static_cast<std::uint16_t>(l));
+                        execFunc.slotStructSchemaIds[sl] = sc->schemaId;
+                        execFunc.slotPayloadOffsets[sl] = allocPayloadBlock(sc->flatSlotCount);
+                    }
+                }
+
+                // Initialize schema IDs for all flat-struct SSA registers
+                std::vector<const FlatStructSchema*> regSchemas(regCount, nullptr);
+                for (std::size_t r = 0; r < regCount; ++r) {
+                    const auto tid = r < function.registerTypeIds.size() ? function.registerTypeIds[r] : 0;
+                    if (const auto* sc = resolveSlotSchema(function.registerTypes[r], tid)) {
+                        regSchemas[r] = sc;
+                        execFunc.slotStructSchemaIds[regSlot(static_cast<std::uint16_t>(r))] = sc->schemaId;
+                        if (regStructMode[r] != StructRegMode::ElidedPrologueOrInPlace) {
+                            regStructMode[r] = StructRegMode::OwnedPayload;
+                        }
+                    }
+                }
+                // Block parameter registers must always own dedicated non-aliased payload slices
+                std::vector<bool> isBlockParamReg(regCount, false);
+                std::size_t maxEdgeStructLeaves = 0;
+                for (const auto& eb : execFunc.blocks) {
+                    if (eb.bytecode) {
+                        for (const auto& bp : eb.bytecode->parameters) {
+                            if (bp.target < regCount && regSchemas[bp.target] != nullptr) {
+                                isBlockParamReg[bp.target] = true;
+                            }
+                        }
+                    }
+                    const auto accumEdgeLeaves = [&](const ExecutionEdge& edge) {
+                        if (!edge.hasArguments || !edge.sources) return;
+                        std::size_t sum = 0;
+                        for (const auto sReg : *edge.sources) {
+                            if (sReg < regCount && regSchemas[sReg] != nullptr) {
+                                sum += regSchemas[sReg]->flatSlotCount;
+                            }
+                        }
+                        if (sum > maxEdgeStructLeaves) maxEdgeStructLeaves = sum;
+                    };
+                    accumEdgeLeaves(eb.branch);
+                    accumEdgeLeaves(eb.falseBranch);
+                }
+
+                // 2) Intra-block alias & in-place struct field mutation analysis
+                for (std::size_t bIdx = 0; bIdx < execFunc.blocks.size(); ++bIdx) {
+                    const auto& blk = execFunc.blocks[bIdx];
+                    const std::size_t nInst = blk.instructions.size();
+                    blockInPlaceStoreTarget[bIdx].assign(nInst, InvalidCompactReg);
+                    blockFusedNestedStore[bIdx].resize(nInst);
+
+                    // 2a) Detect contiguous multi-hop nested struct mutations on flat-struct locals & FlatStruct[] elements:
+                    //     [LoadLocal(loc) | LoadElement(arr, idx)] -> LoadStructField^(H-1) -> StoreStructField^H -> [StoreLocal(loc) | StoreElement(arr, idx)]
+                    for (std::size_t i = 0; i + 2 < nInst;) {
+                        const auto& rootInst = blk.instructions[i];
+                        if (!rootInst.bytecode || rootInst.result >= regCount) {
+                            ++i;
+                            continue;
+                        }
+                        const std::uint16_t s0 = rootInst.result;
+                        const FlatStructSchema* rootSc = regSchemas[s0];
+                        if (!rootSc || isBlockParamReg[s0]) {
+                            ++i;
+                            continue;
+                        }
+                        std::uint8_t rootMode = 0; // 0 = Local, 1 = ArrayElement, 2 = StackRef
+                        std::uint16_t locIdx = InvalidCompactReg;
+                        std::uint16_t arrReg = InvalidCompactReg;
+                        std::uint16_t idxReg = InvalidCompactReg;
+                        semantic::SymbolId stackRefWrapTid = 0;
+                        if (rootInst.opcode == QuickOpcode::LoadLocal &&
+                            rootInst.auxReg1 < localCount &&
+                            execFunc.slotStructSchemaIds[localSlot(rootInst.auxReg1)] == rootSc->schemaId) {
+                            rootMode = 0;
+                            locIdx = rootInst.auxReg1;
+                        } else if (rootInst.bytecode->opcode == bytecode::Opcode::LoadElement &&
+                                   rootInst.bytecode->elementType == semantic::PrimitiveType::Struct &&
+                                   rootInst.bytecode->elementTypeId == rootSc->structTypeId &&
+                                   rootInst.bytecode->operands.size() == 2 &&
+                                   rootInst.bytecode->operands[0] < regCount &&
+                                   rootInst.bytecode->operands[1] < regCount) {
+                            rootMode = 1;
+                            arrReg = static_cast<std::uint16_t>(rootInst.bytecode->operands[0]);
+                            idxReg = static_cast<std::uint16_t>(rootInst.bytecode->operands[1]);
+                        } else if (anyStackRefOps &&
+                                   !execFunc.isAsyncFunction &&
+                                   rootInst.bytecode->opcode == bytecode::Opcode::LoadField &&
+                                   rootInst.bytecode->index == 0 &&
+                                   rootInst.bytecode->operands.size() == 1 &&
+                                   rootInst.bytecode->operands[0] < regCount &&
+                                   rootInst.bytecode->typeIndex < module.types.size() &&
+                                   (bIdx >= blockLocalStackRefSites.size() ||
+                                    i >= blockLocalStackRefSites[bIdx].size() ||
+                                    !blockLocalStackRefSites[bIdx][i].isWriteback)) {
+                            const auto wTid = module.types[rootInst.bytecode->typeIndex].id;
+                            const auto srtIt = mirror->stackRefTemplateByTypeId.find(wTid);
+                            if (srtIt != mirror->stackRefTemplateByTypeId.end() &&
+                                mirror->stackRefTemplates[srtIt->second].flatSchemaId == rootSc->schemaId) {
+                                rootMode = 2;
+                                arrReg = static_cast<std::uint16_t>(rootInst.bytecode->operands[0]);
+                                stackRefWrapTid = wTid;
+                            } else {
+                                ++i;
+                                continue;
+                            }
+                        } else {
+                            ++i;
+                            continue;
+                        }
+
+                        // Walk forward across 0+ LoadStructField drill-down hops
+                        std::vector<std::uint16_t> sChain = {s0};
+                        std::vector<const FlatStructSchema*> scChain = {rootSc};
+                        std::vector<std::size_t> fIdxChain;
+                        std::uint32_t totalLeafOff = 0;
+                        std::size_t curPos = i + 1;
+                        bool chainValid = true;
+                        while (curPos < nInst) {
+                            const auto& ld = blk.instructions[curPos];
+                            if (!ld.bytecode || ld.bytecode->opcode != bytecode::Opcode::LoadStructField) {
+                                break;
+                            }
+                            if (ld.bytecode->operands.size() != 1 ||
+                                ld.bytecode->operands[0] != sChain.back() ||
+                                ld.result >= regCount ||
+                                isBlockParamReg[ld.result]) {
+                                chainValid = false;
+                                break;
+                            }
+                            const auto* parentSc = scChain.back();
+                            const std::size_t fIdx = ld.bytecode->index;
+                            if (fIdx >= parentSc->directFields.size()) {
+                                chainValid = false;
+                                break;
+                            }
+                            const auto& fd = parentSc->directFields[fIdx];
+                            const auto* subSc = getFlatStructSchema(fd.subSchemaId);
+                            if (!subSc || regSchemas[ld.result] != subSc) {
+                                chainValid = false;
+                                break;
+                            }
+                            totalLeafOff += fd.leafOffset;
+                            fIdxChain.push_back(fIdx);
+                            sChain.push_back(ld.result);
+                            scChain.push_back(subSc);
+                            ++curPos;
+                        }
+                        const std::size_t H = sChain.size(); // number of StoreStructField ops
+                        const std::size_t totalSpan = 2u * H + 1u;
+                        if (!chainValid || totalSpan > 250u || i + totalSpan > nInst) {
+                            ++i;
+                            continue;
+                        }
+
+                        // Verify inner-most leaf StoreStructField at i + H
+                        const auto& leafSt = blk.instructions[i + H];
+                        if (!leafSt.bytecode ||
+                            leafSt.bytecode->opcode != bytecode::Opcode::StoreStructField ||
+                            leafSt.bytecode->operands.size() != 2 ||
+                            leafSt.bytecode->operands[0] != sChain.back() ||
+                            leafSt.bytecode->operands[1] >= regCount ||
+                            leafSt.result >= regCount ||
+                            isBlockParamReg[leafSt.result] ||
+                            regSchemas[leafSt.result] != scChain.back() ||
+                            globalRegReads[leafSt.result] != 1) {
+                            ++i;
+                            continue;
+                        }
+                        const std::size_t leafFieldIdx = leafSt.bytecode->index;
+                        if (leafFieldIdx >= scChain.back()->directFields.size()) {
+                            ++i;
+                            continue;
+                        }
+                        const auto& leafFd = scChain.back()->directFields[leafFieldIdx];
+                        totalLeafOff += leafFd.leafOffset;
+                        const std::uint16_t rhsReg = static_cast<std::uint16_t>(leafSt.bytecode->operands[1]);
+
+                        // Verify read counts on sChain[0..H-1] and that rhsReg/arrReg/idxReg do not alias chain temps
+                        bool countsOk = (globalRegReads[sChain.back()] == 1) && (rhsReg != sChain.back());
+                        for (std::size_t m = 0; m + 1 < H && countsOk; ++m) {
+                            if (globalRegReads[sChain[m]] != 2 || rhsReg == sChain[m]) {
+                                countsOk = false;
+                            }
+                        }
+                        if (!countsOk) {
+                            ++i;
+                            continue;
+                        }
+
+                        // Verify outward reconstruction StoreStructField ops at i + H + 1 .. i + 2*H - 1
+                        std::vector<std::uint16_t> uChain;
+                        uChain.reserve(H);
+                        uChain.push_back(leafSt.result);
+                        for (std::size_t step = 1; step < H && countsOk; ++step) {
+                            const std::size_t m = H - 1u - step;
+                            const auto& hopSt = blk.instructions[i + H + step];
+                            if (!hopSt.bytecode ||
+                                hopSt.bytecode->opcode != bytecode::Opcode::StoreStructField ||
+                                hopSt.bytecode->operands.size() != 2 ||
+                                hopSt.bytecode->operands[0] != sChain[m] ||
+                                hopSt.bytecode->operands[1] != uChain.back() ||
+                                hopSt.bytecode->index != fIdxChain[m] ||
+                                hopSt.result >= regCount ||
+                                isBlockParamReg[hopSt.result] ||
+                                regSchemas[hopSt.result] != scChain[m] ||
+                                globalRegReads[hopSt.result] != 1) {
+                                countsOk = false;
+                                break;
+                            }
+                            uChain.push_back(hopSt.result);
+                        }
+                        if (!countsOk || totalLeafOff >= InvalidCompactReg) {
+                            ++i;
+                            continue;
+                        }
+
+                        // Verify root writeback at i + 2*H
+                        const auto& wbInst = blk.instructions[i + 2u * H];
+                        bool wbOk = false;
+                        if (rootMode == 0) {
+                            wbOk = (wbInst.opcode == QuickOpcode::StoreLocal &&
+                                    wbInst.auxReg1 == locIdx &&
+                                    wbInst.op0 == uChain.back());
+                        } else if (rootMode == 1) {
+                            wbOk = (wbInst.bytecode != nullptr &&
+                                    wbInst.bytecode->opcode == bytecode::Opcode::StoreElement &&
+                                    wbInst.bytecode->elementType == semantic::PrimitiveType::Struct &&
+                                    wbInst.bytecode->elementTypeId == rootSc->structTypeId &&
+                                    wbInst.bytecode->operands.size() == 3 &&
+                                    wbInst.bytecode->operands[0] == arrReg &&
+                                    wbInst.bytecode->operands[1] == idxReg &&
+                                    wbInst.bytecode->operands[2] == uChain.back());
+                        } else {
+                            wbOk = (wbInst.bytecode != nullptr &&
+                                    wbInst.bytecode->opcode == bytecode::Opcode::StoreField &&
+                                    wbInst.bytecode->index == 0 &&
+                                    wbInst.bytecode->typeIndex < module.types.size() &&
+                                    module.types[wbInst.bytecode->typeIndex].id == stackRefWrapTid &&
+                                    wbInst.bytecode->operands.size() == 2 &&
+                                    wbInst.bytecode->operands[0] == arrReg &&
+                                    wbInst.bytecode->operands[1] == uChain.back());
+                        }
+                        if (!wbOk) {
+                            ++i;
+                            continue;
+                        }
+
+                        // All intermediate struct registers are completely elided!
+                        for (const auto sr : sChain) regStructMode[sr] = StructRegMode::ElidedPrologueOrInPlace;
+                        for (const auto ur : uChain) regStructMode[ur] = StructRegMode::ElidedPrologueOrInPlace;
+                        auto& meta = blockFusedNestedStore[bIdx][i];
+                        meta.valid = true;
+                        meta.rootMode = rootMode;
+                        meta.span = static_cast<std::uint8_t>(totalSpan);
+                        meta.localIdx = locIdx;
+                        meta.arrReg = arrReg;
+                        meta.idxReg = idxReg;
+                        meta.rhsReg = rhsReg;
+                        meta.totalLeafOffset = static_cast<std::uint16_t>(totalLeafOff);
+                        meta.leafSubSchemaId = leafFd.subSchemaId;
+                        meta.rootSchemaId = rootSc->schemaId;
+                        meta.rootTypeId = (rootMode == 2) ? stackRefWrapTid : rootSc->structTypeId;
+                        i += totalSpan;
+                    }
+
+                    for (std::size_t i = 0; i < nInst; ++i) {
+                        const auto& inst = blk.instructions[i];
+                        if (!inst.bytecode || inst.result >= regCount) continue;
+                        const std::uint16_t rDef = inst.result;
+                        if (regSchemas[rDef] == nullptr || isBlockParamReg[rDef] ||
+                            regStructMode[rDef] == StructRegMode::ElidedPrologueOrInPlace) {
+                            continue;
+                        }
+
+                        // Read-only parameter load: parameters are immutable in RealScript bytecode!
+                        if (inst.opcode == QuickOpcode::LoadParameter &&
+                            inst.auxReg1 < paramCount &&
+                            execFunc.slotStructSchemaIds[paramSlot(inst.auxReg1)] == regSchemas[rDef]->schemaId) {
+                            if (i + 1 < nInst &&
+                                globalRegReads[rDef] == 1 &&
+                                blk.instructions[i + 1].opcode == QuickOpcode::StoreLocal &&
+                                blk.instructions[i + 1].op0 == rDef &&
+                                execFunc.slotStructSchemaIds[localSlot(blk.instructions[i + 1].auxReg1)] ==
+                                    regSchemas[rDef]->schemaId) {
+                                regStructMode[rDef] = StructRegMode::ElidedPrologueOrInPlace;
+                            } else {
+                                regStructMode[rDef] = StructRegMode::AliasSlice;
+                            }
+                            continue;
+                        }
+
+                        // Local struct load: check for in-place field store OR safe read-only alias before next StoreLocal(loc)
+                        if (inst.opcode == QuickOpcode::LoadLocal &&
+                            inst.auxReg1 < localCount &&
+                            execFunc.slotStructSchemaIds[localSlot(inst.auxReg1)] == regSchemas[rDef]->schemaId) {
+                            const std::uint16_t locIdx = inst.auxReg1;
+                            std::size_t readsSeen = 0;
+                            bool localOverwrittenBeforeLastUse = false;
+                            std::size_t singleUseIdx = InvalidBlockIndex;
+
+                            for (std::size_t j = i + 1; j < nInst; ++j) {
+                                const auto& later = blk.instructions[j];
+                                if (!later.bytecode) continue;
+                                for (const auto opReg : later.bytecode->operands) {
+                                    if (opReg == rDef) {
+                                        ++readsSeen;
+                                        singleUseIdx = j;
+                                    }
+                                }
+                                if (readsSeen == globalRegReads[rDef]) {
+                                    break;
+                                }
+                                if (later.bytecode->opcode == bytecode::Opcode::StoreLocal &&
+                                    later.auxReg1 == locIdx) {
+                                    localOverwrittenBeforeLastUse = true;
+                                    break;
+                                }
+                            }
+
+                            if (readsSeen == globalRegReads[rDef] && !localOverwrittenBeforeLastUse) {
+                                regStructMode[rDef] = StructRegMode::AliasSlice;
+                                // Check for `r2 = StoreStructField(rDef, fIdx, rhs); StoreLocal(locIdx, r2)`
+                                if (globalRegReads[rDef] == 1 &&
+                                    singleUseIdx != InvalidBlockIndex &&
+                                    singleUseIdx + 1 < nInst) {
+                                    const auto& stInst = blk.instructions[singleUseIdx];
+                                    const auto& svInst = blk.instructions[singleUseIdx + 1];
+                                    if (stInst.bytecode &&
+                                        stInst.bytecode->opcode == bytecode::Opcode::StoreStructField &&
+                                        stInst.bytecode->operands.size() == 2 &&
+                                        stInst.bytecode->operands[0] == rDef &&
+                                        stInst.bytecode->operands[1] != rDef &&
+                                        stInst.result < regCount &&
+                                        regSchemas[stInst.result] == regSchemas[rDef] &&
+                                        !isBlockParamReg[stInst.result] &&
+                                        globalRegReads[stInst.result] == 1 &&
+                                        svInst.opcode == QuickOpcode::StoreLocal &&
+                                        svInst.auxReg1 == locIdx &&
+                                        svInst.op0 == stInst.result) {
+                                        blockInPlaceStoreTarget[bIdx][singleUseIdx] = locIdx;
+                                        regStructMode[stInst.result] = StructRegMode::ElidedPrologueOrInPlace;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+
+                        // Single-use LoadField(__RsRef__*.0) read-only alias slice before any StoreField/Call in the same block
+                        if (anyStackRefOps &&
+                            !execFunc.isAsyncFunction &&
+                            inst.bytecode->opcode == bytecode::Opcode::LoadField &&
+                            inst.bytecode->index == 0 &&
+                            inst.bytecode->operands.size() == 1 &&
+                            inst.bytecode->typeIndex < module.types.size() &&
+                            globalRegReads[rDef] == 1) {
+                            bytecode::Register curWrapReg = inst.bytecode->operands[0];
+                            bool wrapFromHeapLikeOp = false;
+                            for (int hop = 0; hop < 8; ++hop) {
+                                const bytecode::Instruction* defInst = nullptr;
+                                for (const auto& dBlk : function.blocks) {
+                                    for (const auto& dInst : dBlk.instructions) {
+                                        if (dInst.result == curWrapReg) {
+                                            defInst = &dInst;
+                                            break;
+                                        }
+                                    }
+                                    if (defInst) break;
+                                }
+                                if (!defInst) break;
+                                if (defInst->opcode == bytecode::Opcode::CheckNotNull &&
+                                    defInst->operands.size() == 1) {
+                                    curWrapReg = defInst->operands[0];
+                                    continue;
+                                }
+                                if (defInst->opcode == bytecode::Opcode::NewObject) {
+                                    wrapFromHeapLikeOp =
+                                        defInst->result >= regCount ||
+                                        !isNonEscapingBytecodeStackRef(
+                                            static_cast<std::uint16_t>(defInst->result));
+                                } else if (defInst->opcode == bytecode::Opcode::LoadLocal) {
+                                    bool anyStore = false;
+                                    bool allStoresStackSafe = true;
+                                    for (const auto& sBlk : function.blocks) {
+                                        for (const auto& sInst : sBlk.instructions) {
+                                            if (sInst.opcode == bytecode::Opcode::StoreLocal &&
+                                                sInst.index == defInst->index &&
+                                                sInst.operands.size() == 1) {
+                                                anyStore = true;
+                                                const bytecode::Instruction* stDef = nullptr;
+                                                for (const auto& sdBlk : function.blocks) {
+                                                    for (const auto& sdInst : sdBlk.instructions) {
+                                                        if (sdInst.result == sInst.operands[0]) {
+                                                            stDef = &sdInst;
+                                                            break;
+                                                        }
+                                                    }
+                                                    if (stDef) break;
+                                                }
+                                                const bool storeOk = stDef != nullptr &&
+                                                    (stDef->opcode == bytecode::Opcode::LoadParameter ||
+                                                     (stDef->opcode == bytecode::Opcode::NewObject &&
+                                                      stDef->result < regCount &&
+                                                      isNonEscapingBytecodeStackRef(
+                                                          static_cast<std::uint16_t>(stDef->result))));
+                                                if (!storeOk) {
+                                                    allStoresStackSafe = false;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if (!allStoresStackSafe) break;
+                                    }
+                                    wrapFromHeapLikeOp = !(anyStore && allStoresStackSafe);
+                                } else {
+                                    wrapFromHeapLikeOp =
+                                        (defInst->opcode == bytecode::Opcode::LoadField ||
+                                         defInst->opcode == bytecode::Opcode::LoadElement ||
+                                         defInst->opcode == bytecode::Opcode::Call ||
+                                         defInst->opcode == bytecode::Opcode::InvokeDelegate);
+                                }
+                                break;
+                            }
+                            const auto srtIt = mirror->stackRefTemplateByTypeId.find(
+                                module.types[inst.bytecode->typeIndex].id);
+                            if (!wrapFromHeapLikeOp &&
+                                srtIt != mirror->stackRefTemplateByTypeId.end() &&
+                                mirror->stackRefTemplates[srtIt->second].flatSchemaId == regSchemas[rDef]->schemaId) {
+                                bool safeRefAlias = false;
+                                for (std::size_t j = i + 1; j < nInst; ++j) {
+                                    const auto& later = blk.instructions[j];
+                                    if (!later.bytecode) break;
+                                    bool usesHere = false;
+                                    for (const auto opReg : later.bytecode->operands) {
+                                        if (opReg == rDef) usesHere = true;
+                                    }
+                                    if (usesHere) {
+                                        safeRefAlias = true;
+                                        break;
+                                    }
+                                    const auto lop = later.bytecode->opcode;
+                                    if (lop == bytecode::Opcode::StoreField ||
+                                        lop == bytecode::Opcode::Call ||
+                                        lop == bytecode::Opcode::InvokeDelegate) {
+                                        break;
+                                    }
+                                }
+                                if (safeRefAlias) {
+                                    regStructMode[rDef] = StructRegMode::AliasSlice;
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // Single-use nested LoadStructField sub-slice view before any StoreLocal in the same block
+                        if (inst.bytecode->opcode == bytecode::Opcode::LoadStructField &&
+                            inst.bytecode->operands.size() == 1 &&
+                            globalRegReads[rDef] == 1) {
+                            const auto srcReg = inst.bytecode->operands[0];
+                            if (srcReg < regCount && regSchemas[srcReg] != nullptr) {
+                                bool safeSubSlice = false;
+                                for (std::size_t j = i + 1; j < nInst; ++j) {
+                                    const auto& later = blk.instructions[j];
+                                    if (!later.bytecode) break;
+                                    bool usesHere = false;
+                                    for (const auto opReg : later.bytecode->operands) {
+                                        if (opReg == rDef) usesHere = true;
+                                    }
+                                    if (usesHere) {
+                                        safeSubSlice = true;
+                                        break;
+                                    }
+                                    if (later.bytecode->opcode == bytecode::Opcode::StoreLocal) {
+                                        break;
+                                    }
+                                }
+                                if (safeSubSlice) {
+                                    regStructMode[rDef] = StructRegMode::AliasSlice;
+                                }
+                            }
+                        }
+
+                        // Single-use NewStruct / LoadElement(Struct) immediately stored into flat-struct local
+                        if ((inst.bytecode->opcode == bytecode::Opcode::NewStruct ||
+                             inst.bytecode->opcode == bytecode::Opcode::LoadElement) &&
+                            globalRegReads[rDef] == 1 &&
+                            i + 1 < nInst &&
+                            blk.instructions[i + 1].opcode == QuickOpcode::StoreLocal &&
+                            blk.instructions[i + 1].op0 == rDef &&
+                            execFunc.slotStructSchemaIds[localSlot(blk.instructions[i + 1].auxReg1)] ==
+                                regSchemas[rDef]->schemaId) {
+                            regStructMode[rDef] = StructRegMode::ElidedPrologueOrInPlace;
+                        }
+                    }
+                }
+
+                // 3) CFG-Aware Liveness-Interval Linear-Scan Allocator for OwnedPayload SSA struct registers
+                std::vector<std::uint16_t> ownedStructRegs;
+                std::vector<std::int32_t> regToDenseIdx(regCount, -1);
+                std::uint32_t uncompactedRegSlots = 0;
+                for (std::size_t r = 0; r < regCount; ++r) {
+                    if (regSchemas[r] != nullptr) {
+                        uncompactedRegSlots += regSchemas[r]->flatSlotCount;
+                        if (regStructMode[r] == StructRegMode::OwnedPayload) {
+                            regToDenseIdx[r] = static_cast<std::int32_t>(ownedStructRegs.size());
+                            ownedStructRegs.push_back(static_cast<std::uint16_t>(r));
+                        }
+                    }
+                }
+                execFunc.uncompactedRegPayloadSlots = uncompactedRegSlots;
+
+                std::uint32_t compactedRegSlots = 0;
+                if (!ownedStructRegs.empty()) {
+                    const std::size_t nOwned = ownedStructRegs.size();
+                    const std::size_t nWords = (nOwned + 63u) / 64u;
+                    const std::size_t nBlocks = execFunc.blocks.size();
+
+                    std::vector<std::uint32_t> blkPosStart(nBlocks, 0);
+                    std::vector<std::uint32_t> blkPosEnd(nBlocks, 0);
+                    std::uint32_t posCursor = 0;
+                    for (std::size_t b = 0; b < nBlocks; ++b) {
+                        blkPosStart[b] = posCursor;
+                        // +1 slot at block entry for BlockParameters, +1 per instruction, +1 for terminator
+                        posCursor += static_cast<std::uint32_t>(execFunc.blocks[b].instructions.size() + 2u);
+                        blkPosEnd[b] = posCursor - 1u;
+                    }
+
+                    std::vector<std::vector<std::uint64_t>> useBits(nBlocks, std::vector<std::uint64_t>(nWords, 0ULL));
+                    std::vector<std::vector<std::uint64_t>> defBits(nBlocks, std::vector<std::uint64_t>(nWords, 0ULL));
+                    std::vector<std::uint32_t> intervalStart(nOwned, 0xFFFFFFFFu);
+                    std::vector<std::uint32_t> intervalEnd(nOwned, 0u);
+
+                    const auto notePoint = [&](std::size_t denseIdx, std::uint32_t pos) noexcept {
+                        if (pos < intervalStart[denseIdx]) intervalStart[denseIdx] = pos;
+                        if (pos > intervalEnd[denseIdx]) intervalEnd[denseIdx] = pos;
+                    };
+                    const auto setBit = [](std::vector<std::uint64_t>& bits, std::size_t idx) noexcept {
+                        bits[idx >> 6u] |= (std::uint64_t{1} << (idx & 63u));
+                    };
+                    const auto testBit = [](const std::vector<std::uint64_t>& bits, std::size_t idx) noexcept -> bool {
+                        return (bits[idx >> 6u] & (std::uint64_t{1} << (idx & 63u))) != 0ULL;
+                    };
+
+                    for (std::size_t b = 0; b < nBlocks; ++b) {
+                        const auto& eb = execFunc.blocks[b];
+                        const std::uint32_t basePos = blkPosStart[b];
+                        if (eb.bytecode) {
+                            for (const auto& bp : eb.bytecode->parameters) {
+                                if (bp.target < regCount && regToDenseIdx[bp.target] >= 0) {
+                                    const auto dIdx = static_cast<std::size_t>(regToDenseIdx[bp.target]);
+                                    setBit(defBits[b], dIdx);
+                                    notePoint(dIdx, basePos);
+                                }
+                            }
+                        }
+                        for (std::size_t i = 0; i < eb.instructions.size(); ++i) {
+                            const std::uint32_t instPos = basePos + 1u + static_cast<std::uint32_t>(i);
+                            const auto& inst = eb.instructions[i];
+                            if (inst.bytecode) {
+                                for (const auto opReg : inst.bytecode->operands) {
+                                    if (opReg < regCount && regToDenseIdx[opReg] >= 0) {
+                                        const auto dIdx = static_cast<std::size_t>(regToDenseIdx[opReg]);
+                                        if (!testBit(defBits[b], dIdx)) setBit(useBits[b], dIdx);
+                                        notePoint(dIdx, instPos);
+                                    }
+                                }
+                            }
+                            if (inst.result < regCount && regToDenseIdx[inst.result] >= 0) {
+                                const auto dIdx = static_cast<std::size_t>(regToDenseIdx[inst.result]);
+                                setBit(defBits[b], dIdx);
+                                notePoint(dIdx, instPos);
+                            }
+                        }
+                        const std::uint32_t termPos = blkPosEnd[b];
+                        if (eb.bytecode) {
+                            const auto& term = eb.bytecode->terminator;
+                            if ((term.kind == bytecode::TerminatorKind::ReturnValue ||
+                                 term.kind == bytecode::TerminatorKind::Throw) &&
+                                term.value < regCount && regToDenseIdx[term.value] >= 0) {
+                                const auto dIdx = static_cast<std::size_t>(regToDenseIdx[term.value]);
+                                if (!testBit(defBits[b], dIdx)) setBit(useBits[b], dIdx);
+                                notePoint(dIdx, termPos);
+                            }
+                            for (const auto arg : term.arguments) {
+                                if (arg < regCount && regToDenseIdx[arg] >= 0) {
+                                    const auto dIdx = static_cast<std::size_t>(regToDenseIdx[arg]);
+                                    if (!testBit(defBits[b], dIdx)) setBit(useBits[b], dIdx);
+                                    notePoint(dIdx, termPos);
+                                }
+                            }
+                            for (const auto arg : term.falseArguments) {
+                                if (arg < regCount && regToDenseIdx[arg] >= 0) {
+                                    const auto dIdx = static_cast<std::size_t>(regToDenseIdx[arg]);
+                                    if (!testBit(defBits[b], dIdx)) setBit(useBits[b], dIdx);
+                                    notePoint(dIdx, termPos);
+                                }
+                            }
+                        }
+                    }
+
+                    // Exception handler edges: any protected block can transfer control to its handler block
+                    std::vector<std::vector<std::size_t>> extraSuccs(nBlocks);
+                    for (const auto& eh : function.exceptionHandlers) {
+                        const auto hIt = execFunc.blockIndices.find(eh.handlerBlock);
+                        if (hIt == execFunc.blockIndices.end()) continue;
+                        for (const auto pbId : eh.protectedBlocks) {
+                            const auto pIt = execFunc.blockIndices.find(pbId);
+                            if (pIt != execFunc.blockIndices.end()) {
+                                extraSuccs[pIt->second].push_back(hIt->second);
+                            }
+                        }
+                    }
+
+                    std::vector<std::vector<std::uint64_t>> liveIn(nBlocks, std::vector<std::uint64_t>(nWords, 0ULL));
+                    std::vector<std::vector<std::uint64_t>> liveOut(nBlocks, std::vector<std::uint64_t>(nWords, 0ULL));
+
+                    const auto edgeFilteredLiveIn = [&](const ExecutionEdge& edge,
+                                                        std::vector<std::uint64_t>& accOut) {
+                        if (edge.target == InvalidBlockIndex || edge.target >= nBlocks) return;
+                        std::vector<std::uint64_t> succIn = liveIn[edge.target];
+                        // BlockParameters of edge.target are defined ON edge arrival, not live across predecessors
+                        if (edge.destinations) {
+                            for (const auto& bp : *edge.destinations) {
+                                if (bp.target < regCount && regToDenseIdx[bp.target] >= 0) {
+                                    const auto dIdx = static_cast<std::size_t>(regToDenseIdx[bp.target]);
+                                    succIn[dIdx >> 6u] &= ~(std::uint64_t{1} << (dIdx & 63u));
+                                }
+                            }
+                        }
+                        for (std::size_t w = 0; w < nWords; ++w) accOut[w] |= succIn[w];
+                    };
+
+                    bool changed = true;
+                    while (changed) {
+                        changed = false;
+                        for (std::size_t rev = nBlocks; rev > 0; --rev) {
+                            const std::size_t b = rev - 1u;
+                            std::vector<std::uint64_t> newOut(nWords, 0ULL);
+                            edgeFilteredLiveIn(execFunc.blocks[b].branch, newOut);
+                            edgeFilteredLiveIn(execFunc.blocks[b].falseBranch, newOut);
+                            for (const auto ehSucc : extraSuccs[b]) {
+                                for (std::size_t w = 0; w < nWords; ++w) newOut[w] |= liveIn[ehSucc][w];
+                            }
+                            std::vector<std::uint64_t> newIn(nWords, 0ULL);
+                            for (std::size_t w = 0; w < nWords; ++w) {
+                                newIn[w] = useBits[b][w] | (newOut[w] & ~defBits[b][w]);
+                                if (newOut[w] != liveOut[b][w] || newIn[w] != liveIn[b][w]) {
+                                    changed = true;
+                                }
+                            }
+                            liveOut[b] = std::move(newOut);
+                            liveIn[b] = std::move(newIn);
+                        }
+                    }
+
+                    // Expand [intervalStart, intervalEnd] across blocks where the register is liveIn or liveOut
+                    // Also keep intervals live across any await suspension if async function
+                    for (std::size_t b = 0; b < nBlocks; ++b) {
+                        for (std::size_t dIdx = 0; dIdx < nOwned; ++dIdx) {
+                            if (testBit(liveIn[b], dIdx)) notePoint(dIdx, blkPosStart[b]);
+                            if (testBit(liveOut[b], dIdx)) notePoint(dIdx, blkPosEnd[b]);
+                        }
+                    }
+
+                    struct RegLiveInterval {
+                        std::uint16_t reg = 0;
+                        std::uint16_t slotSize = 1;
+                        std::uint32_t start = 0;
+                        std::uint32_t end = 0;
+                    };
+                    std::vector<RegLiveInterval> intervals;
+                    intervals.reserve(nOwned);
+                    for (std::size_t dIdx = 0; dIdx < nOwned; ++dIdx) {
+                        const std::uint16_t r = ownedStructRegs[dIdx];
+                        const std::uint16_t sz = regSchemas[r]->flatSlotCount;
+                        const std::uint32_t st = intervalStart[dIdx] == 0xFFFFFFFFu ? 0u : intervalStart[dIdx];
+                        const std::uint32_t en = intervalEnd[dIdx] < st ? st : intervalEnd[dIdx];
+                        intervals.push_back(RegLiveInterval{r, sz, st, en});
+                    }
+                    std::sort(intervals.begin(), intervals.end(), [](const RegLiveInterval& a, const RegLiveInterval& b) {
+                        if (a.start != b.start) return a.start < b.start;
+                        return a.reg < b.reg;
+                    });
+
+                    struct ActiveChunk {
+                        std::uint16_t offset = 0;
+                        std::uint16_t size = 0;
+                        std::uint32_t end = 0;
+                    };
+                    struct FreeChunk {
+                        std::uint16_t offset = 0;
+                        std::uint16_t size = 0;
+                    };
+                    std::vector<ActiveChunk> active;
+                    std::vector<FreeChunk> freePool;
+                    const std::size_t regArenaBase = payloadCursor;
+
+                    for (const auto& iv : intervals) {
+                        // Expire intervals whose last use strictly precedes iv.start
+                        for (std::size_t aIdx = 0; aIdx < active.size();) {
+                            if (active[aIdx].end < iv.start) {
+                                freePool.push_back(FreeChunk{active[aIdx].offset, active[aIdx].size});
+                                active[aIdx] = active.back();
+                                active.pop_back();
+                            } else {
+                                ++aIdx;
+                            }
+                        }
+                        // Best-fit reuse from freePool (prefer exact size match, else smallest sufficient chunk)
+                        std::size_t bestIdx = freePool.size();
+                        for (std::size_t fIdx = 0; fIdx < freePool.size(); ++fIdx) {
+                            if (freePool[fIdx].size == iv.slotSize) {
+                                bestIdx = fIdx;
+                                break;
+                            }
+                            if (freePool[fIdx].size > iv.slotSize &&
+                                (bestIdx == freePool.size() || freePool[fIdx].size < freePool[bestIdx].size)) {
+                                bestIdx = fIdx;
+                            }
+                        }
+                        std::uint16_t chosenOff = InvalidCompactReg;
+                        std::uint16_t chosenCap = iv.slotSize;
+                        if (bestIdx < freePool.size()) {
+                            chosenOff = freePool[bestIdx].offset;
+                            chosenCap = freePool[bestIdx].size;
+                            freePool[bestIdx] = freePool.back();
+                            freePool.pop_back();
+                        } else {
+                            chosenOff = allocPayloadBlock(iv.slotSize);
+                        }
+                        execFunc.slotPayloadOffsets[regSlot(iv.reg)] = chosenOff;
+                        active.push_back(ActiveChunk{chosenOff, chosenCap, iv.end});
+                    }
+                    compactedRegSlots = static_cast<std::uint32_t>(payloadCursor - regArenaBase);
+                }
+                execFunc.compactedRegPayloadSlots = compactedRegSlots;
+
+                if (maxEdgeStructLeaves > 0) {
+                    execFunc.edgeStructScratchOffset = allocPayloadBlock(maxEdgeStructLeaves);
+                }
+                execFunc.hasStructPayloads = (payloadCursor > singleSlots);
+                } // end if (anyFlatStructs)
+
+                // Allocate stack-backed cells for any non-escaping NewObject(__RsRef__*) not elided by BindLocalStackRef
+                if (anyStackRefOps && !execFunc.isAsyncFunction) {
+                    for (std::size_t bIdx = 0; bIdx < execFunc.blocks.size(); ++bIdx) {
+                        const auto& blk = execFunc.blocks[bIdx];
+                        for (std::size_t i = 0; i < blk.instructions.size(); ++i) {
+                            const auto& inst = blk.instructions[i];
+                            if (!inst.bytecode ||
+                                inst.bytecode->opcode != bytecode::Opcode::NewObject ||
+                                !inst.bytecode->operands.empty() ||
+                                inst.result >= regCount ||
+                                inst.bytecode->typeIndex >= module.types.size()) {
+                                continue;
+                            }
+                            if (i > 0 && blockLocalStackRefSites[bIdx][i - 1].isBind &&
+                                blockLocalStackRefSites[bIdx][i - 1].wrapReg == inst.result) {
+                                continue;
+                            }
+                            const auto srtIt = mirror->stackRefTemplateByTypeId.find(
+                                module.types[inst.bytecode->typeIndex].id);
+                            if (srtIt == mirror->stackRefTemplateByTypeId.end()) continue;
+                            if (!isNonEscapingBytecodeStackRef(static_cast<std::uint16_t>(inst.result))) continue;
+                            const auto& srt = mirror->stackRefTemplates[srtIt->second];
+                            blockStackRefCellOffsets[bIdx][i] = allocPayloadBlock(srt.slotCount);
+                        }
+                    }
+                }
+
+                if (payloadOverflow || payloadCursor >= InvalidCompactReg) {
+                    execFunc.canUseFlatFastPath = false;
+                    continue;
+                }
+                totalSlots = payloadCursor;
+            }
+            execFunc.totalFrameSlots = static_cast<std::uint32_t>(totalSlots);
 
             struct FlatBuildItem {
                 FlatInstruction hot{};
@@ -2355,24 +3522,259 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         continue;
                     }
 
+                    // Zero-copy BindLocalStackRef & WritebackLocalStackRef fusions
+                    if (bIdx < blockLocalStackRefSites.size() &&
+                        i < blockLocalStackRefSites[bIdx].size()) {
+                        const auto& site = blockLocalStackRefSites[bIdx][i];
+                        if (site.isBind) {
+                            const std::uint16_t locSl = localSlot(site.localIdx);
+                            const std::uint32_t targetOff = (site.flatSchemaId != 0u)
+                                ? static_cast<std::uint32_t>(execFunc.slotPayloadOffsets[locSl])
+                                : static_cast<std::uint32_t>(locSl);
+                            flat.flatOpcode = FlatOpcode::BindLocalStackRef;
+                            flat.span = site.span;
+                            flat.dstSlot = regSlot(site.wrapReg);
+                            flat.src0Slot = locSl;
+                            flat.aux0Slot = site.flatSchemaId;
+                            flat.auxImm32 = targetOff;
+                            buildStream.push_back({flat, cold});
+                            i += site.span;
+                            continue;
+                        }
+                        if (site.isWriteback) {
+                            const std::uint16_t locSl = localSlot(site.localIdx);
+                            const std::uint32_t targetOff = (site.flatSchemaId != 0u)
+                                ? static_cast<std::uint32_t>(execFunc.slotPayloadOffsets[locSl])
+                                : static_cast<std::uint32_t>(locSl);
+                            flat.flatOpcode = FlatOpcode::WritebackLocalStackRef;
+                            flat.span = site.span;
+                            flat.dstSlot = locSl;
+                            flat.src0Slot = regSlot(site.wrapReg);
+                            flat.aux0Slot = site.flatSchemaId;
+                            flat.auxImm32 = targetOff;
+                            buildStream.push_back({flat, cold});
+                            i += site.span;
+                            continue;
+                        }
+                    }
+
+                    // Flat-struct multi-instruction fusions (Prologue Copy, In-Place Field Store, Direct Local Init)
+                    if (anyFlatStructs && inst.bytecode) {
+                        // 0) Contiguous multi-hop nested struct field write on local, FlatStruct[] element, or StackSlotRef (span = 2*H + 1)
+                        if (bIdx < blockFusedNestedStore.size() &&
+                            i < blockFusedNestedStore[bIdx].size() &&
+                            blockFusedNestedStore[bIdx][i].valid) {
+                            const auto& meta = blockFusedNestedStore[bIdx][i];
+                            if (meta.rootMode == 0) {
+                                const std::uint16_t dstLocSlot = localSlot(meta.localIdx);
+                                flat.flatOpcode = FlatOpcode::StoreLocalStructFieldInPlace;
+                                flat.span = meta.span;
+                                flat.dstSlot = dstLocSlot;
+                                flat.src0Slot = dstLocSlot;
+                                flat.src1Slot = regSlot(meta.rhsReg);
+                                flat.aux0Slot = meta.totalLeafOffset;
+                                flat.aux1Slot = meta.leafSubSchemaId;
+                                flat.auxImm32 = execFunc.slotPayloadOffsets[dstLocSlot];
+                                flat.integerImmediate = static_cast<std::int64_t>(meta.rootTypeId);
+                            } else if (meta.rootMode == 1) {
+                                flat.flatOpcode = FlatOpcode::StoreElementStructFieldInPlace;
+                                flat.span = meta.span;
+                                flat.dstSlot = InvalidCompactReg;
+                                flat.src0Slot = regSlot(meta.arrReg);
+                                flat.src1Slot = regSlot(meta.idxReg);
+                                flat.src2Slot = regSlot(meta.rhsReg);
+                                flat.aux0Slot = meta.totalLeafOffset;
+                                flat.aux1Slot = meta.leafSubSchemaId;
+                                flat.auxImm32 = meta.rootSchemaId;
+                                flat.integerImmediate = static_cast<std::int64_t>(meta.rootTypeId);
+                            } else {
+                                flat.flatOpcode = FlatOpcode::StoreStackRefStructFieldInPlace;
+                                flat.span = meta.span;
+                                flat.dstSlot = InvalidCompactReg;
+                                flat.src0Slot = regSlot(meta.arrReg);
+                                flat.src1Slot = regSlot(meta.rhsReg);
+                                flat.aux0Slot = meta.totalLeafOffset;
+                                flat.aux1Slot = meta.leafSubSchemaId;
+                                flat.auxImm32 = meta.rootSchemaId;
+                                flat.integerImmediate = static_cast<std::int64_t>(meta.rootTypeId);
+                            }
+                            buildStream.push_back({flat, cold});
+                            i += meta.span;
+                            continue;
+                        }
+                        // 1) LoadParameter(struct) + StoreLocal(struct) single-use prologue -> CopyStructSlice(span=2)
+                        if (inst.opcode == QuickOpcode::LoadParameter &&
+                            inst.result < regCount &&
+                            regStructMode[inst.result] == StructRegMode::ElidedPrologueOrInPlace &&
+                            i + 1 < nInst &&
+                            blk.instructions[i + 1].opcode == QuickOpcode::StoreLocal &&
+                            blk.instructions[i + 1].op0 == inst.result) {
+                            const std::uint16_t dstLocSlot = localSlot(blk.instructions[i + 1].auxReg1);
+                            const std::uint16_t sid = execFunc.slotStructSchemaIds[dstLocSlot];
+                            if (const auto* sc = getFlatStructSchema(sid)) {
+                                flat.flatOpcode = FlatOpcode::CopyStructSlice;
+                                flat.span = 2;
+                                flat.dstSlot = dstLocSlot;
+                                flat.src0Slot = paramSlot(inst.auxReg1);
+                                flat.aux0Slot = sid;
+                                flat.aux1Slot = sc->flatSlotCount;
+                                flat.auxImm32 = execFunc.slotPayloadOffsets[dstLocSlot];
+                                flat.integerImmediate = static_cast<std::int64_t>(sc->structTypeId);
+                                buildStream.push_back({flat, cold});
+                                i += 2;
+                                continue;
+                            }
+                        }
+                        // 2) StoreStructField(r_alias, fIdx, r_rhs) + StoreLocal(loc, r_res) -> StoreLocalStructFieldInPlace(span=2)
+                        if (i < blockInPlaceStoreTarget[bIdx].size() &&
+                            blockInPlaceStoreTarget[bIdx][i] != InvalidCompactReg &&
+                            i + 1 < nInst &&
+                            inst.bytecode->typeIndex < module.types.size()) {
+                            const std::uint16_t locIdx = blockInPlaceStoreTarget[bIdx][i];
+                            const std::uint16_t dstLocSlot = localSlot(locIdx);
+                            const std::uint16_t sid = execFunc.slotStructSchemaIds[dstLocSlot];
+                            const auto* sc = getFlatStructSchema(sid);
+                            const std::size_t fIdx = inst.bytecode->index;
+                            if (sc && fIdx < sc->directFields.size() && inst.bytecode->operands.size() == 2) {
+                                const auto& fd = sc->directFields[fIdx];
+                                flat.flatOpcode = FlatOpcode::StoreLocalStructFieldInPlace;
+                                flat.span = 2;
+                                flat.dstSlot = dstLocSlot;
+                                flat.src0Slot = regSlot(static_cast<std::uint16_t>(inst.bytecode->operands[0]));
+                                flat.src1Slot = regSlot(static_cast<std::uint16_t>(inst.bytecode->operands[1]));
+                                flat.aux0Slot = fd.leafOffset;
+                                flat.aux1Slot = fd.subSchemaId;
+                                flat.auxImm32 = execFunc.slotPayloadOffsets[dstLocSlot];
+                                flat.integerImmediate = static_cast<std::int64_t>(sc->structTypeId);
+                                buildStream.push_back({flat, cold});
+                                i += 2;
+                                continue;
+                            }
+                        }
+                        // 3) Single-use NewStruct(flat) + StoreLocal(loc) -> InitStructSlice directly into localSlot (span=2)
+                        if (inst.bytecode->opcode == bytecode::Opcode::NewStruct &&
+                            inst.result < regCount &&
+                            regStructMode[inst.result] == StructRegMode::ElidedPrologueOrInPlace &&
+                            i + 1 < nInst &&
+                            blk.instructions[i + 1].opcode == QuickOpcode::StoreLocal &&
+                            blk.instructions[i + 1].op0 == inst.result) {
+                            const std::uint16_t dstLocSlot = localSlot(blk.instructions[i + 1].auxReg1);
+                            const std::uint16_t sid = execFunc.slotStructSchemaIds[dstLocSlot];
+                            if (const auto* sc = getFlatStructSchema(sid)) {
+                                flat.flatOpcode = FlatOpcode::InitStructSlice;
+                                flat.span = 2;
+                                flat.dstSlot = dstLocSlot;
+                                flat.aux0Slot = sid;
+                                flat.aux1Slot = sc->flatSlotCount;
+                                flat.auxImm32 = execFunc.slotPayloadOffsets[dstLocSlot];
+                                flat.integerImmediate = static_cast<std::int64_t>(sc->structTypeId);
+                                buildStream.push_back({flat, cold});
+                                i += 2;
+                                continue;
+                            }
+                        }
+                        // 4) Single-use LoadElement(flat struct) + StoreLocal(loc) -> LoadElementTypedFast directly into localSlot (span=2)
+                        if (inst.bytecode->opcode == bytecode::Opcode::LoadElement &&
+                            inst.bytecode->operands.size() == 2 &&
+                            inst.bytecode->operands[0] < regCount &&
+                            inst.bytecode->operands[1] < regCount &&
+                            inst.result < regCount &&
+                            regStructMode[inst.result] == StructRegMode::ElidedPrologueOrInPlace &&
+                            i + 1 < nInst &&
+                            blk.instructions[i + 1].opcode == QuickOpcode::StoreLocal &&
+                            blk.instructions[i + 1].op0 == inst.result) {
+                            const std::uint16_t dstLocSlot = localSlot(blk.instructions[i + 1].auxReg1);
+                            flat.flatOpcode = FlatOpcode::LoadElementTypedFast;
+                            flat.span = 2;
+                            flat.dstSlot = dstLocSlot;
+                            flat.src0Slot = regSlot(static_cast<std::uint16_t>(inst.bytecode->operands[0]));
+                            flat.src1Slot = regSlot(static_cast<std::uint16_t>(inst.bytecode->operands[1]));
+                            flat.binaryOpcode1 = static_cast<QuickOpcode>(static_cast<std::uint8_t>(inst.bytecode->elementType));
+                            flat.integerImmediate = static_cast<std::int64_t>(inst.bytecode->elementTypeId);
+                            buildStream.push_back({flat, cold});
+                            i += 2;
+                            continue;
+                        }
+                    }
+
                     // Single instruction mapping
                     flat.span = 1;
                     switch (inst.opcode) {
-                    case QuickOpcode::LoadParameter:
-                        flat.flatOpcode = FlatOpcode::MoveSlot;
-                        flat.dstSlot = regSlot(inst.result);
-                        flat.src0Slot = paramSlot(inst.auxReg1);
+                    case QuickOpcode::LoadParameter: {
+                        const std::uint16_t dst = regSlot(inst.result);
+                        const std::uint16_t src = paramSlot(inst.auxReg1);
+                        if (anyFlatStructs && dst < execFunc.slotStructSchemaIds.size() &&
+                            execFunc.slotStructSchemaIds[dst] != 0u) {
+                            if (regStructMode[inst.result] == StructRegMode::AliasSlice) {
+                                flat.flatOpcode = FlatOpcode::AliasStructSlice;
+                                flat.dstSlot = dst;
+                                flat.src0Slot = src;
+                            } else {
+                                const std::uint16_t sid = execFunc.slotStructSchemaIds[dst];
+                                const auto* sc = getFlatStructSchema(sid);
+                                flat.flatOpcode = FlatOpcode::CopyStructSlice;
+                                flat.dstSlot = dst;
+                                flat.src0Slot = src;
+                                flat.aux0Slot = sid;
+                                flat.aux1Slot = sc ? sc->flatSlotCount : 1u;
+                                flat.auxImm32 = execFunc.slotPayloadOffsets[dst];
+                                flat.integerImmediate = sc ? static_cast<std::int64_t>(sc->structTypeId) : 0;
+                            }
+                        } else {
+                            flat.flatOpcode = FlatOpcode::MoveSlot;
+                            flat.dstSlot = dst;
+                            flat.src0Slot = src;
+                        }
                         break;
-                    case QuickOpcode::LoadLocal:
-                        flat.flatOpcode = FlatOpcode::MoveSlot;
-                        flat.dstSlot = regSlot(inst.result);
-                        flat.src0Slot = localSlot(inst.auxReg1);
+                    }
+                    case QuickOpcode::LoadLocal: {
+                        const std::uint16_t dst = regSlot(inst.result);
+                        const std::uint16_t src = localSlot(inst.auxReg1);
+                        if (anyFlatStructs && dst < execFunc.slotStructSchemaIds.size() &&
+                            execFunc.slotStructSchemaIds[dst] != 0u) {
+                            if (regStructMode[inst.result] == StructRegMode::AliasSlice) {
+                                flat.flatOpcode = FlatOpcode::AliasStructSlice;
+                                flat.dstSlot = dst;
+                                flat.src0Slot = src;
+                            } else {
+                                const std::uint16_t sid = execFunc.slotStructSchemaIds[dst];
+                                const auto* sc = getFlatStructSchema(sid);
+                                flat.flatOpcode = FlatOpcode::CopyStructSlice;
+                                flat.dstSlot = dst;
+                                flat.src0Slot = src;
+                                flat.aux0Slot = sid;
+                                flat.aux1Slot = sc ? sc->flatSlotCount : 1u;
+                                flat.auxImm32 = execFunc.slotPayloadOffsets[dst];
+                                flat.integerImmediate = sc ? static_cast<std::int64_t>(sc->structTypeId) : 0;
+                            }
+                        } else {
+                            flat.flatOpcode = FlatOpcode::MoveSlot;
+                            flat.dstSlot = dst;
+                            flat.src0Slot = src;
+                        }
                         break;
-                    case QuickOpcode::StoreLocal:
-                        flat.flatOpcode = FlatOpcode::MoveSlot;
-                        flat.dstSlot = localSlot(inst.auxReg1);
-                        flat.src0Slot = regSlot(inst.op0);
+                    }
+                    case QuickOpcode::StoreLocal: {
+                        const std::uint16_t dst = localSlot(inst.auxReg1);
+                        const std::uint16_t src = regSlot(inst.op0);
+                        if (anyFlatStructs && dst < execFunc.slotStructSchemaIds.size() &&
+                            execFunc.slotStructSchemaIds[dst] != 0u) {
+                            const std::uint16_t sid = execFunc.slotStructSchemaIds[dst];
+                            const auto* sc = getFlatStructSchema(sid);
+                            flat.flatOpcode = FlatOpcode::CopyStructSlice;
+                            flat.dstSlot = dst;
+                            flat.src0Slot = src;
+                            flat.aux0Slot = sid;
+                            flat.aux1Slot = sc ? sc->flatSlotCount : 1u;
+                            flat.auxImm32 = execFunc.slotPayloadOffsets[dst];
+                            flat.integerImmediate = sc ? static_cast<std::int64_t>(sc->structTypeId) : 0;
+                        } else {
+                            flat.flatOpcode = FlatOpcode::MoveSlot;
+                            flat.dstSlot = dst;
+                            flat.src0Slot = src;
+                        }
                         break;
+                    }
                     case QuickOpcode::ConstantInt:
                         flat.flatOpcode = FlatOpcode::ConstantInt;
                         flat.dstSlot = regSlot(inst.result);
@@ -3077,6 +4479,27 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         break;
                     case QuickOpcode::LoadFieldFast: {
                         const auto& ownerType = module.types[inst.bytecode->typeIndex];
+                        if (inst.auxReg1 == 0) {
+                            const auto srtIt = mirror->stackRefTemplateByTypeId.find(ownerType.id);
+                            if (srtIt != mirror->stackRefTemplateByTypeId.end()) {
+                                const auto& srt = mirror->stackRefTemplates[srtIt->second];
+                                const std::uint16_t dstSl = regSlot(inst.result);
+                                flat.flatOpcode = FlatOpcode::LoadStackRefCell;
+                                flat.dstSlot = dstSl;
+                                flat.src0Slot = regSlot(inst.op0);
+                                flat.aux0Slot = srt.flatSchemaId;
+                                if (srt.flatSchemaId != 0u &&
+                                    inst.result < regCount &&
+                                    regStructMode[inst.result] != StructRegMode::AliasSlice &&
+                                    dstSl < execFunc.slotPayloadOffsets.size()) {
+                                    flat.auxImm32 = execFunc.slotPayloadOffsets[dstSl];
+                                } else {
+                                    flat.auxImm32 = InvalidStreamOffset;
+                                }
+                                flat.integerImmediate = static_cast<std::int64_t>(srt.innerTypeId);
+                                break;
+                            }
+                        }
                         const auto& fld = ownerType.fields[inst.auxReg1];
                         FastFieldKind fk = FastFieldKind::None;
                         std::uint8_t exactTag = 0u;
@@ -3099,6 +4522,18 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     }
                     case QuickOpcode::StoreFieldFast: {
                         const auto& ownerType = module.types[inst.bytecode->typeIndex];
+                        if (inst.auxReg1 == 0) {
+                            const auto srtIt = mirror->stackRefTemplateByTypeId.find(ownerType.id);
+                            if (srtIt != mirror->stackRefTemplateByTypeId.end()) {
+                                const auto& srt = mirror->stackRefTemplates[srtIt->second];
+                                flat.flatOpcode = FlatOpcode::StoreStackRefCell;
+                                flat.src0Slot = regSlot(inst.op0);
+                                flat.src1Slot = regSlot(inst.op1);
+                                flat.aux0Slot = srt.flatSchemaId;
+                                flat.integerImmediate = static_cast<std::int64_t>(srt.wrapperTypeId);
+                                break;
+                            }
+                        }
                         const auto& fld = ownerType.fields[inst.auxReg1];
                         FastFieldKind fk = FastFieldKind::None;
                         std::uint8_t exactTag = 0u;
@@ -3141,6 +4576,19 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                    fld.type == semantic::PrimitiveType::Struct &&
                                    fldTid == fixedTypeId()) {
                             flat.flatOpcode = FlatOpcode::LoadQuatFieldFast;
+                        } else if (const auto* sc = findFlatStructSchemaByTypeId(structType.id);
+                                   anyFlatStructs && sc != nullptr && inst.auxReg1 < sc->directFields.size()) {
+                            const auto& fd = sc->directFields[inst.auxReg1];
+                            flat.flatOpcode = FlatOpcode::LoadStructSliceField;
+                            flat.aux0Slot = fd.leafOffset;
+                            flat.aux1Slot = fd.subSchemaId;
+                            if (fd.subSchemaId != 0u &&
+                                inst.result < regCount &&
+                                regStructMode[inst.result] != StructRegMode::AliasSlice) {
+                                flat.auxImm32 = execFunc.slotPayloadOffsets[flat.dstSlot];
+                            } else {
+                                flat.auxImm32 = InvalidStreamOffset;
+                            }
                         } else {
                             flat.flatOpcode = FlatOpcode::LoadStructFieldFast;
                             flat.auxImm32 = inst.bytecode->typeIndex;
@@ -3170,6 +4618,13 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                    fld.type == semantic::PrimitiveType::Struct &&
                                    fldTid == fixedTypeId()) {
                             flat.flatOpcode = FlatOpcode::StoreQuatFieldFast;
+                        } else if (const auto* sc = findFlatStructSchemaByTypeId(structType.id);
+                                   anyFlatStructs && sc != nullptr && inst.auxReg1 < sc->directFields.size()) {
+                            flat.flatOpcode = FlatOpcode::StoreStructSliceField;
+                            flat.aux0Slot = sc->schemaId;
+                            flat.aux1Slot = inst.auxReg1;
+                            flat.auxImm32 = execFunc.slotPayloadOffsets[flat.dstSlot];
+                            flat.integerImmediate = static_cast<std::int64_t>(sc->structTypeId);
                         } else {
                             flat.flatOpcode = FlatOpcode::StoreStructFieldFast;
                             flat.auxImm32 = inst.bytecode->typeIndex;
@@ -3330,11 +4785,91 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     default:
                         if (inst.bytecode) {
                             const auto& bcInst = *inst.bytecode;
+                            if (anyFlatStructs &&
+                                bcInst.opcode == bytecode::Opcode::NewStruct &&
+                                bcInst.operands.empty() &&
+                                bcInst.result < regCount &&
+                                bcInst.typeIndex < module.types.size() &&
+                                module.types[bcInst.typeIndex].kind == semantic::TypeKind::Struct) {
+                                const auto dst = regSlot(static_cast<std::uint16_t>(bcInst.result));
+                                const std::uint16_t sid = execFunc.slotStructSchemaIds[dst];
+                                if (const auto* sc = getFlatStructSchema(sid)) {
+                                    flat.flatOpcode = FlatOpcode::InitStructSlice;
+                                    flat.dstSlot = dst;
+                                    flat.aux0Slot = sid;
+                                    flat.aux1Slot = sc->flatSlotCount;
+                                    flat.auxImm32 = execFunc.slotPayloadOffsets[dst];
+                                    flat.integerImmediate = static_cast<std::int64_t>(sc->structTypeId);
+                                    break;
+                                }
+                            }
+                            if (anyFlatStructs &&
+                                bcInst.opcode == bytecode::Opcode::LoadStructField &&
+                                bcInst.operands.size() == 1 &&
+                                bcInst.operands[0] < regCount &&
+                                bcInst.result < regCount &&
+                                bcInst.typeIndex < module.types.size() &&
+                                module.types[bcInst.typeIndex].kind == semantic::TypeKind::Struct) {
+                                const auto& stType = module.types[bcInst.typeIndex];
+                                if (const auto* sc = findFlatStructSchemaByTypeId(stType.id);
+                                    sc != nullptr && bcInst.index < sc->directFields.size()) {
+                                    const auto& fd = sc->directFields[bcInst.index];
+                                    const auto dst = regSlot(static_cast<std::uint16_t>(bcInst.result));
+                                    flat.flatOpcode = FlatOpcode::LoadStructSliceField;
+                                    flat.dstSlot = dst;
+                                    flat.src0Slot = regSlot(static_cast<std::uint16_t>(bcInst.operands[0]));
+                                    flat.aux0Slot = fd.leafOffset;
+                                    flat.aux1Slot = fd.subSchemaId;
+                                    flat.integerImmediate = static_cast<std::int64_t>(fd.typeId);
+                                    if (fd.subSchemaId != 0u &&
+                                        regStructMode[bcInst.result] != StructRegMode::AliasSlice) {
+                                        flat.auxImm32 = execFunc.slotPayloadOffsets[dst];
+                                    } else {
+                                        flat.auxImm32 = InvalidStreamOffset;
+                                    }
+                                    break;
+                                }
+                            }
+                            if (anyFlatStructs &&
+                                bcInst.opcode == bytecode::Opcode::StoreStructField &&
+                                bcInst.operands.size() == 2 &&
+                                bcInst.operands[0] < regCount &&
+                                bcInst.operands[1] < regCount &&
+                                bcInst.result < regCount &&
+                                bcInst.typeIndex < module.types.size() &&
+                                module.types[bcInst.typeIndex].kind == semantic::TypeKind::Struct) {
+                                const auto& stType = module.types[bcInst.typeIndex];
+                                if (const auto* sc = findFlatStructSchemaByTypeId(stType.id);
+                                    sc != nullptr && bcInst.index < sc->directFields.size()) {
+                                    const auto dst = regSlot(static_cast<std::uint16_t>(bcInst.result));
+                                    flat.flatOpcode = FlatOpcode::StoreStructSliceField;
+                                    flat.dstSlot = dst;
+                                    flat.src0Slot = regSlot(static_cast<std::uint16_t>(bcInst.operands[0]));
+                                    flat.src1Slot = regSlot(static_cast<std::uint16_t>(bcInst.operands[1]));
+                                    flat.aux0Slot = sc->schemaId;
+                                    flat.aux1Slot = static_cast<std::uint16_t>(bcInst.index);
+                                    flat.auxImm32 = execFunc.slotPayloadOffsets[dst];
+                                    flat.integerImmediate = static_cast<std::int64_t>(sc->structTypeId);
+                                    break;
+                                }
+                            }
                             if (bcInst.opcode == bytecode::Opcode::NewObject &&
                                 bcInst.operands.empty() &&
                                 bcInst.result < regCount &&
                                 bcInst.typeIndex < module.types.size()) {
                                 const auto& objType = module.types[bcInst.typeIndex];
+                                if (bIdx < blockStackRefCellOffsets.size() &&
+                                    i < blockStackRefCellOffsets[bIdx].size() &&
+                                    blockStackRefCellOffsets[bIdx][i] != InvalidCompactReg) {
+                                    const auto srtIt = mirror->stackRefTemplateByTypeId.find(objType.id);
+                                    if (srtIt != mirror->stackRefTemplateByTypeId.end()) {
+                                        flat.flatOpcode = FlatOpcode::InitStackRefCell;
+                                        flat.dstSlot = regSlot(static_cast<std::uint16_t>(bcInst.result));
+                                        flat.aux0Slot = srtIt->second;
+                                        flat.auxImm32 = blockStackRefCellOffsets[bIdx][i];
+                                        break;
+                                    }
+                                }
                                 const auto itTmpl = objectTemplateByTypeId.find(objType.id);
                                 if (itTmpl != objectTemplateByTypeId.end()) {
                                     flat.flatOpcode = FlatOpcode::NewObjectFast;
@@ -3365,6 +4900,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                     else if (bcInst.elementTypeId == vec2fTypeId()) flat.aux0Slot = 8;
                                     else if (bcInst.elementTypeId == vec3fTypeId()) flat.aux0Slot = 9;
                                     else if (bcInst.elementTypeId == quatfTypeId()) flat.aux0Slot = 10;
+                                    else if (findFlatStructSchemaByTypeId(bcInst.elementTypeId) != nullptr) flat.aux0Slot = 11;
                                     else flat.aux0Slot = 0;
                                 } else {
                                     flat.aux0Slot = 0;
@@ -4975,6 +6511,22 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         }
                         break;
                     }
+                    case FlatOpcode::InitStructSlice:
+                    case FlatOpcode::AliasStructSlice:
+                    case FlatOpcode::CopyStructSlice:
+                    case FlatOpcode::LoadStructSliceField:
+                    case FlatOpcode::StoreStructSliceField:
+                    case FlatOpcode::StoreLocalStructFieldInPlace:
+                    case FlatOpcode::InitStackRefCell:
+                    case FlatOpcode::BindLocalStackRef:
+                    case FlatOpcode::WritebackLocalStackRef:
+                    case FlatOpcode::LoadStackRefCell:
+                        setSlot(fi.dstSlot, ProvenTag::Mixed);
+                        break;
+                    case FlatOpcode::StoreElementStructFieldInPlace:
+                    case FlatOpcode::StoreStackRefCell:
+                    case FlatOpcode::StoreStackRefStructFieldInPlace:
+                        break;
                     case FlatOpcode::GenericBytecode:
                         std::fill(st.begin(), st.end(), ProvenTag::Mixed);
                         break;
@@ -5581,6 +7133,11 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     case FlatOpcode::LoadFieldExactFast:
                     case FlatOpcode::StoreFieldFast:
                     case FlatOpcode::StoreFieldExactFast:
+                    case FlatOpcode::AliasStructSlice:
+                    case FlatOpcode::LoadStructSliceField:
+                    case FlatOpcode::LoadStackRefCell:
+                    case FlatOpcode::StoreStackRefCell:
+                    case FlatOpcode::StoreStackRefStructFieldInPlace:
                     case FlatOpcode::ArrayLengthFast:
                     case FlatOpcode::LoadElementIntFast:
                     case FlatOpcode::LoadElementTypedFast:
@@ -5611,15 +7168,66 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         return false;
                     }
                 };
-                bool allPure = true;
+                if (execFunc.hasStructPayloads &&
+                    execFunc.edgeStructScratchOffset == InvalidCompactReg) {
+                    bool anyLivePayloadRef = false;
+                    for (std::size_t s = 0; s < execFunc.registerOffset && s < execFunc.slotStructSchemaIds.size(); ++s) {
+                        if (execFunc.slotStructSchemaIds[s] != 0u) {
+                            anyLivePayloadRef = true;
+                            break;
+                        }
+                    }
+                    for (std::size_t idx = 0; idx < execFunc.flatStream.size() && !anyLivePayloadRef; ++idx) {
+                        const auto& fi = execFunc.flatStream[idx];
+                        switch (fi.flatOpcode) {
+                        case FlatOpcode::InitStructSlice:
+                        case FlatOpcode::CopyStructSlice:
+                        case FlatOpcode::StoreStructSliceField:
+                        case FlatOpcode::StoreLocalStructFieldInPlace:
+                        case FlatOpcode::InitStackRefCell:
+                        case FlatOpcode::BindLocalStackRef:
+                        case FlatOpcode::WritebackLocalStackRef:
+                            anyLivePayloadRef = true;
+                            break;
+                        case FlatOpcode::LoadStructSliceField:
+                        case FlatOpcode::LoadStackRefCell:
+                            if (fi.auxImm32 != InvalidStreamOffset) {
+                                anyLivePayloadRef = true;
+                            }
+                            break;
+                        case FlatOpcode::LoadElementTypedFast:
+                            if (fi.dstSlot < execFunc.slotStructSchemaIds.size() &&
+                                execFunc.slotStructSchemaIds[fi.dstSlot] != 0u) {
+                                anyLivePayloadRef = true;
+                            }
+                            break;
+                        default:
+                            if (!isPureSlotInlinableOp(fi.flatOpcode)) {
+                                anyLivePayloadRef = true;
+                            }
+                            break;
+                        }
+                    }
+                    if (!anyLivePayloadRef) {
+                        execFunc.totalFrameSlots = static_cast<std::uint32_t>(execFunc.singleZoneSlots);
+                        execFunc.hasStructPayloads = false;
+                        execFunc.slotPayloadOffsets.clear();
+                        execFunc.slotStructSchemaIds.clear();
+                    }
+                }
+                bool allPure = (execFunc.totalFrameSlots == execFunc.singleZoneSlots);
                 for (const auto& fi : execFunc.flatStream) {
-                    if (!isPureSlotInlinableOp(fi.flatOpcode)) {
+                    if (!allPure || !isPureSlotInlinableOp(fi.flatOpcode) ||
+                        ((fi.flatOpcode == FlatOpcode::LoadStackRefCell ||
+                          fi.flatOpcode == FlatOpcode::LoadStructSliceField) &&
+                         fi.auxImm32 != InvalidStreamOffset)) {
                         allPure = false;
                         break;
                     }
                 }
                 execFunc.isSmallLeafInlineCandidate = allPure;
-                if (allPure && paramCount > 0 && execFunc.flatStream.size() > paramCount && localCount >= paramCount) {
+                if (allPure && !execFunc.hasStructPayloads && paramCount > 0 &&
+                    execFunc.flatStream.size() > paramCount && localCount >= paramCount) {
                     bool fastPrologue = true;
                     for (std::size_t p = 0; p < paramCount; ++p) {
                         const auto& pInst = execFunc.flatStream[p];
@@ -5775,6 +7383,18 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
             };
             const auto hasAuxNonSlotMeta = [](FlatOpcode op) noexcept -> bool {
                 return op == FlatOpcode::NewStructFast ||
+                    op == FlatOpcode::InitStructSlice ||
+                    op == FlatOpcode::CopyStructSlice ||
+                    op == FlatOpcode::LoadStructSliceField ||
+                    op == FlatOpcode::StoreStructSliceField ||
+                    op == FlatOpcode::StoreLocalStructFieldInPlace ||
+                    op == FlatOpcode::StoreElementStructFieldInPlace ||
+                    op == FlatOpcode::InitStackRefCell ||
+                    op == FlatOpcode::BindLocalStackRef ||
+                    op == FlatOpcode::WritebackLocalStackRef ||
+                    op == FlatOpcode::LoadStackRefCell ||
+                    op == FlatOpcode::StoreStackRefCell ||
+                    op == FlatOpcode::StoreStackRefStructFieldInPlace ||
                     op == FlatOpcode::NewArrayFast ||
                     op == FlatOpcode::NewObjectFast ||
                     op == FlatOpcode::CheckNotNullFast ||
@@ -6180,6 +7800,27 @@ const semantic::TypeSymbol* ProgramImage::resolveType(
     semantic::SymbolId typeId) const noexcept {
     const auto found = types_.find(typeId);
     return found == types_.end() ? nullptr : found->second;
+}
+
+std::optional<ProgramImage::FrameStructAllocationStats> ProgramImage::functionStructFrameStats(
+    const std::string& qualifiedName) const {
+    const auto symOpt = findFunction(qualifiedName);
+    if (!symOpt || !executionMirror_) return std::nullopt;
+    const auto* loc = resolveFunction(*symOpt);
+    if (!loc || !loc->function) return std::nullopt;
+    const auto* execFn = detail::findExecutionFunction(*executionMirror_, *loc->function);
+    if (!execFn) return std::nullopt;
+    FrameStructAllocationStats stats{};
+    stats.singleZoneSlots = execFn->singleZoneSlots;
+    stats.payloadZoneSlots = execFn->totalFrameSlots >= execFn->singleZoneSlots
+        ? (execFn->totalFrameSlots - execFn->singleZoneSlots)
+        : 0u;
+    stats.uncompactedRegPayloadSlots = execFn->uncompactedRegPayloadSlots;
+    stats.compactedRegPayloadSlots = execFn->compactedRegPayloadSlots;
+    stats.reusedRegPayloadSlots = execFn->uncompactedRegPayloadSlots >= execFn->compactedRegPayloadSlots
+        ? (execFn->uncompactedRegPayloadSlots - execFn->compactedRegPayloadSlots)
+        : 0u;
+    return stats;
 }
 
 } // namespace realscript::runtime

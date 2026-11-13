@@ -423,47 +423,98 @@ GeneratedProgram CppGenerator::generate(
     source.line();
 
     std::unordered_set<semantic::SymbolId> unboxableCustomStructs;
-    for (const auto& [id, view] : types) {
-        (void)id;
-        const auto& type = *view.type;
-        if (type.kind != semantic::TypeKind::Struct ||
-            classifyInlineMath(semantic::PrimitiveType::Struct, type.id) !=
-                InlineMathKind::None ||
-            type.fields.empty() ||
-            type.fields.size() > 16) {
-            continue;
-        }
-        bool allScalarOrMath = true;
-        for (const auto& field : type.fields) {
-            const auto fieldTypeId = semantic::isExactType(field.type) && !field.typeName.empty()
-                ? semantic::stableTypeId(field.typeName)
-                : 0;
-            if (field.staticField ||
-                field.type == semantic::PrimitiveType::Enum ||
-                field.type == semantic::PrimitiveType::Object ||
-                field.type == semantic::PrimitiveType::Array ||
-                field.type == semantic::PrimitiveType::String ||
-                !isTypedAotSlot({field.type, fieldTypeId}, nullptr)) {
-                allScalarOrMath = false;
-                break;
+    std::vector<semantic::SymbolId> orderedUnboxableStructs;
+    for (bool progress = true; progress;) {
+        progress = false;
+        for (const auto& [id, view] : types) {
+            if (unboxableCustomStructs.find(id) != unboxableCustomStructs.end()) {
+                continue;
             }
-        }
-        if (allScalarOrMath) {
-            unboxableCustomStructs.insert(type.id);
+            const auto& type = *view.type;
+            if (type.kind != semantic::TypeKind::Struct ||
+                classifyInlineMath(semantic::PrimitiveType::Struct, type.id) !=
+                    InlineMathKind::None ||
+                type.fields.empty() ||
+                type.fields.size() > 256) {
+                continue;
+            }
+            bool allScalarMathOrNested = true;
+            for (const auto& field : type.fields) {
+                const auto fieldTypeId = semantic::isExactType(field.type) && !field.typeName.empty()
+                    ? semantic::stableTypeId(field.typeName)
+                    : 0;
+                if (field.staticField ||
+                    !isTypedAotSlot({field.type, fieldTypeId}, &unboxableCustomStructs)) {
+                    allScalarMathOrNested = false;
+                    break;
+                }
+            }
+            if (allScalarMathOrNested) {
+                unboxableCustomStructs.insert(type.id);
+                orderedUnboxableStructs.push_back(type.id);
+                progress = true;
+            }
         }
     }
 
-    for (const auto& [id, view] : types) {
-        if (unboxableCustomStructs.find(id) == unboxableCustomStructs.end()) {
-            continue;
+    std::unordered_map<semantic::SymbolId, std::size_t> structGcSlotCounts;
+    for (const auto id : orderedUnboxableStructs) {
+        const auto viewIt = types.find(id);
+        if (viewIt == types.end()) continue;
+        const auto& type = *viewIt->second.type;
+        bool hasNestedCustomStructField = false;
+        std::size_t gcSlots = 0;
+        for (const auto& field : type.fields) {
+            const auto fTid = exactTypeId(field.type, field.typeName);
+            if ((field.type == semantic::PrimitiveType::Struct &&
+                 classifyInlineMath(field.type, fTid) == InlineMathKind::None) ||
+                field.type == semantic::PrimitiveType::Enum ||
+                field.type == semantic::PrimitiveType::Object ||
+                field.type == semantic::PrimitiveType::Array ||
+                field.type == semantic::PrimitiveType::String) {
+                hasNestedCustomStructField = true;
+            }
+            if (field.type == semantic::PrimitiveType::Object ||
+                field.type == semantic::PrimitiveType::Array ||
+                field.type == semantic::PrimitiveType::String) {
+                ++gcSlots;
+            } else if (field.type == semantic::PrimitiveType::Struct &&
+                       classifyInlineMath(field.type, fTid) == InlineMathKind::None) {
+                const auto gcIt = structGcSlotCounts.find(fTid);
+                if (gcIt != structGcSlotCounts.end()) {
+                    gcSlots += gcIt->second;
+                }
+            }
         }
-        const auto& type = *view.type;
+        structGcSlotCounts[type.id] = gcSlots;
         const std::string structName = "AotStruct_" + hexId(type.id);
         source.line("struct " + structName + " {");
         source.line("    // RealScript struct: " + semantic::canonicalTypeName(type));
         source.line("    static constexpr bool kIsGeneratedAotStruct = true;");
         source.line("    static constexpr semantic::SymbolId kTypeId = 0x" + hexId(type.id) + "ULL;");
         source.line("    static constexpr std::size_t kFieldCount = " + std::to_string(type.fields.size()) + "u;");
+        source.line("    static constexpr std::size_t kGcSlotCount = " + std::to_string(gcSlots) + "u;");
+        source.line("    static void retainGcSlots(runtime::ManagedHeap* rawH, runtime::PersistentRoot*& slotCursor, const " + structName + "& val) {");
+        if (gcSlots == 0) {
+            source.line("        (void)rawH; (void)slotCursor; (void)val;");
+        } else {
+            for (std::size_t i = 0; i < type.fields.size(); ++i) {
+                const auto& field = type.fields[i];
+                const auto fTid = exactTypeId(field.type, field.typeName);
+                if (field.type == semantic::PrimitiveType::Object ||
+                    field.type == semantic::PrimitiveType::Array ||
+                    field.type == semantic::PrimitiveType::String) {
+                    source.line("        aot::retainTypedGcSlot(rawH, *slotCursor++, val.f_" + std::to_string(i) + ");");
+                } else if (field.type == semantic::PrimitiveType::Struct &&
+                           classifyInlineMath(field.type, fTid) == InlineMathKind::None) {
+                    const auto gcIt = structGcSlotCounts.find(fTid);
+                    if (gcIt != structGcSlotCounts.end() && gcIt->second > 0) {
+                        source.line("        AotStruct_" + hexId(fTid) + "::retainGcSlots(rawH, slotCursor, val.f_" + std::to_string(i) + ");");
+                    }
+                }
+            }
+        }
+        source.line("    }");
         for (std::size_t i = 0; i < type.fields.size(); ++i) {
             const auto& field = type.fields[i];
             const auto fTypeId = exactTypeId(field.type, field.typeName);
@@ -481,6 +532,24 @@ GeneratedProgram CppGenerator::generate(
         source.line("    friend bool operator!=(const " + structName + "& left, const " + structName + "& right) noexcept {");
         source.line("        return !(left == right);");
         source.line("    }");
+        std::string heapEqExpr = "true";
+        for (std::size_t i = 0; i < type.fields.size(); ++i) {
+            const auto& field = type.fields[i];
+            const auto fTid = exactTypeId(field.type, field.typeName);
+            const auto idxStr = std::to_string(i);
+            if (field.type == semantic::PrimitiveType::String) {
+                heapEqExpr += " && aot::equalStringValuesNoThrow(rawH, left.f_" + idxStr + ", right.f_" + idxStr + ")";
+            } else if (field.type == semantic::PrimitiveType::Struct &&
+                       classifyInlineMath(field.type, fTid) == InlineMathKind::None) {
+                heapEqExpr += " && AotStruct_" + hexId(fTid) + "::equalsWithHeap(rawH, left.f_" + idxStr + ", right.f_" + idxStr + ")";
+            } else {
+                heapEqExpr += " && (left.f_" + idxStr + " == right.f_" + idxStr + ")";
+            }
+        }
+        source.line("    [[nodiscard]] static bool equalsWithHeap(const runtime::ManagedHeap* rawH, const " + structName + "& left, const " + structName + "& right) noexcept {");
+        source.line("        (void)rawH;");
+        source.line("        return " + heapEqExpr + ";");
+        source.line("    }");
         source.line("    [[nodiscard]] runtime::Value boxToValue() const {");
         source.line("        const std::array<runtime::Value, " + std::to_string(type.fields.size()) + "> fields{{");
         for (std::size_t i = 0; i < type.fields.size(); ++i) {
@@ -490,9 +559,63 @@ GeneratedProgram CppGenerator::generate(
         source.line("        }};");
         source.line("        return runtime::Value{runtime::makeStructValueFromFields(kTypeId, runtime::ValueSpan(fields.data(), fields.size()))};");
         source.line("    }");
+        source.line("    [[nodiscard]] static bool loadFromFlatLeaves(const runtime::Value*& cur, " + structName + "& out) noexcept {");
+        for (std::size_t i = 0; i < type.fields.size(); ++i) {
+            const auto& field = type.fields[i];
+            const auto fTid = exactTypeId(field.type, field.typeName);
+            if (field.type == semantic::PrimitiveType::Struct &&
+                classifyInlineMath(field.type, fTid) == InlineMathKind::None) {
+                source.line("        if (!AotStruct_" + hexId(fTid) + "::loadFromFlatLeaves(cur, out.f_" + std::to_string(i) + ")) return false;");
+            } else {
+                source.line("        if (!aot::typedUnboxScalar(" + primitiveExpression(field.type) + ", *cur++, out.f_" + std::to_string(i) + ")) return false;");
+            }
+        }
+        source.line("        return true;");
+        source.line("    }");
+        source.line("    static void storeToFlatLeaves(runtime::Value*& cur, const " + structName + "& val) {");
+        for (std::size_t i = 0; i < type.fields.size(); ++i) {
+            const auto& field = type.fields[i];
+            const auto fTid = exactTypeId(field.type, field.typeName);
+            if (field.type == semantic::PrimitiveType::Struct &&
+                classifyInlineMath(field.type, fTid) == InlineMathKind::None) {
+                source.line("        AotStruct_" + hexId(fTid) + "::storeToFlatLeaves(cur, val.f_" + std::to_string(i) + ");");
+            } else {
+                source.line("        *cur++ = aot::typedBoxScalar(" + primitiveExpression(field.type) + ", val.f_" + std::to_string(i) + ");");
+            }
+        }
+        source.line("    }");
+        source.line("    static void storeToFlatLeavesPinned(runtime::Value*& cur, const " + structName + "& val) {");
+        for (std::size_t i = 0; i < type.fields.size(); ++i) {
+            const auto& field = type.fields[i];
+            const auto fTid = exactTypeId(field.type, field.typeName);
+            const auto mathKind = classifyInlineMath(field.type, fTid);
+            if (field.type == semantic::PrimitiveType::Struct &&
+                mathKind == InlineMathKind::None) {
+                source.line("        AotStruct_" + hexId(fTid) + "::storeToFlatLeavesPinned(cur, val.f_" + std::to_string(i) + ");");
+            } else if (field.type == semantic::PrimitiveType::String ||
+                       field.type == semantic::PrimitiveType::Enum ||
+                       mathKind == InlineMathKind::Quat ||
+                       mathKind == InlineMathKind::Quatf) {
+                source.line("        {");
+                source.line("            const runtime::Value lv_" + std::to_string(i) + " = aot::typedBoxScalar(" + primitiveExpression(field.type) + ", val.f_" + std::to_string(i) + ");");
+                source.line("            runtime::pinValueInPools(lv_" + std::to_string(i) + ");");
+                source.line("            *cur++ = lv_" + std::to_string(i) + ";");
+                source.line("        }");
+            } else {
+                source.line("        *cur++ = aot::typedBoxScalar(" + primitiveExpression(field.type) + ", val.f_" + std::to_string(i) + ");");
+            }
+        }
+        source.line("    }");
         source.line("    [[nodiscard]] static bool unboxFromValue(const runtime::Value& value, " + structName + "& out) {");
         source.line("        const auto* s = std::get_if<runtime::StructValue>(&value);");
         source.line("        if (!s || !s->valid() || s->typeId != kTypeId || s->fieldCount() != kFieldCount) return false;");
+        source.line("        if (s->isFrameSlice()) {");
+        source.line("            if (const auto* sc = runtime::getFlatStructSchema(s->frameSchemaId())) {");
+        source.line("                if (const runtime::Value* leaves = runtime::detail::lookupFlatStackSlice(s->storage.frameSliceBank(), s->storage.frameSliceOffset(), sc->flatSlotCount)) {");
+        source.line("                    return loadFromFlatLeaves(leaves, out);");
+        source.line("                }");
+        source.line("            }");
+        source.line("        }");
         for (std::size_t i = 0; i < type.fields.size(); ++i) {
             const auto& field = type.fields[i];
             source.line("        if (const auto fv_" + std::to_string(i) + " = runtime::structValueFieldAt(*s, " + std::to_string(i) + "u)) {");
@@ -502,28 +625,36 @@ GeneratedProgram CppGenerator::generate(
         source.line("        return true;");
         source.line("    }");
         source.line("    static bool loadFromRawColumn(const aot::TypedRawColumnCache& rawCol, std::int64_t index, " + structName + "& out) noexcept {");
-        source.line("        if (RS_AOT_LIKELY(rawCol.exactNativeLayout)) {");
-        source.line("            std::memcpy(&out, rawCol.basePtr + static_cast<std::size_t>(index) * sizeof(" + structName + "), sizeof(" + structName + "));");
-        source.line("            return true;");
-        source.line("        }");
-        source.line("        const std::uint8_t* elemPtr = rawCol.basePtr + static_cast<std::size_t>(index) * rawCol.strideBytes;");
-        for (std::size_t i = 0; i < type.fields.size(); ++i) {
-            source.line("        out.f_" + std::to_string(i) + " = aot::readRawColumnField<decltype(out.f_" +
-                std::to_string(i) + ")>(elemPtr, rawCol.fields[" + std::to_string(i) + "u]);");
+        if (hasNestedCustomStructField) {
+            source.line("        (void)rawCol; (void)index; (void)out; return false;");
+        } else {
+            source.line("        if (RS_AOT_LIKELY(rawCol.exactNativeLayout)) {");
+            source.line("            std::memcpy(&out, rawCol.basePtr + static_cast<std::size_t>(index) * sizeof(" + structName + "), sizeof(" + structName + "));");
+            source.line("            return true;");
+            source.line("        }");
+            source.line("        const std::uint8_t* elemPtr = rawCol.basePtr + static_cast<std::size_t>(index) * rawCol.strideBytes;");
+            for (std::size_t i = 0; i < type.fields.size(); ++i) {
+                source.line("        out.f_" + std::to_string(i) + " = aot::readRawColumnField<decltype(out.f_" +
+                    std::to_string(i) + ")>(elemPtr, rawCol.fields[" + std::to_string(i) + "u]);");
+            }
+            source.line("        return true;");
         }
-        source.line("        return true;");
         source.line("    }");
         source.line("    static bool storeToRawColumn(const aot::TypedRawColumnCache& rawCol, std::int64_t index, const " + structName + "& val) noexcept {");
-        source.line("        if (RS_AOT_LIKELY(rawCol.exactNativeLayout)) {");
-        source.line("            std::memcpy(rawCol.basePtr + static_cast<std::size_t>(index) * sizeof(" + structName + "), &val, sizeof(" + structName + "));");
-        source.line("            return true;");
-        source.line("        }");
-        source.line("        std::uint8_t* elemPtr = rawCol.basePtr + static_cast<std::size_t>(index) * rawCol.strideBytes;");
-        for (std::size_t i = 0; i < type.fields.size(); ++i) {
-            source.line("        aot::writeRawColumnField<decltype(val.f_" +
-                std::to_string(i) + ")>(elemPtr, rawCol.fields[" + std::to_string(i) + "u], val.f_" + std::to_string(i) + ");");
+        if (hasNestedCustomStructField) {
+            source.line("        (void)rawCol; (void)index; (void)val; return false;");
+        } else {
+            source.line("        if (RS_AOT_LIKELY(rawCol.exactNativeLayout)) {");
+            source.line("            std::memcpy(rawCol.basePtr + static_cast<std::size_t>(index) * sizeof(" + structName + "), &val, sizeof(" + structName + "));");
+            source.line("            return true;");
+            source.line("        }");
+            source.line("        std::uint8_t* elemPtr = rawCol.basePtr + static_cast<std::size_t>(index) * rawCol.strideBytes;");
+            for (std::size_t i = 0; i < type.fields.size(); ++i) {
+                source.line("        aot::writeRawColumnField<decltype(val.f_" +
+                    std::to_string(i) + ")>(elemPtr, rawCol.fields[" + std::to_string(i) + "u], val.f_" + std::to_string(i) + ");");
+            }
+            source.line("        return true;");
         }
-        source.line("        return true;");
         source.line("    }");
         source.line("};");
         source.line("static constexpr aot::GeneratedFieldLayout " + structName + "_layout[] = {");
@@ -997,7 +1128,36 @@ GeneratedProgram CppGenerator::generate(
             const bool isAsyncFunction = !function.blocks.empty() &&
                 !function.blocks.front().instructions.empty() &&
                 function.blocks.front().instructions.front().opcode == mir::Opcode::AsyncEnter;
-            source.line("    FrameScope frame(context, argumentValues, locals, registers);");
+            source.line("    FrameScope frame(context, argumentValues, locals, registers, " +
+                std::string(!isAsyncFunction ? "true" : "false") + ");");
+            const auto allMembersNonEscapingStackRef =
+                [&](std::size_t bIdx, std::size_t iIdx) noexcept -> bool {
+                if (isAsyncFunction) return false;
+                for (const auto& member : group.members) {
+                    const auto* mf = member.view->function;
+                    if (bIdx >= mf->blocks.size() ||
+                        iIdx >= mf->blocks[bIdx].instructions.size() ||
+                        !isNonEscapingMirStackRefAlloc(
+                            *mf, mf->blocks[bIdx].instructions[iIdx], types)) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            if (!isAsyncFunction) {
+                bool hasNonEscapingStackRef = false;
+                for (std::size_t bIdx = 0; bIdx < function.blocks.size() && !hasNonEscapingStackRef; ++bIdx) {
+                    for (std::size_t iIdx = 0; iIdx < function.blocks[bIdx].instructions.size(); ++iIdx) {
+                        if (allMembersNonEscapingStackRef(bIdx, iIdx)) {
+                            hasNonEscapingStackRef = true;
+                            break;
+                        }
+                    }
+                }
+                if (hasNonEscapingStackRef) {
+                    source.line("    StackRefScope aotStackRefScope(context);");
+                }
+            }
             source.line("    std::uint32_t currentBlock = 0;");
             if (isAsyncFunction) {
                 source.line("    runtime::CoroutineFrameHandle activeCoroutine{};");
@@ -1163,7 +1323,11 @@ GeneratedProgram CppGenerator::generate(
                         break;
                     case mir::Opcode::NewObject: {
                         const auto tidExpr = nextSpecTypeExpr();
-                        source.line("            if (!context.newObject(" +
+                        const std::size_t blkIdx = static_cast<std::size_t>(&block - function.blocks.data());
+                        const char* allocFn = allMembersNonEscapingStackRef(blkIdx, instructionIndex)
+                            ? "context.newStackRefObject("
+                            : "context.newObject(";
+                        source.line("            if (!" + std::string(allocFn) +
                             tidExpr + ", " + resExpr + ")) return false;");
                         break;
                     }
@@ -1465,8 +1629,8 @@ GeneratedProgram CppGenerator::generate(
                     source.line("            return true;");
                     break;
                 case mir::TerminatorKind::ReturnValue:
-                    source.line("            result = " +
-                        valueExpression(block.terminator.value) + ";");
+                    source.line("            result = runtime::detachFrameSliceValue(" +
+                        valueExpression(block.terminator.value) + ");");
                     source.line("            return true;");
                     break;
                 case mir::TerminatorKind::Jump:
@@ -1612,7 +1776,23 @@ GeneratedProgram CppGenerator::generate(
         const bool isAsyncFunction = !function.blocks.empty() &&
             !function.blocks.front().instructions.empty() &&
             function.blocks.front().instructions.front().opcode == mir::Opcode::AsyncEnter;
-        source.line("    FrameScope frame(context, argumentValues, locals, registers);");
+        source.line("    FrameScope frame(context, argumentValues, locals, registers, " +
+            std::string(!isAsyncFunction ? "true" : "false") + ");");
+        if (!isAsyncFunction) {
+            bool hasNonEscapingStackRef = false;
+            for (const auto& blk : function.blocks) {
+                for (const auto& inst : blk.instructions) {
+                    if (isNonEscapingMirStackRefAlloc(function, inst, types)) {
+                        hasNonEscapingStackRef = true;
+                        break;
+                    }
+                }
+                if (hasNonEscapingStackRef) break;
+            }
+            if (hasNonEscapingStackRef) {
+                source.line("    StackRefScope aotStackRefScope(context);");
+            }
+        }
         source.line("    std::uint32_t currentBlock = 0;");
         if (isAsyncFunction) {
             source.line("    runtime::CoroutineFrameHandle activeCoroutine{};");
@@ -1751,13 +1931,18 @@ GeneratedProgram CppGenerator::generate(
                         std::to_string(instruction.localIndex) + "] = " +
                         operand(0) + ";");
                     break;
-                case mir::Opcode::NewObject:
-                    source.line("            if (!context.newObject(0x" +
+                case mir::Opcode::NewObject: {
+                    const char* allocFn = (!isAsyncFunction &&
+                        isNonEscapingMirStackRefAlloc(function, instruction, types))
+                        ? "context.newStackRefObject(0x"
+                        : "context.newObject(0x";
+                    source.line("            if (!" + std::string(allocFn) +
                         hexId(instruction.resultTypeId != 0
                             ? instruction.resultTypeId
                             : instruction.typeId) + "ULL, " + result +
                         ")) return false;");
                     break;
+                }
                 case mir::Opcode::NewStruct:
                     source.line("            if (!context.newStruct(0x" +
                         hexId(instruction.resultTypeId != 0
@@ -2026,8 +2211,8 @@ GeneratedProgram CppGenerator::generate(
                 source.line("            return true;");
                 break;
             case mir::TerminatorKind::ReturnValue:
-                source.line("            result = " +
-                    valueExpression(block.terminator.value) + ";");
+                source.line("            result = runtime::detachFrameSliceValue(" +
+                    valueExpression(block.terminator.value) + ");");
                 source.line("            return true;");
                 break;
             case mir::TerminatorKind::Jump:

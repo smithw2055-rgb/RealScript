@@ -73,38 +73,93 @@ void emitTypedPrimitiveFunction(
         std::numeric_limits<std::size_t>::max());
     std::size_t totalGcGuardSlots = 0;
     bool hasRefParams = false;
+    const auto countSlotGcGuards = [&](const auto& self, TypedSlotType slot, int depth) -> std::size_t {
+        if (depth > 32) return 0;
+        if (slot.primitive == semantic::PrimitiveType::Object ||
+            slot.primitive == semantic::PrimitiveType::Array ||
+            slot.primitive == semantic::PrimitiveType::String) {
+            return 1;
+        }
+        if (slot.primitive == semantic::PrimitiveType::Struct &&
+            classifyInlineMath(slot.primitive, slot.typeId) == InlineMathKind::None) {
+            const auto tIt = allTypes.find(slot.typeId);
+            if (tIt != allTypes.end() && tIt->second.type &&
+                tIt->second.type->kind == semantic::TypeKind::Struct) {
+                std::size_t sum = 0;
+                for (const auto& field : tIt->second.type->fields) {
+                    if (field.staticField) continue;
+                    const auto fTid = semantic::isExactType(field.type) && !field.typeName.empty()
+                        ? semantic::stableTypeId(field.typeName)
+                        : 0;
+                    sum += self(self, TypedSlotType{field.type, fTid}, depth + 1);
+                }
+                return sum;
+            }
+        }
+        return 0;
+    };
     for (std::size_t pIdx = 0; pIdx < function.parameterTypes.size(); ++pIdx) {
-        if (function.parameterTypes[pIdx] == semantic::PrimitiveType::Object ||
-            function.parameterTypes[pIdx] == semantic::PrimitiveType::Array) {
-            paramGuardSlot[pIdx] = totalGcGuardSlots++;
+        const auto pTid = pIdx < function.parameterTypeIds.size() ? function.parameterTypeIds[pIdx] : 0;
+        const std::size_t slots = countSlotGcGuards(
+            countSlotGcGuards, {function.parameterTypes[pIdx], pTid}, 0);
+        if (slots > 0) {
+            paramGuardSlot[pIdx] = totalGcGuardSlots;
+            totalGcGuardSlots += slots;
             hasRefParams = true;
         }
     }
     for (std::size_t lIdx = 0; lIdx < function.localTypes.size(); ++lIdx) {
-        if (function.localTypes[lIdx] == semantic::PrimitiveType::Object ||
-            function.localTypes[lIdx] == semantic::PrimitiveType::Array) {
-            localGuardSlot[lIdx] = totalGcGuardSlots++;
+        const auto lTid = lIdx < function.localTypeIds.size() ? function.localTypeIds[lIdx] : 0;
+        const std::size_t slots = countSlotGcGuards(
+            countSlotGcGuards, {function.localTypes[lIdx], lTid}, 0);
+        if (slots > 0) {
+            localGuardSlot[lIdx] = totalGcGuardSlots;
+            totalGcGuardSlots += slots;
         }
     }
     for (std::size_t rIdx = 0; rIdx < types.size(); ++rIdx) {
-        if (types[rIdx].primitive == semantic::PrimitiveType::Object ||
-            types[rIdx].primitive == semantic::PrimitiveType::Array) {
-            regGuardSlot[rIdx] = totalGcGuardSlots++;
+        const std::size_t slots = countSlotGcGuards(countSlotGcGuards, types[rIdx], 0);
+        if (slots > 0) {
+            regGuardSlot[rIdx] = totalGcGuardSlots;
+            totalGcGuardSlots += slots;
         }
     }
+    bool hasHeapAllocOrCallInFn = false;
+    for (const auto& blk : function.blocks) {
+        for (const auto& inst : blk.instructions) {
+            if (inst.opcode == mir::Opcode::NewObject ||
+                inst.opcode == mir::Opcode::NewArray ||
+                inst.opcode == mir::Opcode::ConstantString ||
+                inst.opcode == mir::Opcode::NewDelegate ||
+                inst.opcode == mir::Opcode::CombineDelegate ||
+                inst.opcode == mir::Opcode::RemoveDelegate ||
+                inst.opcode == mir::Opcode::Call ||
+                inst.opcode == mir::Opcode::InvokeDelegate ||
+                inst.opcode == mir::Opcode::AwaitSuspend ||
+                inst.opcode == mir::Opcode::AwaitResume ||
+                inst.opcode == mir::Opcode::AsyncResolve) {
+                hasHeapAllocOrCallInFn = true;
+                break;
+            }
+        }
+        if (hasHeapAllocOrCallInFn) break;
+    }
+    const std::string gcGuardCond = hasHeapAllocOrCallInFn
+        ? "true"
+        : "!FastAccounting && !DeterminismAccounting && !TrustedRelease";
     if (totalGcGuardSlots > 0) {
-        source.line("    std::conditional_t<!FastAccounting && !DeterminismAccounting && !TrustedRelease, std::array<runtime::PersistentRoot, " +
+        source.line("    std::conditional_t<" + gcGuardCond + ", std::array<runtime::PersistentRoot, " +
             std::to_string(totalGcGuardSlots) + ">, aot::EmptyGcGuards> typedLocalGcGuards{};");
     } else {
         source.line("    aot::EmptyGcGuards typedLocalGcGuards{};");
     }
     source.line("    (void)typedLocalGcGuards;");
     if (hasRefParams) {
-        source.line("    if constexpr (!FastAccounting && !DeterminismAccounting && !TrustedRelease) {");
+        source.line("    if constexpr (" + gcGuardCond + ") {");
         source.line("        if (auto* rawH = context.rawHeap()) {");
         for (std::size_t pIdx = 0; pIdx < function.parameterTypes.size(); ++pIdx) {
             if (paramGuardSlot[pIdx] != std::numeric_limits<std::size_t>::max()) {
-                source.line("            aot::retainTypedGcSlot(rawH, typedLocalGcGuards[" +
+                source.line("            aot::retainTypedGcSlot(rawH, &typedLocalGcGuards[" +
                     std::to_string(paramGuardSlot[pIdx]) + "], typedArg_" +
                     std::to_string(pIdx) + ");");
             }
@@ -123,6 +178,21 @@ void emitTypedPrimitiveFunction(
     const bool isAsyncFunction = !function.blocks.empty() &&
         !function.blocks.front().instructions.empty() &&
         function.blocks.front().instructions.front().opcode == mir::Opcode::AsyncEnter;
+    if (!isAsyncFunction) {
+        bool hasNonEscapingStackRef = false;
+        for (const auto& blk : function.blocks) {
+            for (const auto& inst : blk.instructions) {
+                if (isNonEscapingMirStackRefAlloc(function, inst, allTypes)) {
+                    hasNonEscapingStackRef = true;
+                    break;
+                }
+            }
+            if (hasNonEscapingStackRef) break;
+        }
+        if (hasNonEscapingStackRef) {
+            source.line("    aot::StackRefScope typedStackRefScope(context);");
+        }
+    }
     std::vector<std::size_t> localStoreCounts(function.localTypes.size(), 0);
     for (const auto& blk : function.blocks) {
         for (const auto& inst : blk.instructions) {
@@ -158,6 +228,7 @@ void emitTypedPrimitiveFunction(
     std::unordered_map<mir::ValueId, std::size_t> valueToArrayLocal;
     std::unordered_map<mir::ValueId, std::size_t> valueToArrayParam;
     std::unordered_map<std::size_t, semantic::SymbolId> arrayLocalStructElemType;
+    std::unordered_map<std::size_t, semantic::SymbolId> arrayParamStructElemType;
     for (const auto& blk : function.blocks) {
         for (const auto& inst : blk.instructions) {
             if (inst.opcode == mir::Opcode::LoadLocal &&
@@ -181,17 +252,36 @@ void emitTypedPrimitiveFunction(
             if ((inst.opcode == mir::Opcode::LoadElement ||
                  inst.opcode == mir::Opcode::StoreElement) &&
                 !inst.operands.empty()) {
+                const bool isCustomStructElem =
+                    inst.elementType == semantic::PrimitiveType::Struct &&
+                    classifyInlineMath(inst.elementType, inst.elementTypeId) ==
+                        InlineMathKind::None;
                 const auto it = valueToArrayLocal.find(inst.operands[0]);
                 if (it != valueToArrayLocal.end()) {
-                    if (inst.elementType == semantic::PrimitiveType::Struct &&
-                        classifyInlineMath(inst.elementType, inst.elementTypeId) ==
-                            InlineMathKind::None) {
+                    if (isCustomStructElem) {
                         arrayLocalStructElemType[it->second] = inst.elementTypeId;
                     } else if (inst.elementTypeId == 0 &&
                                (inst.elementType == semantic::PrimitiveType::Int ||
                                 inst.elementType == semantic::PrimitiveType::Double)) {
                         arrayLocalPackedPrim.try_emplace(it->second, inst.elementType);
                     }
+                }
+                const auto pIt = valueToArrayParam.find(inst.operands[0]);
+                if (pIt != valueToArrayParam.end() && isCustomStructElem) {
+                    arrayParamStructElemType[pIt->second] = inst.elementTypeId;
+                }
+            }
+        }
+    }
+    for (const auto& blk : function.blocks) {
+        for (const auto& inst : blk.instructions) {
+            if (inst.opcode == mir::Opcode::StoreLocal &&
+                !inst.operands.empty() &&
+                localStoreCounts[inst.localIndex] == 1) {
+                const auto lStructIt = arrayLocalStructElemType.find(inst.localIndex);
+                const auto pIt = valueToArrayParam.find(inst.operands[0]);
+                if (lStructIt != arrayLocalStructElemType.end() && pIt != valueToArrayParam.end()) {
+                    arrayParamStructElemType.try_emplace(pIt->second, lStructIt->second);
                 }
             }
         }
@@ -215,6 +305,12 @@ void emitTypedPrimitiveFunction(
             source.line("    (void)typedArgPackedF64_" + std::to_string(pIdx) + ";");
         }
     }
+    for (const auto& [pIdx, sElemTid] : arrayParamStructElemType) {
+        source.line("    aot::TypedStructArrayCache typedArgStructArr_" +
+            std::to_string(pIdx) + " = context.acquireStructArrayCache(0x" +
+            hexId(sElemTid) + "ULL, typedArg_" + std::to_string(pIdx) + ");");
+        source.line("    (void)typedArgStructArr_" + std::to_string(pIdx) + ";");
+    }
     for (std::size_t index = 0; index < function.localTypes.size(); ++index) {
         const auto typeId = index < function.localTypeIds.size()
             ? function.localTypeIds[index]
@@ -228,6 +324,11 @@ void emitTypedPrimitiveFunction(
             source.line("    aot::TypedRawColumnCache typedLocalRawCol_" +
                 std::to_string(index) + "{};");
             source.line("    (void)typedLocalRawCol_" + std::to_string(index) + ";");
+            if (arrayLocalStructElemType.find(index) != arrayLocalStructElemType.end()) {
+                source.line("    aot::TypedStructArrayCache typedLocalStructArr_" +
+                    std::to_string(index) + "{};");
+                source.line("    (void)typedLocalStructArr_" + std::to_string(index) + ";");
+            }
             const auto packedIt = arrayLocalPackedPrim.find(index);
             if (packedIt != arrayLocalPackedPrim.end()) {
                 if (packedIt->second == semantic::PrimitiveType::Int) {
@@ -444,11 +545,11 @@ void emitTypedPrimitiveFunction(
                 }
             }
             if (anyHeapRefField) {
-                source.line("            if constexpr (!FastAccounting && !DeterminismAccounting && !TrustedRelease) {");
+                source.line("            if constexpr (" + gcGuardCond + ") {");
                 source.line("                if (auto* rawH = context.rawHeap()) {");
                 for (const auto& rf : refCoroFields) {
                     if (rf.guardSlot == std::numeric_limits<std::size_t>::max()) continue;
-                    source.line("                    aot::retainTypedGcSlot(rawH, typedLocalGcGuards[" +
+                    source.line("                    aot::retainTypedGcSlot(rawH, &typedLocalGcGuards[" +
                         std::to_string(rf.guardSlot) + "], " + rf.exprName + ");");
                 }
                 source.line("                }");
@@ -465,6 +566,9 @@ void emitTypedPrimitiveFunction(
                         ", 0x" + hexId(elemTypeIt->second) + "ULL, sizeof(" +
                         structName + "), " + structName + "_layout, " +
                         structName + "::kFieldCount);");
+                    source.line("            typedLocalStructArr_" + std::to_string(lIdx) +
+                        " = context.acquireStructArrayCache(0x" + hexId(elemTypeIt->second) +
+                        "ULL, " + typedLocalExpression(lIdx) + ");");
                 } else {
                     source.line("            typedLocalRawCol_" + std::to_string(lIdx) +
                         " = context.acquireRawColumnCache(" + typedLocalExpression(lIdx) + ");");
@@ -526,6 +630,23 @@ void emitTypedPrimitiveFunction(
                 return (expectedPrim == semantic::PrimitiveType::Int
                     ? "typedArgPackedI32_"
                     : "typedArgPackedF64_") + std::to_string(parIt->second);
+            }
+        }
+        return {};
+    };
+    const auto resolveStructArrayCacheExpr = [&](mir::ValueId arrVal, semantic::SymbolId expectedTid) -> std::string {
+        const auto locIt = valueToArrayLocal.find(arrVal);
+        if (locIt != valueToArrayLocal.end()) {
+            const auto sIt = arrayLocalStructElemType.find(locIt->second);
+            if (sIt != arrayLocalStructElemType.end() && (expectedTid == 0 || sIt->second == expectedTid)) {
+                return "typedLocalStructArr_" + std::to_string(locIt->second);
+            }
+        }
+        const auto parIt = valueToArrayParam.find(arrVal);
+        if (parIt != valueToArrayParam.end()) {
+            const auto sIt = arrayParamStructElemType.find(parIt->second);
+            if (sIt != arrayParamStructElemType.end() && (expectedTid == 0 || sIt->second == expectedTid)) {
+                return "typedArgStructArr_" + std::to_string(parIt->second);
             }
         }
         return {};
@@ -603,6 +724,9 @@ void emitTypedPrimitiveFunction(
                     if (instruction.parameterTypes[index] == semantic::PrimitiveType::Array) {
                         return "runtime::Value{runtime::NullArray{}}";
                     }
+                    if (instruction.parameterTypes[index] == semantic::PrimitiveType::String) {
+                        return "runtime::Value{runtime::NullString{}}";
+                    }
                 }
                 return operand(index);
             };
@@ -613,8 +737,8 @@ void emitTypedPrimitiveFunction(
                     regGuardSlot[rIdx] == std::numeric_limits<std::size_t>::max()) {
                     return;
                 }
-                source.line(indent + "if constexpr (!FastAccounting && !DeterminismAccounting && !TrustedRelease) {");
-                source.line(indent + "    aot::retainTypedGcSlot(context.rawHeap(), typedLocalGcGuards[" +
+                source.line(indent + "if constexpr (" + gcGuardCond + ") {");
+                source.line(indent + "    aot::retainTypedGcSlot(context.rawHeap(), &typedLocalGcGuards[" +
                     std::to_string(regGuardSlot[rIdx]) + "], " + result + ");");
                 source.line(indent + "}");
             };
@@ -636,26 +760,45 @@ void emitTypedPrimitiveFunction(
                         int64Literal(instruction.integerImmediate) + "};");
                 }
                 break;
+            case mir::Opcode::ConstantString:
+                source.line("            if (!context.constantString(\"" +
+                    escapeCppString(instruction.stringImmediate) + "\", " +
+                    result + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                emitRetainRegResult();
+                break;
             case mir::Opcode::ConstantNull:
                 if (instruction.resultType == semantic::PrimitiveType::Object) {
                     source.line("            " + result + " = runtime::Value{runtime::NullObject{}};");
                 } else if (instruction.resultType == semantic::PrimitiveType::Array) {
                     source.line("            " + result + " = runtime::Value{runtime::NullArray{}};");
+                } else if (instruction.resultType == semantic::PrimitiveType::String) {
+                    source.line("            " + result + " = runtime::Value{runtime::NullString{}};");
                 } else {
                     source.line("            " + result + " = runtime::Value{std::monostate{}};");
                 }
+                emitRetainRegResult();
+                break;
+            case mir::Opcode::ConvertNullToString:
+                source.line("            " + result + " = runtime::Value{runtime::NullString{}};");
+                emitRetainRegResult();
                 break;
             case mir::Opcode::ConvertNullToObject:
                 source.line("            " + result + " = runtime::Value{runtime::NullObject{}};");
+                emitRetainRegResult();
                 break;
             case mir::Opcode::ConvertNullToArray:
                 source.line("            " + result + " = runtime::Value{runtime::NullArray{}};");
+                emitRetainRegResult();
                 break;
             case mir::Opcode::NewObject: {
                 const auto objTid = instruction.resultTypeId != 0
                     ? instruction.resultTypeId
                     : instruction.typeId;
-                source.line("            if (!context.newObject(0x" +
+                const char* allocFn = (!isAsyncFunction &&
+                    isNonEscapingMirStackRefAlloc(function, instruction, allTypes))
+                    ? "context.newStackRefObject(0x"
+                    : "context.newObject(0x";
+                source.line("            if (!" + std::string(allocFn) +
                     hexId(objTid) + "ULL, " + result +
                     ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
                 emitRetainRegResult();
@@ -700,10 +843,7 @@ void emitTypedPrimitiveFunction(
                         ", " + tmpField + ") || !aot::typedUnboxScalar(" +
                         primitiveExpression(instruction.resultType) + ", " + tmpField +
                         ", " + result + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
-                    if (instruction.resultType == semantic::PrimitiveType::Object ||
-                        instruction.resultType == semantic::PrimitiveType::Array) {
-                        emitRetainRegResult();
-                    }
+                    emitRetainRegResult();
                 }
                 break;
             }
@@ -711,6 +851,12 @@ void emitTypedPrimitiveFunction(
                 const auto valSlot = operandSlot(1);
                 if (valSlot.primitive == semantic::PrimitiveType::Int) {
                     source.line("            if (!context.storeFieldInt64Fast(0x" +
+                        hexId(instruction.typeId) + "ULL, " +
+                        std::to_string(instruction.fieldIndex) + "u, " + operand(0) +
+                        ", " + operand(1) + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                } else if (valSlot.primitive == semantic::PrimitiveType::Struct &&
+                           classifyInlineMath(valSlot.primitive, valSlot.typeId) == InlineMathKind::None) {
+                    source.line("            if (!context.storeFieldCustomStructFast(0x" +
                         hexId(instruction.typeId) + "ULL, " +
                         std::to_string(instruction.fieldIndex) + "u, " + operand(0) +
                         ", " + operand(1) + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
@@ -746,6 +892,22 @@ void emitTypedPrimitiveFunction(
                     source.line("                " + result + " = " + packedCache + ".count;");
                     source.line("            } else if (!context.arrayLengthFast(" + operand(0) +
                         ", " + result + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                } else if (const std::string sCache = resolveStructArrayCacheExpr(instruction.operands[0], 0);
+                           !sCache.empty()) {
+                    if (arrLocalIt != valueToArrayLocal.end()) {
+                        const auto rawColExpr = "typedLocalRawCol_" + std::to_string(arrLocalIt->second);
+                        source.line("            if (RS_AOT_LIKELY(" + sCache + ".count >= 0)) {");
+                        source.line("                " + result + " = " + sCache + ".count;");
+                        source.line("            } else if (RS_AOT_LIKELY(" + rawColExpr + ".count >= 0)) {");
+                        source.line("                " + result + " = " + rawColExpr + ".count;");
+                        source.line("            } else if (!context.arrayLengthFast(" + operand(0) +
+                            ", " + result + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                    } else {
+                        source.line("            if (RS_AOT_LIKELY(" + sCache + ".count >= 0)) {");
+                        source.line("                " + result + " = " + sCache + ".count;");
+                        source.line("            } else if (!context.arrayLengthFast(" + operand(0) +
+                            ", " + result + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                    }
                 } else if (arrLocalIt != valueToArrayLocal.end()) {
                     const auto rawColExpr = "typedLocalRawCol_" + std::to_string(arrLocalIt->second);
                     source.line("            if (RS_AOT_LIKELY(" + rawColExpr + ".count >= 0)) {");
@@ -764,7 +926,8 @@ void emitTypedPrimitiveFunction(
                         InlineMathKind::None) {
                     const auto arrLocalIt = valueToArrayLocal.find(instruction.operands[0]);
                     const std::string structName = "AotStruct_" + hexId(instruction.elementTypeId);
-                    const auto tmpElem = "typedElem_" + std::to_string(instructionIndex);
+                    const std::string sCache = resolveStructArrayCacheExpr(
+                        instruction.operands[0], instruction.elementTypeId);
                     if (arrLocalIt != valueToArrayLocal.end()) {
                         const auto rawColExpr = "typedLocalRawCol_" + std::to_string(arrLocalIt->second);
                         source.line("            if (RS_AOT_LIKELY(" + rawColExpr + ".basePtr != nullptr)) {");
@@ -774,22 +937,29 @@ void emitTypedPrimitiveFunction(
                         source.line("                    }");
                         source.line("                }");
                         source.line("                (void)" + structName + "::loadFromRawColumn(" + rawColExpr + ", " + operand(1) + ", " + result + ");");
-                        source.line("            } else {");
-                        source.line("                runtime::Value " + tmpElem + ";");
-                        source.line("                if (!context.loadElement(semantic::PrimitiveType::Struct, 0x" +
-                            hexId(instruction.elementTypeId) + "ULL, " + operand(0) +
-                            ", runtime::Value{" + operand(1) + "}, " + tmpElem +
-                            ") || !aot::typedUnboxScalar(semantic::PrimitiveType::Struct, " + tmpElem +
-                            ", " + result + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
-                        source.line("            }");
+                        if (!sCache.empty()) {
+                            source.line("            } else if (!context.loadElementStructCached(0x" +
+                                hexId(instruction.elementTypeId) + "ULL, " + sCache + ", " + operand(0) +
+                                ", " + operand(1) + ", " + result +
+                                ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                        } else {
+                            source.line("            } else if (!context.loadElementStructFast(0x" +
+                                hexId(instruction.elementTypeId) + "ULL, " + operand(0) +
+                                ", " + operand(1) + ", " + result +
+                                ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                        }
+                    } else if (!sCache.empty()) {
+                        source.line("            if (!context.loadElementStructCached(0x" +
+                            hexId(instruction.elementTypeId) + "ULL, " + sCache + ", " + operand(0) +
+                            ", " + operand(1) + ", " + result +
+                            ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
                     } else {
-                        source.line("            runtime::Value " + tmpElem + ";");
-                        source.line("            if (!context.loadElement(semantic::PrimitiveType::Struct, 0x" +
+                        source.line("            if (!context.loadElementStructFast(0x" +
                             hexId(instruction.elementTypeId) + "ULL, " + operand(0) +
-                            ", runtime::Value{" + operand(1) + "}, " + tmpElem +
-                            ") || !aot::typedUnboxScalar(semantic::PrimitiveType::Struct, " + tmpElem +
-                            ", " + result + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                            ", " + operand(1) + ", " + result +
+                            ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
                     }
+                    emitRetainRegResult();
                 } else if (instruction.elementType == semantic::PrimitiveType::Int &&
                            instruction.elementTypeId == 0 &&
                            instruction.resultType == semantic::PrimitiveType::Int) {
@@ -845,10 +1015,7 @@ void emitTypedPrimitiveFunction(
                         ") || !aot::typedUnboxScalar(" +
                         primitiveExpression(instruction.resultType) + ", " + tmpElem +
                         ", " + result + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
-                    if (instruction.resultType == semantic::PrimitiveType::Array ||
-                        instruction.resultType == semantic::PrimitiveType::Object) {
-                        emitRetainRegResult();
-                    }
+                    emitRetainRegResult();
                 }
                 break;
             }
@@ -859,6 +1026,8 @@ void emitTypedPrimitiveFunction(
                         InlineMathKind::None) {
                     const auto arrLocalIt = valueToArrayLocal.find(instruction.operands[0]);
                     const std::string structName = "AotStruct_" + hexId(instruction.elementTypeId);
+                    const std::string sCache = resolveStructArrayCacheExpr(
+                        instruction.operands[0], instruction.elementTypeId);
                     if (arrLocalIt != valueToArrayLocal.end()) {
                         const auto rawColExpr = "typedLocalRawCol_" + std::to_string(arrLocalIt->second);
                         source.line("            if (RS_AOT_LIKELY(" + rawColExpr + ".basePtr != nullptr)) {");
@@ -868,17 +1037,27 @@ void emitTypedPrimitiveFunction(
                         source.line("                    }");
                         source.line("                }");
                         source.line("                (void)" + structName + "::storeToRawColumn(" + rawColExpr + ", " + operand(1) + ", " + operand(2) + ");");
-                        source.line("            } else {");
-                        source.line("                if (!context.storeElement(semantic::PrimitiveType::Struct, 0x" +
-                            hexId(instruction.elementTypeId) + "ULL, " + operand(0) +
-                            ", runtime::Value{" + operand(1) + "}, " + operand(2) +
-                            ".boxToValue())) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
-                        source.line("            }");
+                        if (!sCache.empty()) {
+                            source.line("            } else if (!context.storeElementStructCached(0x" +
+                                hexId(instruction.elementTypeId) + "ULL, " + sCache + ", " + operand(0) +
+                                ", " + operand(1) + ", " + operand(2) +
+                                ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                        } else {
+                            source.line("            } else if (!context.storeElementStructFast(0x" +
+                                hexId(instruction.elementTypeId) + "ULL, " + operand(0) +
+                                ", " + operand(1) + ", " + operand(2) +
+                                ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                        }
+                    } else if (!sCache.empty()) {
+                        source.line("            if (!context.storeElementStructCached(0x" +
+                            hexId(instruction.elementTypeId) + "ULL, " + sCache + ", " + operand(0) +
+                            ", " + operand(1) + ", " + operand(2) +
+                            ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
                     } else {
-                        source.line("            if (!context.storeElement(semantic::PrimitiveType::Struct, 0x" +
+                        source.line("            if (!context.storeElementStructFast(0x" +
                             hexId(instruction.elementTypeId) + "ULL, " + operand(0) +
-                            ", runtime::Value{" + operand(1) + "}, " + operand(2) +
-                            ".boxToValue())) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                            ", " + operand(1) + ", " + operand(2) +
+                            ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
                     }
                 } else if (instruction.elementType == semantic::PrimitiveType::Int &&
                            instruction.elementTypeId == 0 &&
@@ -956,6 +1135,8 @@ void emitTypedPrimitiveFunction(
                         rhsExpr = "runtime::Value{runtime::NullObject{}}";
                     } else if (function.localTypes[instruction.localIndex] == semantic::PrimitiveType::Array) {
                         rhsExpr = "runtime::Value{runtime::NullArray{}}";
+                    } else if (function.localTypes[instruction.localIndex] == semantic::PrimitiveType::String) {
+                        rhsExpr = "runtime::Value{runtime::NullString{}}";
                     }
                 }
                 source.line("            " +
@@ -963,8 +1144,8 @@ void emitTypedPrimitiveFunction(
                     rhsExpr + ";");
                 if (instruction.localIndex < localGuardSlot.size() &&
                     localGuardSlot[instruction.localIndex] != std::numeric_limits<std::size_t>::max()) {
-                    source.line("            if constexpr (!FastAccounting && !DeterminismAccounting && !TrustedRelease) {");
-                    source.line("                aot::retainTypedGcSlot(context.rawHeap(), typedLocalGcGuards[" +
+                    source.line("            if constexpr (" + gcGuardCond + ") {");
+                    source.line("                aot::retainTypedGcSlot(context.rawHeap(), &typedLocalGcGuards[" +
                         std::to_string(localGuardSlot[instruction.localIndex]) + "], " +
                         typedLocalExpression(instruction.localIndex) + ");");
                     source.line("            }");
@@ -981,6 +1162,20 @@ void emitTypedPrimitiveFunction(
                             ", 0x" + hexId(elemTypeIt->second) + "ULL, sizeof(" +
                             structName + "), " + structName + "_layout, " +
                             structName + "::kFieldCount);");
+                        const auto parStructIt = valueToArrayParam.find(instruction.operands[0]);
+                        if (parStructIt != valueToArrayParam.end() &&
+                            arrayParamStructElemType.find(parStructIt->second) != arrayParamStructElemType.end() &&
+                            arrayParamStructElemType.at(parStructIt->second) == elemTypeIt->second) {
+                            source.line("            typedLocalStructArr_" +
+                                std::to_string(instruction.localIndex) +
+                                " = typedArgStructArr_" + std::to_string(parStructIt->second) + ";");
+                        } else {
+                            source.line("            typedLocalStructArr_" +
+                                std::to_string(instruction.localIndex) +
+                                " = context.acquireStructArrayCache(0x" +
+                                hexId(elemTypeIt->second) + "ULL, " +
+                                typedLocalExpression(instruction.localIndex) + ");");
+                        }
                     } else {
                         source.line("            typedLocalRawCol_" +
                             std::to_string(instruction.localIndex) +
@@ -1179,13 +1374,33 @@ void emitTypedPrimitiveFunction(
                 source.line("            " + result + " = !" + operand(0) + ";");
                 break;
             case mir::Opcode::Equal:
-                source.line("            " + result + " = (" + operand(0) +
-                    " == " + operand(1) + ");");
+            case mir::Opcode::NotEqual: {
+                const auto opSlot = operandSlot(0);
+                const bool isNeq = (instruction.opcode == mir::Opcode::NotEqual);
+                if (opSlot.primitive == semantic::PrimitiveType::String) {
+                    source.line("            if (!context.compareStringsFast<TrustedRelease, " +
+                        std::string(isNeq ? "true" : "false") + ">(" +
+                        operand(0) + ", " + operand(1) + ", " + result +
+                        ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                } else if (opSlot.primitive == semantic::PrimitiveType::Object ||
+                           opSlot.primitive == semantic::PrimitiveType::Array) {
+                    source.line("            if (!context.compareReferencesFast<TrustedRelease, " +
+                        std::string(isNeq ? "true" : "false") + ">(" +
+                        operand(0) + ", " + operand(1) + ", " + result +
+                        ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                } else if (opSlot.primitive == semantic::PrimitiveType::Struct &&
+                           classifyInlineMath(opSlot.primitive, opSlot.typeId) == InlineMathKind::None) {
+                    source.line("            " + result + " = " +
+                        std::string(isNeq ? "!" : "") +
+                        "AotStruct_" + hexId(opSlot.typeId) + "::equalsWithHeap(context.rawHeap(), " +
+                        operand(0) + ", " + operand(1) + ");");
+                } else {
+                    source.line("            " + result + " = " +
+                        std::string(isNeq ? "!(" : "(") + operand(0) +
+                        " == " + operand(1) + ");");
+                }
                 break;
-            case mir::Opcode::NotEqual:
-                source.line("            " + result + " = !(" + operand(0) +
-                    " == " + operand(1) + ");");
-                break;
+            }
             case mir::Opcode::LessInt:
             case mir::Opcode::LessOrEqualInt:
             case mir::Opcode::GreaterInt:
@@ -1229,6 +1444,7 @@ void emitTypedPrimitiveFunction(
                     source.line("            if (!context.initUnboxedStruct(0x" +
                         hexId(typeId) + "ULL, " + result + ")) return false;");
                 }
+                emitRetainRegResult();
                 break;
             }
             case mir::Opcode::LoadStructField: {
@@ -1257,6 +1473,7 @@ void emitTypedPrimitiveFunction(
                     source.line("            " + result + " = " + operand(0) +
                         ".f_" + std::to_string(instruction.fieldIndex) + ";");
                 }
+                emitRetainRegResult();
                 break;
             }
             case mir::Opcode::StoreStructField: {
@@ -1289,6 +1506,7 @@ void emitTypedPrimitiveFunction(
                     source.line("            " + result + ".f_" +
                         std::to_string(instruction.fieldIndex) + " = " + operand(1) + ";");
                 }
+                emitRetainRegResult();
                 break;
             }
             case mir::Opcode::Call: {
@@ -1482,10 +1700,7 @@ void emitTypedPrimitiveFunction(
                     if (instruction.result >= 0 &&
                         instruction.resultType != semantic::PrimitiveType::Void) {
                         source.line("            " + result + " = polyCallRes_" + suffix + ";");
-                        if (instruction.resultType == semantic::PrimitiveType::Array ||
-                            instruction.resultType == semantic::PrimitiveType::Object) {
-                            emitRetainRegResult();
-                        }
+                        emitRetainRegResult();
                     }
                 } else if (targetIt != typedFunctions.end()) {
                     const auto* calleeView = targetIt->second;
@@ -1536,10 +1751,7 @@ void emitTypedPrimitiveFunction(
                     if (instruction.result >= 0 &&
                         instruction.resultType != semantic::PrimitiveType::Void) {
                         source.line("            " + result + " = directCallRes_" + suffix + ";");
-                        if (instruction.resultType == semantic::PrimitiveType::Array ||
-                            instruction.resultType == semantic::PrimitiveType::Object) {
-                            emitRetainRegResult();
-                        }
+                        emitRetainRegResult();
                     }
                 } else {
                     const auto callId = callIds.at(&instruction);
@@ -1609,9 +1821,7 @@ void emitTypedPrimitiveFunction(
                         source.line("                determinismAccounting.resumeAfterCall();");
                         source.line("            }");
                         source.line("            if (!colOk_" + suffix + ") return false;");
-                        if (!options.trustedRelease) {
-                            emitRetainRegResult();
-                        }
+                        emitRetainRegResult();
                     } else {
                         std::string fastAsyncExpr;
                         if (symName.rfind("$intrinsic::Async.__", 0) == 0 && instruction.result >= 0) {
@@ -1706,10 +1916,7 @@ void emitTypedPrimitiveFunction(
                                 ", bridgeRes_" + suffix + ", " + result +
                                 ")) return typedFail(runtime::ErrorCode::TypeMismatch, "
                                 "\"AOT call return type mismatch\");");
-                            if (instruction.resultType == semantic::PrimitiveType::Array ||
-                                instruction.resultType == semantic::PrimitiveType::Object) {
-                                emitRetainRegResult(brIndent);
-                            }
+                            emitRetainRegResult(brIndent);
                         }
                         if (!fastAsyncExpr.empty()) {
                             source.line("            }");
@@ -2013,10 +2220,7 @@ void emitTypedPrimitiveFunction(
                 if (instruction.result >= 0 &&
                     instruction.resultType != semantic::PrimitiveType::Void) {
                     source.line("            " + result + " = delCallRes_" + suffix + ";");
-                    if (instruction.resultType == semantic::PrimitiveType::Array ||
-                        instruction.resultType == semantic::PrimitiveType::Object) {
-                        emitRetainRegResult();
-                    }
+                    emitRetainRegResult();
                 }
                 break;
             }
@@ -2112,10 +2316,7 @@ void emitTypedPrimitiveFunction(
                         primitiveExpression(instruction.elementType) + ", awaitedBoxedVal, " + result + ")) {");
                     source.line("                    return typedFail(runtime::ErrorCode::TypeMismatch, \"AOT await result type mismatch\");");
                     source.line("                }");
-                    if (instruction.elementType == semantic::PrimitiveType::Array ||
-                        instruction.elementType == semantic::PrimitiveType::Object) {
-                        emitRetainRegResult("                ");
-                    }
+                    emitRetainRegResult("                ");
                     source.line("            }");
                 }
                 break;
@@ -2227,8 +2428,8 @@ void emitTypedPrimitiveFunction(
                         const auto rIdx = static_cast<std::size_t>(paramVal);
                         if (rIdx < regGuardSlot.size() &&
                             regGuardSlot[rIdx] != std::numeric_limits<std::size_t>::max()) {
-                            source.line("            if constexpr (!FastAccounting && !DeterminismAccounting && !TrustedRelease) {");
-                            source.line("                aot::retainTypedGcSlot(context.rawHeap(), typedLocalGcGuards[" +
+                            source.line("            if constexpr (" + gcGuardCond + ") {");
+                            source.line("                aot::retainTypedGcSlot(context.rawHeap(), &typedLocalGcGuards[" +
                                 std::to_string(regGuardSlot[rIdx]) + "], " +
                                 typedValueExpression(paramVal) + ");");
                             source.line("            }");
@@ -2248,12 +2449,12 @@ void emitTypedPrimitiveFunction(
             emitTypedTransfer(
                 source, function, block.terminator.target,
                 block.terminator.arguments, "typedTrueEdge", "                ",
-                &regGuardSlot);
+                &regGuardSlot, gcGuardCond);
             source.line("            } else {");
             emitTypedTransfer(
                 source, function, block.terminator.falseTarget,
                 block.terminator.falseArguments, "typedFalseEdge", "                ",
-                &regGuardSlot);
+                &regGuardSlot, gcGuardCond);
             source.line("            }");
             break;
         case mir::TerminatorKind::Throw:
@@ -2287,7 +2488,7 @@ void emitTypedPrimitiveFunction(
         source.line("        if (context.heap() != nullptr) {");
     }
     source.line("            for (std::size_t idx = 0; idx < argumentCount; ++idx) {");
-    source.line("                if (std::holds_alternative<runtime::ObjectRef>(arguments[idx])) {");
+    source.line("                if ((std::holds_alternative<runtime::ObjectRef>(arguments[idx]) && !std::get<runtime::ObjectRef>(arguments[idx]).isStackSlotRef()) || arguments[idx].rawTag() == runtime::ValueTag::String) {");
     source.line("                    typedGcGuards.push_back(context.heap()->retain(arguments[idx]));");
     source.line("                }");
     source.line("            }");

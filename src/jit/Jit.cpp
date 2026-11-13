@@ -30,6 +30,11 @@
 #include <dlfcn.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#include <libkern/OSCacheControl.h>
+#include <pthread.h>
+#endif
 #endif
 
 namespace realscript::jit {
@@ -456,7 +461,46 @@ template <typename FnPtr>
     return rem == 0 ? value : (value + (alignment - rem));
 }
 
-[[nodiscard]] std::uint8_t* osAllocateRwPages(std::size_t byteSize) noexcept {
+struct ScopedJitWriteEnable {
+    bool active = false;
+    explicit ScopedJitWriteEnable(bool isMapJit) noexcept : active(isMapJit) {
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+        if (active) {
+            pthread_jit_write_protect_np(0);
+        }
+#endif
+    }
+    ~ScopedJitWriteEnable() noexcept {
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+        if (active) {
+            pthread_jit_write_protect_np(1);
+        }
+#endif
+    }
+    ScopedJitWriteEnable(const ScopedJitWriteEnable&) = delete;
+    ScopedJitWriteEnable& operator=(const ScopedJitWriteEnable&) = delete;
+};
+
+void fillArchTrapPadding(std::uint8_t* dst, std::size_t byteLen) noexcept {
+    if (!dst || byteLen == 0) return;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    // ARM64: fill 4-byte aligned slots with `brk #0` (0xD4200000 little-endian)
+    constexpr std::uint32_t kArm64Brk0 = 0xD4200000u;
+    std::size_t off = 0;
+    while (off + 4u <= byteLen) {
+        std::memcpy(dst + off, &kArm64Brk0, 4u);
+        off += 4u;
+    }
+    if (off < byteLen) {
+        std::memset(dst + off, 0, byteLen - off);
+    }
+#else
+    std::memset(dst, 0xCC, byteLen);
+#endif
+}
+
+[[nodiscard]] std::uint8_t* osAllocateCodePages(std::size_t byteSize, bool& outMapJit) noexcept {
+    outMapJit = false;
     if (byteSize == 0) return nullptr;
 #if defined(_WIN32)
     void* mem = VirtualAlloc(nullptr, byteSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -470,15 +514,31 @@ template <typename FnPtr>
     constexpr int kAnonFlag = 0;
 #endif
     if (kAnonFlag == 0) return nullptr;
+#if defined(__APPLE__) && defined(TARGET_OS_OSX) && TARGET_OS_OSX && (defined(__aarch64__) || defined(__arm64__)) && defined(MAP_JIT)
+    // macOS Apple Silicon: prefer MAP_JIT + pthread_jit_write_protect_np hardware APRR W^X
+    void* jitMem = mmap(
+        nullptr,
+        byteSize,
+        PROT_READ | PROT_WRITE | PROT_EXEC,
+        MAP_PRIVATE | kAnonFlag | MAP_JIT,
+        -1,
+        0);
+    if (jitMem != MAP_FAILED) {
+        outMapJit = true;
+        pthread_jit_write_protect_np(1);
+        return static_cast<std::uint8_t*>(jitMem);
+    }
+#endif
     void* mem = mmap(nullptr, byteSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | kAnonFlag, -1, 0);
     if (mem == MAP_FAILED) return nullptr;
     return static_cast<std::uint8_t*>(mem);
 #endif
 }
 
-[[nodiscard]] bool osProtectRxPages(std::uint8_t* base, std::size_t byteSize) noexcept {
+[[nodiscard]] bool osProtectRxPages(std::uint8_t* base, std::size_t byteSize, bool isMapJit) noexcept {
     if (!base || byteSize == 0) return false;
 #if defined(_WIN32)
+    (void)isMapJit;
     DWORD oldProtect = 0;
     if (VirtualProtect(base, byteSize, PAGE_EXECUTE_READ, &oldProtect) == 0) {
         return false;
@@ -486,10 +546,14 @@ template <typename FnPtr>
     FlushInstructionCache(GetCurrentProcess(), base, byteSize);
     return true;
 #else
-    if (mprotect(base, byteSize, PROT_READ | PROT_EXEC) != 0) {
-        return false;
+    if (!isMapJit) {
+        if (mprotect(base, byteSize, PROT_READ | PROT_EXEC) != 0) {
+            return false;
+        }
     }
-#if defined(__GNUC__) || defined(__clang__)
+#if defined(__APPLE__)
+    sys_icache_invalidate(base, byteSize);
+#elif defined(__GNUC__) || defined(__clang__)
     char* begin = reinterpret_cast<char*>(base);
     __builtin___clear_cache(begin, begin + byteSize);
 #endif
@@ -572,14 +636,19 @@ std::uint8_t* ExecutableCodeArena::emit(
     std::size_t size,
     std::size_t alignment) {
     if (sealed_ || !code || size == 0) return nullptr;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    const std::size_t align = std::max<std::size_t>(alignUp(alignment, 4u), 4u);
+#else
     const std::size_t align = std::max<std::size_t>(alignment, 1);
+#endif
 
     if (!blocks_.empty() && !blocks_.back().executable) {
         auto& cur = blocks_.back();
         const std::size_t alignedOff = alignUp(cur.used, align);
         if (alignedOff <= cur.capacity && size <= cur.capacity - alignedOff) {
+            ScopedJitWriteEnable writeGuard(cur.mapJit);
             if (alignedOff > cur.used) {
-                std::memset(cur.base + cur.used, 0xCC, alignedOff - cur.used);
+                fillArchTrapPadding(cur.base + cur.used, alignedOff - cur.used);
             }
             std::uint8_t* dst = cur.base + alignedOff;
             std::memcpy(dst, code, size);
@@ -591,7 +660,8 @@ std::uint8_t* ExecutableCodeArena::emit(
 
     const std::size_t pageSz = systemPageSize();
     const std::size_t allocCap = alignUp(std::max(defaultBlockBytes_, size + align), pageSz);
-    std::uint8_t* base = osAllocateRwPages(allocCap);
+    bool isMapJit = false;
+    std::uint8_t* base = osAllocateCodePages(allocCap, isMapJit);
     if (!base) return nullptr;
 
     Block blk{};
@@ -599,7 +669,11 @@ std::uint8_t* ExecutableCodeArena::emit(
     blk.capacity = allocCap;
     blk.used = size;
     blk.executable = false;
-    std::memcpy(blk.base, code, size);
+    blk.mapJit = isMapJit;
+    {
+        ScopedJitWriteEnable writeGuard(blk.mapJit);
+        std::memcpy(blk.base, code, size);
+    }
     blocks_.push_back(blk);
     mappedBytes_ += allocCap;
     allocatedBytes_ += size;
@@ -611,9 +685,10 @@ bool ExecutableCodeArena::seal() noexcept {
     for (auto& blk : blocks_) {
         if (blk.executable) continue;
         if (blk.used < blk.capacity) {
-            std::memset(blk.base + blk.used, 0xCC, blk.capacity - blk.used);
+            ScopedJitWriteEnable writeGuard(blk.mapJit);
+            fillArchTrapPadding(blk.base + blk.used, blk.capacity - blk.used);
         }
-        if (!osProtectRxPages(blk.base, blk.capacity)) {
+        if (!osProtectRxPages(blk.base, blk.capacity, blk.mapJit)) {
             return false;
         }
         blk.executable = true;
@@ -636,6 +711,25 @@ bool ExecutableCodeArena::nativeCodeExecutionSupported() noexcept {
             0xB8, 0x54, 0x4A, 0x53, 0x52, 0xC3
         };
         std::uint8_t* entry = probe.emit(kProbeCode, sizeof(kProbeCode), 16);
+        if (!entry || !probe.seal()) return false;
+        using ProbeFn = std::uint32_t (*)();
+        const auto fn = bitCastFnPtr<ProbeFn>(entry);
+        return fn() == 0x52534A54u;
+    }();
+    return supported;
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    static const bool supported = []() noexcept {
+        ExecutableCodeArena probe(systemPageSize());
+        // movz w0, #0x4a54; movk w0, #0x5253, lsl #16; ret
+        static constexpr std::uint32_t kProbeWords[] = {
+            0x52894A80u,
+            0x72AA4A60u,
+            0xD65F03C0u,
+        };
+        std::uint8_t* entry = probe.emit(
+            reinterpret_cast<const std::uint8_t*>(kProbeWords),
+            sizeof(kProbeWords),
+            16);
         if (!entry || !probe.seal()) return false;
         using ProbeFn = std::uint32_t (*)();
         const auto fn = bitCastFnPtr<ProbeFn>(entry);
@@ -702,19 +796,23 @@ constexpr std::uint8_t kPackedFloat64 = static_cast<std::uint8_t>(runtime::Packe
 }
 
 struct alignas(16) JitArrayCacheEntry {
-    std::uint64_t slotAndGen;     // offset 0  (0xffffffffffffffffULL when invalid)
-    std::uint32_t heapId;         // offset 8
-    std::uint8_t kind;            // offset 12
-    std::uint8_t isPacked;        // offset 13
-    std::uint8_t encoding;        // offset 14 (PackedElemEncoding)
-    std::uint8_t elementType;     // offset 15 (semantic::PrimitiveType)
-    void* rawData;                // offset 16 (packed rawData or boxed Value* data)
-    std::uint32_t length;         // offset 24
-    std::uint32_t pad0;           // offset 28
-    std::uint64_t elementTypeId;  // offset 32
-    std::uint64_t pad1;           // offset 40
-    std::uint64_t pad2;           // offset 48
-    std::uint64_t pad3;           // offset 56
+    std::uint64_t slotAndGen;        // offset 0  (0xffffffffffffffffULL when invalid)
+    std::uint32_t heapId;            // offset 8
+    std::uint8_t kind;               // offset 12
+    std::uint8_t isPacked;           // offset 13 (1 = Packed, 2 = FlatStruct, 0 = Boxed)
+    std::uint8_t encoding;           // offset 14 (PackedElemEncoding)
+    std::uint8_t elementType;        // offset 15 (semantic::PrimitiveType)
+    void* rawData;                   // offset 16 (packed rawData, FlatStruct Value*, or boxed Value*)
+    std::uint32_t length;            // offset 24
+    std::uint16_t flatStride;        // offset 28 (FlatStruct[] leaf stride)
+    std::uint16_t flatSchemaId;      // offset 30 (FlatStruct[] schemaId)
+    std::uint64_t elementTypeId;     // offset 32
+    std::uint8_t* dirtyCards;        // offset 40 (FlatStruct[] GC card table or nullptr)
+    std::uint32_t blittableSchemaId; // offset 48 (Packed BlittableStruct schemaId)
+    std::uint8_t flatFlags;          // offset 52 (bit0=hasRefs, bit1=hasPool, bit2=needsRemBarrier)
+    std::uint8_t padByte0;           // offset 53
+    std::uint16_t padWord1;          // offset 54
+    std::uint64_t pad3;              // offset 56
 };
 static_assert(std::is_standard_layout_v<JitArrayCacheEntry>, "JitArrayCacheEntry must be standard layout");
 static_assert(sizeof(JitArrayCacheEntry) == 64, "JitArrayCacheEntry must be 64 bytes");
@@ -726,7 +824,12 @@ static_assert(offsetof(JitArrayCacheEntry, encoding) == 14);
 static_assert(offsetof(JitArrayCacheEntry, elementType) == 15);
 static_assert(offsetof(JitArrayCacheEntry, rawData) == 16);
 static_assert(offsetof(JitArrayCacheEntry, length) == 24);
+static_assert(offsetof(JitArrayCacheEntry, flatStride) == 28);
+static_assert(offsetof(JitArrayCacheEntry, flatSchemaId) == 30);
 static_assert(offsetof(JitArrayCacheEntry, elementTypeId) == 32);
+static_assert(offsetof(JitArrayCacheEntry, dirtyCards) == 40);
+static_assert(offsetof(JitArrayCacheEntry, blittableSchemaId) == 48);
+static_assert(offsetof(JitArrayCacheEntry, flatFlags) == 52);
 
 struct JitRuntimeSession;
 struct CompiledFunctionRecord;
@@ -769,7 +872,12 @@ inline void invalidateJitArrayCaches(JitAbiContext& ctx) noexcept {
         ce.elementType = 0;
         ce.rawData = nullptr;
         ce.length = 0;
+        ce.flatStride = 0;
+        ce.flatSchemaId = 0;
         ce.elementTypeId = 0;
+        ce.dirtyCards = nullptr;
+        ce.blittableSchemaId = 0;
+        ce.flatFlags = 0;
     }
 }
 
@@ -783,6 +891,9 @@ struct JitRuntimeSession {
     std::size_t frameOffset = 0;
     std::size_t valueTop = 0;
     std::size_t callDepth = 0;
+    runtime::Value* valuesBase = nullptr;
+    std::uint32_t frameOffset32 = 0;
+    std::uint8_t flatBankId = 0;
     runtime::ShadowStack shadowStack{};
 };
 
@@ -989,7 +1100,34 @@ void populateJitErrorDiagnostics(
         ce.elementType = static_cast<std::uint8_t>(pView.elementType);
         ce.rawData = pView.rawData;
         ce.length = pView.length;
+        ce.flatStride = 0u;
+        ce.flatSchemaId = 0u;
         ce.elementTypeId = static_cast<std::uint64_t>(pView.elementTypeId);
+        ce.dirtyCards = nullptr;
+        ce.blittableSchemaId = pView.blittableSchemaId;
+        ce.flatFlags = 0u;
+        return true;
+    }
+
+    runtime::FlatStructArrayFastView fView{};
+    if (heap->tryBindFlatStructArrayFastView(ref, fView)) {
+        ce.slotAndGen = slotAndGen;
+        ce.heapId = ref.heapId;
+        ce.kind = static_cast<std::uint8_t>(ref.kind);
+        ce.isPacked = 2u;
+        ce.encoding = 0u;
+        ce.elementType = static_cast<std::uint8_t>(semantic::PrimitiveType::Struct);
+        ce.rawData = fView.data;
+        ce.length = fView.length;
+        ce.flatStride = fView.flatStride;
+        ce.flatSchemaId = fView.flatSchemaId;
+        ce.elementTypeId = static_cast<std::uint64_t>(fView.elementTypeId);
+        ce.dirtyCards = fView.dirtyCards;
+        ce.blittableSchemaId = 0u;
+        ce.flatFlags = static_cast<std::uint8_t>(
+            (fView.containsManagedReferences ? 1u : 0u) |
+            (fView.containsPoolValues ? 2u : 0u) |
+            (fView.needsRememberedBarrier ? 4u : 0u));
         return true;
     }
 
@@ -1003,7 +1141,12 @@ void populateJitErrorDiagnostics(
         ce.elementType = static_cast<std::uint8_t>(bView.elementType);
         ce.rawData = bView.data;
         ce.length = bView.length;
+        ce.flatStride = 0u;
+        ce.flatSchemaId = 0u;
         ce.elementTypeId = static_cast<std::uint64_t>(bView.elementTypeId);
+        ce.dirtyCards = nullptr;
+        ce.blittableSchemaId = 0u;
+        ce.flatFlags = 0u;
         return true;
     }
     return false;
@@ -1086,6 +1229,9 @@ std::uint32_t jitNewArrayHelper(JitAbiContext* ctx, std::uint32_t flatIdx) noexc
         case 9: initVal = runtime::Vec3fValue{}; break;
         default: initVal = runtime::QuatfValue{}; break;
         }
+    } else if (fi.aux0Slot == 11) {
+        if (cold.bytecode) elemTid = cold.bytecode->elementTypeId;
+        initVal = runtime::Value{};
     } else if (cold.bytecode) {
         elemTid = cold.bytecode->elementTypeId;
         if (elemType == semantic::PrimitiveType::Enum) {
@@ -1093,7 +1239,10 @@ std::uint32_t jitNewArrayHelper(JitAbiContext* ctx, std::uint32_t flatIdx) noexc
         } else if (elemType == semantic::PrimitiveType::Array) {
             initVal = runtime::NullArray{};
         } else if (elemType == semantic::PrimitiveType::Struct) {
-            if (auto defStruct = runtime::makeDefaultBlittableStructValue(elemTid)) {
+            if (runtime::isBlittableStructType(elemTid) ||
+                runtime::findFlatStructSchemaByTypeId(elemTid) != nullptr) {
+                initVal = runtime::Value{};
+            } else if (auto defStruct = runtime::makeDefaultBlittableStructValue(elemTid)) {
                 initVal = std::move(*defStruct);
             }
         }
@@ -1236,6 +1385,68 @@ std::uint32_t jitLoadElementHelper(JitAbiContext* ctx, std::uint32_t flatIdx) no
     const runtime::Value& arrVal = ctx->frameBase[fi.src0Slot];
     const runtime::Value& idxVal = ctx->frameBase[fi.src1Slot];
 
+    // Lock-free JitArrayCacheEntry fast path for FlatStruct[] & BlittableStruct[]!
+    if (fi.flatOpcode == runtime::detail::FlatOpcode::LoadElementTypedFast &&
+        execFunc.hasStructPayloads &&
+        session.flatBankId != 0u &&
+        arrVal.rawTag() == runtime::ValueTag::ObjectRef &&
+        fi.dstSlot < execFunc.slotStructSchemaIds.size()) {
+        const std::uint16_t sid = execFunc.slotStructSchemaIds[fi.dstSlot];
+        const std::uint16_t payOff = execFunc.slotPayloadOffsets[fi.dstSlot];
+        if (sid != 0u && payOff != runtime::detail::InvalidCompactReg) {
+            auto& ce = ctx->arrayCache[fi.src0Slot & 3u];
+            std::uint64_t sg = 0;
+            std::memcpy(&sg, &arrVal, sizeof(sg));
+            if (sg != ce.slotAndGen || arrVal.u_.objectRef.heapId != ce.heapId) {
+                (void)bindJitArrayCacheSlot(session.heap, arrVal, ce);
+            }
+            std::int64_t fastIdx = 0;
+            if (sg == ce.slotAndGen &&
+                arrVal.u_.objectRef.heapId == ce.heapId &&
+                idxVal.tryGetInt64(fastIdx) &&
+                static_cast<std::uint64_t>(fastIdx) < ce.length) {
+                const auto expectedTid = static_cast<semantic::SymbolId>(fi.integerImmediate);
+                if (ce.elementTypeId == expectedTid) {
+                    if (ctx->remainingBudget < fi.span) {
+                        ctx->remainingBudget = 0;
+                        return setHelperError(ctx, flatIdx, runtime::ErrorCode::InstructionBudgetExceeded, "instruction budget exceeded");
+                    }
+                    const auto uIdx = static_cast<std::size_t>(fastIdx);
+                    if (ce.isPacked == 2u && ce.flatSchemaId == sid) {
+                        const runtime::Value* elemSrc =
+                            static_cast<const runtime::Value*>(ce.rawData) + uIdx * ce.flatStride;
+                        std::memcpy(
+                            static_cast<void*>(ctx->frameBase + payOff),
+                            static_cast<const void*>(elemSrc),
+                            static_cast<std::size_t>(ce.flatStride) * sizeof(runtime::Value));
+                        ctx->remainingBudget -= fi.span;
+                        ctx->frameBase[fi.dstSlot] = runtime::StructValue::makeFrameSlice(
+                            expectedTid,
+                            session.flatBankId,
+                            static_cast<std::uint32_t>(session.frameOffset + payOff),
+                            sid);
+                        return 0u;
+                    }
+                    if (ce.isPacked == 1u &&
+                        ce.encoding == static_cast<std::uint8_t>(runtime::PackedElemEncoding::BlittableStruct)) {
+                        if (const auto* sc = runtime::getFlatStructSchema(sid)) {
+                            if (runtime::decodePackedStructToLeaves(
+                                    ce.rawData, uIdx, ce.blittableSchemaId, *sc, ctx->frameBase + payOff)) {
+                                ctx->remainingBudget -= fi.span;
+                                ctx->frameBase[fi.dstSlot] = runtime::StructValue::makeFrameSlice(
+                                    expectedTid,
+                                    session.flatBankId,
+                                    static_cast<std::uint32_t>(session.frameOffset + payOff),
+                                    sid);
+                                return 0u;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if (std::holds_alternative<runtime::NullArray>(arrVal)) {
         if (ctx->remainingBudget < opDoneCost) {
             ctx->remainingBudget = 0;
@@ -1317,21 +1528,81 @@ std::uint32_t jitLoadElementHelper(JitAbiContext* ctx, std::uint32_t flatIdx) no
         return setHelperError(ctx, flatIdx, runtime::ErrorCode::TypeMismatch, "array element metadata mismatch");
     }
 
-    const auto loaded = session.heap->arrayGet(ref, static_cast<std::size_t>(idx));
-    if (!loaded) {
-        if (ctx->remainingBudget < opDoneCost) {
-            ctx->remainingBudget = 0;
-            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InstructionBudgetExceeded, "instruction budget exceeded");
-        }
-        ctx->remainingBudget -= opDoneCost;
-        return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "array element load failed");
-    }
-
     if (ctx->remainingBudget < fi.span) {
         ctx->remainingBudget = 0;
         return setHelperError(ctx, flatIdx, runtime::ErrorCode::InstructionBudgetExceeded, "instruction budget exceeded");
     }
+
+    // Zero-StructStorage fast path when destination slot is a flat-frame struct slice!
+    if (expectedType == semantic::PrimitiveType::Struct &&
+        execFunc.hasStructPayloads &&
+        session.flatBankId != 0u &&
+        fi.dstSlot < execFunc.slotStructSchemaIds.size()) {
+        const std::uint16_t sid = execFunc.slotStructSchemaIds[fi.dstSlot];
+        const std::uint16_t payOff = execFunc.slotPayloadOffsets[fi.dstSlot];
+        const auto* sc = sid != 0u ? runtime::getFlatStructSchema(sid) : nullptr;
+        if (sc != nullptr && payOff != runtime::detail::InvalidCompactReg) {
+            runtime::FlatStructArrayFastView fView{};
+            if ((session.heap->tryBindFlatStructArrayFastView(ref, fView) && fView.elementTypeId == expectedTid && fView.flatStride == sc->flatSlotCount) &&
+                fView.flatSchemaId == sid) {
+                const runtime::Value* elemSrc =
+                    fView.data + static_cast<std::size_t>(idx) * fView.flatStride;
+                std::memcpy(
+                    static_cast<void*>(ctx->frameBase + payOff),
+                    static_cast<const void*>(elemSrc),
+                    static_cast<std::size_t>(sc->flatSlotCount) * sizeof(runtime::Value));
+                ctx->remainingBudget -= fi.span;
+                ctx->frameBase[fi.dstSlot] = runtime::StructValue::makeFrameSlice(
+                    expectedTid,
+                    session.flatBankId,
+                    static_cast<std::uint32_t>(session.frameOffset + payOff),
+                    sid);
+                return 0u;
+            }
+            runtime::PackedArrayFastView pView{};
+            if (session.heap->tryBindPackedArrayFastView(ref, pView) &&
+                pView.encoding == runtime::PackedElemEncoding::BlittableStruct &&
+                runtime::decodePackedStructToLeaves(
+                    pView.rawData,
+                    static_cast<std::size_t>(idx),
+                    pView.blittableSchemaId,
+                    *sc,
+                    ctx->frameBase + payOff)) {
+                ctx->remainingBudget -= fi.span;
+                ctx->frameBase[fi.dstSlot] = runtime::StructValue::makeFrameSlice(
+                    expectedTid,
+                    session.flatBankId,
+                    static_cast<std::uint32_t>(session.frameOffset + payOff),
+                    sid);
+                return 0u;
+            }
+        }
+    }
+
+    const auto loaded = session.heap->arrayGet(ref, static_cast<std::size_t>(idx));
+    if (!loaded) {
+        ctx->remainingBudget -= opDoneCost;
+        return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "array element load failed");
+    }
+
     ctx->remainingBudget -= fi.span;
+    if (execFunc.hasStructPayloads &&
+        session.flatBankId != 0u &&
+        fi.dstSlot < execFunc.slotStructSchemaIds.size() &&
+        execFunc.slotStructSchemaIds[fi.dstSlot] != 0u) {
+        const std::uint16_t sid = execFunc.slotStructSchemaIds[fi.dstSlot];
+        const std::uint16_t payOff = execFunc.slotPayloadOffsets[fi.dstSlot];
+        const auto* sc = runtime::getFlatStructSchema(sid);
+        if (sc != nullptr && payOff != runtime::detail::InvalidCompactReg &&
+            runtime::extractStructLeavesToBuffer(*loaded, *sc, ctx->frameBase + payOff)) {
+            ctx->frameBase[fi.dstSlot] = runtime::StructValue::makeFrameSlice(
+                sc->structTypeId,
+                session.flatBankId,
+                static_cast<std::uint32_t>(session.frameOffset + payOff),
+                sid);
+            return 0u;
+        }
+    }
     ctx->frameBase[fi.dstSlot] = *loaded;
     return 0u;
 }
@@ -1349,6 +1620,117 @@ std::uint32_t jitStoreElementHelper(JitAbiContext* ctx, std::uint32_t flatIdx) n
     const runtime::Value& arrVal = ctx->frameBase[fi.src0Slot];
     const runtime::Value& idxVal = ctx->frameBase[fi.src1Slot];
     const runtime::Value& storeVal = ctx->frameBase[fi.src2Slot];
+
+    // Lock-free JitArrayCacheEntry fast path for FlatStruct[] & BlittableStruct[] stores!
+    if ((fi.flatOpcode == runtime::detail::FlatOpcode::StoreElementStructFieldInPlace ||
+         fi.flatOpcode == runtime::detail::FlatOpcode::StoreElementStructFast) &&
+        arrVal.rawTag() == runtime::ValueTag::ObjectRef) {
+        auto& ce = ctx->arrayCache[fi.src0Slot & 3u];
+        std::uint64_t sg = 0;
+        std::memcpy(&sg, &arrVal, sizeof(sg));
+        if (sg != ce.slotAndGen || arrVal.u_.objectRef.heapId != ce.heapId) {
+            (void)bindJitArrayCacheSlot(session.heap, arrVal, ce);
+        }
+        std::int64_t fastIdx = 0;
+        if (sg == ce.slotAndGen &&
+            arrVal.u_.objectRef.heapId == ce.heapId &&
+            idxVal.tryGetInt64(fastIdx) &&
+            static_cast<std::uint64_t>(fastIdx) < ce.length) {
+            const auto uIdx = static_cast<std::size_t>(fastIdx);
+            const runtime::ObjectRef ref = arrVal.u_.objectRef;
+            if (fi.flatOpcode == runtime::detail::FlatOpcode::StoreElementStructFieldInPlace) {
+                const auto expectedTid = static_cast<semantic::SymbolId>(fi.integerImmediate);
+                const auto rootSid = static_cast<std::uint16_t>(fi.auxImm32);
+                if (ce.elementTypeId == expectedTid) {
+                    if (ce.isPacked == 2u && ce.flatSchemaId == rootSid && fi.aux0Slot < ce.flatStride) {
+                        if (ctx->remainingBudget < fi.span) {
+                            ctx->remainingBudget = 0;
+                            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InstructionBudgetExceeded, "instruction budget exceeded");
+                        }
+                        runtime::Value* dstLeaf =
+                            static_cast<runtime::Value*>(ce.rawData) + uIdx * ce.flatStride + fi.aux0Slot;
+                        bool wroteOk = false;
+                        bool needPoolFallback = false;
+                        if (fi.aux1Slot == 0u) {
+                            const runtime::Value detached = runtime::detachFrameSliceValue(storeVal);
+                            if ((ce.flatFlags & 2u) != 0u &&
+                                (detached.rawTag() == runtime::ValueTag::String ||
+                                 detached.rawTag() == runtime::ValueTag::QuatArena ||
+                                 detached.rawTag() == runtime::ValueTag::QuatfArena)) {
+                                needPoolFallback = true;
+                            } else {
+                                *dstLeaf = detached;
+                                wroteOk = true;
+                            }
+                        } else if ((ce.flatFlags & 2u) == 0u) {
+                            const auto* subSc = runtime::getFlatStructSchema(fi.aux1Slot);
+                            if (subSc != nullptr &&
+                                fi.aux0Slot + subSc->flatSlotCount <= ce.flatStride &&
+                                runtime::extractStructLeavesToBuffer(storeVal, *subSc, dstLeaf)) {
+                                wroteOk = true;
+                            }
+                        }
+                        if (wroteOk && !needPoolFallback) {
+                            if ((ce.flatFlags & 1u) != 0u) {
+                                if (ce.dirtyCards != nullptr) {
+                                    ce.dirtyCards[uIdx >> runtime::ManagedHeap::kCardElementShift] = 1u;
+                                }
+                                if ((ce.flatFlags & 4u) != 0u ||
+                                    (session.heap != nullptr && session.heap->phase() != runtime::GcPhase::Idle)) {
+                                    session.heap->recordFlatStructArrayWriteBarrier(ref, uIdx);
+                                    ce.flatFlags = static_cast<std::uint8_t>(ce.flatFlags & ~4u);
+                                }
+                            }
+                            ctx->remainingBudget -= fi.span;
+                            return 0u;
+                        }
+                    } else if (ce.isPacked == 1u &&
+                               ce.encoding == static_cast<std::uint8_t>(runtime::PackedElemEncoding::BlittableStruct)) {
+                        if (const auto* rootSc = runtime::getFlatStructSchema(rootSid)) {
+                            if (ctx->remainingBudget < fi.span) {
+                                ctx->remainingBudget = 0;
+                                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InstructionBudgetExceeded, "instruction budget exceeded");
+                            }
+                            bool needsDemote = false;
+                            if (runtime::writePackedStructLeafSlice(
+                                    ce.rawData, uIdx, ce.blittableSchemaId, *rootSc,
+                                    fi.aux0Slot, fi.aux1Slot, storeVal, needsDemote)) {
+                                ctx->remainingBudget -= fi.span;
+                                return 0u;
+                            }
+                        }
+                    }
+                }
+            } else if (ce.isPacked == 2u && (ce.flatFlags & 2u) == 0u) {
+                const auto expectedTid = static_cast<semantic::SymbolId>(fi.integerImmediate);
+                if (ce.elementTypeId == expectedTid &&
+                    runtime::valueType(storeVal) == semantic::PrimitiveType::Struct) {
+                    if (const auto* sc = runtime::getFlatStructSchema(ce.flatSchemaId)) {
+                        if (ctx->remainingBudget < fi.span) {
+                            ctx->remainingBudget = 0;
+                            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InstructionBudgetExceeded, "instruction budget exceeded");
+                        }
+                        runtime::Value* dstElem =
+                            static_cast<runtime::Value*>(ce.rawData) + uIdx * ce.flatStride;
+                        if (runtime::extractStructLeavesToBuffer(storeVal, *sc, dstElem)) {
+                            if ((ce.flatFlags & 1u) != 0u) {
+                                if (ce.dirtyCards != nullptr) {
+                                    ce.dirtyCards[uIdx >> runtime::ManagedHeap::kCardElementShift] = 1u;
+                                }
+                                if ((ce.flatFlags & 4u) != 0u ||
+                                    (session.heap != nullptr && session.heap->phase() != runtime::GcPhase::Idle)) {
+                                    session.heap->recordFlatStructArrayWriteBarrier(ref, uIdx);
+                                    ce.flatFlags = static_cast<std::uint8_t>(ce.flatFlags & ~4u);
+                                }
+                            }
+                            ctx->remainingBudget -= fi.span;
+                            return 0u;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     if (std::holds_alternative<runtime::NullArray>(arrVal)) {
         if (ctx->remainingBudget < opDoneCost) {
@@ -1406,14 +1788,119 @@ std::uint32_t jitStoreElementHelper(JitAbiContext* ctx, std::uint32_t flatIdx) n
         return setHelperError(ctx, flatIdx, runtime::ErrorCode::IndexOutOfRange, "array element index is out of range");
     }
 
+    if (fi.flatOpcode == runtime::detail::FlatOpcode::StoreElementStructFieldInPlace) {
+        if (ctx->remainingBudget < fi.span) {
+            ctx->remainingBudget = 0;
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InstructionBudgetExceeded, "instruction budget exceeded");
+        }
+        const auto expectedTid = static_cast<semantic::SymbolId>(fi.integerImmediate);
+        const auto rootSid = static_cast<std::uint16_t>(fi.auxImm32);
+        const auto* rootSc = runtime::getFlatStructSchema(rootSid);
+        const auto uIdx = static_cast<std::size_t>(idx);
+        runtime::PackedArrayFastView pView{};
+        if (rootSc != nullptr &&
+            session.heap->tryBindPackedArrayFastView(ref, pView) &&
+            pView.encoding == runtime::PackedElemEncoding::BlittableStruct &&
+            pView.elementTypeId == expectedTid) {
+            bool needsDemote = false;
+            if (runtime::writePackedStructLeafSlice(
+                    pView.rawData, uIdx, pView.blittableSchemaId, *rootSc,
+                    fi.aux0Slot, fi.aux1Slot, storeVal, needsDemote)) {
+                ctx->remainingBudget -= fi.span;
+                return 0u;
+            }
+            // Demote packed array via full element reconstruct + arraySet if int32 overflowed
+            if (auto elemOpt = session.heap->arrayGet(ref, uIdx); elemOpt.has_value()) {
+                std::vector<runtime::Value> tmpLeaves(rootSc->flatSlotCount);
+                if (runtime::extractStructLeavesToBuffer(*elemOpt, *rootSc, tmpLeaves.data())) {
+                    if (fi.aux1Slot == 0u) {
+                        tmpLeaves[fi.aux0Slot] = runtime::detachFrameSliceValue(storeVal);
+                    } else if (const auto* subSc = runtime::getFlatStructSchema(fi.aux1Slot)) {
+                        (void)runtime::extractStructLeavesToBuffer(storeVal, *subSc, tmpLeaves.data() + fi.aux0Slot);
+                    }
+                    const runtime::Value rebuilt = runtime::reconstructDetachedStructFromLeaves(*rootSc, tmpLeaves.data());
+                    runtime::RuntimeError demErr;
+                    if (session.heap->arraySet(ref, uIdx, rebuilt, &demErr)) {
+                        ctx->remainingBudget -= fi.span;
+                        invalidateJitArrayCaches(*ctx);
+                        (void)bindJitArrayCacheSlot(session.heap, arrVal, ctx->arrayCache[fi.src0Slot & 3u]);
+                        return 0u;
+                    }
+                }
+            }
+        }
+        runtime::FlatStructArrayFastView fView{};
+        if (rootSc != nullptr &&
+            (session.heap->tryBindFlatStructArrayFastView(ref, fView) && fView.elementTypeId == expectedTid && fView.flatStride == rootSc->flatSlotCount) &&
+            fView.flatSchemaId == rootSid &&
+            fi.aux0Slot < fView.flatStride) {
+            runtime::Value* dstLeaf = fView.data + uIdx * fView.flatStride + fi.aux0Slot;
+            if (fi.aux1Slot == 0u) {
+                *dstLeaf = runtime::detachFrameSliceValue(storeVal);
+                if (fView.containsManagedReferences) {
+                    if (fView.dirtyCards != nullptr) {
+                        fView.dirtyCards[uIdx >> runtime::ManagedHeap::kCardElementShift] = 1u;
+                    }
+                    if (fView.needsRememberedBarrier || session.heap->phase() != runtime::GcPhase::Idle) {
+                        session.heap->recordFlatStructArrayWriteBarrier(ref, uIdx);
+                    }
+                }
+                // If containsPoolValues, delegate via arraySet only when value is pool-backed String/Arena
+                if (fView.containsPoolValues &&
+                    (dstLeaf->rawTag() == runtime::ValueTag::String ||
+                     dstLeaf->rawTag() == runtime::ValueTag::QuatArena ||
+                     dstLeaf->rawTag() == runtime::ValueTag::QuatfArena)) {
+                    const runtime::Value rebuilt = runtime::reconstructDetachedStructFromLeaves(
+                        *rootSc, fView.data + uIdx * fView.flatStride);
+                    (void)session.heap->arraySet(ref, uIdx, rebuilt, nullptr);
+                    invalidateJitArrayCaches(*ctx);
+                    (void)bindJitArrayCacheSlot(session.heap, arrVal, ctx->arrayCache[fi.src0Slot & 3u]);
+                }
+                ctx->remainingBudget -= fi.span;
+                return 0u;
+            }
+            const auto* subSc = runtime::getFlatStructSchema(fi.aux1Slot);
+            if (subSc != nullptr &&
+                fi.aux0Slot + subSc->flatSlotCount <= fView.flatStride &&
+                runtime::extractStructLeavesToBuffer(storeVal, *subSc, dstLeaf)) {
+                if (fView.containsManagedReferences) {
+                    if (fView.dirtyCards != nullptr) {
+                        fView.dirtyCards[uIdx >> runtime::ManagedHeap::kCardElementShift] = 1u;
+                    }
+                    if (fView.needsRememberedBarrier || session.heap->phase() != runtime::GcPhase::Idle) {
+                        session.heap->recordFlatStructArrayWriteBarrier(ref, uIdx);
+                    }
+                }
+                if (fView.containsPoolValues) {
+                    const runtime::Value rebuilt = runtime::reconstructDetachedStructFromLeaves(
+                        *rootSc, fView.data + uIdx * fView.flatStride);
+                    (void)session.heap->arraySet(ref, uIdx, rebuilt, nullptr);
+                    invalidateJitArrayCaches(*ctx);
+                    (void)bindJitArrayCacheSlot(session.heap, arrVal, ctx->arrayCache[fi.src0Slot & 3u]);
+                }
+                ctx->remainingBudget -= fi.span;
+                return 0u;
+            }
+        }
+        ctx->remainingBudget -= opDoneCost;
+        return setHelperError(ctx, flatIdx, runtime::ErrorCode::TypeMismatch, "in-place struct element field store failed");
+    }
+
     semantic::PrimitiveType expectedType = semantic::PrimitiveType::Int;
-    if (fi.flatOpcode == runtime::detail::FlatOpcode::StoreElementPrimFast) {
+    if (fi.flatOpcode == runtime::detail::FlatOpcode::StoreElementPrimFast ||
+        fi.flatOpcode == runtime::detail::FlatOpcode::StoreElementObjFast) {
         expectedType = static_cast<semantic::PrimitiveType>(static_cast<std::uint8_t>(fi.binaryOpcode1));
+    } else if (fi.flatOpcode == runtime::detail::FlatOpcode::StoreElementStructFast) {
+        expectedType = semantic::PrimitiveType::Struct;
     } else if (cold.bytecode) {
         expectedType = cold.bytecode->elementType;
     }
 
-    if (runtime::valueType(storeVal) != expectedType) {
+    const bool nullMatchesExpected =
+        (expectedType == semantic::PrimitiveType::Object && std::holds_alternative<runtime::NullObject>(storeVal)) ||
+        (expectedType == semantic::PrimitiveType::String && std::holds_alternative<runtime::NullString>(storeVal)) ||
+        (expectedType == semantic::PrimitiveType::Array && std::holds_alternative<runtime::NullArray>(storeVal));
+    if (!nullMatchesExpected && runtime::valueType(storeVal) != expectedType) {
         if (ctx->remainingBudget < opDoneCost) {
             ctx->remainingBudget = 0;
             return setHelperError(ctx, flatIdx, runtime::ErrorCode::InstructionBudgetExceeded, "instruction budget exceeded");
@@ -1427,6 +1914,7 @@ std::uint32_t jitStoreElementHelper(JitAbiContext* ctx, std::uint32_t flatIdx) n
         return setHelperError(ctx, flatIdx, runtime::ErrorCode::InstructionBudgetExceeded, "instruction budget exceeded");
     }
 
+    // Note: ManagedHeap::arraySet already handles FrameSlice StructValue with ZERO StructStorage allocations!
     runtime::RuntimeError setErr;
     if (!session.heap->arraySet(ref, static_cast<std::size_t>(idx), storeVal, &setErr)) {
         ctx->remainingBudget -= opDoneCost;
@@ -1437,9 +1925,723 @@ std::uint32_t jitStoreElementHelper(JitAbiContext* ctx, std::uint32_t flatIdx) n
     }
 
     ctx->remainingBudget -= fi.span;
-    // Re-bind cache slot in case PackedI32 widened to PackedI64
+    invalidateJitArrayCaches(*ctx);
+    // Re-bind cache slot in case PackedI32 widened to PackedI64 or GC ran
     (void)bindJitArrayCacheSlot(session.heap, arrVal, ctx->arrayCache[fi.src0Slot & 3u]);
     return 0u;
+}
+
+bool jitValuesEqual(
+    runtime::ManagedHeap* heap,
+    const runtime::Value& left,
+    const runtime::Value& right,
+    bool& outEqual,
+    runtime::ErrorCode& outErrCode,
+    const char*& outErrMsg) noexcept {
+    const auto leftType = runtime::valueType(left);
+    if (leftType != runtime::valueType(right)) {
+        outEqual = false;
+        return true;
+    }
+    if (leftType == semantic::PrimitiveType::Object ||
+        leftType == semantic::PrimitiveType::Array) {
+        const auto isValidRef = [&](const runtime::Value& value) noexcept {
+            if (value.rawTag() != runtime::ValueTag::ObjectRef) return true;
+            const auto& ref = value.asObjectRefUnchecked();
+            if (ref.isStackSlotRef()) return true;
+            return heap != nullptr && heap->isAlive(ref);
+        };
+        if (!isValidRef(left) || !isValidRef(right)) {
+            outErrCode = runtime::ErrorCode::InvalidObjectReference;
+            outErrMsg = "reference equality encountered an invalid managed reference";
+            return false;
+        }
+        outEqual = (left == right);
+        return true;
+    }
+    if (leftType == semantic::PrimitiveType::String) {
+        if (std::holds_alternative<runtime::NullString>(left) ||
+            std::holds_alternative<runtime::NullString>(right)) {
+            outEqual = std::holds_alternative<runtime::NullString>(left) &&
+                std::holds_alternative<runtime::NullString>(right);
+            return true;
+        }
+        try {
+            const auto extractText = [&](const runtime::Value& value)
+                -> std::optional<std::string_view> {
+                if (const auto* text = std::get_if<std::string>(&value)) return *text;
+                if (value.rawTag() == runtime::ValueTag::String) {
+                    return std::string_view(value.asStringUnchecked().str());
+                }
+                if (const auto* ref = std::get_if<runtime::ObjectRef>(&value)) {
+                    return heap ? heap->stringView(*ref) : std::nullopt;
+                }
+                return std::nullopt;
+            };
+            const auto a = extractText(left);
+            const auto b = extractText(right);
+            if (!a || !b) {
+                outErrCode = runtime::ErrorCode::InvalidObjectReference;
+                outErrMsg = "string equality encountered an invalid managed reference";
+                return false;
+            }
+            outEqual = (*a == *b);
+            return true;
+        } catch (...) {
+            outErrCode = runtime::ErrorCode::InvalidObjectReference;
+            outErrMsg = "string equality encountered an invalid managed reference";
+            return false;
+        }
+    }
+    if (leftType == semantic::PrimitiveType::Struct) {
+        if (left == right) {
+            outEqual = true;
+            return true;
+        }
+        if (left.rawTag() == runtime::ValueTag::Struct &&
+            right.rawTag() == runtime::ValueTag::Struct) {
+            const auto& ls = left.asStructUnchecked();
+            const auto& rs = right.asStructUnchecked();
+            if (ls.typeId == rs.typeId && ls.fieldCount() == rs.fieldCount()) {
+                const auto count = ls.fieldCount();
+                for (std::size_t i = 0; i < count; ++i) {
+                    const auto lf = runtime::structValueFieldAt(ls, i);
+                    const auto rf = runtime::structValueFieldAt(rs, i);
+                    if (!lf || !rf) {
+                        outEqual = false;
+                        return true;
+                    }
+                    bool fieldEq = false;
+                    if (!jitValuesEqual(heap, *lf, *rf, fieldEq, outErrCode, outErrMsg)) {
+                        return false;
+                    }
+                    if (!fieldEq) {
+                        outEqual = false;
+                        return true;
+                    }
+                }
+                outEqual = true;
+                return true;
+            }
+        }
+        outEqual = false;
+        return true;
+    }
+    outEqual = (left == right);
+    return true;
+}
+
+// Fast C++ runtime helper for FlatStruct slice & StackSlotRef opcodes in StencilJit
+std::uint32_t jitFlatStructAndStackRefHelper(JitAbiContext* ctx, std::uint32_t flatIdx) noexcept {
+    const auto& execFunc = *ctx->compiledFn->execFunc;
+    const auto& fi = execFunc.flatStream[flatIdx];
+    auto& session = *ctx->session;
+    using FO = runtime::detail::FlatOpcode;
+
+    if (ctx->remainingBudget < fi.span) {
+        ctx->remainingBudget = 0;
+        return setHelperError(ctx, flatIdx, runtime::ErrorCode::InstructionBudgetExceeded, "instruction budget exceeded");
+    }
+    if (fi.flatOpcode == FO::CheckNotNullFast) {
+        const runtime::Value& val = ctx->frameBase[fi.src0Slot];
+        if (val.rawTag() == runtime::ValueTag::ObjectRef) {
+            const runtime::ObjectRef ref = val.u_.objectRef;
+            if ((ref.isStackSlotRef() && ref.generation == session.flatBankId) ||
+                (session.heap != nullptr && session.heap->isAlive(ref))) {
+                ctx->remainingBudget -= fi.span;
+                ctx->frameBase[fi.dstSlot] = val;
+                return 0u;
+            }
+        }
+        return setHelperError(ctx, flatIdx, runtime::ErrorCode::NullReference, "null object reference");
+    }
+    if (fi.flatOpcode == FO::NewObjectFast) {
+        if (!session.heap || !session.program) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "object allocation requires heap");
+        }
+        const auto& mirror = runtime::detail::executionMirror(*session.program);
+        if (fi.aux0Slot >= mirror.objectTemplates.size()) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "invalid object template");
+        }
+        const auto& tmpl = mirror.objectTemplates[fi.aux0Slot];
+        runtime::RuntimeError allocErr;
+        const auto allocated = session.heap->allocateObjectFromTemplate(
+            tmpl.typeId,
+            tmpl.defaultFields.data(),
+            tmpl.defaultFields.size(),
+            tmpl.referenceFields,
+            &allocErr);
+        if (!allocated) {
+            return setHelperError(
+                ctx,
+                flatIdx,
+                allocErr.code == runtime::ErrorCode::None ? runtime::ErrorCode::OutOfMemory : allocErr.code,
+                allocErr.message.empty() ? "managed object allocation failed" : allocErr.message);
+        }
+        ctx->remainingBudget -= fi.span;
+        ctx->frameBase[fi.dstSlot] = *allocated;
+        invalidateJitArrayCaches(*ctx);
+        return 0u;
+    }
+    if (fi.flatOpcode == FO::LoadFieldExactFast || fi.flatOpcode == FO::LoadFieldFast) {
+        const runtime::Value& recvVal = ctx->frameBase[fi.src0Slot];
+        if (recvVal.rawTag() != runtime::ValueTag::ObjectRef) {
+            const auto errCode = (recvVal.rawTag() == runtime::ValueTag::NullObject)
+                ? runtime::ErrorCode::NullReference
+                : runtime::ErrorCode::TypeMismatch;
+            return setHelperError(ctx, flatIdx, errCode, "field load attempted on null or non-object");
+        }
+        const runtime::ObjectRef ref = recvVal.u_.objectRef;
+        if (ref.isStackSlotRef()) {
+            if (ref.generation != session.flatBankId || !session.values) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "invalid stack ref");
+            }
+            if (ref.stackRefSchemaId() == 0u) {
+                ctx->remainingBudget -= fi.span;
+                ctx->frameBase[fi.dstSlot] = (*session.values)[ref.slot];
+                return 0u;
+            }
+        }
+        if (!session.heap) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "field load missing heap");
+        }
+        runtime::ObjectFastView view{};
+        if (!session.heap->tryBindObjectFastView(ref, view)) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "dangling object reference");
+        }
+        const auto expectedOwnerTid = static_cast<semantic::SymbolId>(fi.integerImmediate);
+        bool ownerOk = (expectedOwnerTid == 0) || (view.typeId == expectedOwnerTid);
+        if (!ownerOk && session.program) {
+            const auto* cur = session.program->resolveType(view.typeId);
+            while (cur != nullptr) {
+                if (cur->id == expectedOwnerTid) {
+                    ownerOk = true;
+                    break;
+                }
+                cur = (cur->baseTypeId != 0) ? session.program->resolveType(cur->baseTypeId) : nullptr;
+            }
+        }
+        if (!ownerOk || fi.aux0Slot >= view.fieldCount) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::TypeMismatch, "field load receiver type mismatch");
+        }
+        ctx->remainingBudget -= fi.span;
+        ctx->frameBase[fi.dstSlot] = view.fields[fi.aux0Slot];
+        return 0u;
+    }
+    if (fi.flatOpcode == FO::StoreFieldExactFast || fi.flatOpcode == FO::StoreFieldFast) {
+        const runtime::Value& recvVal = ctx->frameBase[fi.src0Slot];
+        const runtime::Value& storeVal = ctx->frameBase[fi.src1Slot];
+        if (recvVal.rawTag() != runtime::ValueTag::ObjectRef) {
+            const auto errCode = (recvVal.rawTag() == runtime::ValueTag::NullObject)
+                ? runtime::ErrorCode::NullReference
+                : runtime::ErrorCode::TypeMismatch;
+            return setHelperError(ctx, flatIdx, errCode, "field store attempted on null or non-object");
+        }
+        const runtime::ObjectRef ref = recvVal.u_.objectRef;
+        if (ref.isStackSlotRef()) {
+            if (ref.generation != session.flatBankId || !session.values) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "invalid stack ref");
+            }
+            if (ref.stackRefSchemaId() == 0u) {
+                (*session.values)[ref.slot] = runtime::detachFrameSliceValue(storeVal);
+                ctx->remainingBudget -= fi.span;
+                return 0u;
+            }
+        }
+        if (!session.heap) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "field store missing heap");
+        }
+        const auto actualTid = session.heap->objectTypeId(ref);
+        if (!actualTid) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "dangling object reference");
+        }
+        const auto expectedOwnerTid = static_cast<semantic::SymbolId>(fi.integerImmediate);
+        bool ownerOk = (expectedOwnerTid == 0) || (*actualTid == expectedOwnerTid);
+        if (!ownerOk && session.program) {
+            const auto* cur = session.program->resolveType(*actualTid);
+            while (cur != nullptr) {
+                if (cur->id == expectedOwnerTid) {
+                    ownerOk = true;
+                    break;
+                }
+                cur = (cur->baseTypeId != 0) ? session.program->resolveType(cur->baseTypeId) : nullptr;
+            }
+        }
+        if (!ownerOk) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::TypeMismatch, "field store receiver type mismatch");
+        }
+        runtime::RuntimeError setErr;
+        if (!session.heap->fieldSet(ref, fi.aux0Slot, runtime::detachFrameSliceValue(storeVal), &setErr)) {
+            return setHelperError(
+                ctx,
+                flatIdx,
+                setErr.code == runtime::ErrorCode::None ? runtime::ErrorCode::InvalidProgram : setErr.code,
+                setErr.message.empty() ? "field store failed" : setErr.message);
+        }
+        ctx->remainingBudget -= fi.span;
+        return 0u;
+    }
+    if (fi.flatOpcode == FO::GenericBytecode) {
+        if (flatIdx >= execFunc.flatCold.size() ||
+            execFunc.flatCold[flatIdx].bytecode == nullptr ||
+            execFunc.bytecode == nullptr) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "missing GenericBytecode metadata");
+        }
+        const auto& bc = *execFunc.flatCold[flatIdx].bytecode;
+        const auto& bcFn = *execFunc.bytecode;
+        const auto regOff = execFunc.registerOffset;
+        switch (bc.opcode) {
+        case bytecode::Opcode::ConstantInt: {
+            const auto resType = bcFn.registerTypes[bc.result];
+            if (resType == semantic::PrimitiveType::Long) {
+                ctx->frameBase[regOff + bc.result] = runtime::LongValue{bc.integerImmediate};
+            } else if (resType == semantic::PrimitiveType::Enum) {
+                const auto tid = bc.result < bcFn.registerTypeIds.size() ? bcFn.registerTypeIds[bc.result] : 0;
+                ctx->frameBase[regOff + bc.result] = runtime::EnumValue{tid, bc.integerImmediate};
+            } else {
+                ctx->frameBase[regOff + bc.result] = bc.integerImmediate;
+            }
+            ctx->remainingBudget -= fi.span;
+            return 0u;
+        }
+        case bytecode::Opcode::ConstantNull: {
+            const auto resType = bcFn.registerTypes[bc.result];
+            if (resType == semantic::PrimitiveType::Null) {
+                ctx->frameBase[regOff + bc.result] = std::monostate{};
+            } else if (resType == semantic::PrimitiveType::String) {
+                ctx->frameBase[regOff + bc.result] = runtime::NullString{};
+            } else if (resType == semantic::PrimitiveType::Array) {
+                ctx->frameBase[regOff + bc.result] = runtime::NullArray{};
+            } else {
+                ctx->frameBase[regOff + bc.result] = runtime::NullObject{};
+            }
+            ctx->remainingBudget -= fi.span;
+            return 0u;
+        }
+        case bytecode::Opcode::ConvertNullToString:
+        case bytecode::Opcode::ConvertNullToObject:
+        case bytecode::Opcode::ConvertNullToArray: {
+            const runtime::Value& src = ctx->frameBase[regOff + bc.operands[0]];
+            const auto tag = src.rawTag();
+            if (tag != runtime::ValueTag::Monostate &&
+                tag != runtime::ValueTag::NullString &&
+                tag != runtime::ValueTag::NullObject &&
+                tag != runtime::ValueTag::NullArray) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::TypeMismatch, "expected null for conversion");
+            }
+            if (bc.opcode == bytecode::Opcode::ConvertNullToString) {
+                ctx->frameBase[regOff + bc.result] = runtime::NullString{};
+            } else if (bc.opcode == bytecode::Opcode::ConvertNullToArray) {
+                ctx->frameBase[regOff + bc.result] = runtime::NullArray{};
+            } else {
+                ctx->frameBase[regOff + bc.result] = runtime::NullObject{};
+            }
+            ctx->remainingBudget -= fi.span;
+            return 0u;
+        }
+        case bytecode::Opcode::ConstantString: {
+            if (!session.heap) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "ConstantString requires heap");
+            }
+            runtime::RuntimeError strErr;
+            const auto interned = session.heap->internString(bc.stringImmediate, &strErr);
+            if (!interned) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::OutOfMemory, strErr.message);
+            }
+            ctx->frameBase[regOff + bc.result] = *interned;
+            ctx->remainingBudget -= fi.span;
+            invalidateJitArrayCaches(*ctx);
+            return 0u;
+        }
+        case bytecode::Opcode::Equal:
+        case bytecode::Opcode::NotEqual: {
+            const runtime::Value& lhs = ctx->frameBase[regOff + bc.operands[0]];
+            const runtime::Value& rhs = ctx->frameBase[regOff + bc.operands[1]];
+            bool eq = false;
+            runtime::ErrorCode eqErrCode = runtime::ErrorCode::InvalidObjectReference;
+            const char* eqErrMsg = "equality comparison failed";
+            if (!jitValuesEqual(session.heap, lhs, rhs, eq, eqErrCode, eqErrMsg)) {
+                return setHelperError(ctx, flatIdx, eqErrCode, eqErrMsg);
+            }
+            ctx->frameBase[regOff + bc.result] = (bc.opcode == bytecode::Opcode::Equal) ? eq : !eq;
+            ctx->remainingBudget -= fi.span;
+            return 0u;
+        }
+        default:
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "unsupported GenericBytecode in StencilJit");
+        }
+    }
+    if (session.flatBankId == 0u || session.values == nullptr) {
+        return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "flat stack bank is inactive in StencilJit");
+    }
+
+    runtime::Value* frameBase = ctx->frameBase;
+    const std::size_t frameOffset = session.frameOffset;
+
+    switch (fi.flatOpcode) {
+    case FO::InitStructSlice: {
+        const std::uint16_t sid = fi.aux0Slot;
+        const auto* sc = runtime::getFlatStructSchema(sid);
+        const std::uint32_t payOff = fi.auxImm32;
+        if (!sc || payOff + sc->flatSlotCount > execFunc.totalFrameSlots ||
+            frameOffset + payOff > runtime::StructStorageHandle::FrameOffsetMask) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "invalid InitStructSlice metadata");
+        }
+        std::memcpy(
+            static_cast<void*>(frameBase + payOff),
+            static_cast<const void*>(sc->prototypeLeaves.data()),
+            static_cast<std::size_t>(sc->flatSlotCount) * sizeof(runtime::Value));
+        ctx->remainingBudget -= fi.span;
+        frameBase[fi.dstSlot] = runtime::StructValue::makeFrameSlice(
+            static_cast<semantic::SymbolId>(fi.integerImmediate),
+            session.flatBankId,
+            static_cast<std::uint32_t>(frameOffset + payOff),
+            sid);
+        return 0u;
+    }
+    case FO::CopyStructSlice: {
+        const std::uint16_t sid = fi.aux0Slot;
+        const std::uint32_t dstPayOff = fi.auxImm32;
+        const auto* sc = runtime::getFlatStructSchema(sid);
+        if (!sc || dstPayOff + sc->flatSlotCount > execFunc.totalFrameSlots ||
+            frameOffset + dstPayOff > runtime::StructStorageHandle::FrameOffsetMask) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "invalid CopyStructSlice metadata");
+        }
+        const runtime::Value& srcVal = frameBase[fi.src0Slot];
+        const std::uint32_t dstAbs = static_cast<std::uint32_t>(frameOffset + dstPayOff);
+        if (srcVal.rawTag() == runtime::ValueTag::Struct &&
+            srcVal.asStructUnchecked().isFrameSlice() &&
+            srcVal.asStructUnchecked().frameSchemaId() == sid &&
+            srcVal.asStructUnchecked().storage.frameSliceBank() == session.flatBankId) {
+            const std::uint32_t srcAbs = srcVal.asStructUnchecked().storage.frameSliceOffset();
+            if (srcAbs != dstAbs) {
+                std::memmove(
+                    static_cast<void*>(session.values->data() + dstAbs),
+                    static_cast<const void*>(session.values->data() + srcAbs),
+                    static_cast<std::size_t>(sc->flatSlotCount) * sizeof(runtime::Value));
+            }
+        } else if (!runtime::extractStructLeavesToBuffer(srcVal, *sc, frameBase + dstPayOff)) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::TypeMismatch, "CopyStructSlice source mismatch");
+        }
+        ctx->remainingBudget -= fi.span;
+        frameBase[fi.dstSlot] = runtime::StructValue::makeFrameSlice(
+            static_cast<semantic::SymbolId>(fi.integerImmediate),
+            session.flatBankId,
+            dstAbs,
+            sid);
+        return 0u;
+    }
+    case FO::LoadStructSliceField: {
+        const runtime::Value& recv = frameBase[fi.src0Slot];
+        if (recv.rawTag() != runtime::ValueTag::Struct) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::TypeMismatch, "LoadStructSliceField invalid slice");
+        }
+        const std::uint16_t subSid = fi.aux1Slot;
+        const auto subTid = static_cast<semantic::SymbolId>(fi.integerImmediate);
+        if (!recv.asStructUnchecked().isFrameSlice()) {
+            const auto* recvSc = runtime::findFlatStructSchemaByTypeId(recv.asStructUnchecked().typeId);
+            if (!recvSc || fi.aux0Slot >= recvSc->flatSlotCount) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::TypeMismatch, "LoadStructSliceField invalid detached struct");
+            }
+            std::vector<runtime::Value> tmpLeaves(recvSc->flatSlotCount);
+            if (!runtime::extractStructLeavesToBuffer(recv, *recvSc, tmpLeaves.data())) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::TypeMismatch, "LoadStructSliceField detached extract failed");
+            }
+            if (subSid == 0u) {
+                ctx->remainingBudget -= fi.span;
+                frameBase[fi.dstSlot] = tmpLeaves[fi.aux0Slot];
+                return 0u;
+            }
+            const auto* subSc = runtime::getFlatStructSchema(subSid);
+            if (!subSc || static_cast<std::uint32_t>(fi.aux0Slot) + subSc->flatSlotCount > recvSc->flatSlotCount) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "LoadStructSliceField invalid detached sub-slice");
+            }
+            if (fi.auxImm32 == runtime::detail::InvalidStreamOffset) {
+                ctx->remainingBudget -= fi.span;
+                frameBase[fi.dstSlot] = runtime::reconstructDetachedStructFromLeaves(*subSc, tmpLeaves.data() + fi.aux0Slot);
+                return 0u;
+            }
+            if (fi.auxImm32 + subSc->flatSlotCount > execFunc.totalFrameSlots ||
+                frameOffset + fi.auxImm32 > runtime::StructStorageHandle::FrameOffsetMask) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "LoadStructSliceField invalid sub-slice");
+            }
+            const std::uint32_t dstAbs = static_cast<std::uint32_t>(frameOffset + fi.auxImm32);
+            for (std::uint16_t k = 0; k < subSc->flatSlotCount; ++k) {
+                (*session.values)[dstAbs + k] = tmpLeaves[fi.aux0Slot + k];
+            }
+            ctx->remainingBudget -= fi.span;
+            frameBase[fi.dstSlot] = runtime::StructValue::makeFrameSlice(
+                subTid, session.flatBankId, dstAbs, subSid);
+            return 0u;
+        }
+        if (recv.asStructUnchecked().storage.frameSliceBank() != session.flatBankId) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::TypeMismatch, "LoadStructSliceField invalid slice");
+        }
+        const std::uint64_t baseAbs64 =
+            static_cast<std::uint64_t>(recv.asStructUnchecked().storage.frameSliceOffset()) + fi.aux0Slot;
+        if (subSid == 0u) {
+            if (baseAbs64 >= session.values->size()) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "LoadStructSliceField out of bounds");
+            }
+            ctx->remainingBudget -= fi.span;
+            frameBase[fi.dstSlot] = (*session.values)[static_cast<std::size_t>(baseAbs64)];
+            return 0u;
+        }
+        if (fi.auxImm32 == runtime::detail::InvalidStreamOffset) {
+            if (baseAbs64 > runtime::StructStorageHandle::FrameOffsetMask) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "LoadStructSliceField offset overflow");
+            }
+            ctx->remainingBudget -= fi.span;
+            frameBase[fi.dstSlot] = runtime::StructValue::makeFrameSlice(
+                subTid, session.flatBankId, static_cast<std::uint32_t>(baseAbs64), subSid);
+            return 0u;
+        }
+        const auto* subSc = runtime::getFlatStructSchema(subSid);
+        if (!subSc || fi.auxImm32 + subSc->flatSlotCount > execFunc.totalFrameSlots ||
+            frameOffset + fi.auxImm32 > runtime::StructStorageHandle::FrameOffsetMask) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "LoadStructSliceField invalid sub-slice");
+        }
+        const std::uint32_t baseAbs = static_cast<std::uint32_t>(baseAbs64);
+        const std::uint32_t dstAbs = static_cast<std::uint32_t>(frameOffset + fi.auxImm32);
+        if (dstAbs != baseAbs) {
+            std::memmove(
+                static_cast<void*>(session.values->data() + dstAbs),
+                static_cast<const void*>(session.values->data() + baseAbs),
+                static_cast<std::size_t>(subSc->flatSlotCount) * sizeof(runtime::Value));
+        }
+        ctx->remainingBudget -= fi.span;
+        frameBase[fi.dstSlot] = runtime::StructValue::makeFrameSlice(
+            subTid, session.flatBankId, dstAbs, subSid);
+        return 0u;
+    }
+    case FO::StoreStructSliceField: {
+        const std::uint16_t sid = fi.aux0Slot;
+        const std::uint16_t fIdx = fi.aux1Slot;
+        const std::uint32_t dstPayOff = fi.auxImm32;
+        const auto* sc = runtime::getFlatStructSchema(sid);
+        if (!sc || fIdx >= sc->directFields.size() || dstPayOff + sc->flatSlotCount > execFunc.totalFrameSlots ||
+            frameOffset + dstPayOff > runtime::StructStorageHandle::FrameOffsetMask) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "StoreStructSliceField invalid metadata");
+        }
+        const runtime::Value& recv = frameBase[fi.src0Slot];
+        const runtime::Value& rhs = frameBase[fi.src1Slot];
+        runtime::Value* dstLeaves = frameBase + dstPayOff;
+        const std::uint32_t dstAbs = static_cast<std::uint32_t>(frameOffset + dstPayOff);
+        if (recv.rawTag() == runtime::ValueTag::Struct &&
+            recv.asStructUnchecked().isFrameSlice() &&
+            recv.asStructUnchecked().frameSchemaId() == sid &&
+            recv.asStructUnchecked().storage.frameSliceBank() == session.flatBankId) {
+            const std::uint32_t srcAbs = recv.asStructUnchecked().storage.frameSliceOffset();
+            if (srcAbs != dstAbs) {
+                std::memmove(
+                    static_cast<void*>(dstLeaves),
+                    static_cast<const void*>(session.values->data() + srcAbs),
+                    static_cast<std::size_t>(sc->flatSlotCount) * sizeof(runtime::Value));
+            }
+        } else if (!runtime::extractStructLeavesToBuffer(recv, *sc, dstLeaves)) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::TypeMismatch, "StoreStructSliceField receiver mismatch");
+        }
+        const auto& fd = sc->directFields[fIdx];
+        if (fd.subSchemaId == 0u) {
+            dstLeaves[fd.leafOffset] = rhs;
+        } else {
+            const auto* subSc = runtime::getFlatStructSchema(fd.subSchemaId);
+            if (!subSc || !runtime::extractStructLeavesToBuffer(rhs, *subSc, dstLeaves + fd.leafOffset)) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::TypeMismatch, "StoreStructSliceField field mismatch");
+            }
+        }
+        ctx->remainingBudget -= fi.span;
+        frameBase[fi.dstSlot] = runtime::StructValue::makeFrameSlice(
+            static_cast<semantic::SymbolId>(fi.integerImmediate),
+            session.flatBankId,
+            dstAbs,
+            sid);
+        return 0u;
+    }
+    case FO::StoreLocalStructFieldInPlace: {
+        const std::uint32_t locPayOff = fi.auxImm32;
+        const std::uint16_t leafOff = fi.aux0Slot;
+        const std::uint16_t subSid = fi.aux1Slot;
+        const runtime::Value& rhs = frameBase[fi.src1Slot];
+        if (subSid == 0u) {
+            frameBase[locPayOff + leafOff] = rhs;
+            ctx->remainingBudget -= fi.span;
+            return 0u;
+        }
+        const auto* subSc = runtime::getFlatStructSchema(subSid);
+        if (!subSc || !runtime::extractStructLeavesToBuffer(rhs, *subSc, frameBase + locPayOff + leafOff)) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::TypeMismatch, "StoreLocalStructFieldInPlace sub-struct mismatch");
+        }
+        ctx->remainingBudget -= fi.span;
+        return 0u;
+    }
+    case FO::InitStackRefCell: {
+        const auto& mirror = runtime::detail::executionMirror(*session.program);
+        if (fi.aux0Slot >= mirror.stackRefTemplates.size() || fi.auxImm32 >= execFunc.totalFrameSlots) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "InitStackRefCell invalid template");
+        }
+        const auto& srt = mirror.stackRefTemplates[fi.aux0Slot];
+        const std::uint32_t cellOff = fi.auxImm32;
+        if (srt.flatSchemaId == 0u) {
+            frameBase[cellOff] = srt.scalarDefaultValue;
+        } else {
+            const auto* sc = runtime::getFlatStructSchema(srt.flatSchemaId);
+            if (!sc || cellOff + sc->flatSlotCount > execFunc.totalFrameSlots) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "InitStackRefCell invalid struct slice");
+            }
+            std::memcpy(
+                static_cast<void*>(frameBase + cellOff),
+                static_cast<const void*>(sc->prototypeLeaves.data()),
+                static_cast<std::size_t>(sc->flatSlotCount) * sizeof(runtime::Value));
+        }
+        ctx->remainingBudget -= fi.span;
+        frameBase[fi.dstSlot] = runtime::ObjectRef::makeStackSlotRef(
+            static_cast<std::uint32_t>(frameOffset + cellOff),
+            session.flatBankId,
+            srt.flatSchemaId);
+        return 0u;
+    }
+    case FO::BindLocalStackRef: {
+        ctx->remainingBudget -= fi.span;
+        frameBase[fi.dstSlot] = runtime::ObjectRef::makeStackSlotRef(
+            static_cast<std::uint32_t>(frameOffset + fi.auxImm32),
+            session.flatBankId,
+            fi.aux0Slot);
+        return 0u;
+    }
+    case FO::WritebackLocalStackRef: {
+        ctx->remainingBudget -= fi.span;
+        return 0u;
+    }
+    case FO::LoadStackRefCell: {
+        const runtime::Value& recvVal = frameBase[fi.src0Slot];
+        if (recvVal.rawTag() != runtime::ValueTag::ObjectRef) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "LoadStackRefCell invalid ref");
+        }
+        const runtime::ObjectRef ref = recvVal.u_.objectRef;
+        const std::uint16_t sid = fi.aux0Slot;
+        if (!ref.isStackSlotRef()) {
+            const auto fv = session.heap ? session.heap->fieldGet(ref, 0) : std::nullopt;
+            if (!fv) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "LoadStackRefCell dangling heap ref");
+            }
+            if (sid == 0u || fi.auxImm32 == runtime::detail::InvalidStreamOffset) {
+                ctx->remainingBudget -= fi.span;
+                frameBase[fi.dstSlot] = *fv;
+                return 0u;
+            }
+            const auto* sc = runtime::getFlatStructSchema(sid);
+            if (!sc || fi.auxImm32 + sc->flatSlotCount > execFunc.totalFrameSlots ||
+                frameOffset + fi.auxImm32 > runtime::StructStorageHandle::FrameOffsetMask) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "LoadStackRefCell invalid payload");
+            }
+            const std::uint32_t dstAbs = static_cast<std::uint32_t>(frameOffset + fi.auxImm32);
+            if (!runtime::extractStructLeavesToBuffer(*fv, *sc, session.values->data() + dstAbs)) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::TypeMismatch, "LoadStackRefCell heap struct mismatch");
+            }
+            ctx->remainingBudget -= fi.span;
+            frameBase[fi.dstSlot] = runtime::StructValue::makeFrameSlice(
+                static_cast<semantic::SymbolId>(fi.integerImmediate), session.flatBankId, dstAbs, sid);
+            return 0u;
+        }
+        if (ref.generation != session.flatBankId) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "LoadStackRefCell invalid ref");
+        }
+        if (sid == 0u) {
+            ctx->remainingBudget -= fi.span;
+            frameBase[fi.dstSlot] = (*session.values)[ref.slot];
+            return 0u;
+        }
+        const auto innerTid = static_cast<semantic::SymbolId>(fi.integerImmediate);
+        if (fi.auxImm32 == runtime::detail::InvalidStreamOffset) {
+            if (ref.slot > runtime::StructStorageHandle::FrameOffsetMask) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "LoadStackRefCell slice offset overflow");
+            }
+            ctx->remainingBudget -= fi.span;
+            frameBase[fi.dstSlot] = runtime::StructValue::makeFrameSlice(
+                innerTid, session.flatBankId, ref.slot, sid);
+            return 0u;
+        }
+        const auto* sc = runtime::getFlatStructSchema(sid);
+        if (!sc || fi.auxImm32 + sc->flatSlotCount > execFunc.totalFrameSlots ||
+            frameOffset + fi.auxImm32 > runtime::StructStorageHandle::FrameOffsetMask) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "LoadStackRefCell invalid payload");
+        }
+        const std::uint32_t dstAbs = static_cast<std::uint32_t>(frameOffset + fi.auxImm32);
+        if (dstAbs != ref.slot) {
+            std::memmove(
+                static_cast<void*>(session.values->data() + dstAbs),
+                static_cast<const void*>(session.values->data() + ref.slot),
+                static_cast<std::size_t>(sc->flatSlotCount) * sizeof(runtime::Value));
+        }
+        ctx->remainingBudget -= fi.span;
+        frameBase[fi.dstSlot] = runtime::StructValue::makeFrameSlice(
+            innerTid, session.flatBankId, dstAbs, sid);
+        return 0u;
+    }
+    case FO::StoreStackRefCell: {
+        const runtime::Value& recvVal = frameBase[fi.src0Slot];
+        if (recvVal.rawTag() != runtime::ValueTag::ObjectRef) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "StoreStackRefCell invalid ref");
+        }
+        const runtime::ObjectRef ref = recvVal.u_.objectRef;
+        const runtime::Value& rhs = frameBase[fi.src1Slot];
+        if (!ref.isStackSlotRef()) {
+            if (!session.heap) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "StoreStackRefCell missing heap");
+            }
+            runtime::RuntimeError setErr;
+            if (!session.heap->fieldSet(ref, 0, runtime::detachFrameSliceValue(rhs), &setErr)) {
+                return setHelperError(
+                    ctx,
+                    flatIdx,
+                    setErr.code == runtime::ErrorCode::None ? runtime::ErrorCode::InvalidProgram : setErr.code,
+                    setErr.message.empty() ? "StoreStackRefCell heap write failed" : setErr.message);
+            }
+            ctx->remainingBudget -= fi.span;
+            return 0u;
+        }
+        if (ref.generation != session.flatBankId) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "StoreStackRefCell invalid ref");
+        }
+        const std::uint16_t sid = fi.aux0Slot;
+        if (sid == 0u) {
+            (*session.values)[ref.slot] = runtime::detachFrameSliceValue(rhs);
+            ctx->remainingBudget -= fi.span;
+            return 0u;
+        }
+        const auto* sc = runtime::getFlatStructSchema(sid);
+        if (!sc || !runtime::extractStructLeavesToBuffer(rhs, *sc, session.values->data() + ref.slot)) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::TypeMismatch, "StoreStackRefCell struct mismatch");
+        }
+        ctx->remainingBudget -= fi.span;
+        return 0u;
+    }
+    case FO::StoreStackRefStructFieldInPlace: {
+        const runtime::Value& recvVal = frameBase[fi.src0Slot];
+        if (recvVal.rawTag() != runtime::ValueTag::ObjectRef ||
+            !recvVal.u_.objectRef.isStackSlotRef() ||
+            recvVal.u_.objectRef.generation != session.flatBankId) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "StoreStackRefStructFieldInPlace invalid ref");
+        }
+        const std::uint32_t dstAbs = recvVal.u_.objectRef.slot + fi.aux0Slot;
+        const std::uint16_t subSid = fi.aux1Slot;
+        const runtime::Value& rhs = frameBase[fi.src1Slot];
+        if (subSid == 0u) {
+            (*session.values)[dstAbs] = runtime::detachFrameSliceValue(rhs);
+            ctx->remainingBudget -= fi.span;
+            return 0u;
+        }
+        const auto* subSc = runtime::getFlatStructSchema(subSid);
+        if (!subSc || !runtime::extractStructLeavesToBuffer(rhs, *subSc, session.values->data() + dstAbs)) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::TypeMismatch, "StoreStackRefStructFieldInPlace sub-struct mismatch");
+        }
+        ctx->remainingBudget -= fi.span;
+        return 0u;
+    }
+    default:
+        return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "unsupported flat struct/ref op in StencilJit");
+    }
 }
 
 // Helper for InlineCallEnter (tracks recursion limit, functionCalls, maximumCallDepth, and frame setup)
@@ -1748,6 +2950,7 @@ std::uint32_t jitPartialSuperBudgetHelper(JitAbiContext* ctx, std::uint32_t flat
     case FO::ConvertFloatToIntFast:
     case FO::ConvertLongToIntFast:
     case FO::ArrayLengthFast:
+    case FO::CheckNotNullFast:
         return validSlot(fi.dstSlot) && validSlot(fi.src0Slot);
     case FO::NewArrayFast: {
         if (!validSlot(fi.dstSlot) || !validSlot(fi.src0Slot)) return false;
@@ -1755,9 +2958,12 @@ std::uint32_t jitPartialSuperBudgetHelper(JitAbiContext* ctx, std::uint32_t flat
             static_cast<std::uint8_t>(fi.binaryOpcode1));
         if (fi.aux0Slot == 0 && elemType == semantic::PrimitiveType::Struct) {
             const auto idx = static_cast<std::size_t>(&fi - execFunc.flatStream.data());
-            return idx < execFunc.flatCold.size() &&
-                   execFunc.flatCold[idx].bytecode != nullptr &&
-                   runtime::isBlittableStructType(execFunc.flatCold[idx].bytecode->elementTypeId);
+            if (idx >= execFunc.flatCold.size() || execFunc.flatCold[idx].bytecode == nullptr) {
+                return false;
+            }
+            const auto elemTid = execFunc.flatCold[idx].bytecode->elementTypeId;
+            return runtime::isBlittableStructType(elemTid) ||
+                   runtime::findFlatStructSchemaByTypeId(elemTid) != nullptr;
         }
         return true;
     }
@@ -1873,7 +3079,109 @@ std::uint32_t jitPartialSuperBudgetHelper(JitAbiContext* ctx, std::uint32_t flat
         return validSlot(fi.dstSlot) && validSlot(fi.src0Slot) && validSlot(fi.src1Slot);
     case FO::StoreElementIntFast:
     case FO::StoreElementPrimFast:
+    case FO::StoreElementStructFast:
+    case FO::StoreElementObjFast:
+    case FO::StoreElementStructFieldInPlace:
         return validSlot(fi.src0Slot) && validSlot(fi.src1Slot) && validSlot(fi.src2Slot);
+    case FO::InitStructSlice:
+    case FO::InitStackRefCell:
+    case FO::BindLocalStackRef:
+        return validSlot(fi.dstSlot) && fi.auxImm32 < execFunc.totalFrameSlots;
+    case FO::AliasStructSlice:
+        return validSlot(fi.dstSlot) && validSlot(fi.src0Slot);
+    case FO::CopyStructSlice:
+        return validSlot(fi.dstSlot) && validSlot(fi.src0Slot) && fi.auxImm32 < execFunc.totalFrameSlots;
+    case FO::LoadStructSliceField:
+    case FO::LoadStackRefCell:
+        return validSlot(fi.dstSlot) && validSlot(fi.src0Slot) &&
+               (fi.auxImm32 == runtime::detail::InvalidStreamOffset || fi.auxImm32 < execFunc.totalFrameSlots);
+    case FO::StoreStructSliceField:
+        return validSlot(fi.dstSlot) && validSlot(fi.src0Slot) && validSlot(fi.src1Slot) &&
+               fi.auxImm32 < execFunc.totalFrameSlots;
+    case FO::StoreLocalStructFieldInPlace:
+        return validSlot(fi.src1Slot) && (fi.auxImm32 + fi.aux0Slot) < execFunc.totalFrameSlots;
+    case FO::WritebackLocalStackRef:
+        return validSlot(fi.src0Slot) && fi.auxImm32 < execFunc.totalFrameSlots;
+    case FO::StoreStackRefCell:
+    case FO::StoreStackRefStructFieldInPlace:
+    case FO::StoreFieldExactFast:
+    case FO::StoreFieldFast:
+        return validSlot(fi.src0Slot) && validSlot(fi.src1Slot);
+    case FO::LoadFieldExactFast:
+    case FO::LoadFieldFast:
+        return validSlot(fi.dstSlot) && validSlot(fi.src0Slot);
+    case FO::NewObjectFast:
+        return validSlot(fi.dstSlot);
+    case FO::GenericBytecode: {
+        const auto idx = static_cast<std::size_t>(&fi - execFunc.flatStream.data());
+        if (idx >= execFunc.flatCold.size() ||
+            execFunc.flatCold[idx].inlinedCallee != nullptr ||
+            execFunc.flatCold[idx].bytecode == nullptr ||
+            execFunc.bytecode == nullptr) {
+            return false;
+        }
+        const auto& bc = *execFunc.flatCold[idx].bytecode;
+        const auto& bcFn = *execFunc.bytecode;
+        const auto regCnt = bcFn.registerTypes.size();
+        const auto regOff = execFunc.registerOffset;
+        switch (bc.opcode) {
+        case bytecode::Opcode::ConstantInt: {
+            if (bc.result >= regCnt || !validSlot(static_cast<std::uint16_t>(regOff + bc.result))) return false;
+            const auto rt = bcFn.registerTypes[bc.result];
+            return rt == semantic::PrimitiveType::Int ||
+                   rt == semantic::PrimitiveType::Long ||
+                   rt == semantic::PrimitiveType::Enum;
+        }
+        case bytecode::Opcode::ConstantNull:
+        case bytecode::Opcode::ConstantString:
+            return bc.result < regCnt && validSlot(static_cast<std::uint16_t>(regOff + bc.result));
+        case bytecode::Opcode::ConvertNullToString:
+        case bytecode::Opcode::ConvertNullToObject:
+        case bytecode::Opcode::ConvertNullToArray:
+            return bc.result < regCnt &&
+                   bc.operands.size() == 1 &&
+                   bc.operands[0] < regCnt &&
+                   validSlot(static_cast<std::uint16_t>(regOff + bc.result)) &&
+                   validSlot(static_cast<std::uint16_t>(regOff + bc.operands[0]));
+        case bytecode::Opcode::Equal:
+        case bytecode::Opcode::NotEqual: {
+            if (bc.result >= regCnt || bc.operands.size() != 2 ||
+                bc.operands[0] >= regCnt || bc.operands[1] >= regCnt) {
+                return false;
+            }
+            if (!validSlot(static_cast<std::uint16_t>(regOff + bc.result)) ||
+                !validSlot(static_cast<std::uint16_t>(regOff + bc.operands[0])) ||
+                !validSlot(static_cast<std::uint16_t>(regOff + bc.operands[1]))) {
+                return false;
+            }
+            const auto t0 = bcFn.registerTypes[bc.operands[0]];
+            const auto t1 = bcFn.registerTypes[bc.operands[1]];
+            const auto okEqType = [](semantic::PrimitiveType t) noexcept {
+                return t == semantic::PrimitiveType::Int ||
+                       t == semantic::PrimitiveType::UInt ||
+                       t == semantic::PrimitiveType::Long ||
+                       t == semantic::PrimitiveType::ULong ||
+                       t == semantic::PrimitiveType::Byte ||
+                       t == semantic::PrimitiveType::SByte ||
+                       t == semantic::PrimitiveType::Short ||
+                       t == semantic::PrimitiveType::UShort ||
+                       t == semantic::PrimitiveType::Char ||
+                       t == semantic::PrimitiveType::Double ||
+                       t == semantic::PrimitiveType::Float ||
+                       t == semantic::PrimitiveType::Bool ||
+                       t == semantic::PrimitiveType::Enum ||
+                       t == semantic::PrimitiveType::Struct ||
+                       t == semantic::PrimitiveType::Object ||
+                       t == semantic::PrimitiveType::Array ||
+                       t == semantic::PrimitiveType::String ||
+                       t == semantic::PrimitiveType::Null;
+            };
+            return okEqType(t0) && okEqType(t1);
+        }
+        default:
+            return false;
+        }
+    }
     case FO::InlineCallEnter:
         return validSlot(fi.dstSlot) && fi.inlineArgCount <= 4u;
     case FO::InlineReturnVoid:
@@ -1930,10 +3238,32 @@ std::uint32_t jitPartialSuperBudgetHelper(JitAbiContext* ctx, std::uint32_t flat
 }
 
 // ============================================================================
-// P2-A Tier 2: Native x86_64 Copy-and-Patch / Stencil Machine Code Emitter
+// Shared Cold-Trap Metadata & Native Machine Code Emitters (x86_64 + ARM64)
 // ============================================================================
 
-#if defined(__x86_64__) || defined(_M_X64)
+struct ColdTrapStub {
+    enum class Kind : std::uint8_t {
+        BudgetSimple,
+        BudgetPartialSuper,
+        IntegerOverflow,
+        DivisionByZero,
+        TypeMismatch,
+        ArrayLengthSlow,
+        ArrayLengthBranchSlow,
+        ArrayLoadSlow,
+        ArrayStoreSlow,
+        FlatStructSlow,
+    };
+
+    Kind kind = Kind::BudgetSimple;
+    std::uint32_t stubLabel = 0;
+    std::uint32_t resumeLabel = 0;
+    std::uint32_t altResumeLabel = 0;
+    std::uint32_t flatIdx = 0;
+    std::int32_t restoreBudget = 0;
+};
+
+#if UINTPTR_MAX == 0xffffffffffffffffULL
 
 enum class X64Reg : std::uint8_t {
     RAX = 0,
@@ -2354,6 +3684,88 @@ public:
         emitMem(xmmSrc, base, disp);
     }
 
+    void movupsLoadSib1(std::uint8_t xmmDst, X64Reg base, X64Reg idx) {
+        emitRex(false, xmmDst, static_cast<std::uint8_t>(idx), static_cast<std::uint8_t>(base));
+        emit8(0x0Fu);
+        emit8(0x10u);
+        emitSibMem0(xmmDst, base, idx, 0);
+    }
+
+    void movupsStoreSib1(X64Reg base, X64Reg idx, std::uint8_t xmmSrc) {
+        emitRex(false, xmmSrc, static_cast<std::uint8_t>(idx), static_cast<std::uint8_t>(base));
+        emit8(0x0Fu);
+        emit8(0x11u);
+        emitSibMem0(xmmSrc, base, idx, 0);
+    }
+
+    void leaDisp64(X64Reg dst, X64Reg base, std::int32_t disp) {
+        emitRex(true, static_cast<std::uint8_t>(dst), 0, static_cast<std::uint8_t>(base));
+        emit8(0x8Du);
+        emitMem(static_cast<std::uint8_t>(dst), base, disp);
+    }
+
+    void leaSib1_64(X64Reg dst, X64Reg base, X64Reg idx) {
+        emitRex(true, static_cast<std::uint8_t>(dst), static_cast<std::uint8_t>(idx), static_cast<std::uint8_t>(base));
+        emit8(0x8Du);
+        emitSibMem0(static_cast<std::uint8_t>(dst), base, idx, 0);
+    }
+
+    void shlImm64(X64Reg dst, std::uint8_t shift) {
+        emitRex(true, 0, 0, static_cast<std::uint8_t>(dst));
+        emit8(0xC1u);
+        emitModRMReg(4, static_cast<std::uint8_t>(dst));
+        emit8(shift);
+    }
+
+    void shrImm32(X64Reg dst, std::uint8_t shift) {
+        emitRex(false, 0, 0, static_cast<std::uint8_t>(dst));
+        emit8(0xC1u);
+        emitModRMReg(5, static_cast<std::uint8_t>(dst));
+        emit8(shift);
+    }
+
+    void andImm32(X64Reg dst, std::uint32_t mask) {
+        emitRex(false, 0, 0, static_cast<std::uint8_t>(dst));
+        emit8(0x81u);
+        emitModRMReg(4, static_cast<std::uint8_t>(dst));
+        emit32(mask);
+    }
+
+    void orImm32(X64Reg dst, std::uint8_t imm) {
+        emitRex(false, 0, 0, static_cast<std::uint8_t>(dst));
+        emit8(0x83u);
+        emitModRMReg(1, static_cast<std::uint8_t>(dst));
+        emit8(imm);
+    }
+
+    void imulImm32_64(X64Reg dst, X64Reg src, std::int32_t imm) {
+        emitRex(true, static_cast<std::uint8_t>(dst), 0, static_cast<std::uint8_t>(src));
+        if (imm >= -128 && imm <= 127) {
+            emit8(0x6Bu);
+            emitModRMReg(static_cast<std::uint8_t>(dst), static_cast<std::uint8_t>(src));
+            emit8(static_cast<std::uint8_t>(static_cast<std::int8_t>(imm)));
+        } else {
+            emit8(0x69u);
+            emitModRMReg(static_cast<std::uint8_t>(dst), static_cast<std::uint8_t>(src));
+            emit32(static_cast<std::uint32_t>(imm));
+        }
+    }
+
+    void cmpMem16Imm(X64Reg base, std::int32_t disp, std::uint16_t imm) {
+        emit8(0x66u);
+        emitRex(false, 0, 0, static_cast<std::uint8_t>(base));
+        emit8(0x81u);
+        emitMem(7, base, disp);
+        emit8(static_cast<std::uint8_t>(imm & 0xFFu));
+        emit8(static_cast<std::uint8_t>((imm >> 8u) & 0xFFu));
+    }
+
+    void repMovsq() {
+        emit8(0xF3u);
+        emit8(0x48u);
+        emit8(0xA5u);
+    }
+
     void xorpsSelf(std::uint8_t xmm) {
         emit8(0x0Fu);
         emit8(0x57u);
@@ -2507,28 +3919,7 @@ private:
     std::vector<Label> labels_;
 };
 
-struct ColdTrapStub {
-    enum class Kind : std::uint8_t {
-        BudgetSimple,
-        BudgetPartialSuper,
-        IntegerOverflow,
-        DivisionByZero,
-        TypeMismatch,
-        ArrayLengthSlow,
-        ArrayLengthBranchSlow,
-        ArrayLoadSlow,
-        ArrayStoreSlow,
-    };
-
-    Kind kind = Kind::BudgetSimple;
-    std::uint32_t stubLabel = 0;
-    std::uint32_t resumeLabel = 0;
-    std::uint32_t altResumeLabel = 0;
-    std::uint32_t flatIdx = 0;
-    std::int32_t restoreBudget = 0;
-};
-
-[[nodiscard]] std::vector<std::uint8_t> compileFunctionX64(
+[[maybe_unused]] [[nodiscard]] std::vector<std::uint8_t> compileFunctionX64(
     const CompiledFunctionRecord& record) {
     const auto& execFunc = *record.execFunc;
     const std::size_t nInst = execFunc.flatStream.size();
@@ -2567,6 +3958,8 @@ struct ColdTrapStub {
     as.push(X64Reg::RBP);
     as.movReg64(X64Reg::RBP, X64Reg::RSP);
     as.push(X64Reg::RBX);
+    as.push(X64Reg::RSI);
+    as.push(X64Reg::RDI);
     as.push(X64Reg::R12);
     as.push(X64Reg::R13);
     as.push(X64Reg::R14);
@@ -2745,11 +4138,233 @@ struct ColdTrapStub {
 
         switch (fi.flatOpcode) {
         case FO::MoveSlot:
+        case FO::AliasStructSlice:
             emitBudgetDeduct(i32Idx, fi.span, false);
             if (fi.dstSlot != fi.src0Slot) {
                 as.movupsLoad(0, X64Reg::RBX, slotOff(fi.src0Slot));
                 as.movupsStore(X64Reg::RBX, slotOff(fi.dstSlot), 0);
             }
+            break;
+
+        case FO::StoreLocalStructFieldInPlace: {
+            const auto targetLeafSlot = static_cast<std::uint32_t>(fi.auxImm32 + fi.aux0Slot);
+            if (fi.aux1Slot == 0u) {
+                const std::uint32_t doneLbl = as.createLabel();
+                const auto slowStub = addColdStub(ColdTrapStub::Kind::FlatStructSlow, i32Idx, 0, doneLbl);
+                // Ensure RHS is not a FrameSlice/traceable Struct needing detach
+                as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src1Slot) + 15, static_cast<std::uint8_t>(runtime::ValueTag::Struct));
+                as.jcc(X64Cond::E, slowStub);
+                emitBudgetDeduct(i32Idx, fi.span, false);
+                as.movupsLoad(0, X64Reg::RBX, slotOff(fi.src1Slot));
+                as.movupsStore(X64Reg::RBX, static_cast<std::int32_t>(targetLeafSlot * 16u), 0);
+                as.bind(doneLbl);
+            } else if (const auto* subSc = runtime::getFlatStructSchema(fi.aux1Slot);
+                       subSc != nullptr && targetLeafSlot + subSc->flatSlotCount <= execFunc.totalFrameSlots) {
+                const std::uint32_t doneLbl = as.createLabel();
+                const auto slowStub = addColdStub(ColdTrapStub::Kind::FlatStructSlow, i32Idx, 0, doneLbl);
+                as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src1Slot) + 15, static_cast<std::uint8_t>(runtime::ValueTag::Struct));
+                as.jcc(X64Cond::NE, slowStub);
+                as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src1Slot) + 13, 0u);
+                as.jcc(X64Cond::NE, slowStub);
+                as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src1Slot) + 12, static_cast<std::uint8_t>(fi.aux1Slot & 0xFFu));
+                as.jcc(X64Cond::NE, slowStub);
+                as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src1Slot) + 14, static_cast<std::uint8_t>((fi.aux1Slot >> 8u) & 0xFFu));
+                as.jcc(X64Cond::NE, slowStub);
+                as.loadMem32(X64Reg::RAX, X64Reg::RBX, slotOff(fi.src1Slot) + 8);
+                as.loadMem64(X64Reg::RDX, X64Reg::R12, static_cast<std::int32_t>(offsetof(JitAbiContext, session)));
+                as.loadMem8ZeroExt(X64Reg::RCX, X64Reg::RDX, static_cast<std::int32_t>(offsetof(JitRuntimeSession, flatBankId)));
+                as.orImm32(X64Reg::RCX, 0x40u);
+                as.movReg64(X64Reg::R8, X64Reg::RAX);
+                as.shrImm32(X64Reg::R8, 24u);
+                as.cmpReg32(X64Reg::R8, X64Reg::RCX);
+                as.jcc(X64Cond::NE, slowStub);
+                as.andImm32(X64Reg::RAX, 0x00FFFFFFu);
+                as.loadMem64(X64Reg::R9, X64Reg::RDX, static_cast<std::int32_t>(offsetof(JitRuntimeSession, valuesBase)));
+                emitBudgetDeduct(i32Idx, fi.span, false);
+                as.shlImm64(X64Reg::RAX, 4u);
+                as.leaSib1_64(X64Reg::RSI, X64Reg::R9, X64Reg::RAX);
+                as.leaDisp64(X64Reg::RDI, X64Reg::RBX, static_cast<std::int32_t>(targetLeafSlot * 16u));
+                const std::uint32_t skipCopyLbl = as.createLabel();
+                as.cmpReg64(X64Reg::RSI, X64Reg::RDI);
+                as.jcc(X64Cond::E, skipCopyLbl);
+                if (subSc->flatSlotCount <= 6u) {
+                    for (std::uint16_t k = 0; k < subSc->flatSlotCount; ++k) {
+                        as.movupsLoad(0, X64Reg::RSI, static_cast<std::int32_t>(k) * 16);
+                        as.movupsStore(X64Reg::RDI, static_cast<std::int32_t>(k) * 16, 0);
+                    }
+                } else {
+                    as.movImm32(X64Reg::RCX, static_cast<std::uint32_t>(subSc->flatSlotCount) * 2u);
+                    as.repMovsq();
+                }
+                as.bind(skipCopyLbl);
+                as.bind(doneLbl);
+            } else {
+                emitHelperCallInline(&jitFlatStructAndStackRefHelper, i32Idx);
+            }
+            break;
+        }
+
+        case FO::LoadStructSliceField: {
+            const std::uint16_t subSid = fi.aux1Slot;
+            if (subSid == 0u || fi.auxImm32 == runtime::detail::InvalidStreamOffset) {
+                const std::uint32_t doneLbl = as.createLabel();
+                const auto slowStub = addColdStub(ColdTrapStub::Kind::FlatStructSlow, i32Idx, 0, doneLbl);
+                as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src0Slot) + 15, static_cast<std::uint8_t>(runtime::ValueTag::Struct));
+                as.jcc(X64Cond::NE, slowStub);
+                as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src0Slot) + 13, 0u);
+                as.jcc(X64Cond::NE, slowStub);
+                as.loadMem32(X64Reg::RAX, X64Reg::RBX, slotOff(fi.src0Slot) + 8);
+                as.loadMem64(X64Reg::RDX, X64Reg::R12, static_cast<std::int32_t>(offsetof(JitAbiContext, session)));
+                as.loadMem8ZeroExt(X64Reg::RCX, X64Reg::RDX, static_cast<std::int32_t>(offsetof(JitRuntimeSession, flatBankId)));
+                as.orImm32(X64Reg::RCX, 0x40u);
+                as.movReg64(X64Reg::R8, X64Reg::RAX);
+                as.shrImm32(X64Reg::R8, 24u);
+                as.cmpReg32(X64Reg::R8, X64Reg::RCX);
+                as.jcc(X64Cond::NE, slowStub);
+                as.andImm32(X64Reg::RAX, 0x00FFFFFFu);
+                as.addImm64(X64Reg::RAX, static_cast<std::int32_t>(fi.aux0Slot));
+                as.cmpReg32Imm(X64Reg::RAX, static_cast<std::int32_t>(runtime::StructStorageHandle::FrameOffsetMask));
+                as.jcc(X64Cond::A, slowStub);
+                as.loadMem64(X64Reg::R8, X64Reg::RDX, static_cast<std::int32_t>(offsetof(JitRuntimeSession, valuesBase)));
+                emitBudgetDeduct(i32Idx, fi.span, false);
+                if (subSid == 0u) {
+                    as.shlImm64(X64Reg::RAX, 4u);
+                    as.movupsLoadSib1(0, X64Reg::R8, X64Reg::RAX);
+                    as.movupsStore(X64Reg::RBX, slotOff(fi.dstSlot), 0);
+                } else {
+                    // Zero-copy AliasSlice nested struct header construction!
+                    as.shlImm64(X64Reg::RCX, 24u);
+                    as.emitRex(false, static_cast<std::uint8_t>(X64Reg::RCX), 0, static_cast<std::uint8_t>(X64Reg::RAX));
+                    as.emit8(0x09u); // OR eax, ecx
+                    as.emitModRMReg(static_cast<std::uint8_t>(X64Reg::RCX), static_cast<std::uint8_t>(X64Reg::RAX));
+                    as.movImm64(X64Reg::RDX, static_cast<std::uint64_t>(fi.integerImmediate));
+                    as.storeMem64(X64Reg::RBX, slotOff(fi.dstSlot) + 0, X64Reg::RDX);
+                    as.storeMem32(X64Reg::RBX, slotOff(fi.dstSlot) + 8, X64Reg::RAX);
+                    as.storeMem8Imm(X64Reg::RBX, slotOff(fi.dstSlot) + 12, static_cast<std::uint8_t>(subSid & 0xFFu));
+                    as.storeMem8Imm(X64Reg::RBX, slotOff(fi.dstSlot) + 13, 0u);
+                    as.storeMem8Imm(X64Reg::RBX, slotOff(fi.dstSlot) + 14, static_cast<std::uint8_t>((subSid >> 8u) & 0xFFu));
+                    as.storeMem8Imm(X64Reg::RBX, slotOff(fi.dstSlot) + 15, static_cast<std::uint8_t>(runtime::ValueTag::Struct));
+                }
+                as.bind(doneLbl);
+            } else {
+                emitHelperCallInline(&jitFlatStructAndStackRefHelper, i32Idx);
+            }
+            break;
+        }
+
+        case FO::CopyStructSlice: {
+            const std::uint16_t sid = fi.aux0Slot;
+            const std::uint32_t dstPayOff = fi.auxImm32;
+            const auto* sc = runtime::getFlatStructSchema(sid);
+            if (sc != nullptr && dstPayOff + sc->flatSlotCount <= execFunc.totalFrameSlots) {
+                const std::uint32_t doneLbl = as.createLabel();
+                const auto slowStub = addColdStub(ColdTrapStub::Kind::FlatStructSlow, i32Idx, 0, doneLbl);
+                as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src0Slot) + 15, static_cast<std::uint8_t>(runtime::ValueTag::Struct));
+                as.jcc(X64Cond::NE, slowStub);
+                as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src0Slot) + 13, 0u);
+                as.jcc(X64Cond::NE, slowStub);
+                as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src0Slot) + 12, static_cast<std::uint8_t>(sid & 0xFFu));
+                as.jcc(X64Cond::NE, slowStub);
+                as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src0Slot) + 14, static_cast<std::uint8_t>((sid >> 8u) & 0xFFu));
+                as.jcc(X64Cond::NE, slowStub);
+                as.loadMem32(X64Reg::RAX, X64Reg::RBX, slotOff(fi.src0Slot) + 8);
+                as.loadMem64(X64Reg::RDX, X64Reg::R12, static_cast<std::int32_t>(offsetof(JitAbiContext, session)));
+                as.loadMem8ZeroExt(X64Reg::RCX, X64Reg::RDX, static_cast<std::int32_t>(offsetof(JitRuntimeSession, flatBankId)));
+                as.orImm32(X64Reg::RCX, 0x40u);
+                as.movReg64(X64Reg::R8, X64Reg::RAX);
+                as.shrImm32(X64Reg::R8, 24u);
+                as.cmpReg32(X64Reg::R8, X64Reg::RCX);
+                as.jcc(X64Cond::NE, slowStub);
+                as.andImm32(X64Reg::RAX, 0x00FFFFFFu);
+                as.loadMem32(X64Reg::R8, X64Reg::RDX, static_cast<std::int32_t>(offsetof(JitRuntimeSession, frameOffset32)));
+                as.addImm64(X64Reg::R8, static_cast<std::int32_t>(dstPayOff));
+                as.cmpReg32Imm(X64Reg::R8, static_cast<std::int32_t>(runtime::StructStorageHandle::FrameOffsetMask));
+                as.jcc(X64Cond::A, slowStub);
+                as.loadMem64(X64Reg::RDX, X64Reg::RDX, static_cast<std::int32_t>(offsetof(JitRuntimeSession, valuesBase)));
+                emitBudgetDeduct(i32Idx, fi.span, false);
+                as.movReg64(X64Reg::R9, X64Reg::RCX); // save (0x40 | bankId)
+                as.shlImm64(X64Reg::RAX, 4u);
+                as.leaSib1_64(X64Reg::RSI, X64Reg::RDX, X64Reg::RAX);
+                as.leaDisp64(X64Reg::RDI, X64Reg::RBX, static_cast<std::int32_t>(dstPayOff * 16u));
+                const std::uint32_t skipCopyLbl = as.createLabel();
+                as.cmpReg64(X64Reg::RSI, X64Reg::RDI);
+                as.jcc(X64Cond::E, skipCopyLbl);
+                if (sc->flatSlotCount <= 6u) {
+                    for (std::uint16_t k = 0; k < sc->flatSlotCount; ++k) {
+                        as.movupsLoad(0, X64Reg::RSI, static_cast<std::int32_t>(k) * 16);
+                        as.movupsStore(X64Reg::RDI, static_cast<std::int32_t>(k) * 16, 0);
+                    }
+                } else {
+                    as.movImm32(X64Reg::RCX, static_cast<std::uint32_t>(sc->flatSlotCount) * 2u);
+                    as.repMovsq();
+                }
+                as.bind(skipCopyLbl);
+                as.shlImm64(X64Reg::R9, 24u);
+                as.movReg64(X64Reg::RAX, X64Reg::R8);
+                as.emitRex(false, static_cast<std::uint8_t>(X64Reg::R9), 0, static_cast<std::uint8_t>(X64Reg::RAX));
+                as.emit8(0x09u); // OR eax, r9d
+                as.emitModRMReg(static_cast<std::uint8_t>(X64Reg::R9), static_cast<std::uint8_t>(X64Reg::RAX));
+                as.movImm64(X64Reg::RDX, static_cast<std::uint64_t>(sc->structTypeId));
+                as.storeMem64(X64Reg::RBX, slotOff(fi.dstSlot) + 0, X64Reg::RDX);
+                as.storeMem32(X64Reg::RBX, slotOff(fi.dstSlot) + 8, X64Reg::RAX);
+                as.storeMem8Imm(X64Reg::RBX, slotOff(fi.dstSlot) + 12, static_cast<std::uint8_t>(sid & 0xFFu));
+                as.storeMem8Imm(X64Reg::RBX, slotOff(fi.dstSlot) + 13, 0u);
+                as.storeMem8Imm(X64Reg::RBX, slotOff(fi.dstSlot) + 14, static_cast<std::uint8_t>((sid >> 8u) & 0xFFu));
+                as.storeMem8Imm(X64Reg::RBX, slotOff(fi.dstSlot) + 15, static_cast<std::uint8_t>(runtime::ValueTag::Struct));
+                as.bind(doneLbl);
+            } else {
+                emitHelperCallInline(&jitFlatStructAndStackRefHelper, i32Idx);
+            }
+            break;
+        }
+
+        case FO::WritebackLocalStackRef:
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            break;
+
+        case FO::StoreStackRefStructFieldInPlace: {
+            if (fi.aux1Slot == 0u) {
+                const std::uint32_t doneLbl = as.createLabel();
+                const auto slowStub = addColdStub(ColdTrapStub::Kind::FlatStructSlow, i32Idx, 0, doneLbl);
+                as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src0Slot) + 15, kTagObjectRef);
+                as.jcc(X64Cond::NE, slowStub);
+                as.loadMem32(X64Reg::RAX, X64Reg::RBX, slotOff(fi.src0Slot) + 8);
+                as.cmpReg32Imm(X64Reg::RAX, static_cast<std::int32_t>(runtime::ObjectRef::StackSlotRefHeapId));
+                as.jcc(X64Cond::NE, slowStub);
+                as.loadMem64(X64Reg::RDX, X64Reg::R12, static_cast<std::int32_t>(offsetof(JitAbiContext, session)));
+                as.loadMem8ZeroExt(X64Reg::RCX, X64Reg::RDX, static_cast<std::int32_t>(offsetof(JitRuntimeSession, flatBankId)));
+                as.cmpReg32Mem(X64Reg::RCX, X64Reg::RBX, slotOff(fi.src0Slot) + 4);
+                as.jcc(X64Cond::NE, slowStub);
+                as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src1Slot) + 15, static_cast<std::uint8_t>(runtime::ValueTag::Struct));
+                as.jcc(X64Cond::E, slowStub);
+                as.loadMem64(X64Reg::R8, X64Reg::RDX, static_cast<std::int32_t>(offsetof(JitRuntimeSession, valuesBase)));
+                emitBudgetDeduct(i32Idx, fi.span, false);
+                as.loadMem32(X64Reg::RAX, X64Reg::RBX, slotOff(fi.src0Slot) + 0);
+                as.addImm64(X64Reg::RAX, static_cast<std::int32_t>(fi.aux0Slot));
+                as.shlImm64(X64Reg::RAX, 4u);
+                as.movupsLoad(0, X64Reg::RBX, slotOff(fi.src1Slot));
+                as.movupsStoreSib1(X64Reg::R8, X64Reg::RAX, 0);
+                as.bind(doneLbl);
+            } else {
+                emitHelperCallInline(&jitFlatStructAndStackRefHelper, i32Idx);
+            }
+            break;
+        }
+
+        case FO::InitStructSlice:
+        case FO::StoreStructSliceField:
+        case FO::InitStackRefCell:
+        case FO::BindLocalStackRef:
+        case FO::LoadStackRefCell:
+        case FO::CheckNotNullFast:
+        case FO::StoreStackRefCell:
+        case FO::NewObjectFast:
+        case FO::LoadFieldExactFast:
+        case FO::LoadFieldFast:
+        case FO::StoreFieldExactFast:
+        case FO::StoreFieldFast:
+        case FO::GenericBytecode:
+            emitHelperCallInline(&jitFlatStructAndStackRefHelper, i32Idx);
             break;
 
         case FO::SuperMoveParamStoreLocal:
@@ -3150,6 +4765,82 @@ struct ColdTrapStub {
             }
 
             if (fastEncoding == 0u) {
+                if (isTyped &&
+                    elemType == semantic::PrimitiveType::Struct &&
+                    execFunc.hasStructPayloads &&
+                    fi.dstSlot < execFunc.slotStructSchemaIds.size() &&
+                    execFunc.slotStructSchemaIds[fi.dstSlot] != 0u) {
+                    const std::uint16_t sid = execFunc.slotStructSchemaIds[fi.dstSlot];
+                    const std::uint16_t payOff = execFunc.slotPayloadOffsets[fi.dstSlot];
+                    const auto* sc = runtime::getFlatStructSchema(sid);
+                    if (sc != nullptr && payOff != runtime::detail::InvalidCompactReg &&
+                        static_cast<std::uint32_t>(payOff) + sc->flatSlotCount <= execFunc.totalFrameSlots) {
+                        const std::uint32_t doneLbl = as.createLabel();
+                        const std::int32_t cacheDisp =
+                            static_cast<std::int32_t>(offsetof(JitAbiContext, arrayCache)) +
+                            static_cast<std::int32_t>(fi.src0Slot & 3u) * 64;
+                        const auto slowStub = addColdStub(
+                            ColdTrapStub::Kind::ArrayLoadSlow, i32Idx, 0, doneLbl);
+
+                        // 1. Inline FlatStruct[] (isPacked == 2u) cache hit check
+                        as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src0Slot) + 15, kTagObjectRef);
+                        as.jcc(X64Cond::NE, slowStub);
+                        as.loadMem64(X64Reg::RAX, X64Reg::RBX, slotOff(fi.src0Slot));
+                        as.cmpReg64Mem(X64Reg::RAX, X64Reg::R12, cacheDisp + 0);
+                        as.jcc(X64Cond::NE, slowStub);
+                        as.loadMem32(X64Reg::RAX, X64Reg::RBX, slotOff(fi.src0Slot) + 8);
+                        as.cmpReg32Mem(X64Reg::RAX, X64Reg::R12, cacheDisp + 8);
+                        as.jcc(X64Cond::NE, slowStub);
+                        as.cmpMem8Imm(X64Reg::R12, cacheDisp + 13, 2u);
+                        as.jcc(X64Cond::NE, slowStub);
+                        as.cmpMem16Imm(X64Reg::R12, cacheDisp + 30, sid);
+                        as.jcc(X64Cond::NE, slowStub);
+
+                        // 2. Index validation & bounds check
+                        as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src1Slot) + 15, kTagInt64);
+                        as.jcc(X64Cond::NE, slowStub);
+                        as.loadMem64(X64Reg::RCX, X64Reg::RBX, slotOff(fi.src1Slot));
+                        as.loadMem32(X64Reg::RDX, X64Reg::R12, cacheDisp + 24);
+                        as.cmpReg64(X64Reg::RCX, X64Reg::RDX);
+                        as.jcc(X64Cond::AE, slowStub);
+
+                        // 3. Direct hardware slice copy from FlatStruct[] buffer -> flat frame payload!
+                        emitBudgetDeduct(i32Idx, fi.span, false);
+                        as.loadMem64(X64Reg::RDX, X64Reg::R12, cacheDisp + 16); // Value* data
+                        as.imulImm32_64(X64Reg::RAX, X64Reg::RCX, static_cast<std::int32_t>(sc->flatSlotCount) * 16);
+                        as.leaSib1_64(X64Reg::RSI, X64Reg::RDX, X64Reg::RAX);
+                        as.leaDisp64(X64Reg::RDI, X64Reg::RBX, static_cast<std::int32_t>(payOff) * 16);
+                        if (sc->flatSlotCount <= 6u) {
+                            for (std::uint16_t k = 0; k < sc->flatSlotCount; ++k) {
+                                as.movupsLoad(0, X64Reg::RSI, static_cast<std::int32_t>(k) * 16);
+                                as.movupsStore(X64Reg::RDI, static_cast<std::int32_t>(k) * 16, 0);
+                            }
+                        } else {
+                            as.movImm32(X64Reg::RCX, static_cast<std::uint32_t>(sc->flatSlotCount) * 2u);
+                            as.repMovsq();
+                        }
+                        as.loadMem64(X64Reg::RDX, X64Reg::R12, static_cast<std::int32_t>(offsetof(JitAbiContext, session)));
+                        as.loadMem8ZeroExt(X64Reg::RCX, X64Reg::RDX, static_cast<std::int32_t>(offsetof(JitRuntimeSession, flatBankId)));
+                        as.orImm32(X64Reg::RCX, 0x40u);
+                        as.shlImm64(X64Reg::RCX, 24u);
+                        as.loadMem32(X64Reg::RAX, X64Reg::RDX, static_cast<std::int32_t>(offsetof(JitRuntimeSession, frameOffset32)));
+                        if (payOff != 0u) {
+                            as.addImm64(X64Reg::RAX, static_cast<std::int32_t>(payOff));
+                        }
+                        as.emitRex(false, static_cast<std::uint8_t>(X64Reg::RCX), 0, static_cast<std::uint8_t>(X64Reg::RAX));
+                        as.emit8(0x09u); // OR eax, ecx
+                        as.emitModRMReg(static_cast<std::uint8_t>(X64Reg::RCX), static_cast<std::uint8_t>(X64Reg::RAX));
+                        as.movImm64(X64Reg::RDX, static_cast<std::uint64_t>(elemTid));
+                        as.storeMem64(X64Reg::RBX, slotOff(fi.dstSlot) + 0, X64Reg::RDX);
+                        as.storeMem32(X64Reg::RBX, slotOff(fi.dstSlot) + 8, X64Reg::RAX);
+                        as.storeMem8Imm(X64Reg::RBX, slotOff(fi.dstSlot) + 12, static_cast<std::uint8_t>(sid & 0xFFu));
+                        as.storeMem8Imm(X64Reg::RBX, slotOff(fi.dstSlot) + 13, 0u);
+                        as.storeMem8Imm(X64Reg::RBX, slotOff(fi.dstSlot) + 14, static_cast<std::uint8_t>((sid >> 8u) & 0xFFu));
+                        as.storeMem8Imm(X64Reg::RBX, slotOff(fi.dstSlot) + 15, static_cast<std::uint8_t>(runtime::ValueTag::Struct));
+                        as.bind(doneLbl);
+                        break;
+                    }
+                }
                 emitHelperCallInline(&jitLoadElementHelper, i32Idx);
                 break;
             }
@@ -3215,6 +4906,66 @@ struct ColdTrapStub {
             as.bind(doneLbl);
             break;
         }
+
+        case FO::StoreElementStructFieldInPlace: {
+            const auto rootSid = static_cast<std::uint16_t>(fi.auxImm32);
+            const auto* rootSc = runtime::getFlatStructSchema(rootSid);
+            if (fi.aux1Slot == 0u && rootSc != nullptr && fi.aux0Slot < rootSc->flatSlotCount) {
+                const std::uint32_t doneLbl = as.createLabel();
+                const std::int32_t cacheDisp =
+                    static_cast<std::int32_t>(offsetof(JitAbiContext, arrayCache)) +
+                    static_cast<std::int32_t>(fi.src0Slot & 3u) * 64;
+                const auto slowStub = addColdStub(
+                    ColdTrapStub::Kind::ArrayStoreSlow, i32Idx, 0, doneLbl);
+
+                // 1. Inline FlatStruct[] (isPacked == 2u) cache hit check
+                as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src0Slot) + 15, kTagObjectRef);
+                as.jcc(X64Cond::NE, slowStub);
+                as.loadMem64(X64Reg::RAX, X64Reg::RBX, slotOff(fi.src0Slot));
+                as.cmpReg64Mem(X64Reg::RAX, X64Reg::R12, cacheDisp + 0);
+                as.jcc(X64Cond::NE, slowStub);
+                as.loadMem32(X64Reg::RAX, X64Reg::RBX, slotOff(fi.src0Slot) + 8);
+                as.cmpReg32Mem(X64Reg::RAX, X64Reg::R12, cacheDisp + 8);
+                as.jcc(X64Cond::NE, slowStub);
+                as.cmpMem8Imm(X64Reg::R12, cacheDisp + 13, 2u);
+                as.jcc(X64Cond::NE, slowStub);
+                as.cmpMem16Imm(X64Reg::R12, cacheDisp + 30, rootSid);
+                as.jcc(X64Cond::NE, slowStub);
+
+                // 2. Index validation & bounds check
+                as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src1Slot) + 15, kTagInt64);
+                as.jcc(X64Cond::NE, slowStub);
+                as.loadMem64(X64Reg::RCX, X64Reg::RBX, slotOff(fi.src1Slot));
+                as.loadMem32(X64Reg::RDX, X64Reg::R12, cacheDisp + 24);
+                as.cmpReg64(X64Reg::RCX, X64Reg::RDX);
+                as.jcc(X64Cond::AE, slowStub);
+
+                // 3. Ensure RHS is a non-traceable, non-pool, non-FrameSlice scalar (1 <= tag < FirstTraceable=23)
+                as.loadMem8ZeroExt(X64Reg::RAX, X64Reg::RBX, slotOff(fi.src2Slot) + 15);
+                as.testReg32(X64Reg::RAX, X64Reg::RAX);
+                as.jcc(X64Cond::E, slowStub);
+                as.cmpReg32Imm(X64Reg::RAX, static_cast<std::int32_t>(runtime::ValueTag::FirstTraceable));
+                as.jcc(X64Cond::AE, slowStub);
+
+                // 4. Direct inline 128-bit XMM leaf store into FlatStruct[] element slot!
+                emitBudgetDeduct(i32Idx, fi.span, false);
+                as.loadMem64(X64Reg::RDX, X64Reg::R12, cacheDisp + 16); // Value* data
+                as.imulImm32_64(X64Reg::RAX, X64Reg::RCX, static_cast<std::int32_t>(rootSc->flatSlotCount));
+                as.addImm64(X64Reg::RAX, static_cast<std::int32_t>(fi.aux0Slot));
+                as.shlImm64(X64Reg::RAX, 4u);
+                as.movupsLoad(0, X64Reg::RBX, slotOff(fi.src2Slot));
+                as.movupsStoreSib1(X64Reg::RDX, X64Reg::RAX, 0);
+                as.bind(doneLbl);
+                break;
+            }
+            emitHelperCallInline(&jitStoreElementHelper, i32Idx);
+            break;
+        }
+
+        case FO::StoreElementStructFast:
+        case FO::StoreElementObjFast:
+            emitHelperCallInline(&jitStoreElementHelper, i32Idx);
+            break;
 
         case FO::StoreElementIntFast:
         case FO::StoreElementPrimFast: {
@@ -3899,6 +5650,11 @@ struct ColdTrapStub {
             emitHelperCallInline(&jitStoreElementHelper, stub.flatIdx);
             as.jmp(stub.resumeLabel);
             break;
+
+        case ColdTrapStub::Kind::FlatStructSlow:
+            emitHelperCallInline(&jitFlatStructAndStackRefHelper, stub.flatIdx);
+            as.jmp(stub.resumeLabel);
+            break;
         }
     }
 
@@ -3947,6 +5703,8 @@ struct ColdTrapStub {
     as.pop(X64Reg::R14);
     as.pop(X64Reg::R13);
     as.pop(X64Reg::R12);
+    as.pop(X64Reg::RDI);
+    as.pop(X64Reg::RSI);
     as.pop(X64Reg::RBX);
     as.pop(X64Reg::RBP);
     as.ret();
@@ -3955,7 +5713,2875 @@ struct ColdTrapStub {
     return as.bytes();
 }
 
-#endif // defined(__x86_64__) || defined(_M_X64)
+// ============================================================================
+// P2-A Tier 2B: Native ARM64 (AArch64) Stencil Machine Code Emitter
+// Covers macOS Apple Silicon (Darwin ARM64), iOS, Android/Linux AAPCS64 & Win-ARM64
+// Strictly avoids platform-reserved register X18 across all OS targets!
+// ============================================================================
+
+enum class A64Reg : std::uint8_t {
+    X0 = 0,
+    X1 = 1,
+    X2 = 2,
+    X3 = 3,
+    X4 = 4,
+    X5 = 5,
+    X6 = 6,
+    X7 = 7,
+    X8 = 8,
+    X9 = 9,   // Primary address-offset scratch register
+    X10 = 10, // Primary immediate/tag scratch register
+    X11 = 11, // Auxiliary loop/slice scratch register
+    X12 = 12,
+    X13 = 13,
+    X14 = 14,
+    X15 = 15,
+    X16 = 16, // IP0: C++ helper call target register (`blr x16`)
+    X17 = 17, // IP1
+    // NOTE: X18 is INTENTIONALLY OMITTED (platform-reserved on Apple Darwin ARM64 & Windows ARM64)
+    X19 = 19, // Callee-saved: pinned `JitAbiContext* ctx`
+    X20 = 20, // Callee-saved: pinned `runtime::Value* frameBase`
+    X21 = 21, // Callee-saved: pinned `uint64_t remainingBudget`
+    X22 = 22, // Callee-saved: pinned `uint64_t branchesTaken`
+    X23 = 23, // Callee-saved
+    X24 = 24, // Callee-saved
+    X29 = 29, // FP
+    X30 = 30, // LR
+    XZR = 31, // Zero register (or SP in stack/immediate base contexts)
+};
+
+enum class A64Cond : std::uint8_t {
+    EQ = 0x0, // Z == 1
+    NE = 0x1, // Z == 0
+    HS = 0x2, // C == 1 (unsigned >=, CS)
+    LO = 0x3, // C == 0 (unsigned <,  CC / borrow on SUBS)
+    MI = 0x4, // N == 1 (FCMP ordered <)
+    PL = 0x5, // N == 0
+    VS = 0x6, // V == 1 (signed overflow / FCMP unordered NaN)
+    VC = 0x7, // V == 0
+    HI = 0x8, // C == 1 && Z == 0 (unsigned >)
+    LS = 0x9, // !(C == 1 && Z == 0) (unsigned <= / FCMP ordered <=)
+    GE = 0xA, // N == V (signed >= / FCMP ordered >=)
+    LT = 0xB, // N != V (signed <)
+    GT = 0xC, // Z == 0 && N == V (signed > / FCMP ordered >)
+    LE = 0xD, // Z == 1 || N != V (signed <=)
+    AL = 0xE,
+};
+
+[[nodiscard]] constexpr A64Cond invertA64Cond(A64Cond cc) noexcept {
+    return static_cast<A64Cond>(static_cast<std::uint8_t>(cc) ^ 1u);
+}
+
+[[nodiscard]] constexpr A64Cond quickCmpToA64Cond(runtime::detail::QuickOpcode op) noexcept {
+    using QO = runtime::detail::QuickOpcode;
+    switch (op) {
+    case QO::LessInt: return A64Cond::LT;
+    case QO::LessOrEqualInt: return A64Cond::LE;
+    case QO::GreaterInt: return A64Cond::GT;
+    case QO::GreaterOrEqualInt: return A64Cond::GE;
+    case QO::EqualInt: return A64Cond::EQ;
+    case QO::NotEqualInt: return A64Cond::NE;
+    default: return A64Cond::EQ;
+    }
+}
+
+class A64Emitter {
+public:
+    enum class PatchKind : std::uint8_t {
+        BImm26,
+        BCondImm19,
+    };
+
+    struct PatchSite {
+        std::size_t bytePos = 0;
+        PatchKind kind = PatchKind::BImm26;
+    };
+
+    struct Label {
+        std::size_t boundOffset = std::numeric_limits<std::size_t>::max();
+        std::vector<PatchSite> patches;
+        [[nodiscard]] bool bound() const noexcept {
+            return boundOffset != std::numeric_limits<std::size_t>::max();
+        }
+    };
+
+    std::uint32_t createLabel() {
+        const auto id = static_cast<std::uint32_t>(labels_.size());
+        labels_.emplace_back();
+        return id;
+    }
+
+    void bind(std::uint32_t labelId) {
+        auto& lbl = labels_[labelId];
+        lbl.boundOffset = buf_.size();
+        for (const auto& site : lbl.patches) {
+            patchSite(site, lbl.boundOffset);
+        }
+        lbl.patches.clear();
+    }
+
+    [[nodiscard]] const std::vector<std::uint8_t>& bytes() const noexcept { return buf_; }
+    [[nodiscard]] std::size_t size() const noexcept { return buf_.size(); }
+    [[nodiscard]] bool ok() const noexcept {
+        if (overflowed_ || (buf_.size() % 4u) != 0u) return false;
+        for (const auto& lbl : labels_) {
+            if (!lbl.patches.empty() && !lbl.bound()) return false;
+        }
+        return true;
+    }
+
+    void emitInst(std::uint32_t word) {
+        std::uint8_t tmp[4];
+        std::memcpy(tmp, &word, 4);
+        buf_.insert(buf_.end(), tmp, tmp + 4);
+    }
+
+    // Stack frame prologue/epilogue helpers
+    void subSp(std::uint16_t imm12) {
+        emitInst(0xD1000000u | ((static_cast<std::uint32_t>(imm12) & 0xFFFu) << 10) | (31u << 5) | 31u);
+    }
+    void addSp(std::uint16_t imm12) {
+        emitInst(0x91000000u | ((static_cast<std::uint32_t>(imm12) & 0xFFFu) << 10) | (31u << 5) | 31u);
+    }
+    void movFpFromSp() {
+        emitInst(0x910003FDu); // add x29, sp, #0
+    }
+    void stp64Sp(A64Reg rt1, A64Reg rt2, std::int32_t byteOff) {
+        const auto imm7 = static_cast<std::uint32_t>((byteOff / 8) & 0x7F);
+        emitInst(0xA9000000u | (imm7 << 15) | (regCode(rt2) << 10) | (31u << 5) | regCode(rt1));
+    }
+    void ldp64Sp(A64Reg rt1, A64Reg rt2, std::int32_t byteOff) {
+        const auto imm7 = static_cast<std::uint32_t>((byteOff / 8) & 0x7F);
+        emitInst(0xA9400000u | (imm7 << 15) | (regCode(rt2) << 10) | (31u << 5) | regCode(rt1));
+    }
+    void ret() {
+        emitInst(0xD65F03C0u);
+    }
+    void blr(A64Reg target) {
+        emitInst(0xD63F0000u | (regCode(target) << 5));
+    }
+
+    // Register moves & wide immediates
+    void movReg64(A64Reg dst, A64Reg src) {
+        if (dst == src) return;
+        emitInst(0xAA0003E0u | (regCode(src) << 16) | regCode(dst));
+    }
+    void movReg32(A64Reg dst, A64Reg src) {
+        if (dst == src) return;
+        emitInst(0x2A0003E0u | (regCode(src) << 16) | regCode(dst));
+    }
+    void movz32(A64Reg dst, std::uint16_t imm16, std::uint8_t hw = 0) {
+        emitInst(0x52800000u | (static_cast<std::uint32_t>(hw & 1u) << 21) |
+                 (static_cast<std::uint32_t>(imm16) << 5) | regCode(dst));
+    }
+    void movn32(A64Reg dst, std::uint16_t imm16, std::uint8_t hw = 0) {
+        emitInst(0x12800000u | (static_cast<std::uint32_t>(hw & 1u) << 21) |
+                 (static_cast<std::uint32_t>(imm16) << 5) | regCode(dst));
+    }
+    void movk32(A64Reg dst, std::uint16_t imm16, std::uint8_t hw = 0) {
+        emitInst(0x72800000u | (static_cast<std::uint32_t>(hw & 1u) << 21) |
+                 (static_cast<std::uint32_t>(imm16) << 5) | regCode(dst));
+    }
+    void movz64(A64Reg dst, std::uint16_t imm16, std::uint8_t hw = 0) {
+        emitInst(0xD2800000u | (static_cast<std::uint32_t>(hw & 3u) << 21) |
+                 (static_cast<std::uint32_t>(imm16) << 5) | regCode(dst));
+    }
+    void movn64(A64Reg dst, std::uint16_t imm16, std::uint8_t hw = 0) {
+        emitInst(0x92800000u | (static_cast<std::uint32_t>(hw & 3u) << 21) |
+                 (static_cast<std::uint32_t>(imm16) << 5) | regCode(dst));
+    }
+    void movk64(A64Reg dst, std::uint16_t imm16, std::uint8_t hw = 0) {
+        emitInst(0xF2800000u | (static_cast<std::uint32_t>(hw & 3u) << 21) |
+                 (static_cast<std::uint32_t>(imm16) << 5) | regCode(dst));
+    }
+
+    void movImm32(A64Reg dst, std::uint32_t val) {
+        if ((val >> 16u) == 0u) {
+            movz32(dst, static_cast<std::uint16_t>(val), 0);
+            return;
+        }
+        const std::uint32_t inv = ~val;
+        if ((inv >> 16u) == 0u) {
+            movn32(dst, static_cast<std::uint16_t>(inv), 0);
+            return;
+        }
+        movz32(dst, static_cast<std::uint16_t>(val & 0xFFFFu), 0);
+        movk32(dst, static_cast<std::uint16_t>(val >> 16u), 1);
+    }
+
+    void movImm64(A64Reg dst, std::uint64_t val) {
+        if (val == 0u) {
+            movz32(dst, 0u, 0);
+            return;
+        }
+        const std::uint64_t inv = ~val;
+        if ((inv >> 16u) == 0u) {
+            movn64(dst, static_cast<std::uint16_t>(inv & 0xFFFFu), 0);
+            return;
+        }
+        bool first = true;
+        for (std::uint8_t hw = 0; hw < 4u; ++hw) {
+            const auto chunk = static_cast<std::uint16_t>((val >> (hw * 16u)) & 0xFFFFu);
+            if (chunk == 0u) continue;
+            if (first) {
+                movz64(dst, chunk, hw);
+                first = false;
+            } else {
+                movk64(dst, chunk, hw);
+            }
+        }
+    }
+
+    // Immediate & register 64-bit / 32-bit arithmetic
+    void addImm64(A64Reg dst, A64Reg src, std::int64_t imm) {
+        if (imm == 0) {
+            movReg64(dst, src);
+            return;
+        }
+        if (imm < 0) {
+            subImm64(dst, src, -imm);
+            return;
+        }
+        if (imm <= 4095) {
+            emitInst(0x91000000u | (static_cast<std::uint32_t>(imm) << 10) | (regCode(src) << 5) | regCode(dst));
+            return;
+        }
+        if (imm <= 0xFFFFFFLL) {
+            const auto hi12 = static_cast<std::uint32_t>((imm >> 12) & 0xFFF);
+            const auto lo12 = static_cast<std::uint32_t>(imm & 0xFFF);
+            emitInst(0x91400000u | (hi12 << 10) | (regCode(src) << 5) | regCode(dst));
+            if (lo12 != 0u) {
+                emitInst(0x91000000u | (lo12 << 10) | (regCode(dst) << 5) | regCode(dst));
+            }
+            return;
+        }
+        const A64Reg scratch = (dst == A64Reg::X10 || src == A64Reg::X10) ? A64Reg::X11 : A64Reg::X10;
+        movImm64(scratch, static_cast<std::uint64_t>(imm));
+        addReg64(dst, src, scratch, 0);
+    }
+
+    void subImm64(A64Reg dst, A64Reg src, std::int64_t imm) {
+        if (imm == 0) {
+            movReg64(dst, src);
+            return;
+        }
+        if (imm < 0) {
+            addImm64(dst, src, -imm);
+            return;
+        }
+        if (imm <= 4095) {
+            emitInst(0xD1000000u | (static_cast<std::uint32_t>(imm) << 10) | (regCode(src) << 5) | regCode(dst));
+            return;
+        }
+        const A64Reg scratch = (dst == A64Reg::X10 || src == A64Reg::X10) ? A64Reg::X11 : A64Reg::X10;
+        movImm64(scratch, static_cast<std::uint64_t>(imm));
+        subReg64(dst, src, scratch);
+    }
+
+    // `subs xDst, xSrc, #uimm12` -> sets C=0 (A64Cond::LO) on unsigned borrow!
+    void subsImm64(A64Reg dst, A64Reg src, std::uint16_t imm12) {
+        emitInst(0xF1000000u | ((static_cast<std::uint32_t>(imm12) & 0xFFFu) << 10) |
+                 (regCode(src) << 5) | regCode(dst));
+    }
+
+    void subsImm32(A64Reg dst, A64Reg src, std::uint16_t imm12) {
+        emitInst(0x71000000u | ((static_cast<std::uint32_t>(imm12) & 0xFFFu) << 10) |
+                 (regCode(src) << 5) | regCode(dst));
+    }
+
+    void addReg64(A64Reg dst, A64Reg lhs, A64Reg rhs, std::uint8_t lslShift = 0) {
+        emitInst(0x8B000000u | (regCode(rhs) << 16) |
+                 ((static_cast<std::uint32_t>(lslShift) & 63u) << 10) |
+                 (regCode(lhs) << 5) | regCode(dst));
+    }
+
+    void subReg64(A64Reg dst, A64Reg lhs, A64Reg rhs) {
+        emitInst(0xCB000000u | (regCode(rhs) << 16) | (regCode(lhs) << 5) | regCode(dst));
+    }
+
+    void addReg32(A64Reg dst, A64Reg lhs, A64Reg rhs) {
+        emitInst(0x0B000000u | (regCode(rhs) << 16) | (regCode(lhs) << 5) | regCode(dst));
+    }
+    void addsReg32(A64Reg dst, A64Reg lhs, A64Reg rhs) {
+        emitInst(0x2B000000u | (regCode(rhs) << 16) | (regCode(lhs) << 5) | regCode(dst));
+    }
+    void subReg32(A64Reg dst, A64Reg lhs, A64Reg rhs) {
+        emitInst(0x4B000000u | (regCode(rhs) << 16) | (regCode(lhs) << 5) | regCode(dst));
+    }
+    void subsReg32(A64Reg dst, A64Reg lhs, A64Reg rhs) {
+        emitInst(0x6B000000u | (regCode(rhs) << 16) | (regCode(lhs) << 5) | regCode(dst));
+    }
+
+    void mulReg64(A64Reg dst, A64Reg lhs, A64Reg rhs) {
+        emitInst(0x9B007C00u | (regCode(rhs) << 16) | (regCode(lhs) << 5) | regCode(dst));
+    }
+    void smullReg(A64Reg dst64, A64Reg lhs32, A64Reg rhs32) {
+        emitInst(0x9B207C00u | (regCode(rhs32) << 16) | (regCode(lhs32) << 5) | regCode(dst64));
+    }
+    void sdivReg32(A64Reg dst, A64Reg lhs, A64Reg rhs) {
+        emitInst(0x1AC00C00u | (regCode(rhs) << 16) | (regCode(lhs) << 5) | regCode(dst));
+    }
+    void msubReg32(A64Reg dst, A64Reg mulLhs, A64Reg mulRhs, A64Reg minuend) {
+        emitInst(0x1B008000u | (regCode(mulRhs) << 16) | (regCode(minuend) << 10) |
+                 (regCode(mulLhs) << 5) | regCode(dst));
+    }
+
+    void sxtw(A64Reg dst64, A64Reg src32) {
+        emitInst(0x93407C00u | (regCode(src32) << 5) | regCode(dst64));
+    }
+    void lslImm64(A64Reg dst, A64Reg src, std::uint8_t shift) {
+        if (shift == 0) {
+            movReg64(dst, src);
+            return;
+        }
+        const std::uint32_t immr = (64u - (shift & 63u)) & 63u;
+        const std::uint32_t imms = 63u - (shift & 63u);
+        emitInst(0xD3400000u | (immr << 16) | (imms << 10) | (regCode(src) << 5) | regCode(dst));
+    }
+    void lsrImm32(A64Reg dst, A64Reg src, std::uint8_t shift) {
+        if (shift == 0) {
+            movReg32(dst, src);
+            return;
+        }
+        emitInst(0x53007C00u | (static_cast<std::uint32_t>(shift & 31u) << 16) |
+                 (regCode(src) << 5) | regCode(dst));
+    }
+    void andLow24Bits32(A64Reg dst, A64Reg src) {
+        // ubfx wd, ws, #0, #24 (ubfm wd, ws, #0, #23)
+        emitInst(0x53005C00u | (regCode(src) << 5) | regCode(dst));
+    }
+
+    void orrReg32(A64Reg dst, A64Reg lhs, A64Reg rhs) {
+        emitInst(0x2A000000u | (regCode(rhs) << 16) | (regCode(lhs) << 5) | regCode(dst));
+    }
+    void eorReg32(A64Reg dst, A64Reg lhs, A64Reg rhs) {
+        emitInst(0x4A000000u | (regCode(rhs) << 16) | (regCode(lhs) << 5) | regCode(dst));
+    }
+    void eorReg64(A64Reg dst, A64Reg lhs, A64Reg rhs) {
+        emitInst(0xCA000000u | (regCode(rhs) << 16) | (regCode(lhs) << 5) | regCode(dst));
+    }
+
+    void cmpReg32(A64Reg lhs, A64Reg rhs) {
+        subsReg32(A64Reg::XZR, lhs, rhs);
+    }
+    void cmpReg64(A64Reg lhs, A64Reg rhs) {
+        emitInst(0xEB00001Fu | (regCode(rhs) << 16) | (regCode(lhs) << 5));
+    }
+    void cmpImm32(A64Reg lhs, std::int32_t imm) {
+        if (imm >= 0 && imm <= 4095) {
+            subsImm32(A64Reg::XZR, lhs, static_cast<std::uint16_t>(imm));
+        } else if (imm < 0 && imm >= -4095) {
+            // cmn wn, #-imm (adds wzr, wn, #-imm)
+            emitInst(0x3100001Fu | (static_cast<std::uint32_t>(-imm) << 10) | (regCode(lhs) << 5));
+        } else {
+            const A64Reg sc = (lhs == A64Reg::X10) ? A64Reg::X11 : A64Reg::X10;
+            movImm32(sc, static_cast<std::uint32_t>(imm));
+            cmpReg32(lhs, sc);
+        }
+    }
+    void cmpImm64(A64Reg lhs, std::int64_t imm) {
+        if (imm >= 0 && imm <= 4095) {
+            subsImm64(A64Reg::XZR, lhs, static_cast<std::uint16_t>(imm));
+        } else if (imm < 0 && imm >= -4095) {
+            emitInst(0xB100001Fu | (static_cast<std::uint32_t>(-imm) << 10) | (regCode(lhs) << 5));
+        } else {
+            const A64Reg sc = (lhs == A64Reg::X10) ? A64Reg::X11 : A64Reg::X10;
+            movImm64(sc, static_cast<std::uint64_t>(imm));
+            cmpReg64(lhs, sc);
+        }
+    }
+
+    void cset32(A64Reg dst, A64Cond cc) {
+        emitInst(0x1A9F07E0u | (static_cast<std::uint32_t>(invertA64Cond(cc)) << 12) | regCode(dst));
+    }
+
+    // Memory Loads & Stores (automatic X9 base materialization when offset exceeds uimm12*scale)
+    void loadMem8ZeroExt(A64Reg dst, A64Reg base, std::int32_t disp) {
+        auto [b, uimm12] = resolveScaledAddr(base, disp, 1);
+        emitInst(0x39400000u | (uimm12 << 10) | (regCode(b) << 5) | regCode(dst));
+    }
+    void storeMem8Reg(A64Reg base, std::int32_t disp, A64Reg src) {
+        auto [b, uimm12] = resolveScaledAddr(base, disp, 1);
+        emitInst(0x39000000u | (uimm12 << 10) | (regCode(b) << 5) | regCode(src));
+    }
+    void storeMem8Imm(A64Reg base, std::int32_t disp, std::uint8_t imm) {
+        if (imm == 0u) {
+            storeMem8Reg(base, disp, A64Reg::XZR);
+        } else {
+            movz32(A64Reg::X10, imm, 0);
+            storeMem8Reg(base, disp, A64Reg::X10);
+        }
+    }
+    void loadMem16ZeroExt(A64Reg dst, A64Reg base, std::int32_t disp) {
+        auto [b, uimm12] = resolveScaledAddr(base, disp, 2);
+        emitInst(0x79400000u | (uimm12 << 10) | (regCode(b) << 5) | regCode(dst));
+    }
+    void loadMem32(A64Reg dst, A64Reg base, std::int32_t disp) {
+        auto [b, uimm12] = resolveScaledAddr(base, disp, 4);
+        emitInst(0xB9400000u | (uimm12 << 10) | (regCode(b) << 5) | regCode(dst));
+    }
+    void loadMem32SignExt64(A64Reg dst64, A64Reg base, std::int32_t disp) {
+        auto [b, uimm12] = resolveScaledAddr(base, disp, 4);
+        emitInst(0xB9800000u | (uimm12 << 10) | (regCode(b) << 5) | regCode(dst64));
+    }
+    void storeMem32(A64Reg base, std::int32_t disp, A64Reg src) {
+        auto [b, uimm12] = resolveScaledAddr(base, disp, 4);
+        emitInst(0xB9000000u | (uimm12 << 10) | (regCode(b) << 5) | regCode(src));
+    }
+    void storeMem32Imm(A64Reg base, std::int32_t disp, std::uint32_t imm) {
+        if (imm == 0u) {
+            storeMem32(base, disp, A64Reg::XZR);
+        } else {
+            movImm32(A64Reg::X10, imm);
+            storeMem32(base, disp, A64Reg::X10);
+        }
+    }
+    void loadMem64(A64Reg dst, A64Reg base, std::int32_t disp) {
+        auto [b, uimm12] = resolveScaledAddr(base, disp, 8);
+        emitInst(0xF9400000u | (uimm12 << 10) | (regCode(b) << 5) | regCode(dst));
+    }
+    void storeMem64(A64Reg base, std::int32_t disp, A64Reg src) {
+        auto [b, uimm12] = resolveScaledAddr(base, disp, 8);
+        emitInst(0xF9000000u | (uimm12 << 10) | (regCode(b) << 5) | regCode(src));
+    }
+    void storeMem64Imm(A64Reg base, std::int32_t disp, std::uint64_t imm) {
+        if (imm == 0u) {
+            storeMem64(base, disp, A64Reg::XZR);
+        } else {
+            movImm64(A64Reg::X10, imm);
+            storeMem64(base, disp, A64Reg::X10);
+        }
+    }
+
+    // NEON 128-bit & FP scalar loads/stores/ops (V0..V7 caller-saved across all ARM64 ABIs)
+    void ldrQ(std::uint8_t vDst, A64Reg base, std::int32_t disp) {
+        auto [b, uimm12] = resolveScaledAddr(base, disp, 16);
+        emitInst(0x3DC00000u | (uimm12 << 10) | (regCode(b) << 5) | (vDst & 31u));
+    }
+    void strQ(A64Reg base, std::int32_t disp, std::uint8_t vSrc) {
+        auto [b, uimm12] = resolveScaledAddr(base, disp, 16);
+        emitInst(0x3D800000u | (uimm12 << 10) | (regCode(b) << 5) | (vSrc & 31u));
+    }
+    void veorZero128(std::uint8_t vReg) {
+        const std::uint32_t v = vReg & 31u;
+        emitInst(0x6E201C00u | (v << 16) | (v << 5) | v);
+    }
+
+    void ldrD(std::uint8_t dDst, A64Reg base, std::int32_t disp) {
+        auto [b, uimm12] = resolveScaledAddr(base, disp, 8);
+        emitInst(0xFD400000u | (uimm12 << 10) | (regCode(b) << 5) | (dDst & 31u));
+    }
+    void strD(A64Reg base, std::int32_t disp, std::uint8_t dSrc) {
+        auto [b, uimm12] = resolveScaledAddr(base, disp, 8);
+        emitInst(0xFD000000u | (uimm12 << 10) | (regCode(b) << 5) | (dSrc & 31u));
+    }
+    void ldrS(std::uint8_t sDst, A64Reg base, std::int32_t disp) {
+        auto [b, uimm12] = resolveScaledAddr(base, disp, 4);
+        emitInst(0xBD400000u | (uimm12 << 10) | (regCode(b) << 5) | (sDst & 31u));
+    }
+    void strS(A64Reg base, std::int32_t disp, std::uint8_t sSrc) {
+        auto [b, uimm12] = resolveScaledAddr(base, disp, 4);
+        emitInst(0xBD000000u | (uimm12 << 10) | (regCode(b) << 5) | (sSrc & 31u));
+    }
+
+    void faddD(std::uint8_t dDst, std::uint8_t dLhs, std::uint8_t dRhs) {
+        emitInst(0x1E602800u | (static_cast<std::uint32_t>(dRhs) << 16) | (static_cast<std::uint32_t>(dLhs) << 5) | dDst);
+    }
+    void fsubD(std::uint8_t dDst, std::uint8_t dLhs, std::uint8_t dRhs) {
+        emitInst(0x1E603800u | (static_cast<std::uint32_t>(dRhs) << 16) | (static_cast<std::uint32_t>(dLhs) << 5) | dDst);
+    }
+    void fmulD(std::uint8_t dDst, std::uint8_t dLhs, std::uint8_t dRhs) {
+        emitInst(0x1E600800u | (static_cast<std::uint32_t>(dRhs) << 16) | (static_cast<std::uint32_t>(dLhs) << 5) | dDst);
+    }
+    void fdivD(std::uint8_t dDst, std::uint8_t dLhs, std::uint8_t dRhs) {
+        emitInst(0x1E601800u | (static_cast<std::uint32_t>(dRhs) << 16) | (static_cast<std::uint32_t>(dLhs) << 5) | dDst);
+    }
+    void fcmpD(std::uint8_t dLhs, std::uint8_t dRhs) {
+        emitInst(0x1E602000u | (static_cast<std::uint32_t>(dRhs) << 16) | (static_cast<std::uint32_t>(dLhs) << 5));
+    }
+
+    void faddS(std::uint8_t sDst, std::uint8_t sLhs, std::uint8_t sRhs) {
+        emitInst(0x1E202800u | (static_cast<std::uint32_t>(sRhs) << 16) | (static_cast<std::uint32_t>(sLhs) << 5) | sDst);
+    }
+    void fsubS(std::uint8_t sDst, std::uint8_t sLhs, std::uint8_t sRhs) {
+        emitInst(0x1E203800u | (static_cast<std::uint32_t>(sRhs) << 16) | (static_cast<std::uint32_t>(sLhs) << 5) | sDst);
+    }
+    void fmulS(std::uint8_t sDst, std::uint8_t sLhs, std::uint8_t sRhs) {
+        emitInst(0x1E200800u | (static_cast<std::uint32_t>(sRhs) << 16) | (static_cast<std::uint32_t>(sLhs) << 5) | sDst);
+    }
+    void fdivS(std::uint8_t sDst, std::uint8_t sLhs, std::uint8_t sRhs) {
+        emitInst(0x1E201800u | (static_cast<std::uint32_t>(sRhs) << 16) | (static_cast<std::uint32_t>(sLhs) << 5) | sDst);
+    }
+    void fcmpS(std::uint8_t sLhs, std::uint8_t sRhs) {
+        emitInst(0x1E202000u | (static_cast<std::uint32_t>(sRhs) << 16) | (static_cast<std::uint32_t>(sLhs) << 5));
+    }
+
+    void fmovDFromX(std::uint8_t dDst, A64Reg src64) {
+        emitInst(0x9E670000u | (regCode(src64) << 5) | (dDst & 31u));
+    }
+    void scvtfDFromX(std::uint8_t dDst, A64Reg src64) {
+        emitInst(0x9E620000u | (regCode(src64) << 5) | (dDst & 31u));
+    }
+    void scvtfSFromX(std::uint8_t sDst, A64Reg src64) {
+        emitInst(0x9E220000u | (regCode(src64) << 5) | (sDst & 31u));
+    }
+    void fcvtDFromS(std::uint8_t dDst, std::uint8_t sSrc) {
+        emitInst(0x1E22C000u | (static_cast<std::uint32_t>(sSrc) << 5) | dDst);
+    }
+    void fcvtSFromD(std::uint8_t sDst, std::uint8_t dSrc) {
+        emitInst(0x1E624000u | (static_cast<std::uint32_t>(dSrc) << 5) | sDst);
+    }
+    void fcvtzsXFromD(A64Reg dst64, std::uint8_t dSrc) {
+        emitInst(0x9E780000u | (static_cast<std::uint32_t>(dSrc) << 5) | regCode(dst64));
+    }
+
+    // Branches
+    void b(std::uint32_t labelId) {
+        const std::size_t pos = buf_.size();
+        emitInst(0x14000000u);
+        recordOrPatch(labelId, PatchSite{pos, PatchKind::BImm26});
+    }
+    void bcc(A64Cond cc, std::uint32_t labelId) {
+        const std::size_t pos = buf_.size();
+        emitInst(0x54000000u | static_cast<std::uint32_t>(cc));
+        recordOrPatch(labelId, PatchSite{pos, PatchKind::BCondImm19});
+    }
+
+private:
+    [[nodiscard]] static constexpr std::uint32_t regCode(A64Reg r) noexcept {
+        return static_cast<std::uint32_t>(r) & 31u;
+    }
+
+    [[nodiscard]] std::pair<A64Reg, std::uint32_t> resolveScaledAddr(
+        A64Reg base,
+        std::int32_t disp,
+        std::int32_t scale) {
+        if (disp >= 0 && (disp % scale) == 0 && (disp / scale) <= 4095) {
+            return {base, static_cast<std::uint32_t>(disp / scale)};
+        }
+        addImm64(A64Reg::X9, base, disp);
+        return {A64Reg::X9, 0u};
+    }
+
+    void recordOrPatch(std::uint32_t labelId, PatchSite site) {
+        auto& lbl = labels_[labelId];
+        if (lbl.bound()) {
+            patchSite(site, lbl.boundOffset);
+        } else {
+            lbl.patches.push_back(site);
+        }
+    }
+
+    void patchSite(const PatchSite& site, std::size_t targetByteOffset) {
+        const std::ptrdiff_t relBytes =
+            static_cast<std::ptrdiff_t>(targetByteOffset) -
+            static_cast<std::ptrdiff_t>(site.bytePos);
+        if ((relBytes & 3) != 0) {
+            overflowed_ = true;
+            return;
+        }
+        const std::ptrdiff_t relWords = relBytes >> 2;
+        std::uint32_t inst = 0;
+        std::memcpy(&inst, buf_.data() + site.bytePos, 4);
+        if (site.kind == PatchKind::BImm26) {
+            if (relWords < -(1 << 25) || relWords >= (1 << 25)) {
+                overflowed_ = true;
+                return;
+            }
+            inst = (inst & 0xFC000000u) | (static_cast<std::uint32_t>(relWords) & 0x03FFFFFFu);
+        } else {
+            if (relWords < -(1 << 18) || relWords >= (1 << 18)) {
+                overflowed_ = true;
+                return;
+            }
+            inst = (inst & 0xFF00001Fu) | ((static_cast<std::uint32_t>(relWords) & 0x7FFFFu) << 5);
+        }
+        std::memcpy(buf_.data() + site.bytePos, &inst, 4);
+    }
+
+    std::vector<std::uint8_t> buf_;
+    std::vector<Label> labels_;
+    bool overflowed_ = false;
+};
+
+[[maybe_unused]] [[nodiscard]] std::vector<std::uint8_t> compileFunctionA64(
+    const CompiledFunctionRecord& record) {
+    const auto& execFunc = *record.execFunc;
+    const std::size_t nInst = execFunc.flatStream.size();
+
+    A64Emitter as;
+    std::vector<std::uint32_t> instLabels(nInst);
+    for (std::size_t i = 0; i < nInst; ++i) {
+        instLabels[i] = as.createLabel();
+    }
+
+    const std::uint32_t epilogueOk = as.createLabel();
+    const std::uint32_t epilogueBudget = as.createLabel();
+    const std::uint32_t epilogueOverflow = as.createLabel();
+    const std::uint32_t epilogueDivZero = as.createLabel();
+    const std::uint32_t epilogueTypeErr = as.createLabel();
+    const std::uint32_t epilogueHelperErr = as.createLabel();
+    const std::uint32_t sharedPopRet = as.createLabel();
+
+    std::vector<ColdTrapStub> coldStubs;
+    coldStubs.reserve(nInst);
+
+    const auto addColdStub = [&](
+        ColdTrapStub::Kind kind,
+        std::uint32_t flatIdx,
+        std::int32_t restoreBudget = 0,
+        std::uint32_t resumeLabel = 0,
+        std::uint32_t altResumeLabel = 0) {
+        const std::uint32_t lbl = as.createLabel();
+        coldStubs.push_back(ColdTrapStub{
+            kind, lbl, resumeLabel, altResumeLabel, flatIdx, restoreBudget
+        });
+        return lbl;
+    };
+
+    // Unified AAPCS64 / Apple Darwin ARM64 / Windows ARM64 Prologue (16-byte aligned 64B frame)
+    as.subSp(64);
+    as.stp64Sp(A64Reg::X29, A64Reg::X30, 0);
+    as.movFpFromSp();
+    as.stp64Sp(A64Reg::X19, A64Reg::X20, 16);
+    as.stp64Sp(A64Reg::X21, A64Reg::X22, 32);
+    as.stp64Sp(A64Reg::X23, A64Reg::X24, 48);
+
+    // X0 holds JitAbiContext* on macOS/iOS, Android/Linux, and Windows ARM64
+    as.movReg64(A64Reg::X19, A64Reg::X0);
+    as.loadMem64(A64Reg::X20, A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, frameBase)));
+    as.loadMem64(A64Reg::X21, A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, remainingBudget)));
+    as.loadMem64(A64Reg::X22, A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, branchesTaken)));
+
+    if (execFunc.entryStreamOffset != 0) {
+        as.b(instLabels[execFunc.entryStreamOffset]);
+    }
+
+    const auto slotOff = [](std::uint16_t slot) noexcept -> std::int32_t {
+        return static_cast<std::int32_t>(slot) * 16;
+    };
+
+    const auto emitBudgetDeduct = [&](std::uint32_t idx, std::uint8_t span, bool mayNeedPartialStep) {
+        as.subsImm64(A64Reg::X21, A64Reg::X21, span);
+        if (span > 1u && mayNeedPartialStep) {
+            const auto stub = addColdStub(
+                ColdTrapStub::Kind::BudgetPartialSuper, idx, static_cast<std::int32_t>(span));
+            as.bcc(A64Cond::LO, stub);
+        } else {
+            const auto stub = addColdStub(ColdTrapStub::Kind::BudgetSimple, idx);
+            as.bcc(A64Cond::LO, stub);
+        }
+    };
+
+    const auto emitCheckTagOrTrap = [&](
+        std::uint16_t slot,
+        std::uint8_t expectedTag,
+        std::uint32_t idx,
+        std::int32_t restoreBudgetAfterFail) {
+        as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(slot) + 15);
+        as.cmpImm32(A64Reg::X6, expectedTag);
+        const auto stub = addColdStub(ColdTrapStub::Kind::TypeMismatch, idx, restoreBudgetAfterFail);
+        as.bcc(A64Cond::NE, stub);
+    };
+
+    const auto emitHelperCallInline = [&](
+        std::uint32_t (*helperFn)(JitAbiContext*, std::uint32_t),
+        std::uint32_t flatIdx) {
+        as.storeMem64(A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, remainingBudget)), A64Reg::X21);
+        as.storeMem64(A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, branchesTaken)), A64Reg::X22);
+        as.movReg64(A64Reg::X0, A64Reg::X19);
+        as.movImm32(A64Reg::X1, flatIdx);
+        as.movImm64(A64Reg::X16, fnPtrAddress(helperFn));
+        as.blr(A64Reg::X16);
+        as.loadMem64(A64Reg::X20, A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, frameBase)));
+        as.loadMem64(A64Reg::X21, A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, remainingBudget)));
+        as.loadMem64(A64Reg::X22, A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, branchesTaken)));
+        as.cmpImm32(A64Reg::X0, 0);
+        as.bcc(A64Cond::NE, epilogueHelperErr);
+    };
+
+    // Copies `slotCount` 16-byte Value slots from pointer in X3 to pointer in X4 using 128-bit Q0
+    const auto emitCopySlots128 = [&](std::uint16_t slotCount) {
+        if (slotCount <= 8u) {
+            for (std::uint16_t k = 0; k < slotCount; ++k) {
+                as.ldrQ(0, A64Reg::X3, static_cast<std::int32_t>(k) * 16);
+                as.strQ(A64Reg::X4, static_cast<std::int32_t>(k) * 16, 0);
+            }
+        } else {
+            as.movImm32(A64Reg::X5, slotCount);
+            const std::uint32_t loopLbl = as.createLabel();
+            as.bind(loopLbl);
+            as.ldrQ(0, A64Reg::X3, 0);
+            as.strQ(A64Reg::X4, 0, 0);
+            as.addImm64(A64Reg::X3, A64Reg::X3, 16);
+            as.addImm64(A64Reg::X4, A64Reg::X4, 16);
+            as.subsImm32(A64Reg::X5, A64Reg::X5, 1u);
+            as.bcc(A64Cond::NE, loopLbl);
+        }
+    };
+
+    // Operates on W0 (lhs) and W1 (rhs); returns kTagInt64 (result in X0) or kTagBool (0/1 in W0)
+    const auto emitQuickIntOpCore = [&](
+        runtime::detail::QuickOpcode qop,
+        bool checked,
+        std::uint32_t idx,
+        std::int32_t unexecAfterTrap) -> std::uint8_t {
+        using QO = runtime::detail::QuickOpcode;
+        switch (qop) {
+        case QO::AddInt:
+            if (checked) {
+                as.addsReg32(A64Reg::X0, A64Reg::X0, A64Reg::X1);
+                const auto ovfStub = addColdStub(ColdTrapStub::Kind::IntegerOverflow, idx, unexecAfterTrap);
+                as.bcc(A64Cond::VS, ovfStub);
+            } else {
+                as.addReg32(A64Reg::X0, A64Reg::X0, A64Reg::X1);
+            }
+            as.sxtw(A64Reg::X0, A64Reg::X0);
+            return kTagInt64;
+        case QO::SubtractInt:
+            if (checked) {
+                as.subsReg32(A64Reg::X0, A64Reg::X0, A64Reg::X1);
+                const auto ovfStub = addColdStub(ColdTrapStub::Kind::IntegerOverflow, idx, unexecAfterTrap);
+                as.bcc(A64Cond::VS, ovfStub);
+            } else {
+                as.subReg32(A64Reg::X0, A64Reg::X0, A64Reg::X1);
+            }
+            as.sxtw(A64Reg::X0, A64Reg::X0);
+            return kTagInt64;
+        case QO::MultiplyInt:
+            as.smullReg(A64Reg::X0, A64Reg::X0, A64Reg::X1);
+            as.sxtw(A64Reg::X2, A64Reg::X0);
+            if (checked) {
+                as.cmpReg64(A64Reg::X0, A64Reg::X2);
+                const auto ovfStub = addColdStub(ColdTrapStub::Kind::IntegerOverflow, idx, unexecAfterTrap);
+                as.bcc(A64Cond::NE, ovfStub);
+            } else {
+                as.movReg64(A64Reg::X0, A64Reg::X2);
+            }
+            return kTagInt64;
+        case QO::DivideInt: {
+            as.cmpImm32(A64Reg::X1, 0);
+            const auto div0Stub = addColdStub(ColdTrapStub::Kind::DivisionByZero, idx, unexecAfterTrap);
+            as.bcc(A64Cond::EQ, div0Stub);
+            const std::uint32_t doDiv = as.createLabel();
+            as.cmpImm32(A64Reg::X0, std::numeric_limits<std::int32_t>::min());
+            as.bcc(A64Cond::NE, doDiv);
+            as.cmpImm32(A64Reg::X1, -1);
+            const auto ovfStub = addColdStub(ColdTrapStub::Kind::IntegerOverflow, idx, unexecAfterTrap);
+            as.bcc(A64Cond::EQ, ovfStub);
+            as.bind(doDiv);
+            as.sdivReg32(A64Reg::X0, A64Reg::X0, A64Reg::X1);
+            as.sxtw(A64Reg::X0, A64Reg::X0);
+            return kTagInt64;
+        }
+        case QO::RemainderInt: {
+            as.cmpImm32(A64Reg::X1, 0);
+            const auto div0Stub = addColdStub(ColdTrapStub::Kind::DivisionByZero, idx, unexecAfterTrap);
+            as.bcc(A64Cond::EQ, div0Stub);
+            const std::uint32_t doRem = as.createLabel();
+            const std::uint32_t remDone = as.createLabel();
+            as.cmpImm32(A64Reg::X0, std::numeric_limits<std::int32_t>::min());
+            as.bcc(A64Cond::NE, doRem);
+            as.cmpImm32(A64Reg::X1, -1);
+            as.bcc(A64Cond::NE, doRem);
+            as.movz32(A64Reg::X0, 0);
+            as.b(remDone);
+            as.bind(doRem);
+            as.sdivReg32(A64Reg::X2, A64Reg::X0, A64Reg::X1);
+            as.msubReg32(A64Reg::X0, A64Reg::X2, A64Reg::X1, A64Reg::X0);
+            as.sxtw(A64Reg::X0, A64Reg::X0);
+            as.bind(remDone);
+            return kTagInt64;
+        }
+        default:
+            as.cmpReg32(A64Reg::X0, A64Reg::X1);
+            as.cset32(A64Reg::X0, quickCmpToA64Cond(qop));
+            return kTagBool;
+        }
+    };
+
+    const auto emitWriteTaggedResult = [&](std::uint16_t slot, std::uint8_t tag) {
+        const std::int32_t off = slotOff(slot);
+        if (tag == kTagBool) {
+            as.storeMem8Reg(A64Reg::X20, off, A64Reg::X0);
+            as.storeMem8Imm(A64Reg::X20, off + 15, kTagBool);
+        } else {
+            as.storeMem64(A64Reg::X20, off, A64Reg::X0);
+            as.storeMem8Imm(A64Reg::X20, off + 15, tag);
+        }
+    };
+
+    const auto emitCondBranchTargets = [&](
+        A64Cond trueCc,
+        std::uint32_t idx,
+        std::uint32_t trueOff,
+        std::uint32_t falseOff) {
+        if (falseOff == idx + 1u) {
+            as.bcc(trueCc, instLabels[trueOff]);
+        } else if (trueOff == idx + 1u) {
+            as.bcc(invertA64Cond(trueCc), instLabels[falseOff]);
+        } else {
+            as.bcc(trueCc, instLabels[trueOff]);
+            as.b(instLabels[falseOff]);
+        }
+    };
+
+    for (std::size_t idx = 0; idx < nInst; ++idx) {
+        as.bind(instLabels[idx]);
+        const auto& fi = execFunc.flatStream[idx];
+        const auto i32Idx = static_cast<std::uint32_t>(idx);
+        const auto unexecAfter = static_cast<std::int32_t>(record.unexecutedAfterOp[idx]);
+        using FO = runtime::detail::FlatOpcode;
+        using QO = runtime::detail::QuickOpcode;
+
+        switch (fi.flatOpcode) {
+        case FO::MoveSlot:
+        case FO::AliasStructSlice:
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            if (fi.dstSlot != fi.src0Slot) {
+                as.ldrQ(0, A64Reg::X20, slotOff(fi.src0Slot));
+                as.strQ(A64Reg::X20, slotOff(fi.dstSlot), 0);
+            }
+            break;
+
+        case FO::StoreLocalStructFieldInPlace: {
+            const auto targetLeafSlot = static_cast<std::uint32_t>(fi.auxImm32 + fi.aux0Slot);
+            if (fi.aux1Slot == 0u) {
+                const std::uint32_t doneLbl = as.createLabel();
+                const auto slowStub = addColdStub(ColdTrapStub::Kind::FlatStructSlow, i32Idx, 0, doneLbl);
+                as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src1Slot) + 15);
+                as.cmpImm32(A64Reg::X6, static_cast<std::int32_t>(runtime::ValueTag::Struct));
+                as.bcc(A64Cond::EQ, slowStub);
+                emitBudgetDeduct(i32Idx, fi.span, false);
+                as.ldrQ(0, A64Reg::X20, slotOff(fi.src1Slot));
+                as.strQ(A64Reg::X20, static_cast<std::int32_t>(targetLeafSlot * 16u), 0);
+                as.bind(doneLbl);
+            } else if (const auto* subSc = runtime::getFlatStructSchema(fi.aux1Slot);
+                       subSc != nullptr && targetLeafSlot + subSc->flatSlotCount <= execFunc.totalFrameSlots) {
+                const std::uint32_t doneLbl = as.createLabel();
+                const auto slowStub = addColdStub(ColdTrapStub::Kind::FlatStructSlow, i32Idx, 0, doneLbl);
+                as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src1Slot) + 15);
+                as.cmpImm32(A64Reg::X6, static_cast<std::int32_t>(runtime::ValueTag::Struct));
+                as.bcc(A64Cond::NE, slowStub);
+                as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src1Slot) + 13);
+                as.cmpImm32(A64Reg::X6, 0);
+                as.bcc(A64Cond::NE, slowStub);
+                as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src1Slot) + 12);
+                as.cmpImm32(A64Reg::X6, static_cast<std::int32_t>(fi.aux1Slot & 0xFFu));
+                as.bcc(A64Cond::NE, slowStub);
+                as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src1Slot) + 14);
+                as.cmpImm32(A64Reg::X6, static_cast<std::int32_t>((fi.aux1Slot >> 8u) & 0xFFu));
+                as.bcc(A64Cond::NE, slowStub);
+                as.loadMem32(A64Reg::X0, A64Reg::X20, slotOff(fi.src1Slot) + 8);
+                as.loadMem64(A64Reg::X2, A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, session)));
+                as.loadMem8ZeroExt(A64Reg::X1, A64Reg::X2, static_cast<std::int32_t>(offsetof(JitRuntimeSession, flatBankId)));
+                as.movz32(A64Reg::X6, 0x40u);
+                as.orrReg32(A64Reg::X1, A64Reg::X1, A64Reg::X6);
+                as.lsrImm32(A64Reg::X6, A64Reg::X0, 24u);
+                as.cmpReg32(A64Reg::X6, A64Reg::X1);
+                as.bcc(A64Cond::NE, slowStub);
+                as.andLow24Bits32(A64Reg::X0, A64Reg::X0);
+                as.loadMem64(A64Reg::X6, A64Reg::X2, static_cast<std::int32_t>(offsetof(JitRuntimeSession, valuesBase)));
+                emitBudgetDeduct(i32Idx, fi.span, false);
+                as.addReg64(A64Reg::X3, A64Reg::X6, A64Reg::X0, 4u);
+                as.addImm64(A64Reg::X4, A64Reg::X20, static_cast<std::int64_t>(targetLeafSlot) * 16LL);
+                const std::uint32_t skipCopyLbl = as.createLabel();
+                as.cmpReg64(A64Reg::X3, A64Reg::X4);
+                as.bcc(A64Cond::EQ, skipCopyLbl);
+                emitCopySlots128(subSc->flatSlotCount);
+                as.bind(skipCopyLbl);
+                as.bind(doneLbl);
+            } else {
+                emitHelperCallInline(&jitFlatStructAndStackRefHelper, i32Idx);
+            }
+            break;
+        }
+
+        case FO::LoadStructSliceField: {
+            const std::uint16_t subSid = fi.aux1Slot;
+            if (subSid == 0u || fi.auxImm32 == runtime::detail::InvalidStreamOffset) {
+                const std::uint32_t doneLbl = as.createLabel();
+                const auto slowStub = addColdStub(ColdTrapStub::Kind::FlatStructSlow, i32Idx, 0, doneLbl);
+                as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src0Slot) + 15);
+                as.cmpImm32(A64Reg::X6, static_cast<std::int32_t>(runtime::ValueTag::Struct));
+                as.bcc(A64Cond::NE, slowStub);
+                as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src0Slot) + 13);
+                as.cmpImm32(A64Reg::X6, 0);
+                as.bcc(A64Cond::NE, slowStub);
+                as.loadMem32(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot) + 8);
+                as.loadMem64(A64Reg::X2, A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, session)));
+                as.loadMem8ZeroExt(A64Reg::X1, A64Reg::X2, static_cast<std::int32_t>(offsetof(JitRuntimeSession, flatBankId)));
+                as.movz32(A64Reg::X6, 0x40u);
+                as.orrReg32(A64Reg::X1, A64Reg::X1, A64Reg::X6);
+                as.lsrImm32(A64Reg::X6, A64Reg::X0, 24u);
+                as.cmpReg32(A64Reg::X6, A64Reg::X1);
+                as.bcc(A64Cond::NE, slowStub);
+                as.andLow24Bits32(A64Reg::X0, A64Reg::X0);
+                as.addImm64(A64Reg::X0, A64Reg::X0, fi.aux0Slot);
+                as.cmpImm32(A64Reg::X0, static_cast<std::int32_t>(runtime::StructStorageHandle::FrameOffsetMask));
+                as.bcc(A64Cond::HI, slowStub);
+                as.loadMem64(A64Reg::X6, A64Reg::X2, static_cast<std::int32_t>(offsetof(JitRuntimeSession, valuesBase)));
+                emitBudgetDeduct(i32Idx, fi.span, false);
+                if (subSid == 0u) {
+                    as.addReg64(A64Reg::X3, A64Reg::X6, A64Reg::X0, 4u);
+                    as.ldrQ(0, A64Reg::X3, 0);
+                    as.strQ(A64Reg::X20, slotOff(fi.dstSlot), 0);
+                } else {
+                    as.lslImm64(A64Reg::X1, A64Reg::X1, 24u);
+                    as.orrReg32(A64Reg::X0, A64Reg::X0, A64Reg::X1);
+                    as.movImm64(A64Reg::X2, static_cast<std::uint64_t>(fi.integerImmediate));
+                    as.storeMem64(A64Reg::X20, slotOff(fi.dstSlot) + 0, A64Reg::X2);
+                    as.storeMem32(A64Reg::X20, slotOff(fi.dstSlot) + 8, A64Reg::X0);
+                    as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 12, static_cast<std::uint8_t>(subSid & 0xFFu));
+                    as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 13, 0u);
+                    as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 14, static_cast<std::uint8_t>((subSid >> 8u) & 0xFFu));
+                    as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 15, static_cast<std::uint8_t>(runtime::ValueTag::Struct));
+                }
+                as.bind(doneLbl);
+            } else {
+                emitHelperCallInline(&jitFlatStructAndStackRefHelper, i32Idx);
+            }
+            break;
+        }
+
+        case FO::CopyStructSlice: {
+            const std::uint16_t sid = fi.aux0Slot;
+            const std::uint32_t dstPayOff = fi.auxImm32;
+            const auto* sc = runtime::getFlatStructSchema(sid);
+            if (sc != nullptr && dstPayOff + sc->flatSlotCount <= execFunc.totalFrameSlots) {
+                const std::uint32_t doneLbl = as.createLabel();
+                const auto slowStub = addColdStub(ColdTrapStub::Kind::FlatStructSlow, i32Idx, 0, doneLbl);
+                as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src0Slot) + 15);
+                as.cmpImm32(A64Reg::X6, static_cast<std::int32_t>(runtime::ValueTag::Struct));
+                as.bcc(A64Cond::NE, slowStub);
+                as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src0Slot) + 13);
+                as.cmpImm32(A64Reg::X6, 0);
+                as.bcc(A64Cond::NE, slowStub);
+                as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src0Slot) + 12);
+                as.cmpImm32(A64Reg::X6, static_cast<std::int32_t>(sid & 0xFFu));
+                as.bcc(A64Cond::NE, slowStub);
+                as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src0Slot) + 14);
+                as.cmpImm32(A64Reg::X6, static_cast<std::int32_t>((sid >> 8u) & 0xFFu));
+                as.bcc(A64Cond::NE, slowStub);
+                as.loadMem32(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot) + 8);
+                as.loadMem64(A64Reg::X2, A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, session)));
+                as.loadMem8ZeroExt(A64Reg::X1, A64Reg::X2, static_cast<std::int32_t>(offsetof(JitRuntimeSession, flatBankId)));
+                as.movz32(A64Reg::X6, 0x40u);
+                as.orrReg32(A64Reg::X1, A64Reg::X1, A64Reg::X6);
+                as.lsrImm32(A64Reg::X6, A64Reg::X0, 24u);
+                as.cmpReg32(A64Reg::X6, A64Reg::X1);
+                as.bcc(A64Cond::NE, slowStub);
+                as.andLow24Bits32(A64Reg::X0, A64Reg::X0);
+                as.loadMem32(A64Reg::X8, A64Reg::X2, static_cast<std::int32_t>(offsetof(JitRuntimeSession, frameOffset32)));
+                if (dstPayOff != 0u) {
+                    as.movImm32(A64Reg::X6, dstPayOff);
+                    as.addReg32(A64Reg::X8, A64Reg::X8, A64Reg::X6);
+                }
+                as.cmpImm32(A64Reg::X8, static_cast<std::int32_t>(runtime::StructStorageHandle::FrameOffsetMask));
+                as.bcc(A64Cond::HI, slowStub);
+                as.loadMem64(A64Reg::X6, A64Reg::X2, static_cast<std::int32_t>(offsetof(JitRuntimeSession, valuesBase)));
+                emitBudgetDeduct(i32Idx, fi.span, false);
+                as.movReg64(A64Reg::X7, A64Reg::X1); // save (0x40 | bankId)
+                as.addReg64(A64Reg::X3, A64Reg::X6, A64Reg::X0, 4u);
+                as.addImm64(A64Reg::X4, A64Reg::X20, static_cast<std::int64_t>(dstPayOff) * 16LL);
+                const std::uint32_t skipCopyLbl = as.createLabel();
+                as.cmpReg64(A64Reg::X3, A64Reg::X4);
+                as.bcc(A64Cond::EQ, skipCopyLbl);
+                emitCopySlots128(sc->flatSlotCount);
+                as.bind(skipCopyLbl);
+                as.lslImm64(A64Reg::X7, A64Reg::X7, 24u);
+                as.movReg64(A64Reg::X0, A64Reg::X8);
+                as.orrReg32(A64Reg::X0, A64Reg::X0, A64Reg::X7);
+                as.movImm64(A64Reg::X2, static_cast<std::uint64_t>(sc->structTypeId));
+                as.storeMem64(A64Reg::X20, slotOff(fi.dstSlot) + 0, A64Reg::X2);
+                as.storeMem32(A64Reg::X20, slotOff(fi.dstSlot) + 8, A64Reg::X0);
+                as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 12, static_cast<std::uint8_t>(sid & 0xFFu));
+                as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 13, 0u);
+                as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 14, static_cast<std::uint8_t>((sid >> 8u) & 0xFFu));
+                as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 15, static_cast<std::uint8_t>(runtime::ValueTag::Struct));
+                as.bind(doneLbl);
+            } else {
+                emitHelperCallInline(&jitFlatStructAndStackRefHelper, i32Idx);
+            }
+            break;
+        }
+
+        case FO::WritebackLocalStackRef:
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            break;
+
+        case FO::StoreStackRefStructFieldInPlace: {
+            if (fi.aux1Slot == 0u) {
+                const std::uint32_t doneLbl = as.createLabel();
+                const auto slowStub = addColdStub(ColdTrapStub::Kind::FlatStructSlow, i32Idx, 0, doneLbl);
+                as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src0Slot) + 15);
+                as.cmpImm32(A64Reg::X6, kTagObjectRef);
+                as.bcc(A64Cond::NE, slowStub);
+                as.loadMem32(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot) + 8);
+                as.cmpImm32(A64Reg::X0, static_cast<std::int32_t>(runtime::ObjectRef::StackSlotRefHeapId));
+                as.bcc(A64Cond::NE, slowStub);
+                as.loadMem64(A64Reg::X2, A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, session)));
+                as.loadMem8ZeroExt(A64Reg::X1, A64Reg::X2, static_cast<std::int32_t>(offsetof(JitRuntimeSession, flatBankId)));
+                as.loadMem32(A64Reg::X6, A64Reg::X20, slotOff(fi.src0Slot) + 4);
+                as.cmpReg32(A64Reg::X1, A64Reg::X6);
+                as.bcc(A64Cond::NE, slowStub);
+                as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src1Slot) + 15);
+                as.cmpImm32(A64Reg::X6, static_cast<std::int32_t>(runtime::ValueTag::Struct));
+                as.bcc(A64Cond::EQ, slowStub);
+                as.loadMem64(A64Reg::X6, A64Reg::X2, static_cast<std::int32_t>(offsetof(JitRuntimeSession, valuesBase)));
+                emitBudgetDeduct(i32Idx, fi.span, false);
+                as.loadMem32(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot) + 0);
+                as.addImm64(A64Reg::X0, A64Reg::X0, fi.aux0Slot);
+                as.addReg64(A64Reg::X3, A64Reg::X6, A64Reg::X0, 4u);
+                as.ldrQ(0, A64Reg::X20, slotOff(fi.src1Slot));
+                as.strQ(A64Reg::X3, 0, 0);
+                as.bind(doneLbl);
+            } else {
+                emitHelperCallInline(&jitFlatStructAndStackRefHelper, i32Idx);
+            }
+            break;
+        }
+
+        case FO::InitStructSlice:
+        case FO::StoreStructSliceField:
+        case FO::InitStackRefCell:
+        case FO::BindLocalStackRef:
+        case FO::LoadStackRefCell:
+        case FO::CheckNotNullFast:
+        case FO::StoreStackRefCell:
+        case FO::NewObjectFast:
+        case FO::LoadFieldExactFast:
+        case FO::LoadFieldFast:
+        case FO::StoreFieldExactFast:
+        case FO::StoreFieldFast:
+        case FO::GenericBytecode:
+            emitHelperCallInline(&jitFlatStructAndStackRefHelper, i32Idx);
+            break;
+
+        case FO::SuperMoveParamStoreLocal:
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.ldrQ(0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.strQ(A64Reg::X20, slotOff(fi.dstSlot), 0);
+            as.strQ(A64Reg::X20, slotOff(fi.storeSlot), 0);
+            break;
+
+        case FO::SuperMoveParamStoreLocalElided:
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.ldrQ(0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.strQ(A64Reg::X20, slotOff(fi.storeSlot), 0);
+            break;
+
+        case FO::ConstantInt:
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.storeMem64Imm(
+                A64Reg::X20,
+                slotOff(fi.dstSlot),
+                static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(fi.integerImmediate))));
+            as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 15, kTagInt64);
+            break;
+
+        case FO::ConstantLong:
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.storeMem64Imm(A64Reg::X20, slotOff(fi.dstSlot), static_cast<std::uint64_t>(fi.integerImmediate));
+            as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 15, kTagLong);
+            break;
+
+        case FO::ConstantBool:
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot), fi.integerImmediate != 0 ? 1u : 0u);
+            as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 15, kTagBool);
+            break;
+
+        case FO::ConstantDouble:
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.storeMem64Imm(A64Reg::X20, slotOff(fi.dstSlot), static_cast<std::uint64_t>(fi.integerImmediate));
+            as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 15, kTagDouble);
+            break;
+
+        case FO::SuperConstFloat: {
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            std::uint32_t fBits = 0;
+            std::memcpy(&fBits, &fi.integerImmediate, 4);
+            as.storeMem32Imm(A64Reg::X20, slotOff(fi.dstSlot), fBits);
+            as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 15, kTagFloat);
+            break;
+        }
+
+        case FO::SuperConstFloatStoreLocal: {
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            std::uint32_t fBits = 0;
+            std::memcpy(&fBits, &fi.integerImmediate, 4);
+            as.storeMem32Imm(A64Reg::X20, slotOff(fi.storeSlot), fBits);
+            as.storeMem8Imm(A64Reg::X20, slotOff(fi.storeSlot) + 15, kTagFloat);
+            break;
+        }
+
+        case FO::AddIntChecked:
+        case FO::AddIntUnchecked:
+        case FO::SubIntChecked:
+        case FO::SubIntUnchecked:
+        case FO::MulIntChecked:
+        case FO::MulIntUnchecked:
+        case FO::DivInt:
+        case FO::RemInt:
+        case FO::LessInt:
+        case FO::LessOrEqualInt:
+        case FO::GreaterInt:
+        case FO::GreaterOrEqualInt:
+        case FO::EqualInt:
+        case FO::NotEqualInt:
+        case FO::AddIntTrustedChecked:
+        case FO::AddIntTrustedUnchecked:
+        case FO::SubIntTrustedChecked:
+        case FO::SubIntTrustedUnchecked:
+        case FO::MulIntTrustedChecked:
+        case FO::MulIntTrustedUnchecked:
+        case FO::LessIntTrusted: {
+            const bool isTrusted =
+                fi.flatOpcode >= FO::AddIntTrustedChecked &&
+                fi.flatOpcode <= FO::LessIntTrusted;
+            const bool isChecked =
+                fi.flatOpcode == FO::AddIntChecked ||
+                fi.flatOpcode == FO::SubIntChecked ||
+                fi.flatOpcode == FO::MulIntChecked ||
+                fi.flatOpcode == FO::AddIntTrustedChecked ||
+                fi.flatOpcode == FO::SubIntTrustedChecked ||
+                fi.flatOpcode == FO::MulIntTrustedChecked;
+            const bool mayTrap =
+                isChecked || fi.flatOpcode == FO::DivInt || fi.flatOpcode == FO::RemInt;
+
+            QO qop = QO::AddInt;
+            switch (fi.flatOpcode) {
+            case FO::AddIntChecked: case FO::AddIntUnchecked:
+            case FO::AddIntTrustedChecked: case FO::AddIntTrustedUnchecked:
+                qop = QO::AddInt; break;
+            case FO::SubIntChecked: case FO::SubIntUnchecked:
+            case FO::SubIntTrustedChecked: case FO::SubIntTrustedUnchecked:
+                qop = QO::SubtractInt; break;
+            case FO::MulIntChecked: case FO::MulIntUnchecked:
+            case FO::MulIntTrustedChecked: case FO::MulIntTrustedUnchecked:
+                qop = QO::MultiplyInt; break;
+            case FO::DivInt: qop = QO::DivideInt; break;
+            case FO::RemInt: qop = QO::RemainderInt; break;
+            case FO::LessInt: case FO::LessIntTrusted: qop = QO::LessInt; break;
+            case FO::LessOrEqualInt: qop = QO::LessOrEqualInt; break;
+            case FO::GreaterInt: qop = QO::GreaterInt; break;
+            case FO::GreaterOrEqualInt: qop = QO::GreaterOrEqualInt; break;
+            case FO::EqualInt: qop = QO::EqualInt; break;
+            case FO::NotEqualInt: qop = QO::NotEqualInt; break;
+            default: break;
+            }
+
+            emitBudgetDeduct(i32Idx, fi.span, mayTrap && fi.span > 1u);
+            if (!isTrusted) {
+                emitCheckTagOrTrap(fi.src0Slot, kTagInt64, i32Idx, unexecAfter);
+                emitCheckTagOrTrap(fi.src1Slot, kTagInt64, i32Idx, unexecAfter);
+            }
+            as.loadMem32(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.loadMem32(A64Reg::X1, A64Reg::X20, slotOff(fi.src1Slot));
+            const std::uint8_t outTag = emitQuickIntOpCore(qop, isChecked, i32Idx, unexecAfter);
+            emitWriteTaggedResult(fi.dstSlot, outTag);
+            break;
+        }
+
+        case FO::NegateIntUnchecked:
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            emitCheckTagOrTrap(fi.src0Slot, kTagInt64, i32Idx, unexecAfter);
+            as.loadMem32(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.subReg32(A64Reg::X0, A64Reg::XZR, A64Reg::X0);
+            as.sxtw(A64Reg::X0, A64Reg::X0);
+            emitWriteTaggedResult(fi.dstSlot, kTagInt64);
+            break;
+
+        case FO::LogicalNot:
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            emitCheckTagOrTrap(fi.src0Slot, kTagBool, i32Idx, unexecAfter);
+            as.loadMem8ZeroExt(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.movz32(A64Reg::X1, 1u);
+            as.eorReg32(A64Reg::X0, A64Reg::X0, A64Reg::X1);
+            emitWriteTaggedResult(fi.dstSlot, kTagBool);
+            break;
+
+        case FO::SuperBinaryLocalIntConst:
+        case FO::SuperBinaryLocalIntConstStore:
+        case FO::SuperBinaryLocalIntConstStoreElided:
+        case FO::SuperBinaryLocalIntConstStoreJump: {
+            const bool isElided = (fi.flatOpcode == FO::SuperBinaryLocalIntConstStoreElided);
+            const bool isJump = (fi.flatOpcode == FO::SuperBinaryLocalIntConstStoreJump);
+            const bool hasStore = (fi.flatOpcode == FO::SuperBinaryLocalIntConstStore);
+            const bool trusted0 = (fi.arithFlags & runtime::detail::FlatInstruction::FlagTrustedSrc0) != 0u;
+
+            emitBudgetDeduct(i32Idx, fi.span, true);
+            if (!trusted0) {
+                emitCheckTagOrTrap(fi.src0Slot, kTagInt64, i32Idx, unexecAfter);
+            }
+            as.loadMem32(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+            if (!isElided && !isJump) {
+                as.sxtw(A64Reg::X2, A64Reg::X0);
+                as.storeMem64(A64Reg::X20, slotOff(fi.dstSlot), A64Reg::X2);
+                as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 15, kTagInt64);
+                as.storeMem64Imm(
+                    A64Reg::X20,
+                    slotOff(fi.aux0Slot),
+                    static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(fi.integerImmediate))));
+                as.storeMem8Imm(A64Reg::X20, slotOff(fi.aux0Slot) + 15, kTagInt64);
+            }
+            as.movImm32(A64Reg::X1, static_cast<std::uint32_t>(static_cast<std::int32_t>(fi.integerImmediate)));
+            const std::uint8_t outTag = emitQuickIntOpCore(fi.binaryOpcode1, fi.checked1(), i32Idx, unexecAfter);
+            if (isJump) {
+                emitWriteTaggedResult(fi.dstSlot, outTag);
+                const std::int64_t brInc =
+                    ((fi.arithFlags & runtime::detail::FlatInstruction::FlagPreJump1) != 0u) ? 2 : 1;
+                as.addImm64(A64Reg::X22, A64Reg::X22, brInc);
+                as.b(instLabels[fi.trueTargetOffset]);
+            } else if (isElided) {
+                emitWriteTaggedResult(fi.storeSlot, outTag);
+            } else {
+                emitWriteTaggedResult(fi.aux1Slot, outTag);
+                if (hasStore) {
+                    emitWriteTaggedResult(fi.storeSlot, outTag);
+                }
+            }
+            break;
+        }
+
+        case FO::SuperBinaryLocalIntLocal:
+        case FO::SuperBinaryLocalIntLocalStore:
+        case FO::SuperBinaryLocalIntLocalStoreElided:
+        case FO::SuperBinaryLocalIntLocalStoreJump:
+        case FO::SuperBinaryLocalIntReg:
+        case FO::SuperBinaryLocalIntRegStore:
+        case FO::SuperBinaryLocalIntRegStoreElided:
+        case FO::SuperBinaryLocalIntRegStoreJump: {
+            const bool isLocalRhs =
+                fi.flatOpcode == FO::SuperBinaryLocalIntLocal ||
+                fi.flatOpcode == FO::SuperBinaryLocalIntLocalStore ||
+                fi.flatOpcode == FO::SuperBinaryLocalIntLocalStoreElided ||
+                fi.flatOpcode == FO::SuperBinaryLocalIntLocalStoreJump;
+            const bool isElided =
+                fi.flatOpcode == FO::SuperBinaryLocalIntLocalStoreElided ||
+                fi.flatOpcode == FO::SuperBinaryLocalIntRegStoreElided;
+            const bool isJump =
+                fi.flatOpcode == FO::SuperBinaryLocalIntLocalStoreJump ||
+                fi.flatOpcode == FO::SuperBinaryLocalIntRegStoreJump;
+            const bool hasStore =
+                fi.flatOpcode == FO::SuperBinaryLocalIntLocalStore ||
+                fi.flatOpcode == FO::SuperBinaryLocalIntRegStore;
+            const bool trustedBoth =
+                (fi.arithFlags & (runtime::detail::FlatInstruction::FlagTrustedSrc0 |
+                                  runtime::detail::FlatInstruction::FlagTrustedSrc1)) ==
+                (runtime::detail::FlatInstruction::FlagTrustedSrc0 |
+                 runtime::detail::FlatInstruction::FlagTrustedSrc1);
+
+            emitBudgetDeduct(i32Idx, fi.span, true);
+            if (!trustedBoth) {
+                emitCheckTagOrTrap(fi.src0Slot, kTagInt64, i32Idx, unexecAfter);
+                emitCheckTagOrTrap(fi.src1Slot, kTagInt64, i32Idx, unexecAfter);
+            }
+            as.loadMem32(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.loadMem32(A64Reg::X1, A64Reg::X20, slotOff(fi.src1Slot));
+            if (!isElided && !isJump) {
+                as.sxtw(A64Reg::X2, A64Reg::X0);
+                as.storeMem64(A64Reg::X20, slotOff(fi.dstSlot), A64Reg::X2);
+                as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 15, kTagInt64);
+                if (isLocalRhs) {
+                    as.sxtw(A64Reg::X2, A64Reg::X1);
+                    as.storeMem64(A64Reg::X20, slotOff(fi.aux0Slot), A64Reg::X2);
+                    as.storeMem8Imm(A64Reg::X20, slotOff(fi.aux0Slot) + 15, kTagInt64);
+                }
+            }
+            const std::uint8_t outTag = emitQuickIntOpCore(fi.binaryOpcode1, fi.checked1(), i32Idx, unexecAfter);
+            if (isJump) {
+                emitWriteTaggedResult(fi.dstSlot, outTag);
+                const std::int64_t brInc =
+                    ((fi.arithFlags & runtime::detail::FlatInstruction::FlagPreJump1) != 0u) ? 2 : 1;
+                as.addImm64(A64Reg::X22, A64Reg::X22, brInc);
+                as.b(instLabels[fi.trueTargetOffset]);
+            } else if (isElided) {
+                emitWriteTaggedResult(fi.storeSlot, outTag);
+            } else {
+                emitWriteTaggedResult(fi.aux1Slot, outTag);
+                if (hasStore) {
+                    emitWriteTaggedResult(fi.storeSlot, outTag);
+                }
+            }
+            break;
+        }
+
+        case FO::SuperBinaryLocalIntRegChainStore:
+        case FO::SuperBinaryLocalIntRegChainStoreElided: {
+            const bool isElided = (fi.flatOpcode == FO::SuperBinaryLocalIntRegChainStoreElided);
+            emitBudgetDeduct(i32Idx, fi.span, true);
+            emitCheckTagOrTrap(fi.src0Slot, kTagInt64, i32Idx, 2);
+            emitCheckTagOrTrap(fi.src1Slot, kTagInt64, i32Idx, 2);
+            as.loadMem32(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.loadMem32(A64Reg::X1, A64Reg::X20, slotOff(fi.src1Slot));
+            if (!isElided) {
+                as.sxtw(A64Reg::X2, A64Reg::X0);
+                as.storeMem64(A64Reg::X20, slotOff(fi.dstSlot), A64Reg::X2);
+                as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 15, kTagInt64);
+            }
+            const std::uint8_t midTag = emitQuickIntOpCore(fi.binaryOpcode1, fi.checked1(), i32Idx, 2);
+            if (!isElided) {
+                emitWriteTaggedResult(fi.aux0Slot, midTag);
+            }
+            emitCheckTagOrTrap(fi.src2Slot, kTagInt64, i32Idx, 1);
+            as.loadMem32(A64Reg::X1, A64Reg::X20, slotOff(fi.src2Slot));
+            const std::uint8_t outTag = emitQuickIntOpCore(fi.binaryOpcode2, fi.checked2(), i32Idx, 1);
+            if (!isElided) {
+                emitWriteTaggedResult(fi.aux1Slot, outTag);
+            }
+            emitWriteTaggedResult(fi.storeSlot, outTag);
+            break;
+        }
+
+        case FO::SuperLessLocalConstBranch: {
+            const bool trusted0 = (fi.arithFlags & runtime::detail::FlatInstruction::FlagTrustedSrc0) != 0u;
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            if (!trusted0) {
+                emitCheckTagOrTrap(fi.src0Slot, kTagInt64, i32Idx, 1);
+            }
+            as.addImm64(A64Reg::X22, A64Reg::X22, 1);
+            as.loadMem64(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.cmpImm64(A64Reg::X0, static_cast<std::int64_t>(static_cast<std::int32_t>(fi.integerImmediate)));
+            emitCondBranchTargets(
+                quickCmpToA64Cond(fi.binaryOpcode1), i32Idx, fi.trueTargetOffset, fi.falseTargetOffset);
+            break;
+        }
+
+        case FO::SuperLessLocalRegBranch: {
+            const bool trustedBoth =
+                (fi.arithFlags & (runtime::detail::FlatInstruction::FlagTrustedSrc0 |
+                                  runtime::detail::FlatInstruction::FlagTrustedSrc1)) ==
+                (runtime::detail::FlatInstruction::FlagTrustedSrc0 |
+                 runtime::detail::FlatInstruction::FlagTrustedSrc1);
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            if (!trustedBoth) {
+                emitCheckTagOrTrap(fi.src0Slot, kTagInt64, i32Idx, 1);
+                emitCheckTagOrTrap(fi.src1Slot, kTagInt64, i32Idx, 1);
+            }
+            as.addImm64(A64Reg::X22, A64Reg::X22, 1);
+            as.loadMem64(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.loadMem64(A64Reg::X1, A64Reg::X20, slotOff(fi.src1Slot));
+            as.cmpReg64(A64Reg::X0, A64Reg::X1);
+            emitCondBranchTargets(
+                quickCmpToA64Cond(fi.binaryOpcode1), i32Idx, fi.trueTargetOffset, fi.falseTargetOffset);
+            break;
+        }
+
+        case FO::SuperLessLocalArrayLengthBranch: {
+            const std::int32_t cacheDisp =
+                static_cast<std::int32_t>(offsetof(JitAbiContext, arrayCache)) +
+                static_cast<std::int32_t>(fi.src1Slot & 3u) * 64;
+            const auto slowStub = addColdStub(
+                ColdTrapStub::Kind::ArrayLengthBranchSlow,
+                i32Idx,
+                0,
+                instLabels[fi.trueTargetOffset],
+                instLabels[fi.falseTargetOffset]);
+
+            as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src0Slot) + 15);
+            as.cmpImm32(A64Reg::X6, kTagInt64);
+            as.bcc(A64Cond::NE, slowStub);
+            as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src1Slot) + 15);
+            as.cmpImm32(A64Reg::X6, kTagObjectRef);
+            as.bcc(A64Cond::NE, slowStub);
+            as.loadMem64(A64Reg::X0, A64Reg::X20, slotOff(fi.src1Slot));
+            as.loadMem64(A64Reg::X1, A64Reg::X19, cacheDisp + 0);
+            as.cmpReg64(A64Reg::X0, A64Reg::X1);
+            as.bcc(A64Cond::NE, slowStub);
+            as.loadMem32(A64Reg::X0, A64Reg::X20, slotOff(fi.src1Slot) + 8);
+            as.loadMem32(A64Reg::X1, A64Reg::X19, cacheDisp + 8);
+            as.cmpReg32(A64Reg::X0, A64Reg::X1);
+            as.bcc(A64Cond::NE, slowStub);
+
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.addImm64(A64Reg::X22, A64Reg::X22, 1);
+            as.loadMem64(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.loadMem32(A64Reg::X1, A64Reg::X19, cacheDisp + 24);
+            as.cmpReg64(A64Reg::X0, A64Reg::X1);
+            emitCondBranchTargets(
+                quickCmpToA64Cond(fi.binaryOpcode1), i32Idx, fi.trueTargetOffset, fi.falseTargetOffset);
+            break;
+        }
+
+        case FO::ArrayLengthFast: {
+            const std::uint32_t doneLbl = as.createLabel();
+            const std::int32_t cacheDisp =
+                static_cast<std::int32_t>(offsetof(JitAbiContext, arrayCache)) +
+                static_cast<std::int32_t>(fi.src0Slot & 3u) * 64;
+            const auto slowStub = addColdStub(
+                ColdTrapStub::Kind::ArrayLengthSlow, i32Idx, 0, doneLbl);
+
+            as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src0Slot) + 15);
+            as.cmpImm32(A64Reg::X6, kTagObjectRef);
+            as.bcc(A64Cond::NE, slowStub);
+            as.loadMem64(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.loadMem64(A64Reg::X1, A64Reg::X19, cacheDisp + 0);
+            as.cmpReg64(A64Reg::X0, A64Reg::X1);
+            as.bcc(A64Cond::NE, slowStub);
+            as.loadMem32(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot) + 8);
+            as.loadMem32(A64Reg::X1, A64Reg::X19, cacheDisp + 8);
+            as.cmpReg32(A64Reg::X0, A64Reg::X1);
+            as.bcc(A64Cond::NE, slowStub);
+
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.loadMem32(A64Reg::X0, A64Reg::X19, cacheDisp + 24);
+            emitWriteTaggedResult(fi.dstSlot, kTagInt64);
+            as.bind(doneLbl);
+            break;
+        }
+
+        case FO::NewArrayFast:
+            emitHelperCallInline(&jitNewArrayHelper, i32Idx);
+            break;
+
+        case FO::LoadElementIntFast:
+        case FO::LoadElementTypedFast: {
+            const bool isTyped = (fi.flatOpcode == FO::LoadElementTypedFast);
+            const auto elemType = isTyped
+                ? static_cast<semantic::PrimitiveType>(static_cast<std::uint8_t>(fi.binaryOpcode1))
+                : semantic::PrimitiveType::Int;
+            const auto elemTid = isTyped
+                ? static_cast<semantic::SymbolId>(fi.integerImmediate)
+                : semantic::SymbolId{0};
+
+            std::uint8_t fastEncoding = 0u;
+            if (elemTid == 0) {
+                if (elemType == semantic::PrimitiveType::Int) fastEncoding = kPackedInt32;
+                else if (elemType == semantic::PrimitiveType::Double) fastEncoding = kPackedFloat64;
+                else if (elemType == semantic::PrimitiveType::Bool) fastEncoding = kPackedBool;
+            }
+
+            if (fastEncoding == 0u) {
+                if (isTyped &&
+                    elemType == semantic::PrimitiveType::Struct &&
+                    execFunc.hasStructPayloads &&
+                    fi.dstSlot < execFunc.slotStructSchemaIds.size() &&
+                    execFunc.slotStructSchemaIds[fi.dstSlot] != 0u) {
+                    const std::uint16_t sid = execFunc.slotStructSchemaIds[fi.dstSlot];
+                    const std::uint16_t payOff = execFunc.slotPayloadOffsets[fi.dstSlot];
+                    const auto* sc = runtime::getFlatStructSchema(sid);
+                    if (sc != nullptr && payOff != runtime::detail::InvalidCompactReg &&
+                        static_cast<std::uint32_t>(payOff) + sc->flatSlotCount <= execFunc.totalFrameSlots) {
+                        const std::uint32_t doneLbl = as.createLabel();
+                        const std::int32_t cacheDisp =
+                            static_cast<std::int32_t>(offsetof(JitAbiContext, arrayCache)) +
+                            static_cast<std::int32_t>(fi.src0Slot & 3u) * 64;
+                        const auto slowStub = addColdStub(
+                            ColdTrapStub::Kind::ArrayLoadSlow, i32Idx, 0, doneLbl);
+
+                        as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src0Slot) + 15);
+                        as.cmpImm32(A64Reg::X6, kTagObjectRef);
+                        as.bcc(A64Cond::NE, slowStub);
+                        as.loadMem64(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+                        as.loadMem64(A64Reg::X1, A64Reg::X19, cacheDisp + 0);
+                        as.cmpReg64(A64Reg::X0, A64Reg::X1);
+                        as.bcc(A64Cond::NE, slowStub);
+                        as.loadMem32(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot) + 8);
+                        as.loadMem32(A64Reg::X1, A64Reg::X19, cacheDisp + 8);
+                        as.cmpReg32(A64Reg::X0, A64Reg::X1);
+                        as.bcc(A64Cond::NE, slowStub);
+                        as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X19, cacheDisp + 13);
+                        as.cmpImm32(A64Reg::X6, 2);
+                        as.bcc(A64Cond::NE, slowStub);
+                        as.loadMem16ZeroExt(A64Reg::X6, A64Reg::X19, cacheDisp + 30);
+                        as.cmpImm32(A64Reg::X6, sid);
+                        as.bcc(A64Cond::NE, slowStub);
+
+                        as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src1Slot) + 15);
+                        as.cmpImm32(A64Reg::X6, kTagInt64);
+                        as.bcc(A64Cond::NE, slowStub);
+                        as.loadMem64(A64Reg::X1, A64Reg::X20, slotOff(fi.src1Slot));
+                        as.loadMem32(A64Reg::X2, A64Reg::X19, cacheDisp + 24);
+                        as.cmpReg64(A64Reg::X1, A64Reg::X2);
+                        as.bcc(A64Cond::HS, slowStub);
+
+                        emitBudgetDeduct(i32Idx, fi.span, false);
+                        as.loadMem64(A64Reg::X2, A64Reg::X19, cacheDisp + 16);
+                        as.movImm64(A64Reg::X6, static_cast<std::uint64_t>(sc->flatSlotCount) * 16ULL);
+                        as.mulReg64(A64Reg::X0, A64Reg::X1, A64Reg::X6);
+                        as.addReg64(A64Reg::X3, A64Reg::X2, A64Reg::X0, 0);
+                        as.addImm64(A64Reg::X4, A64Reg::X20, static_cast<std::int64_t>(payOff) * 16LL);
+                        emitCopySlots128(sc->flatSlotCount);
+
+                        as.loadMem64(A64Reg::X2, A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, session)));
+                        as.loadMem8ZeroExt(A64Reg::X1, A64Reg::X2, static_cast<std::int32_t>(offsetof(JitRuntimeSession, flatBankId)));
+                        as.movz32(A64Reg::X6, 0x40u);
+                        as.orrReg32(A64Reg::X1, A64Reg::X1, A64Reg::X6);
+                        as.lslImm64(A64Reg::X1, A64Reg::X1, 24u);
+                        as.loadMem32(A64Reg::X0, A64Reg::X2, static_cast<std::int32_t>(offsetof(JitRuntimeSession, frameOffset32)));
+                        if (payOff != 0u) {
+                            as.movImm32(A64Reg::X6, static_cast<std::uint32_t>(payOff));
+                            as.addReg32(A64Reg::X0, A64Reg::X0, A64Reg::X6);
+                        }
+                        as.orrReg32(A64Reg::X0, A64Reg::X0, A64Reg::X1);
+                        as.movImm64(A64Reg::X2, static_cast<std::uint64_t>(elemTid));
+                        as.storeMem64(A64Reg::X20, slotOff(fi.dstSlot) + 0, A64Reg::X2);
+                        as.storeMem32(A64Reg::X20, slotOff(fi.dstSlot) + 8, A64Reg::X0);
+                        as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 12, static_cast<std::uint8_t>(sid & 0xFFu));
+                        as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 13, 0u);
+                        as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 14, static_cast<std::uint8_t>((sid >> 8u) & 0xFFu));
+                        as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 15, static_cast<std::uint8_t>(runtime::ValueTag::Struct));
+                        as.bind(doneLbl);
+                        break;
+                    }
+                }
+                emitHelperCallInline(&jitLoadElementHelper, i32Idx);
+                break;
+            }
+
+            const std::uint32_t doneLbl = as.createLabel();
+            const std::int32_t cacheDisp =
+                static_cast<std::int32_t>(offsetof(JitAbiContext, arrayCache)) +
+                static_cast<std::int32_t>(fi.src0Slot & 3u) * 64;
+            const auto slowStub = addColdStub(
+                ColdTrapStub::Kind::ArrayLoadSlow, i32Idx, 0, doneLbl);
+
+            as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src0Slot) + 15);
+            as.cmpImm32(A64Reg::X6, kTagObjectRef);
+            as.bcc(A64Cond::NE, slowStub);
+            as.loadMem64(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.loadMem64(A64Reg::X1, A64Reg::X19, cacheDisp + 0);
+            as.cmpReg64(A64Reg::X0, A64Reg::X1);
+            as.bcc(A64Cond::NE, slowStub);
+            as.loadMem32(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot) + 8);
+            as.loadMem32(A64Reg::X1, A64Reg::X19, cacheDisp + 8);
+            as.cmpReg32(A64Reg::X0, A64Reg::X1);
+            as.bcc(A64Cond::NE, slowStub);
+            as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X19, cacheDisp + 14);
+            as.cmpImm32(A64Reg::X6, fastEncoding);
+            as.bcc(A64Cond::NE, slowStub);
+
+            const bool noBce = (fi.arithFlags & runtime::detail::FlatInstruction::FlagArrayNoBoundsCheck) != 0u;
+            const bool trustedIdx = !isTyped &&
+                (fi.arithFlags & runtime::detail::FlatInstruction::FlagTrustedSrc0) != 0u;
+            if (!noBce && !trustedIdx) {
+                as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src1Slot) + 15);
+                as.cmpImm32(A64Reg::X6, kTagInt64);
+                as.bcc(A64Cond::NE, slowStub);
+            }
+            as.loadMem64(A64Reg::X1, A64Reg::X20, slotOff(fi.src1Slot));
+            if (!noBce) {
+                as.loadMem32(A64Reg::X2, A64Reg::X19, cacheDisp + 24);
+                as.cmpReg64(A64Reg::X1, A64Reg::X2);
+                as.bcc(A64Cond::HS, slowStub);
+            }
+
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.loadMem64(A64Reg::X2, A64Reg::X19, cacheDisp + 16);
+            if (fastEncoding == kPackedInt32) {
+                as.addReg64(A64Reg::X3, A64Reg::X2, A64Reg::X1, 2u);
+                as.loadMem32SignExt64(A64Reg::X0, A64Reg::X3, 0);
+                emitWriteTaggedResult(fi.dstSlot, kTagInt64);
+            } else if (fastEncoding == kPackedFloat64) {
+                as.addReg64(A64Reg::X3, A64Reg::X2, A64Reg::X1, 3u);
+                as.ldrD(0, A64Reg::X3, 0);
+                as.strD(A64Reg::X20, slotOff(fi.dstSlot), 0);
+                as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 15, kTagDouble);
+            } else {
+                as.addReg64(A64Reg::X3, A64Reg::X2, A64Reg::X1, 0u);
+                as.loadMem8ZeroExt(A64Reg::X0, A64Reg::X3, 0);
+                emitWriteTaggedResult(fi.dstSlot, kTagBool);
+            }
+            as.bind(doneLbl);
+            break;
+        }
+
+        case FO::StoreElementStructFieldInPlace: {
+            const auto rootSid = static_cast<std::uint16_t>(fi.auxImm32);
+            const auto* rootSc = runtime::getFlatStructSchema(rootSid);
+            if (fi.aux1Slot == 0u && rootSc != nullptr && fi.aux0Slot < rootSc->flatSlotCount) {
+                const std::uint32_t doneLbl = as.createLabel();
+                const std::int32_t cacheDisp =
+                    static_cast<std::int32_t>(offsetof(JitAbiContext, arrayCache)) +
+                    static_cast<std::int32_t>(fi.src0Slot & 3u) * 64;
+                const auto slowStub = addColdStub(
+                    ColdTrapStub::Kind::ArrayStoreSlow, i32Idx, 0, doneLbl);
+
+                as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src0Slot) + 15);
+                as.cmpImm32(A64Reg::X6, kTagObjectRef);
+                as.bcc(A64Cond::NE, slowStub);
+                as.loadMem64(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+                as.loadMem64(A64Reg::X1, A64Reg::X19, cacheDisp + 0);
+                as.cmpReg64(A64Reg::X0, A64Reg::X1);
+                as.bcc(A64Cond::NE, slowStub);
+                as.loadMem32(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot) + 8);
+                as.loadMem32(A64Reg::X1, A64Reg::X19, cacheDisp + 8);
+                as.cmpReg32(A64Reg::X0, A64Reg::X1);
+                as.bcc(A64Cond::NE, slowStub);
+                as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X19, cacheDisp + 13);
+                as.cmpImm32(A64Reg::X6, 2);
+                as.bcc(A64Cond::NE, slowStub);
+                as.loadMem16ZeroExt(A64Reg::X6, A64Reg::X19, cacheDisp + 30);
+                as.cmpImm32(A64Reg::X6, rootSid);
+                as.bcc(A64Cond::NE, slowStub);
+
+                as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src1Slot) + 15);
+                as.cmpImm32(A64Reg::X6, kTagInt64);
+                as.bcc(A64Cond::NE, slowStub);
+                as.loadMem64(A64Reg::X1, A64Reg::X20, slotOff(fi.src1Slot));
+                as.loadMem32(A64Reg::X2, A64Reg::X19, cacheDisp + 24);
+                as.cmpReg64(A64Reg::X1, A64Reg::X2);
+                as.bcc(A64Cond::HS, slowStub);
+
+                as.loadMem8ZeroExt(A64Reg::X0, A64Reg::X20, slotOff(fi.src2Slot) + 15);
+                as.cmpImm32(A64Reg::X0, 0);
+                as.bcc(A64Cond::EQ, slowStub);
+                as.cmpImm32(A64Reg::X0, static_cast<std::int32_t>(runtime::ValueTag::FirstTraceable));
+                as.bcc(A64Cond::HS, slowStub);
+
+                emitBudgetDeduct(i32Idx, fi.span, false);
+                as.loadMem64(A64Reg::X2, A64Reg::X19, cacheDisp + 16);
+                as.movImm64(A64Reg::X6, rootSc->flatSlotCount);
+                as.mulReg64(A64Reg::X0, A64Reg::X1, A64Reg::X6);
+                as.addImm64(A64Reg::X0, A64Reg::X0, fi.aux0Slot);
+                as.addReg64(A64Reg::X3, A64Reg::X2, A64Reg::X0, 4u);
+                as.ldrQ(0, A64Reg::X20, slotOff(fi.src2Slot));
+                as.strQ(A64Reg::X3, 0, 0);
+                as.bind(doneLbl);
+                break;
+            }
+            emitHelperCallInline(&jitStoreElementHelper, i32Idx);
+            break;
+        }
+
+        case FO::StoreElementStructFast:
+        case FO::StoreElementObjFast:
+            emitHelperCallInline(&jitStoreElementHelper, i32Idx);
+            break;
+
+        case FO::StoreElementIntFast:
+        case FO::StoreElementPrimFast: {
+            const bool isPrim = (fi.flatOpcode == FO::StoreElementPrimFast);
+            const auto elemType = isPrim
+                ? static_cast<semantic::PrimitiveType>(static_cast<std::uint8_t>(fi.binaryOpcode1))
+                : semantic::PrimitiveType::Int;
+
+            std::uint8_t fastEncoding = 0u;
+            if (elemType == semantic::PrimitiveType::Int) fastEncoding = kPackedInt32;
+            else if (elemType == semantic::PrimitiveType::Double) fastEncoding = kPackedFloat64;
+            else if (elemType == semantic::PrimitiveType::Bool) fastEncoding = kPackedBool;
+
+            if (fastEncoding == 0u) {
+                emitHelperCallInline(&jitStoreElementHelper, i32Idx);
+                break;
+            }
+
+            const std::uint32_t doneLbl = as.createLabel();
+            const std::int32_t cacheDisp =
+                static_cast<std::int32_t>(offsetof(JitAbiContext, arrayCache)) +
+                static_cast<std::int32_t>(fi.src0Slot & 3u) * 64;
+            const auto slowStub = addColdStub(
+                ColdTrapStub::Kind::ArrayStoreSlow, i32Idx, 0, doneLbl);
+
+            as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src0Slot) + 15);
+            as.cmpImm32(A64Reg::X6, kTagObjectRef);
+            as.bcc(A64Cond::NE, slowStub);
+            as.loadMem64(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.loadMem64(A64Reg::X1, A64Reg::X19, cacheDisp + 0);
+            as.cmpReg64(A64Reg::X0, A64Reg::X1);
+            as.bcc(A64Cond::NE, slowStub);
+            as.loadMem32(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot) + 8);
+            as.loadMem32(A64Reg::X1, A64Reg::X19, cacheDisp + 8);
+            as.cmpReg32(A64Reg::X0, A64Reg::X1);
+            as.bcc(A64Cond::NE, slowStub);
+            as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X19, cacheDisp + 14);
+            as.cmpImm32(A64Reg::X6, fastEncoding);
+            as.bcc(A64Cond::NE, slowStub);
+
+            const bool noBce = (fi.arithFlags & runtime::detail::FlatInstruction::FlagArrayNoBoundsCheck) != 0u;
+            const bool trustedIdx = !isPrim &&
+                (fi.arithFlags & runtime::detail::FlatInstruction::FlagTrustedSrc0) != 0u;
+            const bool trustedVal = !isPrim &&
+                (fi.arithFlags & runtime::detail::FlatInstruction::FlagTrustedSrc1) != 0u;
+            if (!noBce && !trustedIdx) {
+                as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src1Slot) + 15);
+                as.cmpImm32(A64Reg::X6, kTagInt64);
+                as.bcc(A64Cond::NE, slowStub);
+            }
+            as.loadMem64(A64Reg::X1, A64Reg::X20, slotOff(fi.src1Slot));
+            if (!noBce) {
+                as.loadMem32(A64Reg::X2, A64Reg::X19, cacheDisp + 24);
+                as.cmpReg64(A64Reg::X1, A64Reg::X2);
+                as.bcc(A64Cond::HS, slowStub);
+            }
+
+            if (fastEncoding == kPackedInt32) {
+                if (!trustedVal) {
+                    as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src2Slot) + 15);
+                    as.cmpImm32(A64Reg::X6, kTagInt64);
+                    as.bcc(A64Cond::NE, slowStub);
+                }
+                as.loadMem64(A64Reg::X0, A64Reg::X20, slotOff(fi.src2Slot));
+                as.sxtw(A64Reg::X6, A64Reg::X0);
+                as.cmpReg64(A64Reg::X0, A64Reg::X6);
+                as.bcc(A64Cond::NE, slowStub);
+
+                emitBudgetDeduct(i32Idx, fi.span, false);
+                as.loadMem64(A64Reg::X2, A64Reg::X19, cacheDisp + 16);
+                as.addReg64(A64Reg::X3, A64Reg::X2, A64Reg::X1, 2u);
+                as.storeMem32(A64Reg::X3, 0, A64Reg::X0);
+            } else if (fastEncoding == kPackedFloat64) {
+                as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src2Slot) + 15);
+                as.cmpImm32(A64Reg::X6, kTagDouble);
+                as.bcc(A64Cond::NE, slowStub);
+
+                emitBudgetDeduct(i32Idx, fi.span, false);
+                as.ldrD(0, A64Reg::X20, slotOff(fi.src2Slot));
+                as.loadMem64(A64Reg::X2, A64Reg::X19, cacheDisp + 16);
+                as.addReg64(A64Reg::X3, A64Reg::X2, A64Reg::X1, 3u);
+                as.strD(A64Reg::X3, 0, 0);
+            } else {
+                as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src2Slot) + 15);
+                as.cmpImm32(A64Reg::X6, kTagBool);
+                as.bcc(A64Cond::NE, slowStub);
+
+                emitBudgetDeduct(i32Idx, fi.span, false);
+                as.loadMem8ZeroExt(A64Reg::X0, A64Reg::X20, slotOff(fi.src2Slot));
+                as.loadMem64(A64Reg::X2, A64Reg::X19, cacheDisp + 16);
+                as.addReg64(A64Reg::X3, A64Reg::X2, A64Reg::X1, 0u);
+                as.storeMem8Reg(A64Reg::X3, 0, A64Reg::X0);
+            }
+            as.bind(doneLbl);
+            break;
+        }
+
+        // Scalar Double ALU & Comparisons
+        case FO::AddDouble:
+        case FO::SubDouble:
+        case FO::MulDouble:
+        case FO::DivDouble:
+        case FO::AddDoubleTrusted:
+        case FO::SubDoubleTrusted:
+        case FO::MulDoubleTrusted:
+        case FO::DivDoubleTrusted: {
+            const bool trusted =
+                fi.flatOpcode >= FO::AddDoubleTrusted && fi.flatOpcode <= FO::DivDoubleTrusted;
+            if (!trusted) {
+                emitCheckTagOrTrap(fi.src0Slot, kTagDouble, i32Idx, unexecAfter);
+                emitCheckTagOrTrap(fi.src1Slot, kTagDouble, i32Idx, unexecAfter);
+            }
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.ldrD(0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.ldrD(1, A64Reg::X20, slotOff(fi.src1Slot));
+            if (fi.flatOpcode == FO::SubDouble || fi.flatOpcode == FO::SubDoubleTrusted) as.fsubD(0, 0, 1);
+            else if (fi.flatOpcode == FO::MulDouble || fi.flatOpcode == FO::MulDoubleTrusted) as.fmulD(0, 0, 1);
+            else if (fi.flatOpcode == FO::DivDouble || fi.flatOpcode == FO::DivDoubleTrusted) as.fdivD(0, 0, 1);
+            else as.faddD(0, 0, 1);
+            as.strD(A64Reg::X20, slotOff(fi.dstSlot), 0);
+            as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 15, kTagDouble);
+            break;
+        }
+
+        case FO::LessDouble:
+        case FO::LessOrEqualDouble:
+        case FO::GreaterDouble:
+        case FO::GreaterOrEqualDouble: {
+            emitCheckTagOrTrap(fi.src0Slot, kTagDouble, i32Idx, unexecAfter);
+            emitCheckTagOrTrap(fi.src1Slot, kTagDouble, i32Idx, unexecAfter);
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.ldrD(0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.ldrD(1, A64Reg::X20, slotOff(fi.src1Slot));
+            as.fcmpD(0, 1);
+            // ARM64 FCMP NZCV: NaN sets N=0,Z=0,C=1,V=1 -> MI(<), LS(<=), GT(>), GE(>=) are all 0 on NaN!
+            if (fi.flatOpcode == FO::LessDouble) as.cset32(A64Reg::X0, A64Cond::MI);
+            else if (fi.flatOpcode == FO::LessOrEqualDouble) as.cset32(A64Reg::X0, A64Cond::LS);
+            else if (fi.flatOpcode == FO::GreaterDouble) as.cset32(A64Reg::X0, A64Cond::GT);
+            else as.cset32(A64Reg::X0, A64Cond::GE);
+            emitWriteTaggedResult(fi.dstSlot, kTagBool);
+            break;
+        }
+
+        case FO::NegateDouble:
+            emitCheckTagOrTrap(fi.src0Slot, kTagDouble, i32Idx, unexecAfter);
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.loadMem64(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.movz64(A64Reg::X1, 0x8000u, 3);
+            as.eorReg64(A64Reg::X0, A64Reg::X0, A64Reg::X1);
+            emitWriteTaggedResult(fi.dstSlot, kTagDouble);
+            break;
+
+        case FO::SuperBinaryLocalDoubleConstStore:
+        case FO::SuperBinaryLocalDoubleConstStoreElided:
+        case FO::SuperBinaryLocalDoubleLocalStore:
+        case FO::SuperBinaryLocalDoubleLocalStoreElided: {
+            const bool isConst =
+                fi.flatOpcode == FO::SuperBinaryLocalDoubleConstStore ||
+                fi.flatOpcode == FO::SuperBinaryLocalDoubleConstStoreElided;
+            const bool isElided =
+                fi.flatOpcode == FO::SuperBinaryLocalDoubleConstStoreElided ||
+                fi.flatOpcode == FO::SuperBinaryLocalDoubleLocalStoreElided;
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            emitCheckTagOrTrap(fi.src0Slot, kTagDouble, i32Idx, 1);
+            as.ldrD(0, A64Reg::X20, slotOff(fi.src0Slot));
+            if (isConst) {
+                as.movImm64(A64Reg::X0, static_cast<std::uint64_t>(fi.integerImmediate));
+                as.fmovDFromX(1, A64Reg::X0);
+            } else {
+                emitCheckTagOrTrap(fi.src1Slot, kTagDouble, i32Idx, 1);
+                as.ldrD(1, A64Reg::X20, slotOff(fi.src1Slot));
+            }
+            if (!isElided) {
+                as.strD(A64Reg::X20, slotOff(fi.dstSlot), 0);
+                as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 15, kTagDouble);
+                as.strD(A64Reg::X20, slotOff(fi.aux0Slot), 1);
+                as.storeMem8Imm(A64Reg::X20, slotOff(fi.aux0Slot) + 15, kTagDouble);
+            }
+            if (fi.binaryOpcode1 == QO::SubtractDouble) as.fsubD(0, 0, 1);
+            else if (fi.binaryOpcode1 == QO::MultiplyDouble) as.fmulD(0, 0, 1);
+            else if (fi.binaryOpcode1 == QO::DivideDouble) as.fdivD(0, 0, 1);
+            else as.faddD(0, 0, 1);
+            if (!isElided) {
+                as.strD(A64Reg::X20, slotOff(fi.aux1Slot), 0);
+                as.storeMem8Imm(A64Reg::X20, slotOff(fi.aux1Slot) + 15, kTagDouble);
+            }
+            as.strD(A64Reg::X20, slotOff(fi.storeSlot), 0);
+            as.storeMem8Imm(A64Reg::X20, slotOff(fi.storeSlot) + 15, kTagDouble);
+            break;
+        }
+
+        // Scalar Float ALU & Superinstructions
+        case FO::AddFloat:
+        case FO::SubFloat:
+        case FO::MulFloat:
+        case FO::DivFloat:
+        case FO::AddFloatTrusted:
+        case FO::SubFloatTrusted:
+        case FO::MulFloatTrusted: {
+            const bool trusted =
+                fi.flatOpcode >= FO::AddFloatTrusted && fi.flatOpcode <= FO::MulFloatTrusted;
+            if (!trusted) {
+                emitCheckTagOrTrap(fi.src0Slot, kTagFloat, i32Idx, unexecAfter);
+                emitCheckTagOrTrap(fi.src1Slot, kTagFloat, i32Idx, unexecAfter);
+            }
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.ldrS(0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.ldrS(1, A64Reg::X20, slotOff(fi.src1Slot));
+            if (fi.flatOpcode == FO::SubFloat || fi.flatOpcode == FO::SubFloatTrusted) as.fsubS(0, 0, 1);
+            else if (fi.flatOpcode == FO::MulFloat || fi.flatOpcode == FO::MulFloatTrusted) as.fmulS(0, 0, 1);
+            else if (fi.flatOpcode == FO::DivFloat) as.fdivS(0, 0, 1);
+            else as.faddS(0, 0, 1);
+            as.strS(A64Reg::X20, slotOff(fi.dstSlot), 0);
+            as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 15, kTagFloat);
+            break;
+        }
+
+        case FO::LessFloat:
+        case FO::LessOrEqualFloat:
+        case FO::GreaterFloat:
+        case FO::GreaterOrEqualFloat:
+        case FO::EqualFloat:
+        case FO::NotEqualFloat: {
+            emitCheckTagOrTrap(fi.src0Slot, kTagFloat, i32Idx, unexecAfter);
+            emitCheckTagOrTrap(fi.src1Slot, kTagFloat, i32Idx, unexecAfter);
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.ldrS(0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.ldrS(1, A64Reg::X20, slotOff(fi.src1Slot));
+            as.fcmpS(0, 1);
+            if (fi.flatOpcode == FO::LessFloat) as.cset32(A64Reg::X0, A64Cond::MI);
+            else if (fi.flatOpcode == FO::LessOrEqualFloat) as.cset32(A64Reg::X0, A64Cond::LS);
+            else if (fi.flatOpcode == FO::GreaterFloat) as.cset32(A64Reg::X0, A64Cond::GT);
+            else if (fi.flatOpcode == FO::GreaterOrEqualFloat) as.cset32(A64Reg::X0, A64Cond::GE);
+            else if (fi.flatOpcode == FO::EqualFloat) as.cset32(A64Reg::X0, A64Cond::EQ);
+            else as.cset32(A64Reg::X0, A64Cond::NE);
+            emitWriteTaggedResult(fi.dstSlot, kTagBool);
+            break;
+        }
+
+        case FO::NegateFloat:
+            emitCheckTagOrTrap(fi.src0Slot, kTagFloat, i32Idx, unexecAfter);
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.loadMem32(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.movz32(A64Reg::X1, 0x8000u, 1);
+            as.eorReg32(A64Reg::X0, A64Reg::X0, A64Reg::X1);
+            as.storeMem32(A64Reg::X20, slotOff(fi.dstSlot), A64Reg::X0);
+            as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 15, kTagFloat);
+            break;
+
+        case FO::SuperBinaryLocalFloatLocalStore:
+        case FO::SuperBinaryLocalFloatLocalStoreElided:
+        case FO::SuperBinaryLocalFloatReg:
+        case FO::SuperBinaryLocalFloatRegElided:
+        case FO::SuperBinaryLocalFloatRegStore:
+        case FO::SuperBinaryLocalFloatRegStoreElided:
+        case FO::SuperBinaryRegFloatStoreElided: {
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            emitCheckTagOrTrap(fi.src0Slot, kTagFloat, i32Idx, 0);
+            emitCheckTagOrTrap(fi.src1Slot, kTagFloat, i32Idx, 0);
+            as.ldrS(0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.ldrS(1, A64Reg::X20, slotOff(fi.src1Slot));
+            if (fi.flatOpcode == FO::SuperBinaryLocalFloatLocalStore ||
+                fi.flatOpcode == FO::SuperBinaryLocalFloatReg ||
+                fi.flatOpcode == FO::SuperBinaryLocalFloatRegStore) {
+                as.strS(A64Reg::X20, slotOff(fi.dstSlot), 0);
+                as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 15, kTagFloat);
+                if (fi.flatOpcode == FO::SuperBinaryLocalFloatLocalStore) {
+                    as.strS(A64Reg::X20, slotOff(fi.aux0Slot), 1);
+                    as.storeMem8Imm(A64Reg::X20, slotOff(fi.aux0Slot) + 15, kTagFloat);
+                }
+            }
+            if (fi.binaryOpcode1 == QO::SubtractFloat) as.fsubS(0, 0, 1);
+            else if (fi.binaryOpcode1 == QO::MultiplyFloat) as.fmulS(0, 0, 1);
+            else if (fi.binaryOpcode1 == QO::DivideFloat) as.fdivS(0, 0, 1);
+            else as.faddS(0, 0, 1);
+            if (fi.flatOpcode == FO::SuperBinaryLocalFloatLocalStore ||
+                fi.flatOpcode == FO::SuperBinaryLocalFloatReg ||
+                fi.flatOpcode == FO::SuperBinaryLocalFloatRegElided ||
+                fi.flatOpcode == FO::SuperBinaryLocalFloatRegStore) {
+                as.strS(A64Reg::X20, slotOff(fi.aux1Slot), 0);
+                as.storeMem8Imm(A64Reg::X20, slotOff(fi.aux1Slot) + 15, kTagFloat);
+            }
+            if (fi.flatOpcode != FO::SuperBinaryLocalFloatReg &&
+                fi.flatOpcode != FO::SuperBinaryLocalFloatRegElided) {
+                as.strS(A64Reg::X20, slotOff(fi.storeSlot), 0);
+                as.storeMem8Imm(A64Reg::X20, slotOff(fi.storeSlot) + 15, kTagFloat);
+            }
+            break;
+        }
+
+        // Fast Scalar Conversions
+        case FO::ConvertIntToLongFast:
+            emitCheckTagOrTrap(fi.src0Slot, kTagInt64, i32Idx, unexecAfter);
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.loadMem64(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+            emitWriteTaggedResult(fi.dstSlot, kTagLong);
+            break;
+
+        case FO::ConvertIntToDoubleFast:
+            emitCheckTagOrTrap(fi.src0Slot, kTagInt64, i32Idx, unexecAfter);
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.loadMem64(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.scvtfDFromX(0, A64Reg::X0);
+            as.strD(A64Reg::X20, slotOff(fi.dstSlot), 0);
+            as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 15, kTagDouble);
+            break;
+
+        case FO::ConvertLongToDoubleFast:
+            emitCheckTagOrTrap(fi.src0Slot, kTagLong, i32Idx, unexecAfter);
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.loadMem64(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.scvtfDFromX(0, A64Reg::X0);
+            as.strD(A64Reg::X20, slotOff(fi.dstSlot), 0);
+            as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 15, kTagDouble);
+            break;
+
+        case FO::ConvertIntToFloatFast:
+            emitCheckTagOrTrap(fi.src0Slot, kTagInt64, i32Idx, unexecAfter);
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.loadMem64(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.scvtfSFromX(0, A64Reg::X0);
+            as.strS(A64Reg::X20, slotOff(fi.dstSlot), 0);
+            as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 15, kTagFloat);
+            break;
+
+        case FO::ConvertFloatToDoubleFast:
+            emitCheckTagOrTrap(fi.src0Slot, kTagFloat, i32Idx, unexecAfter);
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.ldrS(0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.fcvtDFromS(0, 0);
+            as.strD(A64Reg::X20, slotOff(fi.dstSlot), 0);
+            as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 15, kTagDouble);
+            break;
+
+        case FO::ConvertDoubleToFloatFast: {
+            emitCheckTagOrTrap(fi.src0Slot, kTagDouble, i32Idx, unexecAfter);
+            emitBudgetDeduct(i32Idx, fi.span, fi.checked1() && fi.span > 1u);
+            as.ldrD(0, A64Reg::X20, slotOff(fi.src0Slot));
+            if (fi.checked1()) {
+                constexpr double kMaxF = static_cast<double>(std::numeric_limits<float>::max());
+                constexpr double kMinF = -kMaxF;
+                std::uint64_t maxBits = 0, minBits = 0;
+                std::memcpy(&maxBits, &kMaxF, 8);
+                std::memcpy(&minBits, &kMinF, 8);
+                const auto ovfStub = addColdStub(ColdTrapStub::Kind::IntegerOverflow, i32Idx, unexecAfter);
+                as.movImm64(A64Reg::X0, minBits);
+                as.fmovDFromX(1, A64Reg::X0);
+                as.fcmpD(0, 1);
+                // Trap if unordered (VS) or d0 < minF (MI) -> !(d0 >= minF) == invert(GE) == LT!
+                as.bcc(A64Cond::LT, ovfStub);
+                as.movImm64(A64Reg::X0, maxBits);
+                as.fmovDFromX(1, A64Reg::X0);
+                as.fcmpD(0, 1);
+                // Trap if d0 > maxF (GT)
+                as.bcc(A64Cond::GT, ovfStub);
+            }
+            as.fcvtSFromD(0, 0);
+            as.strS(A64Reg::X20, slotOff(fi.dstSlot), 0);
+            as.storeMem8Imm(A64Reg::X20, slotOff(fi.dstSlot) + 15, kTagFloat);
+            break;
+        }
+
+        case FO::ConvertFloatToIntFast: {
+            emitCheckTagOrTrap(fi.src0Slot, kTagFloat, i32Idx, unexecAfter);
+            emitBudgetDeduct(i32Idx, fi.span, fi.span > 1u);
+            as.ldrS(0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.fcvtDFromS(0, 0);
+            constexpr double kMinI = static_cast<double>(std::numeric_limits<std::int32_t>::min());
+            constexpr double kMaxI = static_cast<double>(std::numeric_limits<std::int32_t>::max());
+            std::uint64_t minBits = 0, maxBits = 0;
+            std::memcpy(&minBits, &kMinI, 8);
+            std::memcpy(&maxBits, &kMaxI, 8);
+            const auto ovfStub = addColdStub(ColdTrapStub::Kind::IntegerOverflow, i32Idx, unexecAfter);
+            as.movImm64(A64Reg::X0, minBits);
+            as.fmovDFromX(1, A64Reg::X0);
+            as.fcmpD(0, 1);
+            as.bcc(A64Cond::LT, ovfStub);
+            as.movImm64(A64Reg::X0, maxBits);
+            as.fmovDFromX(1, A64Reg::X0);
+            as.fcmpD(0, 1);
+            as.bcc(A64Cond::GT, ovfStub);
+            as.fcvtzsXFromD(A64Reg::X0, 0);
+            emitWriteTaggedResult(fi.dstSlot, kTagInt64);
+            break;
+        }
+
+        case FO::ConvertLongToIntFast: {
+            emitCheckTagOrTrap(fi.src0Slot, kTagLong, i32Idx, unexecAfter);
+            emitBudgetDeduct(i32Idx, fi.span, fi.checked1() && fi.span > 1u);
+            as.loadMem64(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.sxtw(A64Reg::X1, A64Reg::X0);
+            if (fi.checked1()) {
+                as.cmpReg64(A64Reg::X0, A64Reg::X1);
+                const auto ovfStub = addColdStub(ColdTrapStub::Kind::IntegerOverflow, i32Idx, unexecAfter);
+                as.bcc(A64Cond::NE, ovfStub);
+            }
+            as.movReg64(A64Reg::X0, A64Reg::X1);
+            emitWriteTaggedResult(fi.dstSlot, kTagInt64);
+            break;
+        }
+
+        case FO::InlineCallEnter: {
+            emitHelperCallInline(&jitInlineCallEnterHelper, i32Idx);
+            const std::size_t fastTarget = idx + 1u + fi.inlineArgCount;
+            if (fi.inlineArgCount > 0u && fastTarget < nInst) {
+                as.loadMem32(
+                    A64Reg::X0,
+                    A64Reg::X19,
+                    static_cast<std::int32_t>(offsetof(JitAbiContext, nextFlatOffsetOut)));
+                as.cmpImm32(A64Reg::X0, 0);
+                as.bcc(A64Cond::NE, instLabels[fastTarget]);
+            }
+            break;
+        }
+
+        case FO::InlineReturnVoid:
+        case FO::InlineReturnVoidJump: {
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            if (fi.integerImmediate != 0) {
+                const auto packed = static_cast<std::uint64_t>(fi.integerImmediate);
+                const auto clearBase = static_cast<std::uint16_t>(packed & 0xFFFFu);
+                const auto clearCount = static_cast<std::uint32_t>(packed >> 16u);
+                as.veorZero128(0);
+                for (std::uint32_t k = 0; k < clearCount; ++k) {
+                    as.strQ(A64Reg::X20, slotOff(static_cast<std::uint16_t>(clearBase + k)), 0);
+                }
+            }
+            if (fi.flatOpcode == FO::InlineReturnVoidJump) {
+                as.b(instLabels[fi.trueTargetOffset]);
+            }
+            break;
+        }
+
+        case FO::InlineReturnScalar:
+        case FO::InlineReturnScalarJump: {
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            if (fi.dstSlot != runtime::detail::InvalidCompactReg) {
+                as.ldrQ(0, A64Reg::X20, slotOff(fi.src0Slot));
+            }
+            if (fi.integerImmediate != 0) {
+                const auto packed = static_cast<std::uint64_t>(fi.integerImmediate);
+                const auto clearBase = static_cast<std::uint16_t>(packed & 0xFFFFu);
+                const auto clearCount = static_cast<std::uint32_t>(packed >> 16u);
+                as.veorZero128(1);
+                for (std::uint32_t k = 0; k < clearCount; ++k) {
+                    as.strQ(A64Reg::X20, slotOff(static_cast<std::uint16_t>(clearBase + k)), 1);
+                }
+            }
+            if (fi.dstSlot != runtime::detail::InvalidCompactReg) {
+                as.strQ(A64Reg::X20, slotOff(fi.dstSlot), 0);
+            }
+            if (fi.flatOpcode == FO::InlineReturnScalarJump) {
+                as.b(instLabels[fi.trueTargetOffset]);
+            }
+            break;
+        }
+
+        case FO::TermJumpNoArgs:
+            emitBudgetDeduct(i32Idx, fi.span, fi.span > 1u);
+            as.addImm64(A64Reg::X22, A64Reg::X22, fi.span);
+            if (fi.trueTargetOffset != idx + 1u) {
+                as.b(instLabels[fi.trueTargetOffset]);
+            }
+            break;
+
+        case FO::TermBranchBoolNoArgs:
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.addImm64(A64Reg::X22, A64Reg::X22, 1);
+            as.loadMem8ZeroExt(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.cmpImm32(A64Reg::X0, 0);
+            emitCondBranchTargets(A64Cond::NE, i32Idx, fi.trueTargetOffset, fi.falseTargetOffset);
+            break;
+
+        case FO::TermBranchGeneric: {
+            const auto& cold = execFunc.flatCold[idx];
+            if (cold.blockIndex >= execFunc.blocks.size()) return {};
+            const auto& blk = execFunc.blocks[cold.blockIndex];
+            const auto& term = blk.bytecode->terminator;
+
+            const auto emitEdgeCopies = [&](const runtime::detail::ExecutionEdge& edge) -> bool {
+                if (!edge.hasArguments) return true;
+                if (!edge.sources || !edge.destinations ||
+                    edge.sources->size() != edge.destinations->size() ||
+                    edge.sources->size() > execFunc.edgeScratchCount) {
+                    return false;
+                }
+                const auto& srcs = *edge.sources;
+                const auto& dsts = *edge.destinations;
+                if (srcs.size() == 1u) {
+                    const auto sSlot = static_cast<std::uint16_t>(execFunc.registerOffset + srcs[0]);
+                    const auto dSlot = static_cast<std::uint16_t>(execFunc.registerOffset + dsts[0].target);
+                    if (sSlot != dSlot) {
+                        as.ldrQ(0, A64Reg::X20, slotOff(sSlot));
+                        as.strQ(A64Reg::X20, slotOff(dSlot), 0);
+                    }
+                    return true;
+                }
+                for (std::size_t k = 0; k < srcs.size(); ++k) {
+                    const auto sSlot = static_cast<std::uint16_t>(execFunc.registerOffset + srcs[k]);
+                    const auto scSlot = static_cast<std::uint16_t>(execFunc.scratchOffset + k);
+                    as.ldrQ(0, A64Reg::X20, slotOff(sSlot));
+                    as.strQ(A64Reg::X20, slotOff(scSlot), 0);
+                }
+                for (std::size_t k = 0; k < srcs.size(); ++k) {
+                    const auto scSlot = static_cast<std::uint16_t>(execFunc.scratchOffset + k);
+                    const auto dSlot = static_cast<std::uint16_t>(execFunc.registerOffset + dsts[k].target);
+                    as.ldrQ(0, A64Reg::X20, slotOff(scSlot));
+                    as.strQ(A64Reg::X20, slotOff(dSlot), 0);
+                }
+                return true;
+            };
+
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            if (term.kind == bytecode::TerminatorKind::Jump) {
+                as.addImm64(A64Reg::X22, A64Reg::X22, 1);
+                if (!emitEdgeCopies(blk.branch)) return {};
+                if (fi.trueTargetOffset != idx + 1u) {
+                    as.b(instLabels[fi.trueTargetOffset]);
+                }
+            } else if (term.kind == bytecode::TerminatorKind::Branch) {
+                const auto condSlot = static_cast<std::uint16_t>(execFunc.registerOffset + term.condition);
+                if (condSlot >= execFunc.totalFrameSlots || fi.falseTargetOffset >= nInst) {
+                    return {};
+                }
+                emitCheckTagOrTrap(condSlot, kTagBool, i32Idx, 0);
+                as.addImm64(A64Reg::X22, A64Reg::X22, 1);
+                const std::uint32_t falsePathLbl = as.createLabel();
+                as.loadMem8ZeroExt(A64Reg::X0, A64Reg::X20, slotOff(condSlot));
+                as.cmpImm32(A64Reg::X0, 0);
+                as.bcc(A64Cond::EQ, falsePathLbl);
+                if (!emitEdgeCopies(blk.branch)) return {};
+                as.b(instLabels[fi.trueTargetOffset]);
+                as.bind(falsePathLbl);
+                if (!emitEdgeCopies(blk.falseBranch)) return {};
+                if (fi.falseTargetOffset != idx + 1u) {
+                    as.b(instLabels[fi.falseTargetOffset]);
+                }
+            } else {
+                return {};
+            }
+            break;
+        }
+
+        case FO::TermReturnVoid:
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.loadMem64(A64Reg::X0, A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, returnSlot)));
+            as.veorZero128(0);
+            as.strQ(A64Reg::X0, 0, 0);
+            as.b(epilogueOk);
+            break;
+
+        case FO::TermReturnScalarFast:
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            as.ldrQ(0, A64Reg::X20, slotOff(fi.src0Slot));
+            as.loadMem64(A64Reg::X0, A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, returnSlot)));
+            as.strQ(A64Reg::X0, 0, 0);
+            as.b(epilogueOk);
+            break;
+
+        case FO::TermReturnGeneric: {
+            emitBudgetDeduct(i32Idx, fi.span, false);
+            const auto& cold = execFunc.flatCold[idx];
+            const auto retReg = execFunc.blocks[cold.blockIndex].bytecode->terminator.value;
+            const auto retSlot = static_cast<std::uint16_t>(execFunc.registerOffset + retReg);
+            as.ldrQ(0, A64Reg::X20, slotOff(retSlot));
+            as.loadMem64(A64Reg::X0, A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, returnSlot)));
+            as.strQ(A64Reg::X0, 0, 0);
+            as.b(epilogueOk);
+            break;
+        }
+
+        default:
+            return {};
+        }
+    }
+
+    // Out-of-line Cold Stubs
+    for (const auto& stub : coldStubs) {
+        as.bind(stub.stubLabel);
+        switch (stub.kind) {
+        case ColdTrapStub::Kind::BudgetSimple:
+            as.storeMem32Imm(
+                A64Reg::X19,
+                static_cast<std::int32_t>(offsetof(JitAbiContext, errorFlatIndex)),
+                stub.flatIdx);
+            as.b(epilogueBudget);
+            break;
+
+        case ColdTrapStub::Kind::BudgetPartialSuper:
+            as.addImm64(A64Reg::X21, A64Reg::X21, stub.restoreBudget);
+            emitHelperCallInline(&jitPartialSuperBudgetHelper, stub.flatIdx);
+            as.b(epilogueBudget);
+            break;
+
+        case ColdTrapStub::Kind::IntegerOverflow:
+            if (stub.restoreBudget != 0) as.addImm64(A64Reg::X21, A64Reg::X21, stub.restoreBudget);
+            as.storeMem32Imm(
+                A64Reg::X19,
+                static_cast<std::int32_t>(offsetof(JitAbiContext, errorFlatIndex)),
+                stub.flatIdx);
+            as.b(epilogueOverflow);
+            break;
+
+        case ColdTrapStub::Kind::DivisionByZero:
+            if (stub.restoreBudget != 0) as.addImm64(A64Reg::X21, A64Reg::X21, stub.restoreBudget);
+            as.storeMem32Imm(
+                A64Reg::X19,
+                static_cast<std::int32_t>(offsetof(JitAbiContext, errorFlatIndex)),
+                stub.flatIdx);
+            as.b(epilogueDivZero);
+            break;
+
+        case ColdTrapStub::Kind::TypeMismatch:
+            if (stub.restoreBudget != 0) as.addImm64(A64Reg::X21, A64Reg::X21, stub.restoreBudget);
+            as.storeMem32Imm(
+                A64Reg::X19,
+                static_cast<std::int32_t>(offsetof(JitAbiContext, errorFlatIndex)),
+                stub.flatIdx);
+            as.b(epilogueTypeErr);
+            break;
+
+        case ColdTrapStub::Kind::ArrayLengthSlow:
+            emitHelperCallInline(&jitArrayLengthHelper, stub.flatIdx);
+            as.b(stub.resumeLabel);
+            break;
+
+        case ColdTrapStub::Kind::ArrayLengthBranchSlow:
+            emitHelperCallInline(&jitArrayLengthHelper, stub.flatIdx);
+            as.loadMem32(
+                A64Reg::X0,
+                A64Reg::X19,
+                static_cast<std::int32_t>(offsetof(JitAbiContext, branchCondOut)));
+            as.cmpImm32(A64Reg::X0, 0);
+            as.bcc(A64Cond::NE, stub.resumeLabel);
+            as.b(stub.altResumeLabel);
+            break;
+
+        case ColdTrapStub::Kind::ArrayLoadSlow:
+            emitHelperCallInline(&jitLoadElementHelper, stub.flatIdx);
+            as.b(stub.resumeLabel);
+            break;
+
+        case ColdTrapStub::Kind::ArrayStoreSlow:
+            emitHelperCallInline(&jitStoreElementHelper, stub.flatIdx);
+            as.b(stub.resumeLabel);
+            break;
+
+        case ColdTrapStub::Kind::FlatStructSlow:
+            emitHelperCallInline(&jitFlatStructAndStackRefHelper, stub.flatIdx);
+            as.b(stub.resumeLabel);
+            break;
+        }
+    }
+
+    // Shared Exit Epilogues
+    as.bind(epilogueOk);
+    as.storeMem64(A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, remainingBudget)), A64Reg::X21);
+    as.storeMem64(A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, branchesTaken)), A64Reg::X22);
+    as.movz32(A64Reg::X0, 0);
+    as.b(sharedPopRet);
+
+    as.bind(epilogueBudget);
+    as.movz32(A64Reg::X21, 0);
+    as.storeMem64(A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, remainingBudget)), A64Reg::X21);
+    as.storeMem64(A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, branchesTaken)), A64Reg::X22);
+    as.movImm32(A64Reg::X0, static_cast<std::uint32_t>(runtime::ErrorCode::InstructionBudgetExceeded));
+    as.storeMem32(A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, errorCodeRaw)), A64Reg::X0);
+    as.b(sharedPopRet);
+
+    as.bind(epilogueOverflow);
+    as.storeMem64(A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, remainingBudget)), A64Reg::X21);
+    as.storeMem64(A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, branchesTaken)), A64Reg::X22);
+    as.movImm32(A64Reg::X0, static_cast<std::uint32_t>(runtime::ErrorCode::IntegerOverflow));
+    as.storeMem32(A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, errorCodeRaw)), A64Reg::X0);
+    as.b(sharedPopRet);
+
+    as.bind(epilogueDivZero);
+    as.storeMem64(A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, remainingBudget)), A64Reg::X21);
+    as.storeMem64(A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, branchesTaken)), A64Reg::X22);
+    as.movImm32(A64Reg::X0, static_cast<std::uint32_t>(runtime::ErrorCode::DivisionByZero));
+    as.storeMem32(A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, errorCodeRaw)), A64Reg::X0);
+    as.b(sharedPopRet);
+
+    as.bind(epilogueTypeErr);
+    as.storeMem64(A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, remainingBudget)), A64Reg::X21);
+    as.storeMem64(A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, branchesTaken)), A64Reg::X22);
+    as.movImm32(A64Reg::X0, static_cast<std::uint32_t>(runtime::ErrorCode::TypeMismatch));
+    as.storeMem32(A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, errorCodeRaw)), A64Reg::X0);
+    as.b(sharedPopRet);
+
+    as.bind(epilogueHelperErr);
+
+    as.bind(sharedPopRet);
+    as.ldp64Sp(A64Reg::X23, A64Reg::X24, 48);
+    as.ldp64Sp(A64Reg::X21, A64Reg::X22, 32);
+    as.ldp64Sp(A64Reg::X19, A64Reg::X20, 16);
+    as.ldp64Sp(A64Reg::X29, A64Reg::X30, 0);
+    as.addSp(64);
+    as.ret();
+
+    if (!as.ok()) return {};
+    return as.bytes();
+}
+
+// Exact ARMv8-A A64 user-mode ISA simulator for cross-host verification of emitted ARM64 stencils.
+// Executes real 32-bit AArch64 instructions against live JitAbiContext + real C++ BLR helpers,
+// while strictly enforcing SP 16-byte alignment, X19..X29 callee-save preservation, and X18 immutability!
+[[nodiscard]] std::uint32_t executeSimulatedArm64Code(
+    const std::vector<std::uint8_t>& code,
+    JitAbiContext* abi,
+    std::string& outSimDiagnostic) noexcept {
+    if (code.empty() || (code.size() % 4u) != 0u) {
+        outSimDiagnostic = "ARM64 code buffer is empty or not 4-byte aligned";
+        return static_cast<std::uint32_t>(runtime::ErrorCode::InvalidProgram);
+    }
+
+    struct alignas(16) Vec128 {
+        std::uint8_t b[16]{};
+    };
+
+    alignas(16) std::uint8_t simStack[4096]{};
+    std::uint64_t x[31]{};
+    Vec128 v[32]{};
+    const auto entrySp = reinterpret_cast<std::uintptr_t>(simStack + sizeof(simStack));
+    std::uint64_t sp = static_cast<std::uint64_t>(entrySp);
+
+    constexpr std::uint64_t kReturnSentinel = 0xFFFF0000DEADBEEFULL;
+    constexpr std::uint64_t kX18Canary = 0xDEAD1818DEAD1818ULL;
+    x[0] = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(abi));
+    x[18] = kX18Canary;
+    for (std::size_t r = 19; r <= 29; ++r) {
+        x[r] = 0xA640000000000000ULL | r;
+    }
+    x[30] = kReturnSentinel;
+
+    bool flagN = false, flagZ = false, flagC = false, flagV = false;
+
+    const auto readX = [&](std::uint32_t r) noexcept -> std::uint64_t {
+        return (r == 31u) ? 0ULL : x[r];
+    };
+    const auto readW = [&](std::uint32_t r) noexcept -> std::uint32_t {
+        return (r == 31u) ? 0u : static_cast<std::uint32_t>(x[r]);
+    };
+    const auto writeX = [&](std::uint32_t r, std::uint64_t val) noexcept {
+        if (r < 31u) x[r] = val;
+    };
+    const auto writeW = [&](std::uint32_t r, std::uint32_t val) noexcept {
+        if (r < 31u) x[r] = static_cast<std::uint64_t>(val); // ARM64 32-bit write zero-extends to 64 bits
+    };
+    const auto readBase = [&](std::uint32_t rn) noexcept -> std::uint64_t {
+        return (rn == 31u) ? sp : x[rn];
+    };
+
+    const auto evalCond = [&](std::uint32_t cond) noexcept -> bool {
+        switch (cond & 0xFu) {
+        case 0x0: return flagZ;                          // EQ
+        case 0x1: return !flagZ;                         // NE
+        case 0x2: return flagC;                          // HS / CS
+        case 0x3: return !flagC;                         // LO / CC
+        case 0x4: return flagN;                          // MI
+        case 0x5: return !flagN;                         // PL
+        case 0x6: return flagV;                          // VS
+        case 0x7: return !flagV;                         // VC
+        case 0x8: return flagC && !flagZ;                // HI
+        case 0x9: return !flagC || flagZ;                // LS
+        case 0xA: return flagN == flagV;                 // GE
+        case 0xB: return flagN != flagV;                 // LT
+        case 0xC: return !flagZ && (flagN == flagV);     // GT
+        case 0xD: return flagZ || (flagN != flagV);      // LE
+        default:  return true;                           // AL
+        }
+    };
+
+    const auto setFlagsSub32 = [&](std::uint32_t a, std::uint32_t b) noexcept -> std::uint32_t {
+        const std::uint32_t res = a - b;
+        flagN = (res >> 31u) != 0u;
+        flagZ = (res == 0u);
+        flagC = (a >= b); // ARM64 SUBS: C=1 when NO borrow!
+        flagV = (((a ^ b) & (a ^ res)) >> 31u) != 0u;
+        return res;
+    };
+    const auto setFlagsAdd32 = [&](std::uint32_t a, std::uint32_t b) noexcept -> std::uint32_t {
+        const std::uint64_t wide = static_cast<std::uint64_t>(a) + static_cast<std::uint64_t>(b);
+        const auto res = static_cast<std::uint32_t>(wide);
+        flagN = (res >> 31u) != 0u;
+        flagZ = (res == 0u);
+        flagC = (wide >> 32u) != 0u;
+        flagV = (((~(a ^ b)) & (a ^ res)) >> 31u) != 0u;
+        return res;
+    };
+    const auto setFlagsSub64 = [&](std::uint64_t a, std::uint64_t b) noexcept -> std::uint64_t {
+        const std::uint64_t res = a - b;
+        flagN = (res >> 63u) != 0u;
+        flagZ = (res == 0u);
+        flagC = (a >= b);
+        flagV = (((a ^ b) & (a ^ res)) >> 63u) != 0u;
+        return res;
+    };
+    const auto setFlagsAdd64 = [&](std::uint64_t a, std::uint64_t b) noexcept -> std::uint64_t {
+        const std::uint64_t res = a + b;
+        flagN = (res >> 63u) != 0u;
+        flagZ = (res == 0u);
+        flagC = (res < a);
+        flagV = (((~(a ^ b)) & (a ^ res)) >> 63u) != 0u;
+        return res;
+    };
+
+    std::size_t pc = 0;
+    while (pc < code.size()) {
+        if (x[18] != kX18Canary) {
+            outSimDiagnostic = "ARM64 ABI violation: platform-reserved register X18 was modified";
+            return static_cast<std::uint32_t>(runtime::ErrorCode::InvalidProgram);
+        }
+        std::uint32_t inst = 0;
+        std::memcpy(&inst, code.data() + pc, 4);
+        std::size_t nextPc = pc + 4u;
+
+        const std::uint32_t rd = inst & 31u;
+        const std::uint32_t rn = (inst >> 5u) & 31u;
+        const std::uint32_t rm = (inst >> 16u) & 31u;
+
+        // 1. Unconditional B imm26 (0x14000000 .. 0x17FFFFFF)
+        if ((inst & 0xFC000000u) == 0x14000000u) {
+            std::int32_t imm26 = static_cast<std::int32_t>(inst & 0x03FFFFFFu);
+            if ((imm26 & (1 << 25)) != 0) imm26 |= ~0x03FFFFFF;
+            nextPc = static_cast<std::size_t>(static_cast<std::ptrdiff_t>(pc) + static_cast<std::ptrdiff_t>(imm26) * 4);
+        }
+        // 2. Conditional B.cond imm19 (0x54000000)
+        else if ((inst & 0xFF000010u) == 0x54000000u) {
+            if (evalCond(inst & 0xFu)) {
+                std::int32_t imm19 = static_cast<std::int32_t>((inst >> 5u) & 0x7FFFFu);
+                if ((imm19 & (1 << 18)) != 0) imm19 |= ~0x7FFFF;
+                nextPc = static_cast<std::size_t>(static_cast<std::ptrdiff_t>(pc) + static_cast<std::ptrdiff_t>(imm19) * 4);
+            }
+        }
+        // 3. RET Xn (0xD65F0000)
+        else if ((inst & 0xFFFFFC1Fu) == 0xD65F0000u) {
+            const std::uint64_t target = readX(rn);
+            if (target != kReturnSentinel) {
+                outSimDiagnostic = "ARM64 RET target did not match saved LR";
+                return static_cast<std::uint32_t>(runtime::ErrorCode::InvalidProgram);
+            }
+            if (sp != static_cast<std::uint64_t>(entrySp)) {
+                outSimDiagnostic = "ARM64 SP mismatch on function return";
+                return static_cast<std::uint32_t>(runtime::ErrorCode::InvalidProgram);
+            }
+            for (std::size_t r = 19; r <= 29; ++r) {
+                if (x[r] != (0xA640000000000000ULL | r)) {
+                    outSimDiagnostic = "ARM64 AAPCS64 callee-saved register X" + std::to_string(r) + " corrupted";
+                    return static_cast<std::uint32_t>(runtime::ErrorCode::InvalidProgram);
+                }
+            }
+            return static_cast<std::uint32_t>(x[0]);
+        }
+        // 4. BLR Xn (0xD63F0000) -> call real C++ StencilJit helper!
+        else if ((inst & 0xFFFFFC1Fu) == 0xD63F0000u) {
+            if ((sp & 0xFULL) != 0ULL) {
+                outSimDiagnostic = "ARM64 ABI violation: SP not 16-byte aligned at BLR call site";
+                return static_cast<std::uint32_t>(runtime::ErrorCode::InvalidProgram);
+            }
+            using HelperFn = std::uint32_t (*)(JitAbiContext*, std::uint32_t);
+            const auto calleeAddr = static_cast<std::uintptr_t>(readX(rn));
+            const auto helper = bitCastFnPtr<HelperFn>(reinterpret_cast<void*>(calleeAddr));
+            auto* ctxArg = reinterpret_cast<JitAbiContext*>(static_cast<std::uintptr_t>(x[0]));
+            const auto idxArg = static_cast<std::uint32_t>(x[1]);
+            const std::uint32_t ret = helper(ctxArg, idxArg);
+            // Poison caller-saved registers (except X0 return & platform-reserved X18) to prove ABI discipline!
+            for (std::uint32_t r = 1; r <= 17; ++r) x[r] = 0xCCCCCCCCCCCCCCCCULL;
+            for (std::uint32_t vr = 0; vr < 8; ++vr) std::memset(v[vr].b, 0xCC, 16);
+            writeW(0, ret);
+        }
+        // 5. STP / LDP 64-bit signed offset (0xA9000000 / 0xA9400000)
+        else if ((inst & 0xFFC00000u) == 0xA9000000u || (inst & 0xFFC00000u) == 0xA9400000u) {
+            const bool isLoad = ((inst >> 22u) & 1u) != 0u;
+            const std::uint32_t rt2 = (inst >> 10u) & 31u;
+            std::int32_t imm7 = static_cast<std::int32_t>((inst >> 15u) & 0x7Fu);
+            if ((imm7 & 0x40) != 0) imm7 |= ~0x7F;
+            const auto addr = static_cast<std::uintptr_t>(
+                static_cast<std::int64_t>(readBase(rn)) + static_cast<std::int64_t>(imm7) * 8LL);
+            auto* ptr = reinterpret_cast<std::uint8_t*>(addr);
+            if (isLoad) {
+                std::uint64_t v1 = 0, v2 = 0;
+                std::memcpy(&v1, ptr, 8);
+                std::memcpy(&v2, ptr + 8, 8);
+                writeX(rd, v1);
+                writeX(rt2, v2);
+            } else {
+                const std::uint64_t v1 = readX(rd);
+                const std::uint64_t v2 = readX(rt2);
+                std::memcpy(ptr, &v1, 8);
+                std::memcpy(ptr + 8, &v2, 8);
+            }
+        }
+        // 6. Move Wide Immediate (MOVN / MOVZ / MOVK, 32-bit & 64-bit)
+        else if ((inst & 0x1F800000u) == 0x12800000u) {
+            const bool sf64 = (inst >> 31u) != 0u;
+            const std::uint32_t opc = (inst >> 29u) & 3u; // 0=MOVN, 2=MOVZ, 3=MOVK
+            const std::uint32_t hw = (inst >> 21u) & 3u;
+            const std::uint64_t imm16 = (inst >> 5u) & 0xFFFFu;
+            const std::uint32_t shift = hw * 16u;
+            if (opc == 2u) {
+                const std::uint64_t val = imm16 << shift;
+                if (sf64) writeX(rd, val); else writeW(rd, static_cast<std::uint32_t>(val));
+            } else if (opc == 0u) {
+                const std::uint64_t val = ~(imm16 << shift);
+                if (sf64) writeX(rd, val); else writeW(rd, static_cast<std::uint32_t>(val));
+            } else if (opc == 3u) {
+                const std::uint64_t mask = ~(0xFFFFULL << shift);
+                if (sf64) {
+                    writeX(rd, (readX(rd) & mask) | (imm16 << shift));
+                } else {
+                    writeW(rd, static_cast<std::uint32_t>((readW(rd) & mask) | (imm16 << shift)));
+                }
+            }
+        }
+        // 7. ADD / ADDS / SUB / SUBS (immediate, 32-bit & 64-bit)
+        else if ((inst & 0x1F000000u) == 0x11000000u) {
+            const bool sf64 = (inst >> 31u) != 0u;
+            const bool isSub = ((inst >> 30u) & 1u) != 0u;
+            const bool setFlags = ((inst >> 29u) & 1u) != 0u;
+            const std::uint32_t sh = (inst >> 22u) & 3u;
+            const std::uint64_t imm12 = (inst >> 10u) & 0xFFFu;
+            const std::uint64_t imm = (sh == 1u) ? (imm12 << 12u) : imm12;
+            const std::uint64_t baseVal = readBase(rn);
+            if (sf64) {
+                if (setFlags) {
+                    const std::uint64_t res = isSub ? setFlagsSub64(baseVal, imm) : setFlagsAdd64(baseVal, imm);
+                    writeX(rd, res); // rd==31 -> XZR discard!
+                } else {
+                    const std::uint64_t res = isSub ? (baseVal - imm) : (baseVal + imm);
+                    if (rd == 31u) sp = res; else writeX(rd, res);
+                }
+            } else {
+                const auto b32 = static_cast<std::uint32_t>(baseVal);
+                const auto i32 = static_cast<std::uint32_t>(imm);
+                if (setFlags) {
+                    const std::uint32_t res = isSub ? setFlagsSub32(b32, i32) : setFlagsAdd32(b32, i32);
+                    writeW(rd, res);
+                } else {
+                    const std::uint32_t res = isSub ? (b32 - i32) : (b32 + i32);
+                    if (rd == 31u) sp = res; else writeW(rd, res);
+                }
+            }
+        }
+        // 8. ADD / ADDS / SUB / SUBS (shifted register, 32-bit & 64-bit)
+        else if ((inst & 0x1F200000u) == 0x0B000000u) {
+            const bool sf64 = (inst >> 31u) != 0u;
+            const bool isSub = ((inst >> 30u) & 1u) != 0u;
+            const bool setFlags = ((inst >> 29u) & 1u) != 0u;
+            const std::uint32_t shiftAmt = (inst >> 10u) & 63u;
+            if (sf64) {
+                const std::uint64_t lhs = readX(rn);
+                const std::uint64_t rhs = readX(rm) << shiftAmt;
+                const std::uint64_t res = setFlags
+                    ? (isSub ? setFlagsSub64(lhs, rhs) : setFlagsAdd64(lhs, rhs))
+                    : (isSub ? (lhs - rhs) : (lhs + rhs));
+                writeX(rd, res);
+            } else {
+                const std::uint32_t lhs = readW(rn);
+                const std::uint32_t rhs = readW(rm) << (shiftAmt & 31u);
+                const std::uint32_t res = setFlags
+                    ? (isSub ? setFlagsSub32(lhs, rhs) : setFlagsAdd32(lhs, rhs))
+                    : (isSub ? (lhs - rhs) : (lhs + rhs));
+                writeW(rd, res);
+            }
+        }
+        // 9. Logical (shifted register: ORR / EOR / AND, includes MOV reg)
+        else if ((inst & 0x1F200000u) == 0x0A000000u) {
+            const bool sf64 = (inst >> 31u) != 0u;
+            const std::uint32_t opc = (inst >> 29u) & 3u; // 0=AND, 1=ORR, 2=EOR
+            if (sf64) {
+                const std::uint64_t lhs = readX(rn);
+                const std::uint64_t rhs = readX(rm);
+                const std::uint64_t res = (opc == 1u) ? (lhs | rhs) : ((opc == 2u) ? (lhs ^ rhs) : (lhs & rhs));
+                writeX(rd, res);
+            } else {
+                const std::uint32_t lhs = readW(rn);
+                const std::uint32_t rhs = readW(rm);
+                const std::uint32_t res = (opc == 1u) ? (lhs | rhs) : ((opc == 2u) ? (lhs ^ rhs) : (lhs & rhs));
+                writeW(rd, res);
+            }
+        }
+        // 10. Bitfield: SXTW (0x93407C00), UBFM 64-bit LSL (0xD3400000), UBFM 32-bit LSR/UBFX (0x53000000)
+        else if ((inst & 0xFFFFFC00u) == 0x93407C00u) {
+            writeX(rd, static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(readW(rn)))));
+        }
+        else if ((inst & 0xFFC00000u) == 0xD3400000u) {
+            const std::uint32_t immr = (inst >> 16u) & 63u;
+            const std::uint32_t imms = (inst >> 10u) & 63u;
+            const std::uint64_t src = readX(rn);
+            if (imms + 1u == immr) {
+                const std::uint32_t lsl = 64u - immr;
+                writeX(rd, src << lsl);
+            } else if (imms == 63u) {
+                writeX(rd, src >> immr);
+            } else {
+                const std::uint32_t width = imms - immr + 1u;
+                writeX(rd, (src >> immr) & ((1ULL << width) - 1ULL));
+            }
+        }
+        else if ((inst & 0xFFC00000u) == 0x53000000u) {
+            const std::uint32_t immr = (inst >> 16u) & 31u;
+            const std::uint32_t imms = (inst >> 10u) & 31u;
+            const std::uint32_t src = readW(rn);
+            if (imms == 31u) {
+                writeW(rd, src >> immr);
+            } else if (immr == 0u) {
+                const std::uint32_t mask = (imms == 31u) ? 0xFFFFFFFFu : ((1u << (imms + 1u)) - 1u);
+                writeW(rd, src & mask);
+            } else {
+                const std::uint32_t lsl = 32u - immr;
+                writeW(rd, src << lsl);
+            }
+        }
+        // 11. Multiply / Divide: MUL Xd (0x9B007C00), SMULL Xd (0x9B207C00), SDIV Wd (0x1AC00C00), MSUB Wd (0x1B008000)
+        else if ((inst & 0xFFE0FC00u) == 0x9B007C00u) {
+            writeX(rd, readX(rn) * readX(rm));
+        }
+        else if ((inst & 0xFFE0FC00u) == 0x9B207C00u) {
+            const auto a = static_cast<std::int64_t>(static_cast<std::int32_t>(readW(rn)));
+            const auto b = static_cast<std::int64_t>(static_cast<std::int32_t>(readW(rm)));
+            writeX(rd, static_cast<std::uint64_t>(a * b));
+        }
+        else if ((inst & 0xFFE0FC00u) == 0x1AC00C00u) {
+            const auto a = static_cast<std::int32_t>(readW(rn));
+            const auto b = static_cast<std::int32_t>(readW(rm));
+            std::int32_t q = 0;
+            if (b != 0) {
+                q = (a == std::numeric_limits<std::int32_t>::min() && b == -1) ? a : (a / b);
+            }
+            writeW(rd, static_cast<std::uint32_t>(q));
+        }
+        else if ((inst & 0xFFE08000u) == 0x1B008000u) {
+            const std::uint32_t ra = (inst >> 10u) & 31u;
+            const std::uint32_t res = readW(ra) - (readW(rn) * readW(rm));
+            writeW(rd, res);
+        }
+        // 12. Conditional Select Increment: CSINC Wd, WZR, WZR, invCond (CSET Wd, cond)
+        else if ((inst & 0xFFFF0FE0u) == 0x1A9F07E0u) {
+            const std::uint32_t invCond = (inst >> 12u) & 0xFu;
+            writeW(rd, evalCond(invCond) ? 0u : 1u);
+        }
+        // 13. Unsigned-Immediate GP & SIMD Loads/Stores
+        else if ((inst & 0x3B000000u) == 0x39000000u) {
+            const std::uint32_t sizeBits = (inst >> 30u) & 3u;
+            const bool isSimd = ((inst >> 26u) & 1u) != 0u;
+            const std::uint32_t opc = (inst >> 22u) & 3u;
+            const std::uint32_t uimm12 = (inst >> 10u) & 0xFFFu;
+            const std::uint64_t baseAddr = readBase(rn);
+
+            if (!isSimd) {
+                const std::uint64_t addr = baseAddr + (static_cast<std::uint64_t>(uimm12) << sizeBits);
+                auto* ptr = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(addr));
+                if (sizeBits == 0u && opc == 1u) { // LDRB Wt
+                    writeW(rd, *ptr);
+                } else if (sizeBits == 0u && opc == 0u) { // STRB Wt
+                    *ptr = static_cast<std::uint8_t>(readW(rd) & 0xFFu);
+                } else if (sizeBits == 1u && opc == 1u) { // LDRH Wt
+                    std::uint16_t tmp = 0;
+                    std::memcpy(&tmp, ptr, 2);
+                    writeW(rd, tmp);
+                } else if (sizeBits == 2u && opc == 1u) { // LDR Wt
+                    std::uint32_t tmp = 0;
+                    std::memcpy(&tmp, ptr, 4);
+                    writeW(rd, tmp);
+                } else if (sizeBits == 2u && opc == 2u) { // LDRSW Xt
+                    std::int32_t tmp = 0;
+                    std::memcpy(&tmp, ptr, 4);
+                    writeX(rd, static_cast<std::uint64_t>(static_cast<std::int64_t>(tmp)));
+                } else if (sizeBits == 2u && opc == 0u) { // STR Wt
+                    const std::uint32_t tmp = readW(rd);
+                    std::memcpy(ptr, &tmp, 4);
+                } else if (sizeBits == 3u && opc == 1u) { // LDR Xt
+                    std::uint64_t tmp = 0;
+                    std::memcpy(&tmp, ptr, 8);
+                    writeX(rd, tmp);
+                } else if (sizeBits == 3u && opc == 0u) { // STR Xt
+                    const std::uint64_t tmp = readX(rd);
+                    std::memcpy(ptr, &tmp, 8);
+                } else {
+                    outSimDiagnostic = "Unsupported GP LDR/STR encoding in ARM64 simulator";
+                    return static_cast<std::uint32_t>(runtime::ErrorCode::InvalidProgram);
+                }
+            } else {
+                if (sizeBits == 0u && (opc == 3u || opc == 2u)) { // LDR Qt (opc=3) / STR Qt (opc=2)
+                    const std::uint64_t addr = baseAddr + (static_cast<std::uint64_t>(uimm12) * 16ULL);
+                    auto* ptr = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(addr));
+                    if (opc == 3u) std::memcpy(v[rd].b, ptr, 16);
+                    else std::memcpy(ptr, v[rd].b, 16);
+                } else if (sizeBits == 3u && (opc == 1u || opc == 0u)) { // LDR Dt / STR Dt
+                    const std::uint64_t addr = baseAddr + (static_cast<std::uint64_t>(uimm12) * 8ULL);
+                    auto* ptr = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(addr));
+                    if (opc == 1u) {
+                        std::memset(v[rd].b, 0, 16);
+                        std::memcpy(v[rd].b, ptr, 8);
+                    } else {
+                        std::memcpy(ptr, v[rd].b, 8);
+                    }
+                } else if (sizeBits == 2u && (opc == 1u || opc == 0u)) { // LDR St / STR St
+                    const std::uint64_t addr = baseAddr + (static_cast<std::uint64_t>(uimm12) * 4ULL);
+                    auto* ptr = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(addr));
+                    if (opc == 1u) {
+                        std::memset(v[rd].b, 0, 16);
+                        std::memcpy(v[rd].b, ptr, 4);
+                    } else {
+                        std::memcpy(ptr, v[rd].b, 4);
+                    }
+                } else {
+                    outSimDiagnostic = "Unsupported SIMD LDR/STR encoding in ARM64 simulator";
+                    return static_cast<std::uint32_t>(runtime::ErrorCode::InvalidProgram);
+                }
+            }
+        }
+        // 14. NEON EOR Vd.16B, Vn.16B, Vm.16B (0x6E201C00)
+        else if ((inst & 0xFFE0FC00u) == 0x6E201C00u) {
+            for (std::size_t k = 0; k < 16u; ++k) {
+                v[rd].b[k] = static_cast<std::uint8_t>(v[rn].b[k] ^ v[rm].b[k]);
+            }
+        }
+        // 15. Scalar Double FP: FADD / FSUB / FMUL / FDIV / FCMP
+        else if ((inst & 0xFFE0FC00u) == 0x1E602800u ||
+                 (inst & 0xFFE0FC00u) == 0x1E603800u ||
+                 (inst & 0xFFE0FC00u) == 0x1E600800u ||
+                 (inst & 0xFFE0FC00u) == 0x1E601800u) {
+            double a = 0.0, b = 0.0;
+            std::memcpy(&a, v[rn].b, 8);
+            std::memcpy(&b, v[rm].b, 8);
+            const std::uint32_t op = (inst >> 12u) & 0xFu;
+            double r = 0.0;
+            if (op == 2u) r = a + b;
+            else if (op == 3u) r = a - b;
+            else if (op == 0u) r = a * b;
+            else r = a / b;
+            std::memset(v[rd].b, 0, 16);
+            std::memcpy(v[rd].b, &r, 8);
+        }
+        else if ((inst & 0xFFE0FC1Fu) == 0x1E602000u) {
+            double a = 0.0, b = 0.0;
+            std::memcpy(&a, v[rn].b, 8);
+            std::memcpy(&b, v[rm].b, 8);
+            if (std::isnan(a) || std::isnan(b)) {
+                flagN = false; flagZ = false; flagC = true; flagV = true;
+            } else if (a == b) {
+                flagN = false; flagZ = true; flagC = true; flagV = false;
+            } else if (a < b) {
+                flagN = true; flagZ = false; flagC = false; flagV = false;
+            } else {
+                flagN = false; flagZ = false; flagC = true; flagV = false;
+            }
+        }
+        // 16. Scalar Float FP: FADD / FSUB / FMUL / FDIV / FCMP
+        else if ((inst & 0xFFE0FC00u) == 0x1E202800u ||
+                 (inst & 0xFFE0FC00u) == 0x1E203800u ||
+                 (inst & 0xFFE0FC00u) == 0x1E200800u ||
+                 (inst & 0xFFE0FC00u) == 0x1E201800u) {
+            float a = 0.0f, b = 0.0f;
+            std::memcpy(&a, v[rn].b, 4);
+            std::memcpy(&b, v[rm].b, 4);
+            const std::uint32_t op = (inst >> 12u) & 0xFu;
+            float r = 0.0f;
+            if (op == 2u) r = a + b;
+            else if (op == 3u) r = a - b;
+            else if (op == 0u) r = a * b;
+            else r = a / b;
+            std::memset(v[rd].b, 0, 16);
+            std::memcpy(v[rd].b, &r, 4);
+        }
+        else if ((inst & 0xFFE0FC1Fu) == 0x1E202000u) {
+            float a = 0.0f, b = 0.0f;
+            std::memcpy(&a, v[rn].b, 4);
+            std::memcpy(&b, v[rm].b, 4);
+            if (std::isnan(a) || std::isnan(b)) {
+                flagN = false; flagZ = false; flagC = true; flagV = true;
+            } else if (a == b) {
+                flagN = false; flagZ = true; flagC = true; flagV = false;
+            } else if (a < b) {
+                flagN = true; flagZ = false; flagC = false; flagV = false;
+            } else {
+                flagN = false; flagZ = false; flagC = true; flagV = false;
+            }
+        }
+        // 17. FP <-> GP Conversions: FMOV D, X; SCVTF D, X; SCVTF S, X; FCVT D, S; FCVT S, D; FCVTZS X, D
+        else if ((inst & 0xFFFFFC00u) == 0x9E670000u) {
+            const std::uint64_t bits = readX(rn);
+            std::memset(v[rd].b, 0, 16);
+            std::memcpy(v[rd].b, &bits, 8);
+        }
+        else if ((inst & 0xFFFFFC00u) == 0x9E620000u) {
+            const double dv = static_cast<double>(static_cast<std::int64_t>(readX(rn)));
+            std::memset(v[rd].b, 0, 16);
+            std::memcpy(v[rd].b, &dv, 8);
+        }
+        else if ((inst & 0xFFFFFC00u) == 0x9E220000u) {
+            const float fv = static_cast<float>(static_cast<std::int64_t>(readX(rn)));
+            std::memset(v[rd].b, 0, 16);
+            std::memcpy(v[rd].b, &fv, 4);
+        }
+        else if ((inst & 0xFFFFFC00u) == 0x1E22C000u) {
+            float fv = 0.0f;
+            std::memcpy(&fv, v[rn].b, 4);
+            const double dv = static_cast<double>(fv);
+            std::memset(v[rd].b, 0, 16);
+            std::memcpy(v[rd].b, &dv, 8);
+        }
+        else if ((inst & 0xFFFFFC00u) == 0x1E624000u) {
+            double dv = 0.0;
+            std::memcpy(&dv, v[rn].b, 8);
+            const float fv = static_cast<float>(dv);
+            std::memset(v[rd].b, 0, 16);
+            std::memcpy(v[rd].b, &fv, 4);
+        }
+        else if ((inst & 0xFFFFFC00u) == 0x9E780000u) {
+            double dv = 0.0;
+            std::memcpy(&dv, v[rn].b, 8);
+            writeX(rd, static_cast<std::uint64_t>(static_cast<std::int64_t>(dv)));
+        }
+        else {
+            std::ostringstream oss;
+            oss << "Unrecognized ARM64 instruction word 0x" << std::hex << std::setw(8)
+                << std::setfill('0') << inst << " at byte offset " << std::dec << pc;
+            outSimDiagnostic = oss.str();
+            return static_cast<std::uint32_t>(runtime::ErrorCode::InvalidProgram);
+        }
+
+        pc = nextPc;
+    }
+
+    outSimDiagnostic = "ARM64 simulator ran off end of code buffer";
+    return static_cast<std::uint32_t>(runtime::ErrorCode::InvalidProgram);
+}
+
+#endif // UINTPTR_MAX == 0xffffffffffffffffULL
 
 // ============================================================================
 // P2-A Tier 1: Pre-Bound Direct-Threaded C++ Stencil Thunks (Portable Fallback)
@@ -4274,6 +8900,12 @@ StencilStepStatus th_ArrayLength(JitAbiContext* ctx, const ThreadedStencilOp*& p
 
 StencilStepStatus th_NewArray(JitAbiContext* ctx, const ThreadedStencilOp*& pc) noexcept {
     if (jitNewArrayHelper(ctx, pc->flatIdx) != 0u) return StencilStepStatus::Error;
+    ++pc;
+    return StencilStepStatus::Continue;
+}
+
+StencilStepStatus th_FlatStructOrStackRef(JitAbiContext* ctx, const ThreadedStencilOp*& pc) noexcept {
+    if (jitFlatStructAndStackRefHelper(ctx, pc->flatIdx) != 0u) return StencilStepStatus::Error;
     ++pc;
     return StencilStepStatus::Continue;
 }
@@ -4707,7 +9339,30 @@ void buildThreadedStream(CompiledFunctionRecord& rec) {
         using FO = runtime::detail::FlatOpcode;
         using QO = runtime::detail::QuickOpcode;
         switch (fi.flatOpcode) {
-        case FO::MoveSlot: op.handler = &th_MoveSlot; break;
+        case FO::MoveSlot:
+        case FO::AliasStructSlice:
+            op.handler = &th_MoveSlot;
+            break;
+        case FO::InitStructSlice:
+        case FO::CopyStructSlice:
+        case FO::LoadStructSliceField:
+        case FO::StoreStructSliceField:
+        case FO::StoreLocalStructFieldInPlace:
+        case FO::InitStackRefCell:
+        case FO::BindLocalStackRef:
+        case FO::WritebackLocalStackRef:
+        case FO::LoadStackRefCell:
+        case FO::CheckNotNullFast:
+        case FO::StoreStackRefCell:
+        case FO::StoreStackRefStructFieldInPlace:
+        case FO::NewObjectFast:
+        case FO::LoadFieldExactFast:
+        case FO::LoadFieldFast:
+        case FO::StoreFieldExactFast:
+        case FO::StoreFieldFast:
+        case FO::GenericBytecode:
+            op.handler = &th_FlatStructOrStackRef;
+            break;
         case FO::SuperMoveParamStoreLocal:
             op.auxByte = 1u;
             op.handler = &th_SuperMoveParamStore;
@@ -4812,6 +9467,9 @@ void buildThreadedStream(CompiledFunctionRecord& rec) {
             break;
         case FO::StoreElementIntFast:
         case FO::StoreElementPrimFast:
+        case FO::StoreElementStructFast:
+        case FO::StoreElementObjFast:
+        case FO::StoreElementStructFieldInPlace:
             op.handler = &th_StoreElement;
             break;
 
@@ -4913,11 +9571,16 @@ void buildThreadedStream(CompiledFunctionRecord& rec) {
                     return false;
                 }
             }
+        } else if (expectedType == semantic::PrimitiveType::Struct) {
+            if (expectedTid != 0 && runtime::structValueTypeId(arg) != expectedTid) {
+                outCode = runtime::ErrorCode::TypeMismatch;
+                outMsg = "argument has the wrong runtime struct type";
+                return false;
+            }
         } else if (expectedType == semantic::PrimitiveType::Object ||
-                   expectedType == semantic::PrimitiveType::Struct ||
                    expectedType == semantic::PrimitiveType::Enum ||
                    expectedType == semantic::PrimitiveType::Handle) {
-            // Let full signature checker in Interpreter handle complex exact object/struct/handle hierarchy if non-null
+            // Let full signature checker in Interpreter handle complex exact object/handle hierarchy if non-null
             if (expectedTid != 0) {
                 outAllIntArgsFit32 = false;
             }
@@ -4961,11 +9624,15 @@ struct StencilModule::Impl {
           primaryArena(opts.arenaBlockBytes) {}
 
     bool promoteFunctionToNativeLocked(CompiledFunctionRecord& rec, ExecutableCodeArena* batchArena) const {
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__) || defined(_M_ARM64)
         if (!nativeBackendAvailable || !rec.eligibleForNative) return false;
         if (rec.tier.load(std::memory_order_relaxed) == StencilTier::NativeMachineCode) return true;
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+        auto machineBytes = compileFunctionA64(rec);
+#else
         auto machineBytes = compileFunctionX64(rec);
+#endif
         if (machineBytes.empty()) return false;
 
         if (batchArena != nullptr) {
@@ -5018,7 +9685,9 @@ struct StencilModule::Impl {
     runtime::ExecutionResult invokeBySymbol(
         semantic::SymbolId symbolId,
         const std::vector<runtime::Value>& arguments,
-        runtime::ExecutionOptions execOptions) const {
+        runtime::ExecutionOptions execOptions,
+        bool forceSimulateArm64 = false,
+        std::size_t baseFrameOffset = 0) const {
         if (!program) {
             runtime::ExecutionResult invalid;
             invalid.error.code = runtime::ErrorCode::InvalidProgram;
@@ -5113,21 +9782,35 @@ struct StencilModule::Impl {
             }
         } tlsGuard{usingTls};
 
-        const std::size_t totalSlots = execFunc.totalFrameSlots;
+        const std::size_t frameSlots = execFunc.totalFrameSlots;
+        if (baseFrameOffset > runtime::StructStorageHandle::FrameOffsetMask ||
+            frameSlots > runtime::StructStorageHandle::FrameOffsetMask - baseFrameOffset) {
+            runtime::ExecutionResult invalid;
+            invalid.error.code = runtime::ErrorCode::InvalidProgram;
+            invalid.error.message = "frameOffset exceeds 24-bit FlatStruct slice address space";
+            return invalid;
+        }
+        const std::size_t totalSlots = baseFrameOffset + frameSlots;
         if (arenaPtr->size() < totalSlots) {
             arenaPtr->resize(std::max<std::size_t>(totalSlots, 256));
         }
+        if (baseFrameOffset > 0) {
+            std::memset(
+                static_cast<void*>(arenaPtr->data()),
+                0,
+                baseFrameOffset * sizeof(runtime::Value));
+        }
 
-        runtime::Value* frameBase = arenaPtr->data();
+        runtime::Value* frameBase = arenaPtr->data() + baseFrameOffset;
         const std::size_t argCount = arguments.size();
         for (std::size_t i = 0; i < argCount; ++i) {
             frameBase[i] = arguments[i];
         }
-        if (totalSlots > argCount) {
+        if (frameSlots > argCount) {
             std::memset(
                 static_cast<void*>(frameBase + argCount),
                 0,
-                (totalSlots - argCount) * sizeof(runtime::Value));
+                (frameSlots - argCount) * sizeof(runtime::Value));
         }
 
         JitRuntimeSession session{};
@@ -5137,9 +9820,72 @@ struct StencilModule::Impl {
         session.stats.functionCalls = 1;
         session.stats.maximumCallDepth = 1;
         session.values = arenaPtr;
-        session.frameOffset = 0;
+        session.frameOffset = baseFrameOffset;
         session.valueTop = totalSlots;
         session.callDepth = 1;
+        session.valuesBase = arenaPtr->data();
+        session.frameOffset32 = static_cast<std::uint32_t>(baseFrameOffset);
+        session.flatBankId = runtime::detail::acquireFlatStackBank(arenaPtr);
+        struct JitFlatBankGuard {
+            std::uint8_t& bankId;
+            ~JitFlatBankGuard() noexcept {
+                if (bankId != 0u) {
+                    runtime::detail::releaseFlatStackBank(bankId);
+                    bankId = 0u;
+                }
+            }
+        } jitBankGuard{session.flatBankId};
+
+        if (execFunc.hasStructPayloads && session.flatBankId != 0u) {
+            for (std::size_t i = 0; i < argCount; ++i) {
+                const auto pSlot = static_cast<std::uint16_t>(execFunc.paramOffset + i);
+                if (pSlot < execFunc.slotStructSchemaIds.size() && execFunc.slotStructSchemaIds[pSlot] != 0u) {
+                    const std::uint16_t sid = execFunc.slotStructSchemaIds[pSlot];
+                    const std::uint16_t payOff = execFunc.slotPayloadOffsets[pSlot];
+                    const auto* sc = runtime::getFlatStructSchema(sid);
+                    if (sc != nullptr && payOff != runtime::detail::InvalidCompactReg) {
+                        const runtime::Value incoming = frameBase[pSlot];
+                        if (runtime::extractStructLeavesToBuffer(incoming, *sc, frameBase + payOff)) {
+                            frameBase[pSlot] = runtime::StructValue::makeFrameSlice(
+                                sc->structTypeId,
+                                session.flatBankId,
+                                static_cast<std::uint32_t>(baseFrameOffset + payOff),
+                                sid);
+                        } else if (incoming.rawTag() == runtime::ValueTag::Monostate) {
+                            std::memcpy(
+                                static_cast<void*>(frameBase + payOff),
+                                static_cast<const void*>(sc->prototypeLeaves.data()),
+                                static_cast<std::size_t>(sc->flatSlotCount) * sizeof(runtime::Value));
+                            frameBase[pSlot] = runtime::StructValue::makeFrameSlice(
+                                sc->structTypeId,
+                                session.flatBankId,
+                                static_cast<std::uint32_t>(baseFrameOffset + payOff),
+                                sid);
+                        }
+                    }
+                }
+            }
+            const std::size_t nLocals = bcFunc.localTypes.size();
+            for (std::size_t l = 0; l < nLocals; ++l) {
+                const auto lSlot = static_cast<std::uint16_t>(execFunc.localOffset + l);
+                if (lSlot < execFunc.slotStructSchemaIds.size() && execFunc.slotStructSchemaIds[lSlot] != 0u) {
+                    const std::uint16_t sid = execFunc.slotStructSchemaIds[lSlot];
+                    const std::uint16_t payOff = execFunc.slotPayloadOffsets[lSlot];
+                    const auto* sc = runtime::getFlatStructSchema(sid);
+                    if (sc != nullptr && payOff != runtime::detail::InvalidCompactReg) {
+                        std::memcpy(
+                            static_cast<void*>(frameBase + payOff),
+                            static_cast<const void*>(sc->prototypeLeaves.data()),
+                            static_cast<std::size_t>(sc->flatSlotCount) * sizeof(runtime::Value));
+                        frameBase[lSlot] = runtime::StructValue::makeFrameSlice(
+                            sc->structTypeId,
+                            session.flatBankId,
+                            static_cast<std::uint32_t>(baseFrameOffset + payOff),
+                            sid);
+                    }
+                }
+            }
+        }
         session.shadowStack.pushFrame(nullptr, nullptr, arenaPtr, &session.valueTop);
 
         runtime::Value retValue{};
@@ -5155,7 +9901,21 @@ struct StencilModule::Impl {
         invalidateJitArrayCaches(abi);
 
         std::uint32_t rawStatus = 0u;
-        if (currentTier == StencilTier::NativeMachineCode) {
+        std::string simDiag;
+        if (forceSimulateArm64) {
+#if UINTPTR_MAX == 0xffffffffffffffffULL
+            const auto arm64Code = compileFunctionA64(rec);
+            if (arm64Code.empty()) {
+                simDiag = "compileFunctionA64 returned empty machine code";
+                rawStatus = static_cast<std::uint32_t>(runtime::ErrorCode::InvalidProgram);
+            } else {
+                rawStatus = executeSimulatedArm64Code(arm64Code, &abi, simDiag);
+            }
+#else
+            simDiag = "ARM64 StencilJit requires 64-bit host pointers";
+            rawStatus = static_cast<std::uint32_t>(runtime::ErrorCode::InvalidProgram);
+#endif
+        } else if (currentTier == StencilTier::NativeMachineCode) {
             const NativeJitEntryFn fn = rec.nativeEntry.load(std::memory_order_acquire);
             rawStatus = fn(&abi);
         } else {
@@ -5165,6 +9925,7 @@ struct StencilModule::Impl {
             rawStatus = (st == StencilStepStatus::ReturnOk) ? 0u : abi.errorCodeRaw;
         }
 
+        retValue = runtime::detachFrameSliceValue(retValue);
         session.shadowStack.popFrame();
 
         const std::uint64_t executed =
@@ -5195,7 +9956,12 @@ struct StencilModule::Impl {
                 break;
             }
             populateJitErrorDiagnostics(
-                session, fnLoc, execFunc, abi.errorFlatIndex, errCode, msg);
+                session,
+                fnLoc,
+                execFunc,
+                abi.errorFlatIndex,
+                errCode,
+                simDiag.empty() ? std::string(msg) : simDiag);
         }
 
         runtime::DeterminismSession det(std::move(execOptions.determinism));
@@ -5357,18 +10123,89 @@ StencilTier StencilModule::functionTier(const std::string& qualifiedName) const 
     return sym ? functionTier(*sym) : StencilTier::InterpreterFallback;
 }
 
+StencilTargetArch StencilModule::hostTargetArch() const noexcept {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return StencilTargetArch::Arm64;
+#elif defined(__x86_64__) || defined(_M_X64)
+    return StencilTargetArch::X86_64;
+#else
+    return StencilTargetArch::Host;
+#endif
+}
+
 std::vector<std::uint8_t> StencilModule::inspectMachineCode(
     const std::string& qualifiedName) const {
+    return inspectMachineCode(qualifiedName, StencilTargetArch::Host);
+}
+
+std::vector<std::uint8_t> StencilModule::inspectMachineCode(
+    const std::string& qualifiedName,
+    StencilTargetArch targetArch) const {
     if (!valid()) return {};
     const auto sym = impl_->program->findFunction(qualifiedName);
     if (!sym) return {};
     const auto it = impl_->records.find(*sym);
-    if (it == impl_->records.end() || !it->second->rawCodePtr || it->second->rawCodeSize == 0) {
+    if (it == impl_->records.end() || !it->second) {
         return {};
     }
-    return std::vector<std::uint8_t>(
-        it->second->rawCodePtr,
-        it->second->rawCodePtr + it->second->rawCodeSize);
+    const CompiledFunctionRecord& rec = *it->second;
+    if (targetArch == StencilTargetArch::Host || targetArch == hostTargetArch()) {
+        if (rec.rawCodePtr && rec.rawCodeSize > 0) {
+            return std::vector<std::uint8_t>(rec.rawCodePtr, rec.rawCodePtr + rec.rawCodeSize);
+        }
+    }
+#if UINTPTR_MAX == 0xffffffffffffffffULL
+    if (!rec.eligibleForNative || rec.execFunc == nullptr) {
+        return {};
+    }
+    if (targetArch == StencilTargetArch::Arm64) {
+        return compileFunctionA64(rec);
+    }
+    if (targetArch == StencilTargetArch::X86_64) {
+        return compileFunctionX64(rec);
+    }
+#endif
+    return {};
+}
+
+runtime::ExecutionResult StencilModule::invokeSimulatedArm64(
+    const std::string& qualifiedName,
+    const std::vector<runtime::Value>& arguments,
+    runtime::ExecutionOptions options) const {
+    if (!valid()) {
+        runtime::ExecutionResult invalid;
+        invalid.error.code = runtime::ErrorCode::InvalidProgram;
+        invalid.error.message = "StencilJit module is not loaded";
+        return invalid;
+    }
+    if (const auto symId = impl_->program->findFunction(qualifiedName)) {
+        return impl_->invokeBySymbol(*symId, arguments, std::move(options), true);
+    }
+    runtime::ExecutionResult missing;
+    missing.error.code = runtime::ErrorCode::FunctionNotFound;
+    missing.error.message = "entry function '" + qualifiedName + "' was not found";
+    return missing;
+}
+
+runtime::ExecutionResult StencilModule::invokeWithBaseFrameOffset(
+    const std::string& qualifiedName,
+    std::size_t baseFrameOffset,
+    bool simulateArm64,
+    const std::vector<runtime::Value>& arguments,
+    runtime::ExecutionOptions options) const {
+    if (!valid()) {
+        runtime::ExecutionResult invalid;
+        invalid.error.code = runtime::ErrorCode::InvalidProgram;
+        invalid.error.message = "StencilJit module is not loaded";
+        return invalid;
+    }
+    if (const auto symId = impl_->program->findFunction(qualifiedName)) {
+        return impl_->invokeBySymbol(*symId, arguments, std::move(options), simulateArm64, baseFrameOffset);
+    }
+    runtime::ExecutionResult missing;
+    missing.error.code = runtime::ErrorCode::FunctionNotFound;
+    missing.error.message = "entry function '" + qualifiedName + "' was not found";
+    return missing;
 }
 
 bool StencilJit::nativeAvailable() noexcept {

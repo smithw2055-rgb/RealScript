@@ -113,6 +113,7 @@ private:
         std::size_t capacity = 0;
         std::size_t used = 0;
         bool executable = false;
+        bool mapJit = false;
     };
 
     void releaseAll() noexcept;
@@ -128,6 +129,12 @@ enum class StencilTier : std::uint8_t {
     InterpreterFallback = 0,
     ThreadedStencils = 1,
     NativeMachineCode = 2,
+};
+
+enum class StencilTargetArch : std::uint8_t {
+    Host = 0,
+    X86_64 = 1,
+    Arm64 = 2,
 };
 
 struct StencilJitOptions {
@@ -183,8 +190,23 @@ public:
     [[nodiscard]] bool nativeBackendActive() const noexcept;
     [[nodiscard]] StencilTier functionTier(semantic::SymbolId symbolId) const noexcept;
     [[nodiscard]] StencilTier functionTier(const std::string& qualifiedName) const noexcept;
+    [[nodiscard]] StencilTargetArch hostTargetArch() const noexcept;
     [[nodiscard]] std::vector<std::uint8_t> inspectMachineCode(
         const std::string& qualifiedName) const;
+    [[nodiscard]] std::vector<std::uint8_t> inspectMachineCode(
+        const std::string& qualifiedName,
+        StencilTargetArch targetArch) const;
+    [[nodiscard]] runtime::ExecutionResult invokeSimulatedArm64(
+        const std::string& qualifiedName,
+        const std::vector<runtime::Value>& arguments = {},
+        runtime::ExecutionOptions options = {}) const;
+
+    [[nodiscard]] runtime::ExecutionResult invokeWithBaseFrameOffset(
+        const std::string& qualifiedName,
+        std::size_t baseFrameOffset,
+        bool simulateArm64 = false,
+        const std::vector<runtime::Value>& arguments = {},
+        runtime::ExecutionOptions options = {}) const;
 
 private:
     friend class StencilJit;

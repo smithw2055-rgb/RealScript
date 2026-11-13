@@ -336,6 +336,8 @@ bool isTypedAotSlot(
     case semantic::PrimitiveType::Enum:
     case semantic::PrimitiveType::Object:
         return slot.typeId != 0;
+    case semantic::PrimitiveType::String:
+        return slot.typeId == 0;
     case semantic::PrimitiveType::Array:
         return true;
     case semantic::PrimitiveType::Struct:
@@ -400,7 +402,8 @@ bool supportsTypedPrimitiveAot(
     }
     bool usesReferenceSlots =
         function.returnType == semantic::PrimitiveType::Object ||
-        function.returnType == semantic::PrimitiveType::Array;
+        function.returnType == semantic::PrimitiveType::Array ||
+        function.returnType == semantic::PrimitiveType::String;
     for (std::size_t index = 0; index < function.parameterTypes.size(); ++index) {
         const auto typeId = index < function.parameterTypeIds.size()
             ? function.parameterTypeIds[index]
@@ -409,7 +412,8 @@ bool supportsTypedPrimitiveAot(
             return false;
         }
         if (function.parameterTypes[index] == semantic::PrimitiveType::Object ||
-            function.parameterTypes[index] == semantic::PrimitiveType::Array) {
+            function.parameterTypes[index] == semantic::PrimitiveType::Array ||
+            function.parameterTypes[index] == semantic::PrimitiveType::String) {
             usesReferenceSlots = true;
         }
     }
@@ -421,7 +425,8 @@ bool supportsTypedPrimitiveAot(
             return false;
         }
         if (function.localTypes[index] == semantic::PrimitiveType::Object ||
-            function.localTypes[index] == semantic::PrimitiveType::Array) {
+            function.localTypes[index] == semantic::PrimitiveType::Array ||
+            function.localTypes[index] == semantic::PrimitiveType::String) {
             usesReferenceSlots = true;
         }
     }
@@ -433,7 +438,8 @@ bool supportsTypedPrimitiveAot(
             return false;
         }
         if (slot.primitive == semantic::PrimitiveType::Object ||
-            slot.primitive == semantic::PrimitiveType::Array) {
+            slot.primitive == semantic::PrimitiveType::Array ||
+            slot.primitive == semantic::PrimitiveType::String) {
             usesReferenceSlots = true;
         }
     }
@@ -452,7 +458,9 @@ bool supportsTypedPrimitiveAot(
             case mir::Opcode::ConstantInt:
             case mir::Opcode::ConstantDouble:
             case mir::Opcode::ConstantBool:
+            case mir::Opcode::ConstantString:
             case mir::Opcode::ConstantNull:
+            case mir::Opcode::ConvertNullToString:
             case mir::Opcode::ConvertNullToObject:
             case mir::Opcode::ConvertNullToArray:
             case mir::Opcode::LoadLocal:
@@ -582,7 +590,7 @@ bool supportsTypedPrimitiveAot(
                         return false;
                     }
                 } else if (customStructs.find(instruction.typeId) == customStructs.end() ||
-                           instruction.fieldIndex >= 16) {
+                           instruction.fieldIndex >= 256) {
                     return false;
                 }
                 break;
@@ -652,8 +660,13 @@ bool supportsTypedPrimitiveAot(
                     symName.rfind("$intrinsic::ecs_writeback::", 0) == 0;
                 const bool isAsyncIntrinsic =
                     symName.rfind("$intrinsic::Async.__", 0) == 0;
+                const bool isStringOrCoreIntrinsic =
+                    symName.rfind("$intrinsic::string_", 0) == 0 ||
+                    symName.rfind("$intrinsic::to_string::", 0) == 0 ||
+                    symName == "$intrinsic::stable_hash" ||
+                    symName.rfind("$intrinsic::stable_hash::", 0) == 0;
                 bool hasPolyOrLoopInFn = function.blocks.size() > 1 || isAsyncFunction;
-                if (!hasPolyOrLoopInFn && usesReferenceSlots && !isEcsIntrinsic && !isAsyncIntrinsic) {
+                if (!hasPolyOrLoopInFn && usesReferenceSlots && !isEcsIntrinsic && !isAsyncIntrinsic && !isStringOrCoreIntrinsic) {
                     for (const auto& scanBlk : function.blocks) {
                         for (const auto& scanInst : scanBlk.instructions) {
                             if (scanInst.opcode == mir::Opcode::IsType ||
@@ -677,7 +690,8 @@ bool supportsTypedPrimitiveAot(
                 if (!symName.empty() &&
                     symName.rfind("$intrinsic::", 0) == 0 &&
                     !isEcsIntrinsic &&
-                    !isAsyncIntrinsic) {
+                    !isAsyncIntrinsic &&
+                    !isStringOrCoreIntrinsic) {
                     return false;
                 }
                 if (instruction.resultType != semantic::PrimitiveType::Void &&
@@ -699,8 +713,10 @@ bool supportsTypedPrimitiveAot(
                         return false;
                     }
                     const auto actualOpSlot = operandSlot(instruction, index);
-                    if (expectedSlot.primitive == semantic::PrimitiveType::Object) {
-                        if (actualOpSlot.primitive != semantic::PrimitiveType::Object &&
+                    if (expectedSlot.primitive == semantic::PrimitiveType::Object ||
+                        expectedSlot.primitive == semantic::PrimitiveType::Array ||
+                        expectedSlot.primitive == semantic::PrimitiveType::String) {
+                        if (actualOpSlot.primitive != expectedSlot.primitive &&
                             actualOpSlot.primitive != semantic::PrimitiveType::Null) {
                             return false;
                         }
@@ -796,6 +812,7 @@ std::string typedCppType(TypedSlotType slot) {
         return "double";
     case semantic::PrimitiveType::Enum:
         return "runtime::EnumValue";
+    case semantic::PrimitiveType::String:
     case semantic::PrimitiveType::Object:
     case semantic::PrimitiveType::Array:
     case semantic::PrimitiveType::Null:
@@ -833,6 +850,8 @@ std::string typedDefaultValue(TypedSlotType slot) {
         return "0.0";
     case semantic::PrimitiveType::Enum:
         return "runtime::EnumValue{0x" + hexId(slot.typeId) + "ULL, 0}";
+    case semantic::PrimitiveType::String:
+        return "runtime::Value{runtime::NullString{}}";
     case semantic::PrimitiveType::Object:
         return "runtime::Value{runtime::NullObject{}}";
     case semantic::PrimitiveType::Array:
@@ -907,7 +926,8 @@ void emitTypedTransfer(
     const std::vector<mir::ValueId>& arguments,
     const std::string& prefix,
     const std::string& indent,
-    const std::vector<std::size_t>* regGuardSlot) {
+    const std::vector<std::size_t>* regGuardSlot,
+    const std::string& gcGuardCond) {
     const auto* block = findBlock(function, target);
     if (!block) return;
     output.line(indent + "if constexpr (FastAccounting && !TrustedRelease) {");
@@ -937,8 +957,8 @@ void emitTypedTransfer(
             const auto rIdx = static_cast<std::size_t>(paramVal);
             if (rIdx < regGuardSlot->size() &&
                 (*regGuardSlot)[rIdx] != std::numeric_limits<std::size_t>::max()) {
-                output.line(indent + "if constexpr (!FastAccounting && !DeterminismAccounting && !TrustedRelease) {");
-                output.line(indent + "    aot::retainTypedGcSlot(context.rawHeap(), typedLocalGcGuards[" +
+                output.line(indent + "if constexpr (" + gcGuardCond + ") {");
+                output.line(indent + "    aot::retainTypedGcSlot(context.rawHeap(), &typedLocalGcGuards[" +
                     std::to_string((*regGuardSlot)[rIdx]) + "], " +
                     typedValueExpression(paramVal) + ");");
                 output.line(indent + "}");
@@ -1015,6 +1035,7 @@ bool typedInstructionCanFail(
     case mir::Opcode::CheckNotNull:
     case mir::Opcode::LoadField:
     case mir::Opcode::StoreField:
+    case mir::Opcode::ConstantString:
     case mir::Opcode::NewObject:
     case mir::Opcode::NewArray:
     case mir::Opcode::IsType:
@@ -1062,6 +1083,111 @@ std::vector<std::uint64_t> typedRawConsumeBatches(
     }
     result[batchStart] = block.instructions.size() - batchStart + 1;
     return result;
+}
+
+bool isNonEscapingMirStackRefAlloc(
+    const mir::Function& function,
+    const mir::Instruction& allocInst,
+    const std::map<semantic::SymbolId, TypeView>& allTypes) noexcept {
+    if (allocInst.opcode != mir::Opcode::NewObject || allocInst.result < 0) {
+        return false;
+    }
+    bool isRefWrap = runtime::isSynthesizedRefWrapperTypeName(allocInst.symbolName);
+    if (!isRefWrap) {
+        const auto objTid = allocInst.resultTypeId != 0 ? allocInst.resultTypeId : allocInst.typeId;
+        const auto it = allTypes.find(objTid);
+        if (it != allTypes.end() && it->second.type != nullptr) {
+            isRefWrap = runtime::isSynthesizedRefWrapperTypeName(it->second.type->name);
+        }
+    }
+    if (!isRefWrap) {
+        return false;
+    }
+    mir::ValueId aliases[64]{};
+    std::size_t aliasCount = 1;
+    aliases[0] = allocInst.result;
+    const auto isAlias = [&](mir::ValueId v) noexcept -> bool {
+        for (std::size_t i = 0; i < aliasCount; ++i) {
+            if (aliases[i] == v) return true;
+        }
+        return false;
+    };
+    bool expanded = true;
+    while (expanded) {
+        expanded = false;
+        for (const auto& blk : function.blocks) {
+            for (const auto& inst : blk.instructions) {
+                if (inst.opcode == mir::Opcode::CheckNotNull &&
+                    inst.operands.size() == 1 &&
+                    isAlias(inst.operands[0]) &&
+                    inst.result >= 0 &&
+                    !isAlias(inst.result)) {
+                    if (aliasCount >= 64u) return false;
+                    aliases[aliasCount++] = inst.result;
+                    expanded = true;
+                }
+            }
+        }
+    }
+    for (const auto& blk : function.blocks) {
+        const auto& term = blk.terminator;
+        if ((term.kind == mir::TerminatorKind::Branch && isAlias(term.condition)) ||
+            ((term.kind == mir::TerminatorKind::ReturnValue ||
+              term.kind == mir::TerminatorKind::Throw) &&
+             isAlias(term.value))) {
+            return false;
+        }
+        for (const auto arg : term.arguments) {
+            if (isAlias(arg)) return false;
+        }
+        for (const auto arg : term.falseArguments) {
+            if (isAlias(arg)) return false;
+        }
+        for (const auto& inst : blk.instructions) {
+            bool usesWid = false;
+            for (const auto op : inst.operands) {
+                if (isAlias(op)) {
+                    usesWid = true;
+                    break;
+                }
+            }
+            if (!usesWid) continue;
+            if (inst.opcode == mir::Opcode::CheckNotNull &&
+                inst.operands.size() == 1 &&
+                isAlias(inst.operands[0])) {
+                continue;
+            }
+            if (inst.opcode == mir::Opcode::LoadField &&
+                inst.fieldIndex == 0 &&
+                inst.operands.size() == 1 &&
+                isAlias(inst.operands[0])) {
+                continue;
+            }
+            if (inst.opcode == mir::Opcode::StoreField &&
+                inst.fieldIndex == 0 &&
+                inst.operands.size() == 2 &&
+                isAlias(inst.operands[0]) &&
+                !isAlias(inst.operands[1])) {
+                continue;
+            }
+            if (inst.opcode == mir::Opcode::Call ||
+                (inst.opcode == mir::Opcode::InvokeDelegate &&
+                 inst.operands.size() >= 2 &&
+                 !isAlias(inst.operands[0]))) {
+                bool returnsRefWrapper = false;
+                if (inst.result >= 0 && inst.resultType == semantic::PrimitiveType::Object) {
+                    const auto retIt = allTypes.find(inst.resultTypeId);
+                    if (retIt != allTypes.end() && retIt->second.type != nullptr &&
+                        runtime::isSynthesizedRefWrapperTypeName(retIt->second.type->name)) {
+                        returnsRefWrapper = true;
+                    }
+                }
+                if (!returnsRefWrapper) continue;
+            }
+            return false;
+        }
+    }
+    return true;
 }
 
 } // namespace realscript::aot::detail

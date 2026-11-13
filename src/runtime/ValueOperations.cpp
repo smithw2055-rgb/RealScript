@@ -1,12 +1,15 @@
 #include "RuntimeInternal.h"
 
+#include <atomic>
 #include <array>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -396,10 +399,508 @@ semantic::SymbolId StructValue::nestedTypeId() const noexcept {
     return isInline ? inlineEntry().nestedTypeId : 0u;
 }
 
+namespace {
+
+std::atomic<std::uint64_t> g_heapStructStorageAllocations{0};
+
+std::atomic<std::uint64_t>& heapStructAllocCounter() noexcept {
+    if (const auto* b = detail::externalValuePoolBridge(); b && b->heapStructAllocCounterPtr) {
+        return *static_cast<std::atomic<std::uint64_t>*>(b->heapStructAllocCounterPtr);
+    }
+    return g_heapStructStorageAllocations;
+}
+
+struct FlatStructRegistry {
+    static constexpr std::uint32_t kBlockBits = 8u;
+    static constexpr std::uint32_t kBlockSize = 1u << kBlockBits; // 256
+    static constexpr std::uint32_t kMaxBlocks = 256u;             // 65,536 schemas (uint16_t)
+
+    std::mutex mutex;
+    std::array<std::atomic<FlatStructSchema*>, kMaxBlocks> blocks{};
+    std::vector<std::unique_ptr<FlatStructSchema[]>> ownedBlocks;
+    std::atomic<std::uint32_t> nextSchemaId{1u}; // 0 = invalid
+    std::unordered_map<semantic::SymbolId, std::uint16_t> latestByTypeId;
+
+    FlatStructRegistry() noexcept {
+        for (auto& b : blocks) b.store(nullptr, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] const FlatStructSchema* getByIdLockFree(std::uint16_t id) const noexcept {
+        const std::uint32_t limit = nextSchemaId.load(std::memory_order_acquire);
+        if (id == 0u || static_cast<std::uint32_t>(id) >= limit) return nullptr;
+        const std::uint32_t blkIdx = static_cast<std::uint32_t>(id) >> kBlockBits;
+        if (blkIdx >= kMaxBlocks) return nullptr;
+        const auto* blk = blocks[blkIdx].load(std::memory_order_acquire);
+        if (!blk) return nullptr;
+        return &blk[static_cast<std::uint32_t>(id) & (kBlockSize - 1u)];
+    }
+
+    [[nodiscard]] std::uint16_t registerOrReuseUnlocked(FlatStructSchema candidate) {
+        const auto existingIt = latestByTypeId.find(candidate.structTypeId);
+        if (existingIt != latestByTypeId.end()) {
+            if (const auto* cur = getByIdLockFree(existingIt->second)) {
+                if (cur->flatSlotCount == candidate.flatSlotCount &&
+                    cur->containsManagedReferences == candidate.containsManagedReferences &&
+                    cur->containsPoolValues == candidate.containsPoolValues &&
+                    cur->directFields.size() == candidate.directFields.size()) {
+                    bool same = true;
+                    for (std::size_t i = 0; i < cur->directFields.size(); ++i) {
+                        const auto& a = cur->directFields[i];
+                        const auto& b = candidate.directFields[i];
+                        if (a.leafOffset != b.leafOffset ||
+                            a.leafCount != b.leafCount ||
+                            a.type != b.type ||
+                            a.typeId != b.typeId ||
+                            a.subSchemaId != b.subSchemaId) {
+                            same = false;
+                            break;
+                        }
+                    }
+                    if (same) {
+                        return existingIt->second;
+                    }
+                }
+            }
+        }
+        const std::uint32_t id32 = nextSchemaId.load(std::memory_order_relaxed);
+        if (id32 >= 0xFFFFu) return 0u;
+        const std::uint32_t blkIdx = id32 >> kBlockBits;
+        if (!blocks[blkIdx].load(std::memory_order_relaxed)) {
+            auto newBlk = std::make_unique<FlatStructSchema[]>(kBlockSize);
+            FlatStructSchema* raw = newBlk.get();
+            ownedBlocks.push_back(std::move(newBlk));
+            blocks[blkIdx].store(raw, std::memory_order_release);
+        }
+        const auto id16 = static_cast<std::uint16_t>(id32);
+        candidate.schemaId = id16;
+        blocks[blkIdx].load(std::memory_order_relaxed)[id32 & (kBlockSize - 1u)] = std::move(candidate);
+        nextSchemaId.store(id32 + 1u, std::memory_order_release);
+        latestByTypeId[blocks[blkIdx].load(std::memory_order_relaxed)[id32 & (kBlockSize - 1u)].structTypeId] = id16;
+        return id16;
+    }
+};
+
+FlatStructRegistry& localFlatStructRegistry() noexcept {
+    static FlatStructRegistry instance;
+    return instance;
+}
+
+FlatStructRegistry& globalFlatStructRegistry() noexcept {
+    if (const auto* b = detail::externalValuePoolBridge(); b && b->flatStructRegistryPtr) {
+        return *static_cast<FlatStructRegistry*>(b->flatStructRegistryPtr);
+    }
+    return localFlatStructRegistry();
+}
+
+[[nodiscard]] bool isBuiltinSingleCellMathStructId(semantic::SymbolId tid) noexcept {
+    return tid == fixedTypeId() ||
+        tid == fixed16TypeId() ||
+        tid == fixed64TypeId() ||
+        tid == vec2TypeId() ||
+        tid == vec3TypeId() ||
+        tid == quatTypeId() ||
+        tid == vec2fTypeId() ||
+        tid == vec3fTypeId() ||
+        tid == quatfTypeId();
+}
+
+struct ThreadFlatStackBanks {
+    std::array<const std::vector<Value>*, 64> banks{};
+};
+thread_local ThreadFlatStackBanks tlsFlatStackBanks{};
+
+} // namespace
+
+const FlatStructSchema* getFlatStructSchema(std::uint16_t schemaId) noexcept {
+    return globalFlatStructRegistry().getByIdLockFree(schemaId);
+}
+
+const FlatStructSchema* findFlatStructSchemaByTypeId(semantic::SymbolId structTypeId) noexcept {
+    if (structTypeId == 0 || isBuiltinSingleCellMathStructId(structTypeId)) return nullptr;
+    auto& reg = globalFlatStructRegistry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    const auto it = reg.latestByTypeId.find(structTypeId);
+    if (it == reg.latestByTypeId.end()) return nullptr;
+    return reg.getByIdLockFree(it->second);
+}
+
+std::uint64_t heapStructStorageAllocations() noexcept {
+    return heapStructAllocCounter().load(std::memory_order_relaxed);
+}
+
+void resetHeapStructStorageAllocations() noexcept {
+    heapStructAllocCounter().store(0, std::memory_order_relaxed);
+}
+
+namespace detail {
+
+void* localFlatStructRegistryPtr() noexcept {
+    return &localFlatStructRegistry();
+}
+
+void* localHeapStructAllocCounterPtr() noexcept {
+    return &g_heapStructStorageAllocations;
+}
+
+std::uint8_t acquireFlatStackBank(const std::vector<Value>* stackVec) noexcept {
+    if (const auto* b = externalValuePoolBridge(); b && b->acquireFlatStackBankFn) {
+        return b->acquireFlatStackBankFn(static_cast<const void*>(stackVec));
+    }
+    if (!stackVec) return 0u;
+    for (std::uint8_t id = 1u; id < 64u; ++id) {
+        if (tlsFlatStackBanks.banks[id] == nullptr) {
+            tlsFlatStackBanks.banks[id] = stackVec;
+            return id;
+        }
+    }
+    return 0u;
+}
+
+void releaseFlatStackBank(std::uint8_t bankId) noexcept {
+    if (const auto* b = externalValuePoolBridge(); b && b->releaseFlatStackBankFn) {
+        b->releaseFlatStackBankFn(bankId);
+        return;
+    }
+    if (bankId > 0u && bankId < 64u) {
+        tlsFlatStackBanks.banks[bankId] = nullptr;
+    }
+}
+
+const Value* lookupFlatStackSlice(
+    std::uint8_t bankId,
+    std::uint32_t absOffset,
+    std::uint16_t slotCount) noexcept {
+    if (const auto* b = externalValuePoolBridge(); b && b->lookupFlatStackSliceFn) {
+        return static_cast<const Value*>(b->lookupFlatStackSliceFn(bankId, absOffset, slotCount));
+    }
+    if (bankId == 0u || bankId >= 64u) return nullptr;
+    const auto* vec = tlsFlatStackBanks.banks[bankId];
+    if (!vec) return nullptr;
+    const std::size_t end = static_cast<std::size_t>(absOffset) + static_cast<std::size_t>(slotCount);
+    if (end > vec->size()) return nullptr;
+    return vec->data() + absOffset;
+}
+
+void registerFlatStructTypes(
+    const std::vector<std::pair<semantic::SymbolId, std::vector<BlittableFieldInput>>>& structTypes) {
+    if (structTypes.empty()) return;
+    auto& reg = globalFlatStructRegistry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+
+    std::unordered_map<semantic::SymbolId, const std::vector<BlittableFieldInput>*> pending;
+    pending.reserve(structTypes.size());
+    for (const auto& [tid, fields] : structTypes) {
+        if (tid == 0 || isBuiltinSingleCellMathStructId(tid)) continue;
+        pending[tid] = &fields;
+    }
+
+    // 0 = unvisited, 1 = visiting, 2 = resolved, 3 = invalid
+    std::unordered_map<semantic::SymbolId, int> state;
+    const auto makeDefaultLeaf = [](semantic::PrimitiveType pt, semantic::SymbolId tid) noexcept -> Value {
+        switch (pt) {
+        case semantic::PrimitiveType::Bool: return false;
+        case semantic::PrimitiveType::Byte: return ByteValue{};
+        case semantic::PrimitiveType::SByte: return SByteValue{};
+        case semantic::PrimitiveType::Short: return ShortValue{};
+        case semantic::PrimitiveType::UShort: return UShortValue{};
+        case semantic::PrimitiveType::Int: return std::int64_t{0};
+        case semantic::PrimitiveType::UInt: return UIntValue{};
+        case semantic::PrimitiveType::Long: return LongValue{};
+        case semantic::PrimitiveType::ULong: return ULongValue{};
+        case semantic::PrimitiveType::Float: return FloatValue{};
+        case semantic::PrimitiveType::Double: return 0.0;
+        case semantic::PrimitiveType::Char: return CharValue{};
+        case semantic::PrimitiveType::String: return NullString{};
+        case semantic::PrimitiveType::Object: return NullObject{};
+        case semantic::PrimitiveType::Array: return NullArray{};
+        case semantic::PrimitiveType::Handle: {
+            NativeHandle h;
+            h.typeId = tid;
+            return h;
+        }
+        case semantic::PrimitiveType::Enum:
+            return EnumValue{tid, 0};
+        case semantic::PrimitiveType::Struct:
+            if (const auto inl = makeDefaultInlineStructValue(tid)) return *inl;
+            return std::monostate{};
+        default:
+            return std::monostate{};
+        }
+    };
+
+    const auto resolve = [&](auto& self, semantic::SymbolId tid) -> std::uint16_t {
+        const auto stIt = state.find(tid);
+        if (stIt != state.end()) {
+            if (stIt->second == 2) {
+                const auto lIt = reg.latestByTypeId.find(tid);
+                return lIt != reg.latestByTypeId.end() ? lIt->second : 0u;
+            }
+            return 0u;
+        }
+        const auto pIt = pending.find(tid);
+        if (pIt == pending.end()) {
+            const auto lIt = reg.latestByTypeId.find(tid);
+            return lIt != reg.latestByTypeId.end() ? lIt->second : 0u;
+        }
+        state[tid] = 1;
+        const auto& fields = *pIt->second;
+        FlatStructSchema schema{};
+        schema.structTypeId = tid;
+        schema.directFields.reserve(fields.size());
+
+        std::uint32_t cursor = 0;
+        for (const auto& f : fields) {
+            if (f.type == semantic::PrimitiveType::Void ||
+                f.type == semantic::PrimitiveType::Error ||
+                f.type == semantic::PrimitiveType::Null) {
+                state[tid] = 3;
+                return 0u;
+            }
+            if (f.type == semantic::PrimitiveType::Struct &&
+                f.typeId != 0 &&
+                !isBuiltinSingleCellMathStructId(f.typeId)) {
+                const std::uint16_t subSid = self(self, f.typeId);
+                const auto* subSc = reg.getByIdLockFree(subSid);
+                if (subSid == 0u || !subSc || cursor + subSc->flatSlotCount > 0x7FFFu) {
+                    state[tid] = 3;
+                    return 0u;
+                }
+                schema.directFields.push_back(FlatStructFieldDesc{
+                    static_cast<std::uint16_t>(cursor),
+                    subSc->flatSlotCount,
+                    f.type,
+                    f.typeId,
+                    subSid,
+                });
+                if (subSc->containsManagedReferences) schema.containsManagedReferences = true;
+                if (subSc->containsPoolValues) schema.containsPoolValues = true;
+                for (const auto subRefOff : subSc->referenceLeafOffsets) {
+                    schema.referenceLeafOffsets.push_back(
+                        static_cast<std::uint16_t>(cursor + subRefOff));
+                }
+                schema.prototypeLeaves.insert(
+                    schema.prototypeLeaves.end(),
+                    subSc->prototypeLeaves.begin(),
+                    subSc->prototypeLeaves.end());
+                cursor += subSc->flatSlotCount;
+                continue;
+            }
+            if (cursor + 1u > 0x7FFFu) {
+                state[tid] = 3;
+                return 0u;
+            }
+            schema.directFields.push_back(FlatStructFieldDesc{
+                static_cast<std::uint16_t>(cursor),
+                1u,
+                f.type,
+                f.typeId,
+                0u,
+            });
+            if (f.type == semantic::PrimitiveType::Object ||
+                f.type == semantic::PrimitiveType::Array ||
+                f.type == semantic::PrimitiveType::String) {
+                schema.containsManagedReferences = true;
+                schema.referenceLeafOffsets.push_back(static_cast<std::uint16_t>(cursor));
+            }
+            if (f.type == semantic::PrimitiveType::String ||
+                f.type == semantic::PrimitiveType::Enum ||
+                (f.type == semantic::PrimitiveType::Struct &&
+                 (f.typeId == quatTypeId() || f.typeId == quatfTypeId()))) {
+                schema.containsPoolValues = true;
+            }
+            schema.prototypeLeaves.push_back(makeDefaultLeaf(f.type, f.typeId));
+            cursor += 1u;
+        }
+        if (cursor == 0u) {
+            schema.flatSlotCount = 1u;
+            schema.prototypeLeaves.push_back(Value{});
+        } else {
+            schema.flatSlotCount = static_cast<std::uint16_t>(cursor);
+        }
+        const std::uint16_t sid = reg.registerOrReuseUnlocked(std::move(schema));
+        state[tid] = (sid != 0u) ? 2 : 3;
+        return sid;
+    };
+
+    for (const auto& [tid, fields] : structTypes) {
+        (void)fields;
+        if (tid == 0 || isBuiltinSingleCellMathStructId(tid)) continue;
+        (void)resolve(resolve, tid);
+    }
+}
+
+} // namespace detail
+
+Value reconstructDetachedStructFromLeaves(
+    const FlatStructSchema& schema,
+    const Value* srcLeaves) {
+    if (!srcLeaves || schema.directFields.empty()) {
+        return Value{makeStructValueFromFields(schema.structTypeId, ValueSpan{})};
+    }
+    const std::size_t fCount = schema.directFields.size();
+    std::array<Value, 16> stackFields{};
+    std::vector<Value> heapFields;
+    Value* dst = fCount <= stackFields.size()
+        ? stackFields.data()
+        : (heapFields.resize(fCount), heapFields.data());
+
+    for (std::size_t i = 0; i < fCount; ++i) {
+        const auto& fd = schema.directFields[i];
+        if (fd.subSchemaId != 0u) {
+            if (const auto* subSc = getFlatStructSchema(fd.subSchemaId)) {
+                dst[i] = reconstructDetachedStructFromLeaves(*subSc, srcLeaves + fd.leafOffset);
+                continue;
+            }
+        }
+        dst[i] = srcLeaves[fd.leafOffset];
+    }
+    if (fCount <= stackFields.size()) {
+        return Value{makeStructValueFromFields(schema.structTypeId, ValueSpan(stackFields.data(), fCount))};
+    }
+    return Value{makeStructValueFromFields(schema.structTypeId, std::move(heapFields))};
+}
+
+bool extractStructLeavesToBuffer(
+    const Value& structVal,
+    const FlatStructSchema& schema,
+    Value* dstLeaves) noexcept {
+    if (!dstLeaves) return false;
+    const auto* sv = std::get_if<StructValue>(&structVal);
+    if (!sv || !sv->valid() || sv->typeId != schema.structTypeId) {
+        return false;
+    }
+    if (sv->isFrameSlice() && sv->frameSchemaId() == schema.schemaId) {
+        if (const Value* slicePtr = detail::lookupFlatStackSlice(
+                sv->storage.frameSliceBank(),
+                sv->storage.frameSliceOffset(),
+                schema.flatSlotCount)) {
+            if (slicePtr != dstLeaves) {
+                std::memmove(
+                    static_cast<void*>(dstLeaves),
+                    static_cast<const void*>(slicePtr),
+                    static_cast<std::size_t>(schema.flatSlotCount) * sizeof(Value));
+            }
+            return true;
+        }
+        return false;
+    }
+    if (schema.directFields.empty()) {
+        dstLeaves[0] = Value{};
+        return true;
+    }
+    const std::size_t fCount = schema.directFields.size();
+    if (sv->fieldCount() != fCount) return false;
+    for (std::size_t i = 0; i < fCount; ++i) {
+        const auto fv = structValueFieldAt(*sv, i);
+        if (!fv) return false;
+        const auto& fd = schema.directFields[i];
+        if (fd.subSchemaId != 0u) {
+            const auto* subSc = getFlatStructSchema(fd.subSchemaId);
+            if (!subSc || !extractStructLeavesToBuffer(*fv, *subSc, dstLeaves + fd.leafOffset)) {
+                return false;
+            }
+        } else {
+            const auto leafPrim = valueType(*fv);
+            if (fd.type == semantic::PrimitiveType::String) {
+                if (leafPrim == semantic::PrimitiveType::Null) {
+                    dstLeaves[fd.leafOffset] = NullString{};
+                } else if (leafPrim == semantic::PrimitiveType::String) {
+                    dstLeaves[fd.leafOffset] = *fv;
+                } else {
+                    return false;
+                }
+            } else if (fd.type == semantic::PrimitiveType::Object) {
+                if (leafPrim == semantic::PrimitiveType::Null) {
+                    dstLeaves[fd.leafOffset] = NullObject{};
+                } else if (leafPrim == semantic::PrimitiveType::Object) {
+                    dstLeaves[fd.leafOffset] = *fv;
+                } else {
+                    return false;
+                }
+            } else if (fd.type == semantic::PrimitiveType::Array) {
+                if (leafPrim == semantic::PrimitiveType::Null) {
+                    dstLeaves[fd.leafOffset] = NullArray{};
+                } else if (leafPrim == semantic::PrimitiveType::Array) {
+                    dstLeaves[fd.leafOffset] = *fv;
+                } else {
+                    return false;
+                }
+            } else if (fd.type == semantic::PrimitiveType::Enum) {
+                const auto* ev = std::get_if<EnumValue>(&*fv);
+                if (!ev || (fd.typeId != 0 && ev->typeId != fd.typeId)) return false;
+                dstLeaves[fd.leafOffset] = *fv;
+            } else if (fd.type == semantic::PrimitiveType::Handle) {
+                NativeHandle nh{};
+                if (!fv->tryGetNativeHandle(nh) || (fd.typeId != 0 && nh.typeId != fd.typeId)) return false;
+                dstLeaves[fd.leafOffset] = *fv;
+            } else if (fd.type == semantic::PrimitiveType::Struct) {
+                if (leafPrim != semantic::PrimitiveType::Struct) return false;
+                bool okStruct = false;
+                if (fd.typeId == 0) {
+                    okStruct = true;
+                } else if (fd.typeId == fixedTypeId()) {
+                    okStruct = std::holds_alternative<FixedValue>(*fv);
+                } else if (fd.typeId == fixed16TypeId()) {
+                    okStruct = std::holds_alternative<Fixed16Value>(*fv);
+                } else if (fd.typeId == fixed64TypeId()) {
+                    okStruct = std::holds_alternative<Fixed64Value>(*fv);
+                } else if (fd.typeId == vec2TypeId()) {
+                    okStruct = std::holds_alternative<Vec2Value>(*fv);
+                } else if (fd.typeId == vec3TypeId()) {
+                    okStruct = std::holds_alternative<Vec3Value>(*fv);
+                } else if (fd.typeId == quatTypeId()) {
+                    okStruct = std::holds_alternative<QuatValue>(*fv);
+                } else if (fd.typeId == vec2fTypeId()) {
+                    okStruct = std::holds_alternative<Vec2fValue>(*fv);
+                } else if (fd.typeId == vec3fTypeId()) {
+                    okStruct = std::holds_alternative<Vec3fValue>(*fv);
+                } else if (fd.typeId == quatfTypeId()) {
+                    okStruct = std::holds_alternative<QuatfValue>(*fv);
+                } else if (const auto* subSv = std::get_if<StructValue>(&*fv)) {
+                    okStruct = subSv->valid() && subSv->typeId == fd.typeId;
+                }
+                if (!okStruct) return false;
+                dstLeaves[fd.leafOffset] = *fv;
+            } else {
+                if (leafPrim != fd.type) return false;
+                dstLeaves[fd.leafOffset] = *fv;
+            }
+        }
+    }
+    return true;
+}
+
+Value detachFrameSliceValue(const Value& value) {
+    if (value.rawTag() != ValueTag::Struct) return value;
+    const auto& sv = value.asStructUnchecked();
+    if (!sv.isFrameSlice()) return value;
+    const auto* sc = getFlatStructSchema(sv.frameSchemaId());
+    if (!sc) return Value{StructValue{}};
+    const Value* leaves = detail::lookupFlatStackSlice(
+        sv.storage.frameSliceBank(),
+        sv.storage.frameSliceOffset(),
+        sc->flatSlotCount);
+    if (!leaves) return Value{StructValue{}};
+    return reconstructDetachedStructFromLeaves(*sc, leaves);
+}
+
 bool operator==(const StructValue& left, const StructValue& right) {
     if (left.typeId != right.typeId) return false;
     const auto count = left.fieldCount();
     if (count != right.fieldCount()) return false;
+    if (left.isFrameSlice() || right.isFrameSlice()) {
+        if (left.isFrameSlice() && right.isFrameSlice() &&
+            left.storage.raw_ == right.storage.raw_ &&
+            left.frameSchemaId() == right.frameSchemaId()) {
+            return true;
+        }
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto lf = structValueFieldAt(left, i);
+            const auto rf = structValueFieldAt(right, i);
+            if (!lf || !rf || !(*lf == *rf)) return false;
+        }
+        return true;
+    }
     if (left.isInline && right.isInline) {
         if (left.storage.raw_ == right.storage.raw_ &&
             left.inlineSlotCount == right.inlineSlotCount &&
@@ -536,18 +1037,30 @@ StructValue makeStructValueFromFields(
     if (tryPackInlineStructFields(typeId, fields, inlineVal)) {
         return inlineVal;
     }
+    heapStructAllocCounter().fetch_add(1, std::memory_order_relaxed);
+    std::vector<Value> detachedFields;
+    detachedFields.reserve(fields.size());
+    for (const auto& f : fields) {
+        detachedFields.push_back(detachFrameSliceValue(f));
+    }
     auto storage = std::make_shared<StructStorage>();
-    storage->fields.assign(fields.begin(), fields.end());
+    storage->fields = std::move(detachedFields);
     return StructValue{typeId, std::move(storage)};
 }
 
 StructValue makeStructValueFromFields(
     semantic::SymbolId typeId,
     std::vector<Value> fields) {
+    for (auto& f : fields) {
+        if (f.rawTag() == ValueTag::Struct && f.asStructUnchecked().isFrameSlice()) {
+            f = detachFrameSliceValue(f);
+        }
+    }
     StructValue inlineVal;
     if (tryPackInlineStructFields(typeId, ValueSpan(fields), inlineVal)) {
         return inlineVal;
     }
+    heapStructAllocCounter().fetch_add(1, std::memory_order_relaxed);
     auto storage = std::make_shared<StructStorage>();
     storage->fields = std::move(fields);
     return StructValue{typeId, std::move(storage)};
@@ -587,6 +1100,24 @@ std::optional<Value> structValueFieldAt(
             return decodeInlineStructSlot(entry.slots[offset]);
         }
         return decodeInlineStructSlot(entry.slots[index]);
+    }
+    if (structure.isFrameSlice()) {
+        const auto* sc = getFlatStructSchema(structure.frameSchemaId());
+        if (!sc || index >= sc->directFields.size()) return std::nullopt;
+        const Value* base = detail::lookupFlatStackSlice(
+            structure.storage.frameSliceBank(),
+            structure.storage.frameSliceOffset(),
+            sc->flatSlotCount);
+        if (!base) return std::nullopt;
+        const auto& fd = sc->directFields[index];
+        if (fd.subSchemaId != 0u) {
+            return Value{StructValue::makeFrameSlice(
+                fd.typeId,
+                structure.storage.frameSliceBank(),
+                structure.storage.frameSliceOffset() + fd.leafOffset,
+                fd.subSchemaId)};
+        }
+        return base[fd.leafOffset];
     }
     if (!structure.storage || index >= structure.storage->fields.size()) {
         return std::nullopt;
@@ -645,7 +1176,8 @@ std::optional<Value> loadInlineStructField(
         if (fieldIndex == 3) return Value{FloatValue{qf.w}};
         return std::nullopt;
     }
-    if (const auto* s = std::get_if<StructValue>(&value); s && s->isInline) {
+    if (const auto* s = std::get_if<StructValue>(&value);
+        s && (s->isInline || s->isFrameSlice())) {
         return structValueFieldAt(*s, fieldIndex);
     }
     return std::nullopt;

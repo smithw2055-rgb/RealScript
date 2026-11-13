@@ -306,6 +306,21 @@ enum class FlatOpcode : std::uint8_t {
     AddFloatTrusted,
     SubFloatTrusted,
     MulFloatTrusted,
+    // 7f. Arbitrary-size Flat-Frame Struct Slice Opcodes (Zero Heap Allocation)
+    InitStructSlice,
+    AliasStructSlice,
+    CopyStructSlice,
+    LoadStructSliceField,
+    StoreStructSliceField,
+    StoreLocalStructFieldInPlace,
+    StoreElementStructFieldInPlace,
+    // 7g. Zero-Heap-Allocation StackSlotRef Opcodes (ref/out & struct methods)
+    InitStackRefCell,
+    BindLocalStackRef,
+    WritebackLocalStackRef,
+    LoadStackRefCell,
+    StoreStackRefCell,
+    StoreStackRefStructFieldInPlace,
     GenericBytecode,
     // 8. Flattened block terminators
     TermJumpNoArgs,
@@ -565,6 +580,14 @@ struct ExecutionFunction {
     bool isSmallLeafInlineCandidate = false;
     bool hasFastParamToLocalPrologue = false;
     bool isAsyncFunction = false;
+    bool hasStructPayloads = false;
+    std::uint16_t singleZoneSlots = 0;
+    std::uint16_t payloadOffset = 0;
+    std::uint16_t edgeStructScratchOffset = InvalidCompactReg;
+    std::uint32_t uncompactedRegPayloadSlots = 0;
+    std::uint32_t compactedRegPayloadSlots = 0;
+    std::vector<std::uint16_t> slotPayloadOffsets;
+    std::vector<std::uint16_t> slotStructSchemaIds;
     std::vector<ExecutionBlock> blocks;
     std::vector<FlatInstruction> flatStream;
     std::vector<FlatColdMeta> flatCold;
@@ -572,11 +595,22 @@ struct ExecutionFunction {
     std::unordered_map<bytecode::BlockId, std::size_t> blockIndices;
 };
 
+struct StackRefTemplate {
+    semantic::SymbolId wrapperTypeId = 0;
+    semantic::PrimitiveType innerType = semantic::PrimitiveType::Error;
+    semantic::SymbolId innerTypeId = 0;
+    std::uint16_t flatSchemaId = 0;
+    std::uint16_t slotCount = 1;
+    Value scalarDefaultValue{};
+};
+
 struct ExecutionMirror {
     std::uint64_t instanceId = 0;
     std::unordered_map<const bytecode::Function*, ExecutionFunction> functions;
     std::vector<FieldAccessMeta> fieldMetas;
     std::vector<ObjectAllocationTemplate> objectTemplates;
+    std::vector<StackRefTemplate> stackRefTemplates;
+    std::unordered_map<semantic::SymbolId, std::uint16_t> stackRefTemplateByTypeId;
     std::unordered_map<semantic::SymbolId, TypeDispatchMetadata> typeDispatch;
     std::vector<PolymorphicCallSiteDesc> polyCallSites;
     std::vector<NewDelegateSiteDesc> newDelegateSites;

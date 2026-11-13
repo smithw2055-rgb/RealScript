@@ -1088,6 +1088,63 @@ mir::ValueId findMaxValueId(const mir::Function& function) noexcept {
     return maxId;
 }
 
+std::uint64_t computeMirFunctionBodyFingerprint(const mir::Function& fn) noexcept {
+    std::uint64_t h = 14695981039346656037ULL;
+    const auto mixU64 = [&](std::uint64_t v) noexcept {
+        for (unsigned shift = 0; shift < 64u; shift += 8u) {
+            h ^= static_cast<std::uint8_t>((v >> shift) & 0xFFu);
+            h *= 1099511628211ULL;
+        }
+    };
+    const auto mixStr = [&](const std::string& s) noexcept {
+        mixU64(s.size());
+        for (unsigned char c : s) {
+            h ^= c;
+            h *= 1099511628211ULL;
+        }
+    };
+    mixU64(fn.symbolId);
+    mixU64(static_cast<std::uint64_t>(fn.returnType));
+    mixU64(fn.returnTypeId);
+    mixU64(fn.parameterTypes.size());
+    for (std::size_t i = 0; i < fn.parameterTypes.size(); ++i) {
+        mixU64(static_cast<std::uint64_t>(fn.parameterTypes[i]));
+        mixU64(i < fn.parameterTypeIds.size() ? fn.parameterTypeIds[i] : 0ULL);
+    }
+    mixU64(fn.blocks.size());
+    for (const auto& blk : fn.blocks) {
+        mixU64(blk.id);
+        mixU64(blk.instructions.size());
+        for (const auto& inst : blk.instructions) {
+            mixU64(static_cast<std::uint64_t>(inst.opcode));
+            mixU64(static_cast<std::uint64_t>(inst.result));
+            mixU64(static_cast<std::uint64_t>(inst.resultType));
+            mixU64(inst.resultTypeId);
+            mixU64(inst.typeId);
+            mixU64(inst.symbolId);
+            mixU64(static_cast<std::uint64_t>(inst.integerImmediate));
+            std::uint64_t dBits = 0;
+            std::memcpy(&dBits, &inst.doubleImmediate, sizeof(double));
+            mixU64(dBits);
+            mixU64(inst.boolImmediate ? 1ULL : 0ULL);
+            mixStr(inst.stringImmediate);
+            mixU64(inst.fieldIndex);
+            mixU64(inst.localIndex);
+            mixU64(inst.checkedArithmetic ? 1ULL : 0ULL);
+            mixU64(inst.operands.size());
+            for (const auto op : inst.operands) {
+                mixU64(static_cast<std::uint64_t>(op));
+            }
+        }
+        mixU64(static_cast<std::uint64_t>(blk.terminator.kind));
+        mixU64(static_cast<std::uint64_t>(blk.terminator.value));
+        mixU64(static_cast<std::uint64_t>(blk.terminator.condition));
+        mixU64(blk.terminator.target);
+        mixU64(blk.terminator.falseTarget);
+    }
+    return h == 0ULL ? 1ULL : h;
+}
+
 bool inlineSmallFunctions(
     mir::Module& module,
     const Options& options,
@@ -1167,6 +1224,26 @@ bool inlineSmallFunctions(
             }
         }
     };
+    // Stamp pre-inlining MIR body fingerprints for all functions in this module so downstream
+    // hot-reload checks can validate cross-module inlined callees deterministically.
+    module.languageMetadata.functionInlineStamps.clear();
+    module.languageMetadata.functionInlineStamps.reserve(module.functions.size());
+    for (const auto& ownFn : module.functions) {
+        if (ownFn.symbolId != 0) {
+            module.languageMetadata.functionInlineStamps.push_back(
+                compiler::LanguageFunctionInlineStamp{
+                    ownFn.symbolId,
+                    computeMirFunctionBodyFingerprint(ownFn)});
+        }
+    }
+    std::sort(
+        module.languageMetadata.functionInlineStamps.begin(),
+        module.languageMetadata.functionInlineStamps.end(),
+        [](const compiler::LanguageFunctionInlineStamp& a,
+           const compiler::LanguageFunctionInlineStamp& b) {
+            return a.symbolId < b.symbolId;
+        });
+
     collectFromModule(module);
     if (allModules) {
         for (const auto& m : *allModules) {
@@ -1174,6 +1251,64 @@ bool inlineSmallFunctions(
         }
     }
     if (inlineCandidates.empty()) return false;
+
+    std::unordered_map<semantic::SymbolId, std::uint64_t> candidateFingerprints;
+    candidateFingerprints.reserve(inlineCandidates.size());
+    for (const auto& [symId, fnPtr] : inlineCandidates) {
+        candidateFingerprints.emplace(symId, computeMirFunctionBodyFingerprint(*fnPtr));
+    }
+
+    // Collect existing cross-module inline dependencies per function for transitive propagation
+    std::unordered_map<semantic::SymbolId, std::vector<compiler::LanguageInlinedDependency>> transitiveDeps;
+    auto ingestModuleDeps = [&](const mir::Module& m) {
+        for (const auto& dep : m.languageMetadata.inlinedDependencies) {
+            transitiveDeps[dep.callerSymbolId].push_back(dep);
+        }
+    };
+    ingestModuleDeps(module);
+    if (allModules) {
+        for (const auto& m : *allModules) {
+            if (&m != &module) ingestModuleDeps(m);
+        }
+    }
+
+    const auto recordInlinedEdge = [&](const mir::Function& callerFn, const mir::Function& calleeFn) {
+        auto addDep = [&](const std::string& cMod,
+                          const std::string& cName,
+                          semantic::SymbolId cSym,
+                          std::uint64_t cFp) {
+            if (cMod.empty() || cMod == module.name || cSym == 0) return;
+            for (const auto& existing : module.languageMetadata.inlinedDependencies) {
+                if (existing.callerSymbolId == callerFn.symbolId &&
+                    existing.calleeSymbolId == cSym) {
+                    return;
+                }
+            }
+            compiler::LanguageInlinedDependency rec;
+            rec.callerFunction = callerFn.name;
+            rec.callerSymbolId = callerFn.symbolId;
+            rec.calleeModule = cMod;
+            rec.calleeFunction = cName;
+            rec.calleeSymbolId = cSym;
+            rec.calleeBodyFingerprint = cFp;
+            module.languageMetadata.inlinedDependencies.push_back(rec);
+            transitiveDeps[callerFn.symbolId].push_back(std::move(rec));
+        };
+        if (calleeFn.moduleName != module.name) {
+            addDep(
+                calleeFn.moduleName,
+                calleeFn.name,
+                calleeFn.symbolId,
+                candidateFingerprints[calleeFn.symbolId]);
+        }
+        const auto trIt = transitiveDeps.find(calleeFn.symbolId);
+        if (trIt != transitiveDeps.end()) {
+            const auto copyList = trIt->second;
+            for (const auto& sub : copyList) {
+                addDep(sub.calleeModule, sub.calleeFunction, sub.calleeSymbolId, sub.calleeBodyFingerprint);
+            }
+        }
+    };
 
     bool anyInlined = false;
     for (auto& caller : module.functions) {
@@ -1266,6 +1401,7 @@ bool inlineSmallFunctions(
                                     ensureTypeImported(sc.resultTypeId);
                                     expanded.push_back(std::move(sc));
                                 }
+                                recordInlinedEdge(caller, callee);
                                 ++statistics.functionsInlined;
                                 callerChanged = true;
                                 anyInlined = true;
@@ -1281,6 +1417,7 @@ bool inlineSmallFunctions(
                                     expanded.push_back(std::move(sc));
                                 }
                                 replacements[inst.result] = mappedRet->second;
+                                recordInlinedEdge(caller, callee);
                                 ++statistics.functionsInlined;
                                 callerChanged = true;
                                 anyInlined = true;

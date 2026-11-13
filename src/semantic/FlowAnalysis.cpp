@@ -148,6 +148,15 @@ private:
             const auto& call = static_cast<
                 const BoundReferenceCallExpression&>(expression);
             for (const auto& argument : call.arguments) {
+                if (argument.targetReceiver) {
+                    analyzeExpression(*argument.targetReceiver, assigned);
+                }
+                if (argument.targetIndex) {
+                    analyzeExpression(*argument.targetIndex, assigned);
+                }
+                if (argument.structRootStaticInitializer) {
+                    analyzeExpression(*argument.structRootStaticInitializer, assigned);
+                }
                 if (argument.value &&
                     argument.modifier != ParameterModifier::Out) {
                     analyzeExpression(*argument.value, assigned);
@@ -306,6 +315,15 @@ private:
         }
         case BoundNodeKind::StructFieldAssignmentExpression: {
             const auto& value = static_cast<const BoundStructFieldAssignmentExpression&>(expression);
+            if (value.objectReceiver) {
+                analyzeExpression(*value.objectReceiver, assigned);
+            }
+            if (value.elementReceiver) {
+                analyzeExpression(*value.elementReceiver, assigned);
+            }
+            if (value.elementIndex) {
+                analyzeExpression(*value.elementIndex, assigned);
+            }
             if (value.staticReceiverInitializer) {
                 analyzeExpression(*value.staticReceiverInitializer, assigned);
             }

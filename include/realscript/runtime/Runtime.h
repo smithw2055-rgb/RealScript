@@ -89,6 +89,7 @@ enum class ObjectKind : std::uint8_t {
 
 struct ObjectRef {
     static constexpr std::uint32_t InvalidSlot = 0xffffffffu;
+    static constexpr std::uint32_t StackSlotRefHeapId = 0xfffffffeu;
 
     std::uint32_t slot = InvalidSlot;
     std::uint32_t generation = 0;
@@ -114,6 +115,31 @@ struct ObjectRef {
 
     [[nodiscard]] constexpr bool valid() const noexcept {
         return slot != InvalidSlot && generation != 0 && heapId != 0;
+    }
+
+    [[nodiscard]] constexpr bool isStackSlotRef() const noexcept {
+        return heapId == StackSlotRefHeapId && slot != InvalidSlot && generation != 0u;
+    }
+
+    [[nodiscard]] constexpr std::uint16_t stackRefSchemaId() const noexcept {
+        return static_cast<std::uint16_t>(
+            static_cast<std::uint16_t>(pad0_) |
+            (static_cast<std::uint16_t>(pad1_) << 8u));
+    }
+
+    [[nodiscard]] static constexpr ObjectRef makeStackSlotRef(
+        std::uint32_t absSlot,
+        std::uint32_t bankId,
+        std::uint16_t schemaId = 0u) noexcept {
+        ObjectRef r{};
+        r.slot = absSlot;
+        r.generation = bankId;
+        r.heapId = StackSlotRefHeapId;
+        r.kind = ObjectKind::Record;
+        r.pad0_ = static_cast<std::uint8_t>(schemaId & 0xffu);
+        r.pad1_ = static_cast<std::uint8_t>((schemaId >> 8u) & 0xffu);
+        r.vtag_ = static_cast<std::uint8_t>(ValueTag::ObjectRef);
+        return r;
     }
 
     friend constexpr bool operator==(ObjectRef left, ObjectRef right) noexcept {
@@ -420,6 +446,9 @@ struct InlineStructSlot {
 class StructStorageHandle {
 public:
     static constexpr std::uint32_t InlineBit = 0x80000000u;
+    static constexpr std::uint32_t FrameSliceBit = 0x40000000u;
+    static constexpr std::uint32_t ModeMask = 0xC0000000u;
+    static constexpr std::uint32_t FrameOffsetMask = 0x00FFFFFFu;
 
     constexpr StructStorageHandle() noexcept = default;
     constexpr StructStorageHandle(std::nullptr_t) noexcept : raw_(0) {}
@@ -427,7 +456,10 @@ public:
     StructStorageHandle(std::shared_ptr<StructStorage> store);
 
     [[nodiscard]] constexpr bool isStoragePtr() const noexcept {
-        return raw_ != 0 && (raw_ & InlineBit) == 0;
+        return raw_ != 0 && (raw_ & ModeMask) == 0u;
+    }
+    [[nodiscard]] constexpr bool isFrameSlice() const noexcept {
+        return (raw_ & ModeMask) == FrameSliceBit;
     }
     [[nodiscard]] constexpr explicit operator bool() const noexcept {
         return isStoragePtr();
@@ -442,6 +474,20 @@ public:
     }
     constexpr void setInlineArenaIndex(std::uint32_t idx) noexcept {
         raw_ = InlineBit | (idx & ~InlineBit);
+    }
+
+    [[nodiscard]] constexpr std::uint8_t frameSliceBank() const noexcept {
+        return isFrameSlice()
+            ? static_cast<std::uint8_t>((raw_ >> 24u) & 0x3Fu)
+            : 0u;
+    }
+    [[nodiscard]] constexpr std::uint32_t frameSliceOffset() const noexcept {
+        return isFrameSlice() ? (raw_ & FrameOffsetMask) : 0u;
+    }
+    constexpr void setFrameSlice(std::uint8_t bankId, std::uint32_t absOffset) noexcept {
+        raw_ = FrameSliceBit |
+            (static_cast<std::uint32_t>(bankId & 0x3Fu) << 24u) |
+            (absOffset & FrameOffsetMask);
     }
 
     friend constexpr bool operator==(
@@ -516,8 +562,36 @@ struct StructValue {
           packedOffsetsAndLengths(0),
           vtag_(static_cast<std::uint8_t>(ValueTag::Struct)) {}
 
+    [[nodiscard]] constexpr bool isFrameSlice() const noexcept {
+        return !isInline && storage.isFrameSlice();
+    }
+    [[nodiscard]] constexpr std::uint16_t frameSchemaId() const noexcept {
+        return static_cast<std::uint16_t>(
+            static_cast<std::uint16_t>(inlineCount) |
+            (static_cast<std::uint16_t>(inlineSlotCount) << 4u) |
+            (static_cast<std::uint16_t>(packedOffsetsAndLengths) << 8u));
+    }
+    constexpr void setFrameSchemaId(std::uint16_t schemaId) noexcept {
+        inlineCount = static_cast<std::uint8_t>(schemaId & 0x0Fu);
+        inlineSlotCount = static_cast<std::uint8_t>((schemaId >> 4u) & 0x0Fu);
+        packedOffsetsAndLengths = static_cast<std::uint8_t>((schemaId >> 8u) & 0xFFu);
+    }
+    [[nodiscard]] static constexpr StructValue makeFrameSlice(
+        semantic::SymbolId id,
+        std::uint8_t bankId,
+        std::uint32_t absSlotOffset,
+        std::uint16_t schemaId) noexcept {
+        StructValue out;
+        out.typeId = id;
+        out.isInline = false;
+        out.storage.setFrameSlice(bankId, absSlotOffset);
+        out.setFrameSchemaId(schemaId);
+        out.vtag_ = static_cast<std::uint8_t>(ValueTag::Struct);
+        return out;
+    }
+
     [[nodiscard]] bool valid() const noexcept {
-        return typeId != 0 && (isInline || storage != nullptr);
+        return typeId != 0 && (isInline || storage.isFrameSlice() || storage != nullptr);
     }
     [[nodiscard]] std::size_t fieldCount() const noexcept;
     [[nodiscard]] const InlineStructArenaEntry& inlineEntry() const noexcept;
@@ -618,19 +692,42 @@ namespace detail {
 [[nodiscard]] semantic::SymbolId lookupNativeHandleTypeId(std::uint32_t typeIdx) noexcept;
 
 struct SharedValuePoolBridge {
-    std::uint32_t version = 1u;
+    std::uint32_t version = 3u;
     std::uint32_t (*internArenaQuatFn)(QuatValue) noexcept = nullptr;
     QuatValue (*lookupArenaQuatFn)(std::uint32_t) noexcept = nullptr;
     std::uint32_t (*internArenaEnumFn)(EnumValue) noexcept = nullptr;
     EnumValue (*lookupArenaEnumFn)(std::uint32_t) noexcept = nullptr;
     std::uint32_t (*internNativeHandleTypeIdFn)(semantic::SymbolId) noexcept = nullptr;
     semantic::SymbolId (*lookupNativeHandleTypeIdFn)(std::uint32_t) noexcept = nullptr;
-    StringValue (*internStringFn)(std::string_view) = nullptr;
+    const std::string* (*emptyStringFn)() noexcept = nullptr;
+    StringValue (*internStringFn)(std::string_view, bool) = nullptr;
     StringValue (*stringByIdFn)(std::uint32_t) noexcept = nullptr;
     std::uint32_t (*internInlineArenaFn)(const InlineStructArenaEntry&) noexcept = nullptr;
     const InlineStructArenaEntry* (*lookupInlineArenaFn)(std::uint32_t) noexcept = nullptr;
-    std::uint32_t (*registerHeapStructFn)(const void*) = nullptr;
+    std::uint32_t (*registerHeapStructFn)(const void*, bool) = nullptr;
     const void* (*lookupHeapStructFn)(std::uint32_t) noexcept = nullptr;
+    void (*pinValueInPoolsFn)(const void*) noexcept = nullptr;
+    void* flatStructRegistryPtr = nullptr;
+    void* blittableRegistryPtr = nullptr;
+    void* heapPoolMarkerShardsPtr = nullptr;
+    void* liveStringHeapShardsPtr = nullptr;
+    void* heapStructAllocCounterPtr = nullptr;
+    std::uint8_t (*acquireFlatStackBankFn)(const void*) noexcept = nullptr;
+    void (*releaseFlatStackBankFn)(std::uint8_t) noexcept = nullptr;
+    const void* (*lookupFlatStackSliceFn)(std::uint8_t, std::uint32_t, std::uint16_t) noexcept = nullptr;
+    bool (*hasAnyPinnedPoolValuesFn)() noexcept = nullptr;
+    void (*beginValuePoolGcMarkFn)() noexcept = nullptr;
+    void (*markValueInPoolsFn)(const void*) noexcept = nullptr;
+    void (*markStackRootValueInPoolsFn)(const void*) noexcept = nullptr;
+    std::size_t (*finishValuePoolGcSweepFn)() noexcept = nullptr;
+    std::size_t (*reclaimPoolValuesFn)(const void*, bool) noexcept = nullptr;
+    void (*registerShadowStackFn)(void*) noexcept = nullptr;
+    void (*unregisterShadowStackFn)(void*) noexcept = nullptr;
+    void (*transferShadowStackFn)(void*, void*) noexcept = nullptr;
+    void (*enterMutatorFn)() noexcept = nullptr;
+    void (*leaveMutatorFn)() noexcept = nullptr;
+    void (*enterHeapSyncLockFn)() noexcept = nullptr;
+    void (*leaveHeapSyncLockFn)(bool) noexcept = nullptr;
 };
 
 [[nodiscard]] const SharedValuePoolBridge* hostValuePoolBridge() noexcept;
@@ -1657,12 +1754,64 @@ struct StructStorage {
 [[nodiscard]] StructValue makeStructValueFromFields(
     semantic::SymbolId typeId,
     std::vector<Value> fields);
+struct FlatStructFieldDesc {
+    std::uint16_t leafOffset = 0;
+    std::uint16_t leafCount = 1;
+    semantic::PrimitiveType type = semantic::PrimitiveType::Error;
+    semantic::SymbolId typeId = 0;
+    std::uint16_t subSchemaId = 0;
+};
+
+struct FlatStructSchema {
+    std::uint16_t schemaId = 0;
+    semantic::SymbolId structTypeId = 0;
+    std::uint16_t flatSlotCount = 1;
+    bool containsManagedReferences = false;
+    bool containsPoolValues = false;
+    std::vector<FlatStructFieldDesc> directFields;
+    std::vector<std::uint16_t> referenceLeafOffsets;
+    std::vector<Value> prototypeLeaves;
+};
+
+[[nodiscard]] const FlatStructSchema* getFlatStructSchema(std::uint16_t schemaId) noexcept;
+[[nodiscard]] const FlatStructSchema* findFlatStructSchemaByTypeId(semantic::SymbolId structTypeId) noexcept;
+[[nodiscard]] Value detachFrameSliceValue(const Value& value);
+[[nodiscard]] bool extractStructLeavesToBuffer(
+    const Value& structVal,
+    const FlatStructSchema& schema,
+    Value* dstLeaves) noexcept;
+[[nodiscard]] Value reconstructDetachedStructFromLeaves(
+    const FlatStructSchema& schema,
+    const Value* srcLeaves);
+[[nodiscard]] std::uint64_t heapStructStorageAllocations() noexcept;
+void resetHeapStructStorageAllocations() noexcept;
+
+[[nodiscard]] inline bool isSynthesizedRefWrapperTypeName(std::string_view name) noexcept {
+    return name.rfind("__RsRef__", 0) == 0 ||
+        name.find("::__RsRef__") != std::string_view::npos;
+}
+
+namespace detail {
+[[nodiscard]] std::uint8_t acquireFlatStackBank(const std::vector<Value>* stackVec) noexcept;
+void releaseFlatStackBank(std::uint8_t bankId) noexcept;
+[[nodiscard]] const Value* lookupFlatStackSlice(
+    std::uint8_t bankId,
+    std::uint32_t absOffset,
+    std::uint16_t slotCount) noexcept;
+} // namespace detail
+
 [[nodiscard]] std::optional<Value> structValueFieldAt(
     const StructValue& structure,
     std::size_t index) noexcept;
 
 inline std::size_t StructValue::fieldCount() const noexcept {
     if (isInline) return inlineCount;
+    if (storage.isFrameSlice()) {
+        if (const auto* sc = getFlatStructSchema(frameSchemaId())) {
+            return sc->directFields.size();
+        }
+        return 0;
+    }
     return storage ? storage->fields.size() : 0;
 }
 
@@ -1991,6 +2140,34 @@ void registerBlittableStructTypes(
     const Value& value,
     bool& outNeedsDemote) noexcept;
 
+[[nodiscard]] bool decodePackedStructToLeaves(
+    const void* basePtr,
+    std::size_t index,
+    std::uint32_t blittableSchemaId,
+    const FlatStructSchema& flatSchema,
+    Value* dstLeaves) noexcept;
+[[nodiscard]] bool writePackedStructLeafSlice(
+    void* basePtr,
+    std::size_t index,
+    std::uint32_t blittableSchemaId,
+    const FlatStructSchema& flatSchema,
+    std::uint16_t targetLeafOffset,
+    std::uint16_t subSchemaId,
+    const Value& rhs,
+    bool& outNeedsDemote) noexcept;
+
+struct FlatStructArrayFastView {
+    Value* data = nullptr;
+    std::uint8_t* dirtyCards = nullptr;
+    std::uint32_t length = 0;
+    std::uint16_t flatStride = 0;
+    std::uint16_t flatSchemaId = 0;
+    semantic::SymbolId elementTypeId = 0;
+    bool containsManagedReferences = false;
+    bool containsPoolValues = false;
+    bool needsRememberedBarrier = false;
+};
+
 struct PackedArrayFastView {
     void* rawData = nullptr;
     std::uint32_t length = 0;
@@ -2188,11 +2365,17 @@ public:
         ObjectRef reference) const;
     [[nodiscard]] std::optional<Value> arrayGet(ObjectRef reference, std::size_t index) const;
     [[nodiscard]] bool isPackedArray(ObjectRef reference) const noexcept;
+    [[nodiscard]] bool isFlatStructArray(ObjectRef reference) const noexcept;
+    [[nodiscard]] std::optional<std::size_t> flatStructArrayStride(ObjectRef reference) const noexcept;
     [[nodiscard]] std::optional<std::size_t> packedElementStrideBytes(ObjectRef reference) const noexcept;
     [[nodiscard]] std::optional<std::size_t> objectSizeBytes(ObjectRef reference) const noexcept;
     [[nodiscard]] const Value* arrayGetFast(ObjectRef reference, std::size_t index) const noexcept;
     [[nodiscard]] bool tryBindArrayFastView(ObjectRef reference, ArrayFastView& outView) const noexcept;
     [[nodiscard]] bool tryBindPackedArrayFastView(ObjectRef reference, PackedArrayFastView& outView) const noexcept;
+    [[nodiscard]] bool tryBindFlatStructArrayFastView(ObjectRef reference, FlatStructArrayFastView& outView) const noexcept;
+    void recordFlatStructArrayWriteBarrier(ObjectRef arrayRef, std::size_t elementIndex) noexcept;
+    [[nodiscard]] std::uint64_t gcEpoch() const noexcept;
+    void pinFlatStructArrayElement(ObjectRef arrayRef, std::size_t elementIndex) noexcept;
     [[nodiscard]] bool tryBindPackedInt32Array(
         ObjectRef reference,
         std::int32_t*& outData,
@@ -3003,10 +3186,20 @@ public:
     [[nodiscard]] bool contains(semantic::SymbolId symbolId) const noexcept;
     [[nodiscard]] std::optional<semantic::SymbolId> findFunction(
         const std::string& qualifiedName) const;
+    struct FrameStructAllocationStats {
+        std::uint32_t singleZoneSlots = 0;
+        std::uint32_t payloadZoneSlots = 0;
+        std::uint32_t uncompactedRegPayloadSlots = 0;
+        std::uint32_t compactedRegPayloadSlots = 0;
+        std::uint32_t reusedRegPayloadSlots = 0;
+    };
+
     [[nodiscard]] const FunctionLocation* resolveFunction(
         semantic::SymbolId symbolId) const noexcept;
     [[nodiscard]] const semantic::TypeSymbol* resolveType(
         semantic::SymbolId typeId) const noexcept;
+    [[nodiscard]] std::optional<FrameStructAllocationStats> functionStructFrameStats(
+        const std::string& qualifiedName) const;
 
 private:
     friend const detail::ExecutionMirror& detail::executionMirror(

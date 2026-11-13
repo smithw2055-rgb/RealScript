@@ -1177,9 +1177,107 @@ ReloadPlan prepare(
             }
         }
     }
-    std::sort(plan.changedFunctions.begin(), plan.changedFunctions.end());
-    std::sort(plan.addedFunctions.begin(), plan.addedFunctions.end());
-    std::sort(plan.removedFunctions.begin(), plan.removedFunctions.end());
+    // Cross-module -O2 inlining consistency verification:
+    // 1) Build map of pre-inlining MIR stamps in newModules and old inline edges in oldModules.
+    std::unordered_map<semantic::SymbolId, std::uint64_t> newPreInlineStamps;
+    std::unordered_set<std::string> newStampedModules;
+    for (const auto& nm : newModules) {
+        if (!nm.languageMetadata.functionInlineStamps.empty()) {
+            newStampedModules.insert(nm.name);
+            for (const auto& st : nm.languageMetadata.functionInlineStamps) {
+                newPreInlineStamps[st.symbolId] = st.bodyFingerprint;
+            }
+        }
+    }
+    std::unordered_map<std::uint64_t, std::uint64_t> oldEdgeFingerprints;
+    const auto makeInlineEdgeKey = [](semantic::SymbolId callerSym, semantic::SymbolId calleeSym) noexcept -> std::uint64_t {
+        return callerSym ^ (calleeSym + 0x9e3779b97f4a7c15ULL + (callerSym << 6u) + (callerSym >> 2u));
+    };
+    for (const auto& om : oldModules) {
+        for (const auto& dep : om.languageMetadata.inlinedDependencies) {
+            oldEdgeFingerprints[makeInlineEdgeKey(dep.callerSymbolId, dep.calleeSymbolId)] =
+                dep.calleeBodyFingerprint;
+        }
+    }
+    const std::unordered_set<semantic::SymbolId> changedOrRemovedSet = [&]() {
+        std::unordered_set<semantic::SymbolId> s(plan.changedFunctions.begin(), plan.changedFunctions.end());
+        s.insert(plan.removedFunctions.begin(), plan.removedFunctions.end());
+        return s;
+    }();
+
+    for (const auto& nm : newModules) {
+        for (const auto& dep : nm.languageMetadata.inlinedDependencies) {
+            const std::string callerDisplay = nm.name + "::" + dep.callerFunction;
+            const auto calleeNewIt = newFunctions.find(dep.calleeSymbolId);
+            if (calleeNewIt == newFunctions.end()) {
+                plan.issues.push_back({
+                    ReloadIssueKind::StaleInlinedDependency,
+                    callerDisplay,
+                    "caller '" + callerDisplay + "' embeds an inlined body of removed function '" +
+                        dep.calleeModule + "::" + dep.calleeFunction + "'; recompile module '" + nm.name + "'",
+                });
+                continue;
+            }
+            bool staleInlineBody = false;
+            const auto stampIt = newPreInlineStamps.find(dep.calleeSymbolId);
+            if (stampIt != newPreInlineStamps.end()) {
+                if (stampIt->second != dep.calleeBodyFingerprint) {
+                    staleInlineBody = true;
+                }
+            } else if (newStampedModules.count(dep.calleeModule) > 0) {
+                staleInlineBody = true;
+            } else if (changedOrRemovedSet.count(dep.calleeSymbolId) > 0) {
+                const auto oldEdgeIt = oldEdgeFingerprints.find(
+                    makeInlineEdgeKey(dep.callerSymbolId, dep.calleeSymbolId));
+                if (oldEdgeIt != oldEdgeFingerprints.end() &&
+                    oldEdgeIt->second == dep.calleeBodyFingerprint) {
+                    staleInlineBody = true;
+                }
+            }
+
+            if (staleInlineBody) {
+                plan.issues.push_back({
+                    ReloadIssueKind::StaleInlinedDependency,
+                    callerDisplay,
+                    "caller '" + callerDisplay + "' embeds a stale -O2 inlined body of '" +
+                        dep.calleeModule + "::" + dep.calleeFunction + "'; recompile module '" + nm.name + "'",
+                });
+                continue;
+            }
+
+            // If the inlined callee changed and the caller WAS properly recompiled, record the caller
+            // in inlineInvalidatedFunctions and changedFunctions so JIT / coroutine / IC caches flush!
+            const auto oldEdgeIt = oldEdgeFingerprints.find(
+                makeInlineEdgeKey(dep.callerSymbolId, dep.calleeSymbolId));
+            if (changedOrRemovedSet.count(dep.calleeSymbolId) > 0 ||
+                (oldEdgeIt != oldEdgeFingerprints.end() &&
+                 oldEdgeIt->second != dep.calleeBodyFingerprint)) {
+                plan.inlineInvalidatedFunctions.push_back(dep.callerSymbolId);
+                plan.changedFunctions.push_back(dep.callerSymbolId);
+            }
+        }
+    }
+
+    // Also catch the case where oldMod had an inline dependency on a changed callee, and in the
+    // properly recompiled newMod the callee is no longer inlined (e.g. grew >16 instructions):
+    for (const auto& om : oldModules) {
+        for (const auto& oldDep : om.languageMetadata.inlinedDependencies) {
+            if (changedOrRemovedSet.count(oldDep.calleeSymbolId) > 0 &&
+                newFunctions.find(oldDep.callerSymbolId) != newFunctions.end()) {
+                plan.inlineInvalidatedFunctions.push_back(oldDep.callerSymbolId);
+                plan.changedFunctions.push_back(oldDep.callerSymbolId);
+            }
+        }
+    }
+
+    auto sortAndDedup = [](std::vector<semantic::SymbolId>& vec) {
+        std::sort(vec.begin(), vec.end());
+        vec.erase(std::unique(vec.begin(), vec.end()), vec.end());
+    };
+    sortAndDedup(plan.changedFunctions);
+    sortAndDedup(plan.inlineInvalidatedFunctions);
+    sortAndDedup(plan.addedFunctions);
+    sortAndDedup(plan.removedFunctions);
 
     if (options.allowStructuralChanges && plan.issues.empty()) {
         (void)buildStructuralTypeMigrations(
@@ -1240,6 +1338,8 @@ const char* reloadIssueKindName(ReloadIssueKind kind) noexcept {
     case ReloadIssueKind::FunctionSetChanged: return "function-set-changed";
     case ReloadIssueKind::FunctionSignatureChanged: return "function-signature-changed";
     case ReloadIssueKind::LanguageMetadataChanged: return "language-metadata-changed";
+    case ReloadIssueKind::StaleInlinedDependency:
+        return "stale-inlined-dependency";
     }
     return "unknown";
 }

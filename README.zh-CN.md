@@ -21,8 +21,7 @@ RealScript 是一门面向现代 C++17 游戏引擎的嵌入式强类型脚本�
 - **原生引擎集成：** 类型化 C++ 绑定、托管脚本对象、Native Handle、零拷贝 ECS 列绑定、C++ 绑定代码自动生成器（`rsbind`）、CMake 包和生成式 C++17 模块。
 - **完整开发工具：** 编译/运行器、AOT 生成器、自动绑定生成器、DAP 调试器、LSP、VS Code 扩展、热重载、Profiler
   和基准工具。
-- **核心无第三方依赖：** 编译器和运行时只要求 C++17 与 CMake；可选 JIT 调用已安装
-  的外部 C++ 编译器。
+- **核心无第三方依赖：** 编译器和运行时只要求 C++17 与 CMake；内置零第三方依赖的进程内 `StencilJit` 原生机器码 JIT（支持 `x86_64` 与 `ARM64`/`AArch64`），同时支持可选外部 C++ 编译器 JIT。
 
 ## 语言与运行时特性
 
@@ -33,7 +32,7 @@ RealScript 是一门面向现代 C++17 游戏引擎的嵌入式强类型脚本�
 | 编译器 | Lexer、Parser、Binder、Flow Analysis、`[Deterministic]` 静态校验、稳定诊断、经过验证的多基本块 Typed MIR、自然循环 LICM 变量加载外提、跨模块 `-O2` 自动属性与 `void` 小函数内联，以及 O0/O1/O2 优化。 |
 | 字节码 | 类型化寄存器 VM、统一扁平栈帧布局（Unified Flat Frame）、Computed-goto 线程化派发（含 `double` 运算/超级指令与对象/结构体字段读写 `FlatOpcode` 快路径）、16 字节（16B）紧凑 `Value` 与 8B `Instruction`、32 位拓宽 `BytecodeString` 及无锁池、整数循环指令快化（Quickening）、确定性 `.rsbc` 0.9 输出、0.6–0.8 兼容读取、防御性验证和结构化脚本调用栈。 |
 | 内存 | 代际 ObjectRef、12B 内联结构体槽（`InlineStructSlot`）、HeapObject 小缓冲区优化（SBO）、`ValuePoolArena` 池化对象 GC 回收、精确根、带阴影栈保护的增量 Mark/Sweep GC 步进、写屏障、有界 GC Work、Snapshot、Retaining Path 和泄漏诊断。 |
-| 原生执行 | 确定性 C++17 AOT、零预算 Trusted Release AOT（`--trusted-release`）、`#line` 源码行号映射指令、自定义 `struct` 栈标量化（`AotStruct_<id>`）、AVX2/SIMD 向量化 ECS 循环重构（`__restrict` + `#pragma loop(ivdep)`）、C11 Module Query ABI、Source Map、类型化 Native Thunk、原生快速路径与对象标识缓存（Identity Cache）、可选工具链 JIT、内容寻址缓存与 Interpreter/JIT/AOT 分层执行。 |
+| 原生执行 | 确定性 C++17 AOT、零预算 Trusted Release AOT（`--trusted-release`）、`#line` 源码行号映射指令、自定义 `struct` 栈标量化（`AotStruct_<id>`）、AVX2/SIMD 向量化 ECS 循环重构（`__restrict` + `#pragma loop(ivdep)`）、C11 Module Query ABI、Source Map、类型化 Native Thunk、原生快速路径与对象标识缓存（Identity Cache）、进程内原生 `StencilJit`（`x86_64` 与 `ARM64`/`AArch64`）、可选工具链 JIT、内容寻址缓存与 Interpreter/JIT/AOT 分层执行。 |
 | 确定性 | Off/Strict/Record/Replay、指令/递归/分配/堆预算、Mod 能力沙箱（Capability Sandboxing）、稳定 Digest、外部调用回放与跨后端差分验证。 |
 | Game SDK | 类型化 Binding（`structType<S>` 自定义结构体封送、`constructor<Args...>`、`staticMethod<M>`、同名重载绑定、`std::vector<T>` <-> `T[]` 数组封送）、C++ 头文件自动生成绑定（`rsbind`，支持 `RS_EXPORT_STRUCT`、`RS_EXPORT_CONSTRUCTOR`、`static_cast` 重载消歧、静态方法与模板容器类型）、数学原语直接封送与快路径（`Fixed`/`Fixed16`/`Vec2`/`Vec3`/`Quat`）、C++ 宿主连续内存零拷贝 ECS 列绑定（`bindEcsRawColumnAuto<T>`）、`Query<Write<T>, Read<U>, With<V>, Without<W>>()` 与 `EntityCommandBuffer`、2D/3D 定点物理（`stepPhysics2D`/`stepPhysics3D`）、空间查询（Raycast/Overlap）、确定性 `RealScript.Input`、单实体多组件、代际实体句柄、Editor/Play 模式（`[Tool]`/`[ExecuteInEditMode]`）、`OnValidate`、深度 `InspectorTypeSchema` 反射、宿主 `connectSignal`、JSON 场景/预制体序列化与 `RSGS` 状态编码。 |
 | 工具链 | `rsc`、`rsaot`、`rsbind`、`rsdebug`、`rslsp`、`rsbench`、DAP（标准流与内嵌 TCP `--dap-port` 附加调试、条件与异常断点、重入安全点、堆保留路径分析器、无副作用 Watch 求值）、LSP（`ParseSnapshot` 增量缓存、子图元数据增量重构缓存、异步请求桥接、成员 `.` 补全、`signatureHelp`、`.d.rscript` 宿主声明导出）、`vscode-realscript` 官方 VS Code 插件、Chrome Tracing 性能导出，以及带状态结构化热重载（`[FormerlySerializedAs]`、静态字段重命名迁移与跨组件引用迁移）。 |
@@ -230,7 +229,7 @@ RealScript 不是 CLR 兼容 C#。v0.98.0 明确不提供：
 - Unsafe Pointer、Ref Struct、Ref Property 或完整 Escape Analysis；
 - Exception Filter、`lock`、Native Exception Interop，或异常跨越协程暂停点；
 - LINQ、`dynamic`、反射代码生成或 .NET BCL；
-- 直接进程内机器码 JIT、OSR、PGO 或 Rollback Networking Protocol；
+- OSR、PGO、非 x86_64 架构进程内机器码 JIT（当前已内置 x86_64 SysV/Win64 `StencilJit`）或 Rollback Networking Protocol；
 - Source、`.rsbc`、AOT ABI、SDK Metadata 和 Gameplay State 的长期冻结兼容性。
 
 游戏引擎集成应固定到准确的 RealScript Release 或 Commit，并使用匹配 SDK 重新生成

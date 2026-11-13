@@ -28,6 +28,14 @@ bool hasSequenceResultMetadata(const Version& version) noexcept {
     return version.major == 0 && version.minor >= 8;
 }
 
+constexpr std::uint32_t kInlineMetadataTrailerMagic = 0x52534944u; // "RSID"
+
+bool hasInlineDependencyMetadata(const Module& mod) noexcept {
+    return mod.version.major == 0 && mod.version.minor >= 7 &&
+        (!mod.languageMetadata.inlinedDependencies.empty() ||
+         !mod.languageMetadata.functionInlineStamps.empty());
+}
+
 bool hasExceptionMetadata(const Version& version) noexcept {
     return version.major == 0 && version.minor >= 9;
 }
@@ -722,6 +730,13 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
         strings.add(sequence.sourceName);
         for (const auto& callback : sequence.callbacks) strings.add(callback);
     }
+    if (hasInlineDependencyMetadata(module)) {
+        for (const auto& dep : module.languageMetadata.inlinedDependencies) {
+            strings.add(dep.callerFunction);
+            strings.add(dep.calleeModule);
+            strings.add(dep.calleeFunction);
+        }
+    }
 
     Writer stringSection;
     stringSection.u32(static_cast<std::uint32_t>(strings.values().size()));
@@ -1021,6 +1036,25 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
         metadataSection.u32(static_cast<std::uint32_t>(sequence.callbacks.size()));
         for (const auto& callback : sequence.callbacks) {
             metadataSection.u32(strings.indexOf(callback));
+        }
+    }
+    if (hasInlineDependencyMetadata(module)) {
+        metadataSection.u32(kInlineMetadataTrailerMagic);
+        metadataSection.u32(static_cast<std::uint32_t>(
+            module.languageMetadata.inlinedDependencies.size()));
+        for (const auto& dep : module.languageMetadata.inlinedDependencies) {
+            metadataSection.u32(strings.indexOf(dep.callerFunction));
+            metadataSection.u64(dep.callerSymbolId);
+            metadataSection.u32(strings.indexOf(dep.calleeModule));
+            metadataSection.u32(strings.indexOf(dep.calleeFunction));
+            metadataSection.u64(dep.calleeSymbolId);
+            metadataSection.u64(dep.calleeBodyFingerprint);
+        }
+        metadataSection.u32(static_cast<std::uint32_t>(
+            module.languageMetadata.functionInlineStamps.size()));
+        for (const auto& st : module.languageMetadata.functionInlineStamps) {
+            metadataSection.u64(st.symbolId);
+            metadataSection.u64(st.bodyFingerprint);
         }
     }
 
@@ -1336,6 +1370,55 @@ bool decodeModule(
                 sequence.callbacks.push_back(std::move(value));
             }
             module.languageMetadata.sequences.push_back(std::move(sequence));
+        }
+        if (reader.valid() && !reader.empty() &&
+            module.version.major == 0 && module.version.minor >= 7 &&
+            reader.remaining() >= 12) {
+            const auto magic = reader.u32();
+            if (!reader.valid() || magic != kInlineMetadataTrailerMagic) {
+                diagnostics.report("RS5010", "invalid language metadata section", {});
+                return false;
+            }
+            const auto inlineDepCount = reader.u32();
+            if (!reader.valid() || inlineDepCount > reader.remaining() / 36) {
+                diagnostics.report("RS5010", "truncated inline dependency metadata", {});
+                return false;
+            }
+            module.languageMetadata.inlinedDependencies.reserve(inlineDepCount);
+            for (std::uint32_t index = 0; index < inlineDepCount; ++index) {
+                compiler::LanguageInlinedDependency dep;
+                if (!readStringValue(dep.callerFunction, "invalid inline caller string index")) {
+                    return false;
+                }
+                dep.callerSymbolId = reader.u64();
+                if (!readStringValue(dep.calleeModule, "invalid inline callee-module string index") ||
+                    !readStringValue(dep.calleeFunction, "invalid inline callee string index")) {
+                    return false;
+                }
+                dep.calleeSymbolId = reader.u64();
+                dep.calleeBodyFingerprint = reader.u64();
+                if (!reader.valid()) {
+                    diagnostics.report("RS5010", "truncated inline dependency entry", {});
+                    return false;
+                }
+                module.languageMetadata.inlinedDependencies.push_back(std::move(dep));
+            }
+            const auto stampCount = reader.u32();
+            if (!reader.valid() || stampCount > reader.remaining() / 16) {
+                diagnostics.report("RS5010", "truncated inline stamp metadata", {});
+                return false;
+            }
+            module.languageMetadata.functionInlineStamps.reserve(stampCount);
+            for (std::uint32_t index = 0; index < stampCount; ++index) {
+                compiler::LanguageFunctionInlineStamp st;
+                st.symbolId = reader.u64();
+                st.bodyFingerprint = reader.u64();
+                if (!reader.valid()) {
+                    diagnostics.report("RS5010", "truncated inline stamp entry", {});
+                    return false;
+                }
+                module.languageMetadata.functionInlineStamps.push_back(st);
+            }
         }
         if (!reader.valid() || !reader.empty()) {
             diagnostics.report("RS5010", "invalid language metadata section", {});

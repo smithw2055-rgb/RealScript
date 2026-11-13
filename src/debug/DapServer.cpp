@@ -910,10 +910,18 @@ std::string DapServer::describeRootInfo(
                 if (const auto* ref = std::get_if<runtime::ObjectRef>(&val)) {
                     return *ref == target;
                 }
-                if (const auto* st = std::get_if<runtime::StructValue>(&val);
-                    st && st->storage && visited.insert(st->storage.get()).second) {
-                    for (const auto& f : st->storage->fields) {
-                        if (self(self, f, target, visited)) return true;
+                if (const auto* st = std::get_if<runtime::StructValue>(&val)) {
+                    if (st->isFrameSlice()) {
+                        for (std::size_t fi = 0; fi < st->fieldCount(); ++fi) {
+                            if (const auto fv = runtime::structValueFieldAt(*st, fi);
+                                fv && self(self, *fv, target, visited)) {
+                                return true;
+                            }
+                        }
+                    } else if (st->storage && visited.insert(st->storage.get()).second) {
+                        for (const auto& f : st->storage->fields) {
+                            if (self(self, f, target, visited)) return true;
+                        }
                     }
                 }
                 return false;

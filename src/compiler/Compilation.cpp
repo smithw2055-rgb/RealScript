@@ -386,7 +386,21 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         };
         if (previous) {
             const auto cached = previous->modules.find(moduleName);
+            bool inlinedUpstreamUnchanged = true;
+            if (cached != previous->modules.end()) {
+                for (const auto& inlDep : cached->second.module.languageMetadata.inlinedDependencies) {
+                    if (inlDep.calleeModule.empty() || inlDep.calleeModule == moduleName) continue;
+                    const auto curUp = modules.find(inlDep.calleeModule);
+                    const auto prevUp = previous->modules.find(inlDep.calleeModule);
+                    if (curUp == modules.end() || prevUp == previous->modules.end() ||
+                        curUp->second.sourceFingerprint != prevUp->second.sourceFingerprint) {
+                        inlinedUpstreamUnchanged = false;
+                        break;
+                    }
+                }
+            }
             if (cached != previous->modules.end() && !module.invalid &&
+                inlinedUpstreamUnchanged &&
                 cached->second.sourceFingerprint == module.sourceFingerprint &&
                 cached->second.publicFingerprint == module.publicFingerprint &&
                 cached->second.dependencyFingerprint == module.dependencyFingerprint) {

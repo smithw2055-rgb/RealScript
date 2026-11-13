@@ -53,4 +53,27 @@ namespace realscript::runtime::detail {
 [[nodiscard]] const StructStorage* lookupHeapStructStorage(
     std::uint32_t id) noexcept;
 
+void registerFlatStructTypes(
+    const std::vector<std::pair<semantic::SymbolId, std::vector<BlittableFieldInput>>>& structTypes);
+[[nodiscard]] std::uint8_t acquireFlatStackBank(const std::vector<Value>* stackVec) noexcept;
+void releaseFlatStackBank(std::uint8_t bankId) noexcept;
+[[nodiscard]] const Value* lookupFlatStackSlice(
+    std::uint8_t bankId,
+    std::uint32_t absOffset,
+    std::uint16_t slotCount) noexcept;
+
+[[nodiscard]] const SharedValuePoolBridge* externalValuePoolBridge() noexcept;
+[[nodiscard]] void* localFlatStructRegistryPtr() noexcept;
+[[nodiscard]] void* localBlittableRegistryPtr() noexcept;
+[[nodiscard]] void* localHeapPoolMarkerShardsPtr() noexcept;
+[[nodiscard]] void* localLiveStringHeapShardsPtr() noexcept;
+[[nodiscard]] void* localHeapStructAllocCounterPtr() noexcept;
+
+std::size_t hostReclaimPoolValuesBridge(const void* activeShadowStack, bool waitIfBusy) noexcept;
+void hostRegisterShadowStackBridge(void* stack) noexcept;
+void hostUnregisterShadowStackBridge(void* stack) noexcept;
+void hostTransferShadowStackBridge(void* from, void* to) noexcept;
+void hostEnterHeapSyncLockBridge() noexcept;
+void hostLeaveHeapSyncLockBridge(bool flushDeferred) noexcept;
+
 } // namespace realscript::runtime::detail

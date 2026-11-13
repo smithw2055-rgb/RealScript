@@ -886,7 +886,7 @@ std::vector<std::uint8_t> encodeCacheBytecodeModule(const bytecode::Module& mod)
         return bytecode::encodeModule(mod);
     }
     bytecode::Module copy = mod;
-    copy.version.minor = 9;
+    if (copy.version.minor < 9) copy.version.minor = 9;
     addDummySentinelFunction(copy);
     return bytecode::encodeModule(copy);
 }

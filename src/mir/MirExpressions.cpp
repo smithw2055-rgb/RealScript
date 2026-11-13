@@ -1648,9 +1648,21 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
     }
     case semantic::BoundNodeKind::StructFieldAssignmentExpression: {
         const auto& assignment = static_cast<const semantic::BoundStructFieldAssignmentExpression&>(expression);
+        const auto effectiveRootKind = assignment.staticFieldReceiver
+            ? semantic::StructAssignmentRootKind::StaticField
+            : assignment.rootKind;
+        const auto& rootStructType = assignment.intermediateHops.empty()
+            ? assignment.ownerType
+            : assignment.intermediateHops.front().ownerType;
+        const auto rootStructTypeId = rootStructType.id;
+
+        // Step 1: Pre-evaluate root lvalue receiver/index handles (preserving left-to-right single evaluation)
         ValueId wrapper = -1;
-        ValueId current = -1;
-        if (assignment.staticFieldReceiver) {
+        ValueId checkedObjRecv = -1;
+        ValueId arrRecv = -1;
+        ValueId arrIdx = -1;
+
+        if (effectiveRootKind == semantic::StructAssignmentRootKind::StaticField) {
             if (assignment.staticReceiverOwnerType.staticConstructor &&
                 (!currentFunction_ || currentFunction_->symbolId != assignment.staticReceiverOwnerType.staticConstructor->id)) {
                 (void)emitCallInstruction(
@@ -1665,7 +1677,6 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                     0,
                     std::numeric_limits<std::uint32_t>::max());
             }
-            const auto fieldTypeId = assignment.ownerType.id;
             if (assignment.staticReceiverInitializer) {
                 const auto hasName = "$intrinsic::static_has::" +
                     std::to_string(assignment.staticReceiverField.id);
@@ -1692,7 +1703,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 setCall.opcode = Opcode::Call;
                 setCall.operands = {initVal};
                 setCall.parameterTypes = {semantic::PrimitiveType::Struct};
-                setCall.parameterTypeIds = {fieldTypeId};
+                setCall.parameterTypeIds = {rootStructTypeId};
                 setCall.symbolId = semantic::stableTypeId(setName);
                 setCall.symbolName = setName;
                 setCall.sourceSpan = expression.span;
@@ -1701,28 +1712,20 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
 
                 setCurrentBlock(readyBlock);
             }
-            const auto defaultVal = emitValue(
-                Opcode::NewStruct, semantic::PrimitiveType::Struct, {}, expression.span);
-            auto& defInst = block(*currentBlockId_).instructions.back();
-            defInst.typeId = fieldTypeId;
-            defInst.resultTypeId = fieldTypeId;
-            defInst.symbolName = semantic::canonicalTypeName(assignment.ownerType);
-
-            const auto getName = "$intrinsic::static_get::" +
-                std::to_string(assignment.staticReceiverField.id);
-            Instruction getCall;
-            getCall.result = nextValueId_++;
-            getCall.resultType = semantic::PrimitiveType::Struct;
-            getCall.resultTypeId = fieldTypeId;
-            getCall.opcode = Opcode::Call;
-            getCall.operands = {defaultVal};
-            getCall.parameterTypes = {semantic::PrimitiveType::Struct};
-            getCall.parameterTypeIds = {fieldTypeId};
-            getCall.symbolId = semantic::stableTypeId(getName);
-            getCall.symbolName = getName;
-            getCall.sourceSpan = expression.span;
-            current = getCall.result;
-            block(*currentBlockId_).instructions.push_back(std::move(getCall));
+        } else if (effectiveRootKind == semantic::StructAssignmentRootKind::ObjectField) {
+            const auto rawObj = lowerExpression(*assignment.objectReceiver);
+            checkedObjRecv = emitValue(
+                Opcode::CheckNotNull,
+                semantic::PrimitiveType::Object,
+                {rawObj},
+                assignment.objectReceiver->span);
+            auto& check = block(*currentBlockId_).instructions.back();
+            check.typeId = assignment.objectOwnerType.id;
+            check.resultTypeId = assignment.objectOwnerType.id;
+            check.symbolName = semantic::canonicalTypeName(assignment.objectOwnerType);
+        } else if (effectiveRootKind == semantic::StructAssignmentRootKind::ArrayElement) {
+            arrRecv = lowerExpression(*assignment.elementReceiver);
+            arrIdx = lowerExpression(*assignment.elementIndex);
         } else if (assignment.wrappedVariable) {
             wrapper = emitValue(
                 Opcode::LoadLocal, semantic::PrimitiveType::Object,
@@ -1730,32 +1733,126 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             auto& loadWrapper = block(*currentBlockId_).instructions.back();
             loadWrapper.localIndex = assignment.variable.index;
             loadWrapper.resultTypeId = assignment.wrapperType.id;
-            current = emitValue(
+        }
+
+        // Step 2: Evaluate RHS (or compound read-modify-write expression)
+        const auto assigned = lowerExpression(*assignment.expression);
+
+        // Step 3: Load current root struct, drill down intermediate hops, update leaf, rebuild outwards, and write back
+        ValueId rootCurrent = -1;
+        if (effectiveRootKind == semantic::StructAssignmentRootKind::StaticField) {
+            const auto defaultVal = emitValue(
+                Opcode::NewStruct, semantic::PrimitiveType::Struct, {}, expression.span);
+            auto& defInst = block(*currentBlockId_).instructions.back();
+            defInst.typeId = rootStructTypeId;
+            defInst.resultTypeId = rootStructTypeId;
+            defInst.symbolName = semantic::canonicalTypeName(rootStructType);
+
+            const auto getName = "$intrinsic::static_get::" +
+                std::to_string(assignment.staticReceiverField.id);
+            Instruction getCall;
+            getCall.result = nextValueId_++;
+            getCall.resultType = semantic::PrimitiveType::Struct;
+            getCall.resultTypeId = rootStructTypeId;
+            getCall.opcode = Opcode::Call;
+            getCall.operands = {defaultVal};
+            getCall.parameterTypes = {semantic::PrimitiveType::Struct};
+            getCall.parameterTypeIds = {rootStructTypeId};
+            getCall.symbolId = semantic::stableTypeId(getName);
+            getCall.symbolName = getName;
+            getCall.sourceSpan = expression.span;
+            rootCurrent = getCall.result;
+            block(*currentBlockId_).instructions.push_back(std::move(getCall));
+        } else if (effectiveRootKind == semantic::StructAssignmentRootKind::ObjectField) {
+            rootCurrent = emitValue(
+                Opcode::LoadField,
+                semantic::PrimitiveType::Struct,
+                {checkedObjRecv},
+                expression.span);
+            auto& loadField = block(*currentBlockId_).instructions.back();
+            loadField.typeId = assignment.objectOwnerType.id;
+            loadField.resultTypeId = rootStructTypeId;
+            loadField.fieldIndex = assignment.objectField.index;
+            loadField.symbolName = semantic::canonicalTypeName(assignment.objectOwnerType);
+        } else if (effectiveRootKind == semantic::StructAssignmentRootKind::ArrayElement) {
+            rootCurrent = emitValue(
+                Opcode::LoadElement,
+                semantic::PrimitiveType::Struct,
+                {arrRecv, arrIdx},
+                expression.span);
+            auto& loadElem = block(*currentBlockId_).instructions.back();
+            loadElem.elementType = semantic::PrimitiveType::Struct;
+            loadElem.elementTypeId = rootStructTypeId;
+            loadElem.resultTypeId = rootStructTypeId;
+        } else if (assignment.wrappedVariable) {
+            rootCurrent = emitValue(
                 Opcode::LoadField, semantic::PrimitiveType::Struct,
                 {wrapper}, expression.span);
             auto& loadValue = block(*currentBlockId_).instructions.back();
             loadValue.typeId = assignment.wrapperType.id;
-            loadValue.resultTypeId = assignment.ownerType.id;
+            loadValue.resultTypeId = rootStructTypeId;
             loadValue.fieldIndex = assignment.wrapperValueField.index;
             loadValue.symbolName = semantic::canonicalTypeName(
                 assignment.wrapperType);
         } else {
-            current = emitValue(
+            rootCurrent = emitValue(
                 Opcode::LoadLocal, semantic::PrimitiveType::Struct,
                 {}, expression.span);
             auto& load = block(*currentBlockId_).instructions.back();
             load.localIndex = assignment.variable.index;
-            load.resultTypeId = assignment.ownerType.id;
+            load.resultTypeId = rootStructTypeId;
         }
-        const auto assigned = lowerExpression(*assignment.expression);
-        const auto updated = emitValue(Opcode::StoreStructField, semantic::PrimitiveType::Struct,
-            {current, assigned}, expression.span);
-        auto& store = block(*currentBlockId_).instructions.back();
-        store.typeId = assignment.ownerType.id;
-        store.resultTypeId = assignment.ownerType.id;
-        store.fieldIndex = assignment.field.index;
-        store.symbolName = semantic::canonicalTypeName(assignment.ownerType);
-        if (assignment.staticFieldReceiver) {
+
+        std::vector<ValueId> chainStructs;
+        chainStructs.reserve(assignment.intermediateHops.size() + 1);
+        chainStructs.push_back(rootCurrent);
+        for (std::size_t m = 0; m < assignment.intermediateHops.size(); ++m) {
+            const auto& hop = assignment.intermediateHops[m];
+            const auto nextTypeId = (m + 1 < assignment.intermediateHops.size())
+                ? assignment.intermediateHops[m + 1].ownerType.id
+                : assignment.ownerType.id;
+            const auto subStruct = emitValue(
+                Opcode::LoadStructField,
+                semantic::PrimitiveType::Struct,
+                {chainStructs.back()},
+                expression.span);
+            auto& subLoad = block(*currentBlockId_).instructions.back();
+            subLoad.typeId = hop.ownerType.id;
+            subLoad.fieldIndex = hop.field.index;
+            subLoad.resultTypeId = nextTypeId;
+            subLoad.symbolName = semantic::canonicalTypeName(hop.ownerType);
+            chainStructs.push_back(subStruct);
+        }
+
+        ValueId updated = emitValue(
+            Opcode::StoreStructField,
+            semantic::PrimitiveType::Struct,
+            {chainStructs.back(), assigned},
+            expression.span);
+        {
+            auto& leafStore = block(*currentBlockId_).instructions.back();
+            leafStore.typeId = assignment.ownerType.id;
+            leafStore.resultTypeId = assignment.ownerType.id;
+            leafStore.fieldIndex = assignment.field.index;
+            leafStore.symbolName = semantic::canonicalTypeName(assignment.ownerType);
+        }
+
+        for (std::size_t rev = assignment.intermediateHops.size(); rev > 0; --rev) {
+            const std::size_t m = rev - 1u;
+            const auto& hop = assignment.intermediateHops[m];
+            updated = emitValue(
+                Opcode::StoreStructField,
+                semantic::PrimitiveType::Struct,
+                {chainStructs[m], updated},
+                expression.span);
+            auto& hopStore = block(*currentBlockId_).instructions.back();
+            hopStore.typeId = hop.ownerType.id;
+            hopStore.resultTypeId = hop.ownerType.id;
+            hopStore.fieldIndex = hop.field.index;
+            hopStore.symbolName = semantic::canonicalTypeName(hop.ownerType);
+        }
+
+        if (effectiveRootKind == semantic::StructAssignmentRootKind::StaticField) {
             const auto setName = "$intrinsic::static_set::" +
                 std::to_string(assignment.staticReceiverField.id);
             Instruction setCall;
@@ -1763,11 +1860,30 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             setCall.opcode = Opcode::Call;
             setCall.operands = {updated};
             setCall.parameterTypes = {semantic::PrimitiveType::Struct};
-            setCall.parameterTypeIds = {assignment.ownerType.id};
+            setCall.parameterTypeIds = {rootStructTypeId};
             setCall.symbolId = semantic::stableTypeId(setName);
             setCall.symbolName = setName;
             setCall.sourceSpan = expression.span;
             block(*currentBlockId_).instructions.push_back(std::move(setCall));
+        } else if (effectiveRootKind == semantic::StructAssignmentRootKind::ObjectField) {
+            Instruction storeObj;
+            storeObj.resultType = semantic::PrimitiveType::Void;
+            storeObj.opcode = Opcode::StoreField;
+            storeObj.operands = {checkedObjRecv, updated};
+            storeObj.typeId = assignment.objectOwnerType.id;
+            storeObj.fieldIndex = assignment.objectField.index;
+            storeObj.symbolName = semantic::canonicalTypeName(assignment.objectOwnerType);
+            storeObj.sourceSpan = expression.span;
+            block(*currentBlockId_).instructions.push_back(std::move(storeObj));
+        } else if (effectiveRootKind == semantic::StructAssignmentRootKind::ArrayElement) {
+            Instruction storeElem;
+            storeElem.resultType = semantic::PrimitiveType::Void;
+            storeElem.opcode = Opcode::StoreElement;
+            storeElem.operands = {arrRecv, arrIdx, updated};
+            storeElem.elementType = semantic::PrimitiveType::Struct;
+            storeElem.elementTypeId = rootStructTypeId;
+            storeElem.sourceSpan = expression.span;
+            block(*currentBlockId_).instructions.push_back(std::move(storeElem));
         } else if (assignment.wrappedVariable) {
             Instruction writeback;
             writeback.resultType = semantic::PrimitiveType::Void;
@@ -1918,6 +2034,8 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             std::string targetElementTypeName;
             std::optional<semantic::FunctionSymbol> assignHandle;
             const semantic::BoundExpression* valueExpr = nullptr;
+            const semantic::BoundReferenceCallArgument* refArg = nullptr;
+            ValueId structRootWrapper = -1;
         };
         std::vector<Writeback> writebacks;
         for (const auto& argument : call.arguments) {
@@ -1933,6 +2051,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
 
             ValueId targetReceiver = -1;
             ValueId targetIndex = -1;
+            ValueId structRootWrapper = -1;
             ValueId initial = -1;
             switch (argument.targetKind) {
             case semantic::ReferenceTargetKind::Variable:
@@ -2008,12 +2127,162 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                     load.resultTypeId = load.elementTypeId;
                 }
                 break;
-            case semantic::ReferenceTargetKind::StructField:
-                targetReceiver = lowerExpression(*argument.targetReceiver);
+            case semantic::ReferenceTargetKind::StructField: {
+                const auto& rootStructType = argument.intermediateHops.empty()
+                    ? argument.targetOwnerType
+                    : argument.intermediateHops.front().ownerType;
+                const auto rootStructTypeId = rootStructType.id;
+
+                if (argument.structRootKind == semantic::StructAssignmentRootKind::StaticField) {
+                    if (argument.structRootOwnerType.staticConstructor &&
+                        (!currentFunction_ || currentFunction_->symbolId != argument.structRootOwnerType.staticConstructor->id)) {
+                        (void)emitCallInstruction(
+                            *argument.structRootOwnerType.staticConstructor,
+                            semantic::PrimitiveType::Void,
+                            {},
+                            {},
+                            expression.span,
+                            false,
+                            std::numeric_limits<std::uint32_t>::max(),
+                            false,
+                            0,
+                            std::numeric_limits<std::uint32_t>::max());
+                    }
+                    if (argument.structRootStaticInitializer) {
+                        const auto hasName = "$intrinsic::static_has::" +
+                            std::to_string(argument.structRootField.id);
+                        Instruction hasCall;
+                        hasCall.result = nextValueId_++;
+                        hasCall.resultType = semantic::PrimitiveType::Bool;
+                        hasCall.opcode = Opcode::Call;
+                        hasCall.symbolId = semantic::stableTypeId(hasName);
+                        hasCall.symbolName = hasName;
+                        hasCall.sourceSpan = expression.span;
+                        const auto hasVal = hasCall.result;
+                        block(*currentBlockId_).instructions.push_back(std::move(hasCall));
+
+                        const auto initBlock = createBlock();
+                        const auto readyBlock = createBlock();
+                        emitBranch(hasVal, readyBlock, initBlock, {}, {}, expression.span);
+
+                        setCurrentBlock(initBlock);
+                        const auto initVal = lowerExpression(*argument.structRootStaticInitializer);
+                        const auto setName = "$intrinsic::static_set::" +
+                            std::to_string(argument.structRootField.id);
+                        Instruction setCall;
+                        setCall.resultType = semantic::PrimitiveType::Void;
+                        setCall.opcode = Opcode::Call;
+                        setCall.operands = {initVal};
+                        setCall.parameterTypes = {semantic::PrimitiveType::Struct};
+                        setCall.parameterTypeIds = {rootStructTypeId};
+                        setCall.symbolId = semantic::stableTypeId(setName);
+                        setCall.symbolName = setName;
+                        setCall.sourceSpan = expression.span;
+                        block(*currentBlockId_).instructions.push_back(std::move(setCall));
+                        emitJump(readyBlock, {}, expression.span);
+
+                        setCurrentBlock(readyBlock);
+                    }
+                } else if (argument.structRootKind == semantic::StructAssignmentRootKind::ObjectField) {
+                    const auto rawObj = lowerExpression(*argument.targetReceiver);
+                    targetReceiver = emitValue(
+                        Opcode::CheckNotNull,
+                        semantic::PrimitiveType::Object,
+                        {rawObj},
+                        argument.targetReceiver->span);
+                    auto& check = block(*currentBlockId_).instructions.back();
+                    check.typeId = argument.structRootOwnerType.id;
+                    check.resultTypeId = argument.structRootOwnerType.id;
+                    check.symbolName = semantic::canonicalTypeName(argument.structRootOwnerType);
+                } else if (argument.structRootKind == semantic::StructAssignmentRootKind::ArrayElement) {
+                    targetReceiver = lowerExpression(*argument.targetReceiver);
+                    targetIndex = lowerExpression(*argument.targetIndex);
+                } else if (argument.wrappedStructRootVariable) {
+                    structRootWrapper = emitValue(
+                        Opcode::LoadLocal,
+                        semantic::PrimitiveType::Object,
+                        {},
+                        expression.span);
+                    auto& lw = block(*currentBlockId_).instructions.back();
+                    lw.localIndex = argument.variable.index;
+                    lw.resultTypeId = argument.structRootWrapperType.id;
+                }
+
                 if (argument.modifier == semantic::ParameterModifier::Ref) {
+                    ValueId cur = -1;
+                    if (argument.structRootKind == semantic::StructAssignmentRootKind::StaticField) {
+                        const auto defaultVal = emitValue(
+                            Opcode::NewStruct, semantic::PrimitiveType::Struct, {}, expression.span);
+                        auto& defInst = block(*currentBlockId_).instructions.back();
+                        defInst.typeId = rootStructTypeId;
+                        defInst.resultTypeId = rootStructTypeId;
+                        defInst.symbolName = semantic::canonicalTypeName(rootStructType);
+                        const auto getName = "$intrinsic::static_get::" +
+                            std::to_string(argument.structRootField.id);
+                        Instruction getCall;
+                        getCall.result = nextValueId_++;
+                        getCall.resultType = semantic::PrimitiveType::Struct;
+                        getCall.resultTypeId = rootStructTypeId;
+                        getCall.opcode = Opcode::Call;
+                        getCall.operands = {defaultVal};
+                        getCall.parameterTypes = {semantic::PrimitiveType::Struct};
+                        getCall.parameterTypeIds = {rootStructTypeId};
+                        getCall.symbolId = semantic::stableTypeId(getName);
+                        getCall.symbolName = getName;
+                        getCall.sourceSpan = expression.span;
+                        cur = getCall.result;
+                        block(*currentBlockId_).instructions.push_back(std::move(getCall));
+                    } else if (argument.structRootKind == semantic::StructAssignmentRootKind::ObjectField) {
+                        cur = emitValue(
+                            Opcode::LoadField, semantic::PrimitiveType::Struct,
+                            {targetReceiver}, expression.span);
+                        auto& lf = block(*currentBlockId_).instructions.back();
+                        lf.typeId = argument.structRootOwnerType.id;
+                        lf.resultTypeId = rootStructTypeId;
+                        lf.fieldIndex = argument.structRootField.index;
+                        lf.symbolName = semantic::canonicalTypeName(argument.structRootOwnerType);
+                    } else if (argument.structRootKind == semantic::StructAssignmentRootKind::ArrayElement) {
+                        cur = emitValue(
+                            Opcode::LoadElement, semantic::PrimitiveType::Struct,
+                            {targetReceiver, targetIndex}, expression.span);
+                        auto& le = block(*currentBlockId_).instructions.back();
+                        le.elementType = semantic::PrimitiveType::Struct;
+                        le.elementTypeId = rootStructTypeId;
+                        le.resultTypeId = rootStructTypeId;
+                    } else if (argument.wrappedStructRootVariable) {
+                        cur = emitValue(
+                            Opcode::LoadField, semantic::PrimitiveType::Struct,
+                            {structRootWrapper}, expression.span);
+                        auto& lf = block(*currentBlockId_).instructions.back();
+                        lf.typeId = argument.structRootWrapperType.id;
+                        lf.resultTypeId = rootStructTypeId;
+                        lf.fieldIndex = argument.structRootWrapperValueField.index;
+                        lf.symbolName = semantic::canonicalTypeName(argument.structRootWrapperType);
+                    } else {
+                        cur = emitValue(
+                            Opcode::LoadLocal, semantic::PrimitiveType::Struct,
+                            {}, expression.span);
+                        auto& ll = block(*currentBlockId_).instructions.back();
+                        ll.localIndex = argument.variable.index;
+                        ll.resultTypeId = rootStructTypeId;
+                    }
+                    for (std::size_t m = 0; m < argument.intermediateHops.size(); ++m) {
+                        const auto& hop = argument.intermediateHops[m];
+                        const auto nextTid = (m + 1 < argument.intermediateHops.size())
+                            ? argument.intermediateHops[m + 1].ownerType.id
+                            : argument.targetOwnerType.id;
+                        cur = emitValue(
+                            Opcode::LoadStructField, semantic::PrimitiveType::Struct,
+                            {cur}, expression.span);
+                        auto& sl = block(*currentBlockId_).instructions.back();
+                        sl.typeId = hop.ownerType.id;
+                        sl.fieldIndex = hop.field.index;
+                        sl.resultTypeId = nextTid;
+                        sl.symbolName = semantic::canonicalTypeName(hop.ownerType);
+                    }
                     initial = emitValue(
                         Opcode::LoadStructField, argument.targetField.type,
-                        {targetReceiver}, expression.span);
+                        {cur}, expression.span);
                     auto& load = block(*currentBlockId_).instructions.back();
                     load.typeId = argument.targetOwnerType.id;
                     load.fieldIndex = argument.targetField.index;
@@ -2026,6 +2295,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                         argument.targetOwnerType);
                 }
                 break;
+            }
             case semantic::ReferenceTargetKind::None:
                 if (argument.defensiveCopy && argument.value) {
                     initial = lowerExpression(*argument.value);
@@ -2101,7 +2371,9 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                     argument.targetElementType,
                     argument.targetElementTypeName,
                     argument.writebackAssignHandle,
-                    argument.value.get()});
+                    argument.value.get(),
+                    &argument,
+                    structRootWrapper});
             }
         }
 
@@ -2330,11 +2602,94 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 break;
             }
             case semantic::ReferenceTargetKind::StructField: {
+                const auto& refArg = *writeback.refArg;
+                const auto& rootStructType = refArg.intermediateHops.empty()
+                    ? writeback.targetOwnerType
+                    : refArg.intermediateHops.front().ownerType;
+                const auto rootStructTypeId = rootStructType.id;
+
+                ValueId rootCur = -1;
+                if (refArg.structRootKind == semantic::StructAssignmentRootKind::StaticField) {
+                    const auto defaultVal = emitValue(
+                        Opcode::NewStruct, semantic::PrimitiveType::Struct, {}, expression.span);
+                    auto& defInst = block(*currentBlockId_).instructions.back();
+                    defInst.typeId = rootStructTypeId;
+                    defInst.resultTypeId = rootStructTypeId;
+                    defInst.symbolName = semantic::canonicalTypeName(rootStructType);
+                    const auto getName = "$intrinsic::static_get::" +
+                        std::to_string(refArg.structRootField.id);
+                    Instruction getCall;
+                    getCall.result = nextValueId_++;
+                    getCall.resultType = semantic::PrimitiveType::Struct;
+                    getCall.resultTypeId = rootStructTypeId;
+                    getCall.opcode = Opcode::Call;
+                    getCall.operands = {defaultVal};
+                    getCall.parameterTypes = {semantic::PrimitiveType::Struct};
+                    getCall.parameterTypeIds = {rootStructTypeId};
+                    getCall.symbolId = semantic::stableTypeId(getName);
+                    getCall.symbolName = getName;
+                    getCall.sourceSpan = expression.span;
+                    rootCur = getCall.result;
+                    block(*currentBlockId_).instructions.push_back(std::move(getCall));
+                } else if (refArg.structRootKind == semantic::StructAssignmentRootKind::ObjectField) {
+                    rootCur = emitValue(
+                        Opcode::LoadField, semantic::PrimitiveType::Struct,
+                        {writeback.targetReceiver}, expression.span);
+                    auto& lf = block(*currentBlockId_).instructions.back();
+                    lf.typeId = refArg.structRootOwnerType.id;
+                    lf.resultTypeId = rootStructTypeId;
+                    lf.fieldIndex = refArg.structRootField.index;
+                    lf.symbolName = semantic::canonicalTypeName(refArg.structRootOwnerType);
+                } else if (refArg.structRootKind == semantic::StructAssignmentRootKind::ArrayElement) {
+                    rootCur = emitValue(
+                        Opcode::LoadElement, semantic::PrimitiveType::Struct,
+                        {writeback.targetReceiver, writeback.targetIndex}, expression.span);
+                    auto& le = block(*currentBlockId_).instructions.back();
+                    le.elementType = semantic::PrimitiveType::Struct;
+                    le.elementTypeId = rootStructTypeId;
+                    le.resultTypeId = rootStructTypeId;
+                } else if (refArg.wrappedStructRootVariable) {
+                    rootCur = emitValue(
+                        Opcode::LoadField, semantic::PrimitiveType::Struct,
+                        {writeback.structRootWrapper}, expression.span);
+                    auto& lf = block(*currentBlockId_).instructions.back();
+                    lf.typeId = refArg.structRootWrapperType.id;
+                    lf.resultTypeId = rootStructTypeId;
+                    lf.fieldIndex = refArg.structRootWrapperValueField.index;
+                    lf.symbolName = semantic::canonicalTypeName(refArg.structRootWrapperType);
+                } else {
+                    rootCur = emitValue(
+                        Opcode::LoadLocal, semantic::PrimitiveType::Struct,
+                        {}, expression.span);
+                    auto& ll = block(*currentBlockId_).instructions.back();
+                    ll.localIndex = writeback.variable.index;
+                    ll.resultTypeId = rootStructTypeId;
+                }
+
+                std::vector<ValueId> chainStructs;
+                chainStructs.reserve(refArg.intermediateHops.size() + 1);
+                chainStructs.push_back(rootCur);
+                for (std::size_t m = 0; m < refArg.intermediateHops.size(); ++m) {
+                    const auto& hop = refArg.intermediateHops[m];
+                    const auto nextTid = (m + 1 < refArg.intermediateHops.size())
+                        ? refArg.intermediateHops[m + 1].ownerType.id
+                        : writeback.targetOwnerType.id;
+                    const auto sub = emitValue(
+                        Opcode::LoadStructField, semantic::PrimitiveType::Struct,
+                        {chainStructs.back()}, expression.span);
+                    auto& sl = block(*currentBlockId_).instructions.back();
+                    sl.typeId = hop.ownerType.id;
+                    sl.fieldIndex = hop.field.index;
+                    sl.resultTypeId = nextTid;
+                    sl.symbolName = semantic::canonicalTypeName(hop.ownerType);
+                    chainStructs.push_back(sub);
+                }
+
                 if (writeback.assignHandle) {
                     const auto oldVal = emitValue(
                         Opcode::LoadStructField,
                         writeback.targetField.type,
-                        {writeback.targetReceiver}, expression.span);
+                        {chainStructs.back()}, expression.span);
                     auto& oldLoad = block(*currentBlockId_).instructions.back();
                     oldLoad.typeId = writeback.targetOwnerType.id;
                     oldLoad.fieldIndex = writeback.targetField.index;
@@ -2346,44 +2701,75 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                         writeback.targetOwnerType);
                     value = applyAssignHandle(oldVal);
                 }
-                const auto updated = emitValue(
+
+                ValueId updated = emitValue(
                     Opcode::StoreStructField,
                     semantic::PrimitiveType::Struct,
-                    {writeback.targetReceiver, value}, expression.span);
-                auto& store = block(*currentBlockId_).instructions.back();
-                store.typeId = writeback.targetOwnerType.id;
-                store.resultTypeId = writeback.targetOwnerType.id;
-                store.fieldIndex = writeback.targetField.index;
-                store.symbolName = semantic::canonicalTypeName(
-                    writeback.targetOwnerType);
-                const bool capturedStructOwner =
-                    (semantic::storageTypeOf(writeback.variable) !=
-                         writeback.variable.type ||
-                     semantic::storageTypeNameOf(writeback.variable) !=
-                         writeback.variable.typeName) &&
-                    writeback.variable.modifier ==
-                        semantic::ParameterModifier::None;
-                if (capturedStructOwner) {
-                    const auto cell = emitValue(
-                        Opcode::LoadLocal,
-                        semantic::PrimitiveType::Object,
-                        {}, expression.span);
-                    auto& cellLoad =
-                        block(*currentBlockId_).instructions.back();
-                    cellLoad.localIndex = writeback.variable.index;
-                    cellLoad.resultTypeId = semantic::stableTypeId(
-                        semantic::storageTypeNameOf(writeback.variable));
-                    Instruction storeCell;
-                    storeCell.resultType = semantic::PrimitiveType::Void;
-                    storeCell.opcode = Opcode::StoreField;
-                    storeCell.operands = {cell, updated};
-                    storeCell.typeId = cellLoad.resultTypeId;
-                    storeCell.fieldIndex = 0;
-                    storeCell.symbolName =
-                        semantic::storageTypeNameOf(writeback.variable);
-                    storeCell.sourceSpan = expression.span;
-                    block(*currentBlockId_).instructions.push_back(
-                        std::move(storeCell));
+                    {chainStructs.back(), value}, expression.span);
+                {
+                    auto& store = block(*currentBlockId_).instructions.back();
+                    store.typeId = writeback.targetOwnerType.id;
+                    store.resultTypeId = writeback.targetOwnerType.id;
+                    store.fieldIndex = writeback.targetField.index;
+                    store.symbolName = semantic::canonicalTypeName(
+                        writeback.targetOwnerType);
+                }
+                for (std::size_t rev = refArg.intermediateHops.size(); rev > 0; --rev) {
+                    const std::size_t m = rev - 1u;
+                    const auto& hop = refArg.intermediateHops[m];
+                    updated = emitValue(
+                        Opcode::StoreStructField,
+                        semantic::PrimitiveType::Struct,
+                        {chainStructs[m], updated}, expression.span);
+                    auto& hs = block(*currentBlockId_).instructions.back();
+                    hs.typeId = hop.ownerType.id;
+                    hs.resultTypeId = hop.ownerType.id;
+                    hs.fieldIndex = hop.field.index;
+                    hs.symbolName = semantic::canonicalTypeName(hop.ownerType);
+                }
+
+                if (refArg.structRootKind == semantic::StructAssignmentRootKind::StaticField) {
+                    const auto setName = "$intrinsic::static_set::" +
+                        std::to_string(refArg.structRootField.id);
+                    Instruction setCall;
+                    setCall.resultType = semantic::PrimitiveType::Void;
+                    setCall.opcode = Opcode::Call;
+                    setCall.operands = {updated};
+                    setCall.parameterTypes = {semantic::PrimitiveType::Struct};
+                    setCall.parameterTypeIds = {rootStructTypeId};
+                    setCall.symbolId = semantic::stableTypeId(setName);
+                    setCall.symbolName = setName;
+                    setCall.sourceSpan = expression.span;
+                    block(*currentBlockId_).instructions.push_back(std::move(setCall));
+                } else if (refArg.structRootKind == semantic::StructAssignmentRootKind::ObjectField) {
+                    Instruction storeObj;
+                    storeObj.resultType = semantic::PrimitiveType::Void;
+                    storeObj.opcode = Opcode::StoreField;
+                    storeObj.operands = {writeback.targetReceiver, updated};
+                    storeObj.typeId = refArg.structRootOwnerType.id;
+                    storeObj.fieldIndex = refArg.structRootField.index;
+                    storeObj.symbolName = semantic::canonicalTypeName(refArg.structRootOwnerType);
+                    storeObj.sourceSpan = expression.span;
+                    block(*currentBlockId_).instructions.push_back(std::move(storeObj));
+                } else if (refArg.structRootKind == semantic::StructAssignmentRootKind::ArrayElement) {
+                    Instruction storeElem;
+                    storeElem.resultType = semantic::PrimitiveType::Void;
+                    storeElem.opcode = Opcode::StoreElement;
+                    storeElem.operands = {writeback.targetReceiver, writeback.targetIndex, updated};
+                    storeElem.elementType = semantic::PrimitiveType::Struct;
+                    storeElem.elementTypeId = rootStructTypeId;
+                    storeElem.sourceSpan = expression.span;
+                    block(*currentBlockId_).instructions.push_back(std::move(storeElem));
+                } else if (refArg.wrappedStructRootVariable) {
+                    Instruction wb;
+                    wb.resultType = semantic::PrimitiveType::Void;
+                    wb.opcode = Opcode::StoreField;
+                    wb.operands = {writeback.structRootWrapper, updated};
+                    wb.typeId = refArg.structRootWrapperType.id;
+                    wb.fieldIndex = refArg.structRootWrapperValueField.index;
+                    wb.symbolName = semantic::canonicalTypeName(refArg.structRootWrapperType);
+                    wb.sourceSpan = expression.span;
+                    block(*currentBlockId_).instructions.push_back(std::move(wb));
                 } else {
                     emitStoreLocal(
                         writeback.variable.index, updated, expression.span);

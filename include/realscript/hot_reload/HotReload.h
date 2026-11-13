@@ -15,6 +15,7 @@ enum class ReloadIssueKind {
     FunctionSetChanged,
     FunctionSignatureChanged,
     LanguageMetadataChanged,
+    StaleInlinedDependency,
 };
 
 struct ReloadIssue {
@@ -34,6 +35,7 @@ struct ReloadPlan {
     bool structuralMigrationRequired = false;
     std::shared_ptr<const runtime::ProgramImage> program;
     std::vector<semantic::SymbolId> changedFunctions;
+    std::vector<semantic::SymbolId> inlineInvalidatedFunctions;
     std::vector<semantic::SymbolId> addedFunctions;
     std::vector<semantic::SymbolId> removedFunctions;
     std::vector<semantic::SymbolId> addedTypes;
