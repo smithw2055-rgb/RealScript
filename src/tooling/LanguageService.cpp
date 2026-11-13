@@ -354,7 +354,10 @@ bool LanguageService::applyContentChanges(
             ++idx;
         }
         std::size_t curCol = 1;
-        while (idx < text.size() && text[idx] != '\n' && text[idx] != '\r' && curCol < col1) {
+        while (idx < text.size() &&
+               text[idx] != '\n' &&
+               !(text[idx] == '\r' && idx + 1 < text.size() && text[idx + 1] == '\n') &&
+               curCol < col1) {
             ++idx;
             ++curCol;
         }
@@ -3554,27 +3557,60 @@ std::vector<SemanticToken> LanguageService::semanticTokens(const std::string& ra
     for (const auto& tok : documentTokens(path, *doc)) {
         if (tok.kind == syntax::SyntaxKind::EndOfFileToken || tok.span.length == 0) continue;
         const auto rng = rangeFor(path, tok.span);
-        const std::size_t line0 = rng.start.line > 0 ? rng.start.line - 1 : 0;
-        const std::size_t col0 = rng.start.column > 0 ? rng.start.column - 1 : 0;
+        const auto emitSingleLineToken = [&](std::size_t line0,
+                                             std::size_t col0,
+                                             std::size_t length,
+                                             std::uint32_t tokenType,
+                                             std::uint32_t mods) {
+            if (length > 0) {
+                tokens.push_back(SemanticToken{line0, col0, length, tokenType, mods});
+            }
+        };
+        const auto emitToken = [&](std::uint32_t tokenType, std::uint32_t mods) {
+            if (rng.start.line == rng.end.line) {
+                emitSingleLineToken(
+                    rng.start.line, rng.start.column, tok.span.length, tokenType, mods);
+                return;
+            }
+            std::size_t line = rng.start.line;
+            std::size_t col = rng.start.column;
+            std::size_t segLen = 0;
+            const std::string_view text = tok.text;
+            for (std::size_t k = 0; k < text.size(); ++k) {
+                if (text[k] == '\n') {
+                    emitSingleLineToken(line, col, segLen, tokenType, mods);
+                    ++line;
+                    col = 0;
+                    segLen = 0;
+                } else if (text[k] == '\r') {
+                    if (k + 1 < text.size() && text[k + 1] == '\n') {
+                        continue;
+                    }
+                    ++segLen;
+                } else {
+                    ++segLen;
+                }
+            }
+            emitSingleLineToken(line, col, segLen, tokenType, mods);
+        };
 
         if (const auto it = occByStart.find(tok.span.start); it != occByStart.end()) {
             const std::uint32_t mods = it->second->definition ? 1u : 0u;
-            tokens.push_back(SemanticToken{
-                line0, col0, tok.span.length, mapKindToTokenType(it->second->kind), mods});
+            emitToken(mapKindToTokenType(it->second->kind), mods);
             continue;
         }
         if (syntax::isPrimitiveTypeKeyword(tok.kind)) {
-            tokens.push_back(SemanticToken{line0, col0, tok.span.length, 1u, 0u});
+            emitToken(1u, 0u);
         } else if (tok.kind == syntax::SyntaxKind::IntegerLiteralToken ||
                    tok.kind == syntax::SyntaxKind::FloatLiteralToken) {
-            tokens.push_back(SemanticToken{line0, col0, tok.span.length, 8u, 0u});
+            emitToken(8u, 0u);
         } else if (tok.kind == syntax::SyntaxKind::StringLiteralToken ||
                    tok.kind == syntax::SyntaxKind::InterpolatedStringToken) {
-            tokens.push_back(SemanticToken{line0, col0, tok.span.length, 9u, 0u});
+            emitToken(9u, 0u);
         } else if (tok.kind != syntax::SyntaxKind::IdentifierToken &&
                    !tok.text.empty() &&
                    std::isalpha(static_cast<unsigned char>(tok.text.front()))) {
-            tokens.push_back(SemanticToken{line0, col0, tok.span.length, 7u, 0u});
+            emitToken(7u, 0u);
         }
     }
     return tokens;
@@ -3621,9 +3657,7 @@ std::vector<InlayHint> LanguageService::inlayHints(const std::string& rawPath) {
                     const auto& occ = result_.symbols[occIdx];
                     if (occ.definition && occ.span.start == idTok.span.start && !occ.detail.empty()) {
                         const auto rng = rangeFor(path, idTok.span);
-                        const std::size_t line0 = rng.end.line > 0 ? rng.end.line - 1 : 0;
-                        const std::size_t col0 = rng.end.column > 0 ? rng.end.column - 1 : 0;
-                        hints.push_back(InlayHint{{line0, col0}, ": " + occ.detail, 1u});
+                        hints.push_back(InlayHint{{rng.end.line, rng.end.column}, ": " + occ.detail, 1u});
                         break;
                     }
                 }
@@ -3756,9 +3790,7 @@ std::vector<InlayHint> LanguageService::inlayHints(const std::string& rawPath) {
                      allTokens[j + 1].kind == syntax::SyntaxKind::ColonToken);
                 if (!isNamedArg && allTokens[j].text != pNames[paramIdx]) {
                     const auto rng = rangeFor(path, allTokens[j].span);
-                    const std::size_t line0 = rng.start.line > 0 ? rng.start.line - 1 : 0;
-                    const std::size_t col0 = rng.start.column > 0 ? rng.start.column - 1 : 0;
-                    hints.push_back(InlayHint{{line0, col0}, pNames[paramIdx] + ":", 2u});
+                    hints.push_back(InlayHint{{rng.start.line, rng.start.column}, pNames[paramIdx] + ":", 2u});
                 }
                 atArgStart = false;
             }

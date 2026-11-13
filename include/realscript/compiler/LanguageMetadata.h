@@ -54,6 +54,11 @@ struct LanguageFunctionInlineStamp {
     std::uint64_t bodyFingerprint = 0;
 };
 
+struct LanguageFunctionAccessibility {
+    std::uint64_t symbolId = 0;
+    std::uint8_t accessibility = 0;
+};
+
 struct LanguageModuleMetadata {
     std::vector<LanguageAttributeRecord> attributes;
     std::vector<LanguageInterfaceImplementation> interfaces;
@@ -61,11 +66,13 @@ struct LanguageModuleMetadata {
     std::vector<LanguageSequenceRecord> sequences;
     std::vector<LanguageInlinedDependency> inlinedDependencies;
     std::vector<LanguageFunctionInlineStamp> functionInlineStamps;
+    std::vector<LanguageFunctionAccessibility> nonPublicFunctions;
 
     [[nodiscard]] bool empty() const noexcept {
         return attributes.empty() && interfaces.empty() &&
             genericInstantiations.empty() && sequences.empty() &&
-            inlinedDependencies.empty() && functionInlineStamps.empty();
+            inlinedDependencies.empty() && functionInlineStamps.empty() &&
+            nonPublicFunctions.empty();
     }
 };
 

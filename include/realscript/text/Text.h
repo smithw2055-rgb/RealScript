@@ -48,4 +48,24 @@ private:
     std::vector<std::size_t> lineStarts_;
 };
 
+[[nodiscard]] std::size_t utf8ColumnToUtf16Column(
+    std::string_view lineText,
+    std::size_t utf8ByteColumn) noexcept;
+
+[[nodiscard]] std::size_t utf16ColumnToUtf8Column(
+    std::string_view lineText,
+    std::size_t utf16Column) noexcept;
+
+[[nodiscard]] std::string_view lineContentAt(
+    std::string_view documentText,
+    std::size_t zeroBasedLine) noexcept;
+
+[[nodiscard]] LinePosition utf8ToUtf16Position(
+    std::string_view documentText,
+    LinePosition utf8Position) noexcept;
+
+[[nodiscard]] LinePosition utf16ToUtf8Position(
+    std::string_view documentText,
+    LinePosition utf16Position) noexcept;
+
 } // namespace realscript::text

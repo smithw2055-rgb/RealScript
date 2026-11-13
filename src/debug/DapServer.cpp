@@ -149,7 +149,8 @@ private:
 SocketHandle createListeningTcpSocket(
     std::uint16_t port,
     const std::string& bindAddress,
-    std::uint16_t* outBoundPort) noexcept {
+    std::uint16_t* outBoundPort,
+    std::string* outBoundAddress = nullptr) noexcept {
     ensureWinsockInitialized();
     SocketHandle listenSock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listenSock == kInvalidSocket) return kInvalidSocket;
@@ -166,7 +167,9 @@ SocketHandle createListeningTcpSocket(
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    if (bindAddress.empty() || bindAddress == "0.0.0.0" || bindAddress == "*") {
+    if (bindAddress.empty()) {
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    } else if (bindAddress == "0.0.0.0" || bindAddress == "*") {
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
     } else if (::inet_pton(AF_INET, bindAddress.c_str(), &addr.sin_addr) != 1) {
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -181,7 +184,7 @@ SocketHandle createListeningTcpSocket(
         return kInvalidSocket;
     }
 
-    if (outBoundPort) {
+    if (outBoundPort || outBoundAddress) {
         sockaddr_in bound{};
 #if defined(_WIN32)
         int len = sizeof(bound);
@@ -189,9 +192,24 @@ SocketHandle createListeningTcpSocket(
         socklen_t len = sizeof(bound);
 #endif
         if (::getsockname(listenSock, reinterpret_cast<sockaddr*>(&bound), &len) == 0) {
-            *outBoundPort = ntohs(bound.sin_port);
+            if (outBoundPort) {
+                *outBoundPort = ntohs(bound.sin_port);
+            }
+            if (outBoundAddress) {
+                char ipBuf[INET_ADDRSTRLEN]{};
+                if (::inet_ntop(AF_INET, &bound.sin_addr, ipBuf, sizeof(ipBuf)) != nullptr) {
+                    *outBoundAddress = ipBuf;
+                } else {
+                    *outBoundAddress = bindAddress.empty() ? "127.0.0.1" : bindAddress;
+                }
+            }
         } else {
-            *outBoundPort = port;
+            if (outBoundPort) {
+                *outBoundPort = port;
+            }
+            if (outBoundAddress) {
+                *outBoundAddress = bindAddress.empty() ? "127.0.0.1" : bindAddress;
+            }
         }
     }
     return listenSock;
@@ -294,10 +312,20 @@ DapServer::DapServer(
       heap_(heap ? std::move(heap) : std::make_shared<runtime::ManagedHeap>()),
       session_(session ? std::move(session) : std::make_shared<DebugSession>(program_, heap_)) {}
 
-void DapServer::rebindProgram(std::shared_ptr<const runtime::ProgramImage> program) {
+std::shared_ptr<const runtime::ProgramImage> DapServer::program() const {
+    std::lock_guard<std::mutex> lock(programMutex_);
+    return program_;
+}
+
+void DapServer::setProgramImage(std::shared_ptr<const runtime::ProgramImage> program) {
+    std::lock_guard<std::mutex> lock(programMutex_);
     program_ = std::move(program);
+}
+
+void DapServer::rebindProgram(std::shared_ptr<const runtime::ProgramImage> program) {
+    setProgramImage(program);
     if (session_) {
-        session_->rebindProgram(program_);
+        session_->rebindProgram(std::move(program));
     }
 }
 
@@ -315,10 +343,11 @@ void DapServer::bindFrameTelemetry(
 
 tooling::Json DapServer::serializeFrameTelemetrySample(
     const runtime::FrameTelemetrySample& sample) const {
+    const auto prog = program();
     tooling::Json::Array hotArr;
     for (std::uint8_t i = 0; i < sample.hotFunctionCount; ++i) {
         const auto& hf = sample.topFunctions[i];
-        const auto* fnLoc = program_ ? program_->resolveFunction(hf.symbolId) : nullptr;
+        const auto* fnLoc = prog ? prog->resolveFunction(hf.symbolId) : nullptr;
         hotArr.emplace_back(tooling::Json::Object{
             {"symbolId", static_cast<std::int64_t>(hf.symbolId)},
             {"name", fnLoc ? fnLoc->qualifiedName : std::string{}},
@@ -375,7 +404,7 @@ tooling::Json DapServer::buildFrameTelemetryReport(std::size_t maxFrames) const 
         {"returnedFrames", static_cast<std::int64_t>(count)},
         {"latestFrame", std::move(latestJson)},
         {"frames", tooling::Json(std::move(framesJson))},
-        {"summaryText", collector->formatSummary(program_.get(), clampedMax)},
+        {"summaryText", collector->formatSummary(program().get(), clampedMax)},
     };
 }
 
@@ -416,13 +445,14 @@ tooling::Json DapServer::response(
 std::string DapServer::describeValueType(
     const runtime::Value& value,
     semantic::PrimitiveType fallback) const {
+    const auto prog = program();
     if (const auto* objRef = std::get_if<runtime::ObjectRef>(&value)) {
         if (heap_ && objRef->valid() && heap_->isAlive(*objRef)) {
             if (objRef->kind == runtime::ObjectKind::Array) {
                 const auto elemType = heap_->arrayElementType(*objRef).value_or(semantic::PrimitiveType::Error);
                 const auto elemTypeId = heap_->arrayElementTypeId(*objRef).value_or(0);
-                if (program_ && elemTypeId != 0) {
-                    if (const auto* elemDesc = program_->resolveType(elemTypeId)) {
+                if (prog && elemTypeId != 0) {
+                    if (const auto* elemDesc = prog->resolveType(elemTypeId)) {
                         return elemDesc->name + "[]";
                     }
                 }
@@ -432,8 +462,8 @@ std::string DapServer::describeValueType(
                 return "array";
             }
             const auto typeId = heap_->objectTypeId(*objRef).value_or(0);
-            if (program_ && typeId != 0) {
-                if (const auto* typeDesc = program_->resolveType(typeId)) {
+            if (prog && typeId != 0) {
+                if (const auto* typeDesc = prog->resolveType(typeId)) {
                     return typeDesc->name.empty()
                         ? semantic::canonicalTypeName(*typeDesc)
                         : typeDesc->name;
@@ -441,8 +471,8 @@ std::string DapServer::describeValueType(
             }
         }
     } else if (const auto* stVal = std::get_if<runtime::StructValue>(&value)) {
-        if (program_ && stVal->typeId != 0) {
-            if (const auto* typeDesc = program_->resolveType(stVal->typeId)) {
+        if (prog && stVal->typeId != 0) {
+            if (const auto* typeDesc = prog->resolveType(stVal->typeId)) {
                 return typeDesc->name.empty()
                     ? semantic::canonicalTypeName(*typeDesc)
                     : typeDesc->name;
@@ -506,8 +536,9 @@ std::int64_t DapServer::registerExpandableValue(
             childOwnerObjects_[refId] = *objRef;
             return bindRefFrame(refId);
         }
+        const auto prog = program();
         const auto typeId = heap_->objectTypeId(*objRef).value_or(0);
-        const auto* typeDesc = (program_ && typeId != 0) ? program_->resolveType(typeId) : nullptr;
+        const auto* typeDesc = (prog && typeId != 0) ? prog->resolveType(typeId) : nullptr;
         const auto fCount = heap_->fieldCount(*objRef).value_or(0);
         std::vector<DebugVariable> children;
 
@@ -696,7 +727,8 @@ std::int64_t DapServer::registerExpandableValue(
     }
     if (const auto* stVal = std::get_if<runtime::StructValue>(&value)) {
         if (!stVal->valid() || stVal->fieldCount() == 0) return 0;
-        const auto* typeDesc = (program_ && stVal->typeId != 0) ? program_->resolveType(stVal->typeId) : nullptr;
+        const auto prog = program();
+        const auto* typeDesc = (prog && stVal->typeId != 0) ? prog->resolveType(stVal->typeId) : nullptr;
         std::vector<DebugVariable> children;
         for (std::size_t i = 0; i < stVal->fieldCount(); ++i) {
             if (typeDesc && i < typeDesc->fields.size()) {
@@ -832,17 +864,19 @@ std::string DapServer::describeHeapObject(
         }
         os << "string(\"" << preview << "\")";
     } else if (obj.kind == runtime::ObjectKind::Array) {
+        const auto prog = program();
         std::string elemName = semantic::primitiveTypeName(obj.elementType);
-        if (program_ && obj.elementTypeId != 0) {
-            if (const auto* elemTypeDesc = program_->resolveType(obj.elementTypeId)) {
+        if (prog && obj.elementTypeId != 0) {
+            if (const auto* elemTypeDesc = prog->resolveType(obj.elementTypeId)) {
                 elemName = semantic::canonicalTypeName(*elemTypeDesc);
             }
         }
         os << elemName << "[" << obj.valueCount << "]";
     } else {
+        const auto prog = program();
         std::string typeName = "Record";
-        if (program_ && obj.typeId != 0) {
-            if (const auto* typeDesc = program_->resolveType(obj.typeId)) {
+        if (prog && obj.typeId != 0) {
+            if (const auto* typeDesc = prog->resolveType(obj.typeId)) {
                 typeName = semantic::canonicalTypeName(*typeDesc);
             }
         }
@@ -855,14 +889,15 @@ std::string DapServer::describeHeapObject(
 std::string DapServer::describeEdgeLabel(
     const runtime::HeapObjectInfo& owner,
     const std::string& rawLabel) const {
+    const auto prog = program();
     if (owner.kind == runtime::ObjectKind::Record &&
-        program_ && owner.typeId != 0 &&
+        prog && owner.typeId != 0 &&
         rawLabel.rfind("field[", 0) == 0) {
         const auto closePos = rawLabel.find(']');
         if (closePos != std::string::npos) {
             const auto fieldIdx = static_cast<std::size_t>(
                 std::strtoull(rawLabel.substr(6, closePos - 6).c_str(), nullptr, 10));
-            if (const auto* typeDesc = program_->resolveType(owner.typeId)) {
+            if (const auto* typeDesc = prog->resolveType(owner.typeId)) {
                 if (fieldIdx < typeDesc->fields.size()) {
                     const std::string suffix = rawLabel.substr(closePos + 1);
                     return "." + typeDesc->fields[fieldIdx].name + suffix;
@@ -878,8 +913,9 @@ std::string DapServer::describeEdgeLabel(
 
 std::string DapServer::describeRootInfo(
     const runtime::HeapRootInfo& root) const {
-    if (root.kind == "static" && program_) {
-        for (const auto& mod : program_->modules()) {
+    const auto prog = program();
+    if (root.kind == "static" && prog) {
+        for (const auto& mod : prog->modules()) {
             for (const auto& type : mod.types) {
                 for (const auto& fld : type.fields) {
                     if (fld.staticField && fld.id == root.token) {
@@ -1219,16 +1255,18 @@ tooling::Json DapServer::buildHeapSnapshotReport(bool diffBaseline) {
         if (obj.kind == runtime::ObjectKind::String) {
             bucketName = "string";
         } else if (obj.kind == runtime::ObjectKind::Array) {
+            const auto prog = program();
             bucketName = std::string(semantic::primitiveTypeName(obj.elementType)) + "[]";
-            if (program_ && obj.elementTypeId != 0) {
-                if (const auto* elemType = program_->resolveType(obj.elementTypeId)) {
+            if (prog && obj.elementTypeId != 0) {
+                if (const auto* elemType = prog->resolveType(obj.elementTypeId)) {
                     bucketName = semantic::canonicalTypeName(*elemType) + "[]";
                 }
             }
         } else {
+            const auto prog = program();
             bucketName = "Record";
-            if (program_ && obj.typeId != 0) {
-                if (const auto* typeDesc = program_->resolveType(obj.typeId)) {
+            if (prog && obj.typeId != 0) {
+                if (const auto* typeDesc = prog->resolveType(obj.typeId)) {
                     bucketName = semantic::canonicalTypeName(*typeDesc);
                 }
             }
@@ -1567,8 +1605,9 @@ tooling::Json DapServer::handle(
             const runtime::FrameTelemetryCollector* collector =
                 frameTelemetry_ ? frameTelemetry_ : runtime::activeFrameTelemetry();
             if (asJson) {
+                const auto prog = program();
                 const std::string jsonStr = collector
-                    ? collector->toJson(program_.get(), maxFrames)
+                    ? collector->toJson(prog.get(), maxFrames)
                     : buildFrameTelemetryReport(maxFrames).dump();
                 return response(request, true, tooling::Json::Object{
                     {"result", jsonStr},
@@ -2083,9 +2122,10 @@ tooling::Json DapServer::handle(
                 outIdx = acc;
                 return true;
             };
+            const auto activeProg = program();
             if (ownerRef.kind != runtime::ObjectKind::Array) {
                 const auto preTypeId = heap_->objectTypeId(ownerRef).value_or(0);
-                const auto* preTypeDesc = (program_ && preTypeId != 0) ? program_->resolveType(preTypeId) : nullptr;
+                const auto* preTypeDesc = (activeProg && preTypeId != 0) ? activeProg->resolveType(preTypeId) : nullptr;
                 if (preTypeDesc && preTypeDesc->name.rfind("HashSet__", 0) == 0) {
                     return response(request, false, nullptr,
                         "cannot modify HashSet elements in-place without rehashing; use Remove and Add instead");
@@ -2108,7 +2148,7 @@ tooling::Json DapServer::handle(
                 }
             } else {
                 const auto typeId = heap_->objectTypeId(ownerRef).value_or(0);
-                const auto* typeDesc = (program_ && typeId != 0) ? program_->resolveType(typeId) : nullptr;
+                const auto* typeDesc = (activeProg && typeId != 0) ? activeProg->resolveType(typeId) : nullptr;
                 const auto fCount = heap_->fieldCount(ownerRef).value_or(0);
                 auto getOwnerField = [&](std::string_view fname, std::size_t fallbackIdx) -> std::optional<runtime::Value> {
                     if (typeDesc) {
@@ -2447,6 +2487,11 @@ EmbeddedDapServer::~EmbeddedDapServer() {
     stop();
 }
 
+std::string EmbeddedDapServer::boundAddress() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return boundAddress_;
+}
+
 bool EmbeddedDapServer::start(
     std::uint16_t port,
     const std::string& bindAddress) {
@@ -2454,11 +2499,13 @@ bool EmbeddedDapServer::start(
     if (running_.load(std::memory_order_acquire)) return true;
 
     std::uint16_t actualPort = 0;
-    SocketHandle listenSock = createListeningTcpSocket(port, bindAddress, &actualPort);
+    std::string actualAddress;
+    SocketHandle listenSock = createListeningTcpSocket(port, bindAddress, &actualPort, &actualAddress);
     if (listenSock == kInvalidSocket) return false;
 
     listenSocket_ = static_cast<std::intptr_t>(listenSock);
     boundPort_.store(actualPort, std::memory_order_release);
+    boundAddress_ = std::move(actualAddress);
     stopRequested_.store(false, std::memory_order_release);
     running_.store(true, std::memory_order_release);
 
@@ -2487,23 +2534,23 @@ bool EmbeddedDapServer::start(
 #else
             (void)::setsockopt(clientSock, IPPROTO_TCP, TCP_NODELAY, &noDelay, sizeof(noDelay));
 #endif
+            DapServer server(session_, nullptr, heap_);
             {
                 std::lock_guard<std::mutex> clientLock(mutex_);
                 activeClientSocket_ = static_cast<std::intptr_t>(clientSock);
+                activeServer_ = &server;
+                server.setProgramImage(program_);
             }
 
-            std::shared_ptr<const runtime::ProgramImage> currentProg;
-            {
-                std::lock_guard<std::mutex> progLock(mutex_);
-                currentProg = program_;
-            }
-            DapServer server(session_, currentProg, heap_);
             SocketStreamBuf streamBuf(clientSock);
             std::iostream socketStream(&streamBuf);
             (void)server.run(socketStream, socketStream);
 
             {
                 std::lock_guard<std::mutex> clientLock(mutex_);
+                if (activeServer_ == &server) {
+                    activeServer_ = nullptr;
+                }
                 if (activeClientSocket_ == static_cast<std::intptr_t>(clientSock)) {
                     closeSocketHandle(clientSock);
                     activeClientSocket_ = -1;
@@ -2527,6 +2574,7 @@ void EmbeddedDapServer::stop() noexcept {
             closeSocketHandle(static_cast<SocketHandle>(activeClientSocket_));
             activeClientSocket_ = -1;
         }
+        boundAddress_.clear();
     }
     if (session_) {
         if (session_->isAttached()) {
@@ -2543,12 +2591,15 @@ void EmbeddedDapServer::stop() noexcept {
 }
 
 void EmbeddedDapServer::rebindProgram(std::shared_ptr<const runtime::ProgramImage> program) {
+    if (session_) {
+        session_->rebindProgram(program);
+    }
     {
         std::lock_guard<std::mutex> lock(mutex_);
         program_ = program;
-    }
-    if (session_) {
-        session_->rebindProgram(std::move(program));
+        if (activeServer_) {
+            activeServer_->setProgramImage(std::move(program));
+        }
     }
 }
 

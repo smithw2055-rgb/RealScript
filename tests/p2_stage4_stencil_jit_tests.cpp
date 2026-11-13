@@ -209,8 +209,14 @@ public bool DoubleNanCheck(double a, double b) {
     require(
         compiled.nativeFunctionCount == compiled.totalFunctionCount && compiled.fallbackFunctionCount == 0,
         "All P2.ScalarSuite functions must compile to NativeMachineCode");
-    require(compiled.compileTimeMicroseconds < 1000.0,
-        "Single-module StencilJit compile must be < 1000 us, got " +
+#if defined(NDEBUG)
+    constexpr double kMaxSingleModuleStencilCompileUs = 1000.0;
+#else
+    constexpr double kMaxSingleModuleStencilCompileUs = 25000.0;
+#endif
+    require(compiled.compileTimeMicroseconds < kMaxSingleModuleStencilCompileUs,
+        "Single-module StencilJit compile must be < " +
+            std::to_string(kMaxSingleModuleStencilCompileUs) + " us, got " +
             std::to_string(compiled.compileTimeMicroseconds) + " us");
 
     // Dump ControlAndInlineLeaf machine code for optional disassembly verification
@@ -690,14 +696,22 @@ public double PackedDoubleDot(int reps) {
     std::cout << "  - StencilJit::compile median: " << std::fixed << std::setprecision(2)
               << medianStencilUs << " us (" << nativeCompiled.nativeFunctionCount
               << " native fns, " << nativeCompiled.machineCodeBytes << " bytes)";
+#if defined(NDEBUG)
+    constexpr double kMinToolchainOverStencilRatio = 1000.0;
+    constexpr double kMaxBenchStencilCompileUs = 1000.0;
+#else
+    constexpr double kMinToolchainOverStencilRatio = 50.0;
+    constexpr double kMaxBenchStencilCompileUs = 25000.0;
+#endif
     if (toolchainColdUs > 0.0) {
         std::cout << " vs ToolchainJit cold: " << toolchainColdUs << " us ("
                   << std::setprecision(1) << (toolchainColdUs / medianStencilUs) << "x faster!)";
-        require(toolchainColdUs / medianStencilUs > 1000.0,
-            "StencilJit compile should be > 1000x faster than external ToolchainJit");
+        require(toolchainColdUs / medianStencilUs > kMinToolchainOverStencilRatio,
+            "StencilJit compile should be faster than external ToolchainJit");
     }
     std::cout << "\n";
-    require(medianStencilUs < 1000.0, "StencilJit compile latency must be < 1000 us (< 1 ms)");
+    require(medianStencilUs < kMaxBenchStencilCompileUs,
+        "StencilJit compile latency exceeded budget");
 
     benchKernel("IntegerLoop(10k)", "Bench.StencilSuite::IntegerLoop10k", {}, 9, 20);
     benchKernel("ScalarAlu(100k)", "Bench.StencilSuite::ScalarAlu100k", {std::int64_t{100000}}, 9, 5);

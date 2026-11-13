@@ -143,10 +143,21 @@ public:
         const std::vector<SourceFile>& sources,
         ModuleBuildCacheOptions options = {}) const;
 
+    using AotGeneratorCallback = aot::GeneratedProgram (*)(
+        const std::vector<mir::Module>& modules,
+        diagnostics::DiagnosticBag& diagnostics,
+        const aot::GenerationOptions& options);
+
     [[nodiscard]] CachedAotBuildResult buildAot(
         const std::vector<SourceFile>& sources,
         ModuleBuildCacheOptions cacheOptions,
         aot::GenerationOptions aotOptions = {}) const;
+
+    [[nodiscard]] CachedAotBuildResult buildAotWithGenerator(
+        const std::vector<SourceFile>& sources,
+        ModuleBuildCacheOptions cacheOptions,
+        aot::GenerationOptions aotOptions,
+        AotGeneratorCallback generatorCallback) const;
 
     [[nodiscard]] static std::string formatStatistics(
         const BuildCacheStatistics& statistics);

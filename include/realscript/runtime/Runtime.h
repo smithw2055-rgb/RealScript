@@ -24,7 +24,7 @@
 #include <variant>
 #include <vector>
 
-namespace realscript::debug { class DebugController; }
+namespace realscript::debug { class RuntimeDebugHook; class DebugController; }
 
 namespace realscript::runtime {
 
@@ -3032,7 +3032,7 @@ struct ExecutionOptions {
     TraceSink trace;
     std::shared_ptr<ProfileCollector> profile;
     DeterminismOptions determinism;
-    std::shared_ptr<debug::DebugController> debugger;
+    std::shared_ptr<debug::RuntimeDebugHook> debugger;
     bool enforceCapabilities = false;
     std::unordered_set<std::string> grantedCapabilities;
     bool trustedRelease = false;

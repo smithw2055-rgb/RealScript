@@ -3497,6 +3497,23 @@ void Lowerer::emitReturn(
     if (!hasCurrentBlock() || currentBlockTerminated()) {
         throw std::logic_error("cannot emit a return into a closed MIR block");
     }
+    if (currentStaticConstructorGuardId_.has_value()) {
+        const auto trueVal = emitValue(
+            Opcode::ConstantBool, semantic::PrimitiveType::Bool, {}, sourceSpan);
+        block(*currentBlockId_).instructions.back().boolImmediate = true;
+        const auto setName =
+            "$intrinsic::static_set::" + std::to_string(*currentStaticConstructorGuardId_);
+        Instruction setCall;
+        setCall.resultType = semantic::PrimitiveType::Void;
+        setCall.opcode = Opcode::Call;
+        setCall.operands = {trueVal};
+        setCall.parameterTypes = {semantic::PrimitiveType::Bool};
+        setCall.parameterTypeIds = {0};
+        setCall.symbolId = semantic::stableTypeId(setName);
+        setCall.symbolName = setName;
+        setCall.sourceSpan = sourceSpan;
+        block(*currentBlockId_).instructions.push_back(std::move(setCall));
+    }
     if (currentAsyncFunction_) {
         Instruction resolveInst;
         resolveInst.result = nextValueId_++;

@@ -779,6 +779,21 @@ LanguageModuleMetadata languageMetadataForModule(
             }
             return left.name < right.name;
         });
+    for (const auto& function : module.functions) {
+        if (function.moduleName == moduleName &&
+            function.accessibility != semantic::Accessibility::Public) {
+            metadata.nonPublicFunctions.push_back(compiler::LanguageFunctionAccessibility{
+                function.symbolId,
+                static_cast<std::uint8_t>(function.accessibility),
+            });
+        }
+    }
+    std::sort(
+        metadata.nonPublicFunctions.begin(),
+        metadata.nonPublicFunctions.end(),
+        [](const auto& left, const auto& right) {
+            return left.symbolId < right.symbolId;
+        });
     return metadata;
 }
 

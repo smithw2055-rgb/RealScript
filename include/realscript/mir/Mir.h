@@ -161,6 +161,7 @@ struct ExceptionHandler {
 
 struct Function {
     semantic::SymbolId symbolId = 0;
+    semantic::Accessibility accessibility = semantic::Accessibility::Public;
     std::string moduleName;
     std::string name;
     semantic::PrimitiveType returnType = semantic::PrimitiveType::Error;
@@ -236,6 +237,7 @@ private:
     Function* currentFunction_ = nullptr;
     bool currentAsyncFunction_ = false;
     std::string currentAsyncReturnTypeName_;
+    std::optional<semantic::SymbolId> currentStaticConstructorGuardId_;
     std::optional<BlockId> currentBlockId_;
     ValueId nextValueId_ = 0;
     std::vector<BlockId> breakTargets_;

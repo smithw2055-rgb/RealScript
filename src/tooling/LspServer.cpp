@@ -2,7 +2,12 @@
 #include "realscript/Version.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -125,12 +130,88 @@ Json LspServer::error(const Json& request, int code, std::string message) const 
     return object;
 }
 
+std::string LspServer::resolveDocumentText(const std::string& path) const {
+    if (path.empty()) return {};
+    std::string content = service_.documentContent(path);
+    if (!content.empty() || service_.contains(path)) {
+        return content;
+    }
+    const std::filesystem::path fsPath(path);
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(fsPath, ec) || ec) return {};
+    if (fsPath.extension() != ".rscript") return {};
+    constexpr std::uintmax_t kMaxDocumentReadBytes = 16u * 1024u * 1024u;
+    const auto fsize = std::filesystem::file_size(fsPath, ec);
+    if (ec || fsize > kMaxDocumentReadBytes) return {};
+    std::ifstream in(fsPath, std::ios::binary);
+    if (!in) return {};
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+text::LinePosition LspServer::fromLspPosition(
+    std::string_view documentText,
+    const Json* value) const noexcept {
+    const auto raw = readPosition(value);
+    if (positionEncoding_ == PositionEncoding::Utf8) {
+        return raw;
+    }
+    return text::utf16ToUtf8Position(documentText, raw);
+}
+
+Json LspServer::toLspPosition(
+    std::string_view documentText,
+    text::LinePosition utf8Pos) const {
+    if (positionEncoding_ == PositionEncoding::Utf8) {
+        return position(utf8Pos);
+    }
+    return position(text::utf8ToUtf16Position(documentText, utf8Pos));
+}
+
+Json LspServer::toLspRange(
+    std::string_view documentText,
+    const debug::SourceRange& utf8Range) const {
+    if (positionEncoding_ == PositionEncoding::Utf8) {
+        return range(utf8Range);
+    }
+    return Json::Object{
+        {"start", toLspPosition(documentText, utf8Range.start)},
+        {"end", toLspPosition(documentText, utf8Range.end)},
+    };
+}
+
+Json LspServer::toLspLocation(const Location& value) const {
+    if (positionEncoding_ == PositionEncoding::Utf8) {
+        return location(value);
+    }
+    const std::string docText = resolveDocumentText(value.path);
+    return Json::Object{
+        {"uri", pathToUri(value.path)},
+        {"range", toLspRange(docText, value.range)},
+    };
+}
+
 void LspServer::publishDiagnostics(const std::string& path, std::ostream& output) {
     Json::Array values;
     const auto diags = service_.diagnostics(path);
+    const std::string docText = positionEncoding_ == PositionEncoding::Utf16
+        ? resolveDocumentText(path)
+        : std::string{};
+    std::unordered_map<std::string, std::string> docCache;
     for (const auto& diagnostic : diags) {
+        std::string_view diagDocView = docText;
+        if (positionEncoding_ == PositionEncoding::Utf16 &&
+            !diagnostic.location.path.empty() &&
+            diagnostic.location.path != path) {
+            auto [it, inserted] = docCache.try_emplace(diagnostic.location.path);
+            if (inserted) {
+                it->second = resolveDocumentText(diagnostic.location.path);
+            }
+            diagDocView = it->second;
+        }
         values.emplace_back(Json::Object{
-            {"range", range(diagnostic.location.range)},
+            {"range", toLspRange(diagDocView, diagnostic.location.range)},
             {"severity", lspDiagnosticSeverity(diagnostic)},
             {"code", diagnostic.code},
             {"source", "realscript"},
@@ -191,6 +272,21 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
     const auto* params = message.find("params");
 
     if (method == "initialize") {
+        positionEncoding_ = PositionEncoding::Utf16;
+        if (const auto* encodings = nested(message, {"params", "capabilities", "general", "positionEncodings"});
+            encodings && encodings->isArray()) {
+            for (const auto& enc : encodings->arrayValue()) {
+                if (!enc.isString()) continue;
+                if (enc.stringValue() == "utf-8") {
+                    positionEncoding_ = PositionEncoding::Utf8;
+                    break;
+                }
+                if (enc.stringValue() == "utf-16") {
+                    positionEncoding_ = PositionEncoding::Utf16;
+                    break;
+                }
+            }
+        }
         for (const auto& root : extractWorkspaceRoots(params)) {
             (void)service_.addWorkspaceRoot(root);
         }
@@ -199,6 +295,7 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
         }
         return response(message, Json::Object{
             {"capabilities", Json::Object{
+                {"positionEncoding", positionEncoding_ == PositionEncoding::Utf8 ? "utf-8" : "utf-16"},
                 {"textDocumentSync", 2},
                 {"workspace", Json::Object{
                     {"workspaceFolders", Json::Object{
@@ -321,7 +418,29 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
             ? document->find("version")->integerValue() : 0;
         std::vector<ContentChange> parsedChanges;
         if (const auto* changes = params ? params->find("contentChanges") : nullptr) {
-            for (const auto& item : changes->arrayValue()) {
+            const auto& arr = changes->arrayValue();
+            std::string workingText = positionEncoding_ == PositionEncoding::Utf16
+                ? resolveDocumentText(path)
+                : std::string{};
+            const auto lineCol1ToByteOffset = [](std::string_view src, std::size_t line1, std::size_t col1) -> std::size_t {
+                std::size_t curLine = 1;
+                std::size_t idx = 0;
+                while (idx < src.size() && curLine < line1) {
+                    if (src[idx] == '\n') ++curLine;
+                    ++idx;
+                }
+                std::size_t curCol = 1;
+                while (idx < src.size() &&
+                       src[idx] != '\n' &&
+                       !(src[idx] == '\r' && idx + 1u < src.size() && src[idx + 1u] == '\n') &&
+                       curCol < col1) {
+                    ++idx;
+                    ++curCol;
+                }
+                return idx;
+            };
+            for (std::size_t ci = 0; ci < arr.size(); ++ci) {
+                const auto& item = arr[ci];
                 if (!item.isObject()) continue;
                 const auto* text = item.find("text");
                 if (!text || !text->isString()) continue;
@@ -331,15 +450,24 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
                     const auto* sObj = rangeObj->find("start");
                     const auto* eObj = rangeObj->find("end");
                     if (sObj && sObj->isObject() && eObj && eObj->isObject()) {
-                        const auto startPos = readPosition(sObj);
-                        const auto endPos = readPosition(eObj);
+                        const auto startPos = fromLspPosition(workingText, sObj);
+                        const auto endPos = fromLspPosition(workingText, eObj);
                         debug::SourceRange sr{};
                         sr.start.line = static_cast<std::uint32_t>(startPos.line + 1);
                         sr.start.column = static_cast<std::uint32_t>(startPos.column + 1);
                         sr.end.line = static_cast<std::uint32_t>(endPos.line + 1);
                         sr.end.column = static_cast<std::uint32_t>(endPos.column + 1);
                         cc.range = sr;
+                        if (positionEncoding_ == PositionEncoding::Utf16 && ci + 1u < arr.size()) {
+                            const std::size_t sOff = lineCol1ToByteOffset(workingText, sr.start.line, sr.start.column);
+                            const std::size_t eOff = std::max(
+                                sOff,
+                                lineCol1ToByteOffset(workingText, sr.end.line, sr.end.column));
+                            workingText.replace(sOff, eOff - sOff, cc.text);
+                        }
                     }
+                } else if (positionEncoding_ == PositionEncoding::Utf16 && ci + 1u < arr.size()) {
+                    workingText = cc.text;
                 }
                 parsedChanges.push_back(std::move(cc));
             }
@@ -378,7 +506,11 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
     const auto path = uriToPath(nested(message, {"params", "textDocument", "uri"})
         ? nested(message, {"params", "textDocument", "uri"})->stringValue()
         : std::string{});
-    const auto cursor = readPosition(nested(message, {"params", "position"}));
+    const std::string activeDocText =
+        (!path.empty() && positionEncoding_ == PositionEncoding::Utf16)
+        ? resolveDocumentText(path)
+        : std::string{};
+    const auto cursor = fromLspPosition(activeDocText, nested(message, {"params", "position"}));
 
     if (method == "textDocument/completion") {
         Json::Array items;
@@ -417,14 +549,20 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
     if (method == "textDocument/hover") {
         const auto value = service_.hover(path, cursor);
         if (!value) return response(message, nullptr);
+        const std::string targetText =
+            (positionEncoding_ == PositionEncoding::Utf16 &&
+             !value->location.path.empty() &&
+             value->location.path != path)
+            ? resolveDocumentText(value->location.path)
+            : activeDocText;
         return response(message, Json::Object{
             {"contents", Json::Object{{"kind", "plaintext"}, {"value", value->contents}}},
-            {"range", range(value->location.range)},
+            {"range", toLspRange(targetText, value->location.range)},
         });
     }
     if (method == "textDocument/definition") {
         const auto value = service_.definition(path, cursor);
-        return response(message, value ? location(*value) : Json(nullptr));
+        return response(message, value ? toLspLocation(*value) : Json(nullptr));
     }
     if (method == "textDocument/references") {
         bool includeDefinition = true;
@@ -433,7 +571,7 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
         }
         Json::Array values;
         for (const auto& value : service_.references(path, cursor, includeDefinition)) {
-            values.push_back(location(value));
+            values.push_back(toLspLocation(value));
         }
         return response(message, Json(std::move(values)));
     }
@@ -444,8 +582,8 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
                 {"name", symbol.name},
                 {"detail", symbol.detail},
                 {"kind", documentSymbolKind(symbol.kind)},
-                {"range", range(symbol.location.range)},
-                {"selectionRange", range(symbol.location.range)},
+                {"range", toLspRange(activeDocText, symbol.location.range)},
+                {"selectionRange", toLspRange(activeDocText, symbol.location.range)},
             });
         }
         return response(message, Json(std::move(values)));
@@ -459,7 +597,7 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
                 prep.errorMessage.empty() ? "symbol cannot be renamed" : prep.errorMessage);
         }
         return response(message, Json::Object{
-            {"range", range(prep.range)},
+            {"range", toLspRange(activeDocText, prep.range)},
             {"placeholder", prep.placeholder},
         });
     }
@@ -474,10 +612,17 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
                 prep.errorMessage.empty() ? "symbol cannot be renamed" : prep.errorMessage);
         }
         Json::Object changes;
+        std::unordered_map<std::string, std::string> docCache;
         for (const auto& edit : service_.rename(path, cursor, requestedName)) {
+            std::string_view editDocView = activeDocText;
+            if (positionEncoding_ == PositionEncoding::Utf16 && edit.location.path != path) {
+                auto [it, inserted] = docCache.try_emplace(edit.location.path);
+                if (inserted) it->second = resolveDocumentText(edit.location.path);
+                editDocView = it->second;
+            }
             auto& array = changes[pathToUri(edit.location.path)].arrayValue();
             array.emplace_back(Json::Object{
-                {"range", range(edit.location.range)},
+                {"range", toLspRange(editDocView, edit.location.range)},
                 {"newText", edit.replacement},
             });
         }
@@ -487,19 +632,26 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
         debug::SourceRange reqRange{};
         if (const auto* rangeObj = params ? params->find("range") : nullptr;
             rangeObj && rangeObj->isObject()) {
-            reqRange.start = readPosition(rangeObj->find("start"));
-            reqRange.end = readPosition(rangeObj->find("end"));
+            reqRange.start = fromLspPosition(activeDocText, rangeObj->find("start"));
+            reqRange.end = fromLspPosition(activeDocText, rangeObj->find("end"));
         } else {
             reqRange.start = cursor;
             reqRange.end = cursor;
         }
         Json::Array actionsJson;
+        std::unordered_map<std::string, std::string> docCache;
         for (const auto& act : service_.codeActions(path, reqRange)) {
             Json::Object changes;
             for (const auto& edit : act.edits) {
+                std::string_view editDocView = activeDocText;
+                if (positionEncoding_ == PositionEncoding::Utf16 && edit.location.path != path) {
+                    auto [it, inserted] = docCache.try_emplace(edit.location.path);
+                    if (inserted) it->second = resolveDocumentText(edit.location.path);
+                    editDocView = it->second;
+                }
                 auto& arr = changes[pathToUri(edit.location.path)].arrayValue();
                 arr.emplace_back(Json::Object{
-                    {"range", range(edit.location.range)},
+                    {"range", toLspRange(editDocView, edit.location.range)},
                     {"newText", edit.replacement},
                 });
             }
@@ -530,8 +682,37 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
     }
     if (method == "textDocument/semanticTokens/full") {
         Json::Array data;
-        for (const auto val : service_.semanticTokensEncoded(path)) {
-            data.emplace_back(static_cast<std::int64_t>(val));
+        if (positionEncoding_ == PositionEncoding::Utf8) {
+            for (const auto val : service_.semanticTokensEncoded(path)) {
+                data.emplace_back(static_cast<std::int64_t>(val));
+            }
+        } else {
+            const auto raw = service_.semanticTokens(path);
+            std::size_t prevLine = 0;
+            std::size_t prevChar = 0;
+            std::size_t cachedLineIdx = static_cast<std::size_t>(-1);
+            std::string_view cachedLineView{};
+            for (const auto& t : raw) {
+                if (t.line != cachedLineIdx) {
+                    cachedLineIdx = t.line;
+                    cachedLineView = text::lineContentAt(activeDocText, t.line);
+                }
+                const std::size_t lineLen = cachedLineView.size();
+                const std::size_t clampedStart = std::min(t.startChar, lineLen);
+                const std::size_t clampedEnd = std::min(t.startChar + t.length, lineLen);
+                const std::size_t startU16 = text::utf8ColumnToUtf16Column(cachedLineView, clampedStart);
+                const std::size_t endU16 = text::utf8ColumnToUtf16Column(cachedLineView, clampedEnd);
+                const std::size_t lenU16 = endU16 >= startU16 ? (endU16 - startU16) : 0u;
+                const std::size_t deltaLine = t.line - prevLine;
+                const std::size_t deltaStart = (deltaLine == 0) ? (startU16 - prevChar) : startU16;
+                data.emplace_back(static_cast<std::int64_t>(deltaLine));
+                data.emplace_back(static_cast<std::int64_t>(deltaStart));
+                data.emplace_back(static_cast<std::int64_t>(lenU16));
+                data.emplace_back(static_cast<std::int64_t>(t.tokenType));
+                data.emplace_back(static_cast<std::int64_t>(t.tokenModifiers));
+                prevLine = t.line;
+                prevChar = startU16;
+            }
         }
         return response(message, Json::Object{{"data", Json(std::move(data))}});
     }
@@ -539,7 +720,7 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
         Json::Array items;
         for (const auto& hint : service_.inlayHints(path)) {
             items.emplace_back(Json::Object{
-                {"position", position(hint.position)},
+                {"position", toLspPosition(activeDocText, hint.position)},
                 {"label", hint.label},
                 {"kind", static_cast<std::int64_t>(hint.kind)},
             });
@@ -559,7 +740,7 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
         Json::Array edits;
         for (const auto& edit : service_.formatDocument(path, fmtOpts)) {
             edits.emplace_back(Json::Object{
-                {"range", range(edit.location.range)},
+                {"range", toLspRange(activeDocText, edit.location.range)},
                 {"newText", edit.replacement},
             });
         }
@@ -574,7 +755,7 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
             values.emplace_back(Json::Object{
                 {"name", symbol.name},
                 {"kind", documentSymbolKind(symbol.kind)},
-                {"location", location(symbol.location)},
+                {"location", toLspLocation(symbol.location)},
             });
         }
         return response(message, Json(std::move(values)));

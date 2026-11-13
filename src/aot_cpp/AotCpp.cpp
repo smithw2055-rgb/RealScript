@@ -1,4 +1,5 @@
 #include "AotCppInternal.h"
+#include "realscript/compiler/ModuleBuildCache.h"
 
 #include <algorithm>
 #include <cctype>
@@ -303,15 +304,35 @@ GeneratedProgram CppGenerator::generate(
     header.line("    RsModuleExportsV1* out_exports);");
     generated.header = header.str();
 
+    bool usesAsyncRuntimeInlines = false;
+    for (const auto& module : modules) {
+        for (const auto& function : module.functions) {
+            for (const auto& block : function.blocks) {
+                for (const auto& instruction : block.instructions) {
+                    if (instruction.opcode == mir::Opcode::AsyncEnter ||
+                        instruction.opcode == mir::Opcode::AwaitSuspend ||
+                        instruction.opcode == mir::Opcode::AwaitResume ||
+                        instruction.opcode == mir::Opcode::AsyncResolve ||
+                        (instruction.opcode == mir::Opcode::Call &&
+                         instruction.symbolName.find("Async.__") != std::string::npos)) {
+                        usesAsyncRuntimeInlines = true;
+                        break;
+                    }
+                }
+                if (usesAsyncRuntimeInlines) break;
+            }
+            if (usesAsyncRuntimeInlines) break;
+        }
+        if (usesAsyncRuntimeInlines) break;
+    }
+
     Emitter source;
+    if (!usesAsyncRuntimeInlines) {
+        source.line("#define REALSCRIPT_AOT_NO_ASYNC_INLINES 1");
+    }
     source.line("#include \"realscript_aot_generated.h\"");
     source.line();
-    source.line("#include <array>");
-    source.line("#include <cstddef>");
-    source.line("#include <cstdint>");
     source.line("#include <limits>");
-    source.line("#include <utility>");
-    source.line("#include <vector>");
     if (options.trustedRelease) {
         source.line();
         source.line("#if defined(__GNUC__) && !defined(__clang__)");
@@ -2539,3 +2560,22 @@ GeneratedProgram CppGenerator::generate(
 }
 
 } // namespace realscript::aot
+
+namespace realscript::compiler {
+
+CachedAotBuildResult ModuleBuildCache::buildAot(
+    const std::vector<SourceFile>& sources,
+    ModuleBuildCacheOptions cacheOptions,
+    aot::GenerationOptions aotOptions) const {
+    return buildAotWithGenerator(
+        sources,
+        std::move(cacheOptions),
+        std::move(aotOptions),
+        +[](const std::vector<mir::Module>& modules,
+            diagnostics::DiagnosticBag& diagnostics,
+            const aot::GenerationOptions& options) {
+            return aot::CppGenerator{}.generate(modules, diagnostics, options);
+        });
+}
+
+} // namespace realscript::compiler

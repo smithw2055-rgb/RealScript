@@ -1,4 +1,5 @@
 #include "realscript/bytecode/Bytecode.h"
+#include "realscript/mir/Mir.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -175,7 +176,21 @@ Module Lowerer::lower(const mir::Module& source) const {
     for (const auto& sourceFunction : source.functions) {
         Function function;
         function.symbolId = sourceFunction.symbolId;
+        function.accessibility = sourceFunction.accessibility;
         function.name = sourceFunction.name;
+        if (function.accessibility != semantic::Accessibility::Public) {
+            const auto it = std::find_if(
+                result.languageMetadata.nonPublicFunctions.begin(),
+                result.languageMetadata.nonPublicFunctions.end(),
+                [&](const auto& entry) { return entry.symbolId == function.symbolId; });
+            if (it == result.languageMetadata.nonPublicFunctions.end()) {
+                result.languageMetadata.nonPublicFunctions.push_back(
+                    compiler::LanguageFunctionAccessibility{
+                        function.symbolId,
+                        static_cast<std::uint8_t>(function.accessibility),
+                    });
+            }
+        }
         function.returnType = sourceFunction.returnType;
         function.returnTypeId = sourceFunction.returnTypeId;
         function.parameterTypes = sourceFunction.parameterTypes;

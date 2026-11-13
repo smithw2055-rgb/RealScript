@@ -2688,9 +2688,14 @@ void DebugSession::detach() {
 
 void DebugSession::rebindProgram(std::shared_ptr<const runtime::ProgramImage> program) {
     std::lock_guard<std::mutex> lock(sessionMutex_);
+    auto previousProgram = std::move(program_);
     program_ = std::move(program);
-    if (program_ && controller_) {
-        controller_->bindProgram(*program_);
+    if (controller_) {
+        if (program_) {
+            controller_->bindProgram(*program_);
+        } else {
+            controller_->bindModules({});
+        }
     }
 }
 

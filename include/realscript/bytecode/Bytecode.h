@@ -3,7 +3,6 @@
 #include "realscript/compiler/LanguageMetadata.h"
 #include "realscript/debug/DebugInfo.h"
 #include "realscript/diagnostics/Diagnostic.h"
-#include "realscript/mir/Mir.h"
 #include "realscript/semantic/Semantic.h"
 
 #include <cstdint>
@@ -14,6 +13,8 @@
 #include <string_view>
 #include <type_traits>
 #include <vector>
+
+namespace realscript::mir { struct Module; }
 
 namespace realscript::bytecode {
 
@@ -395,6 +396,7 @@ struct ExceptionHandler {
 
 struct Function {
     semantic::SymbolId symbolId = 0;
+    semantic::Accessibility accessibility = semantic::Accessibility::Public;
     std::string name;
     semantic::PrimitiveType returnType = semantic::PrimitiveType::Error;
     semantic::SymbolId returnTypeId = 0;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "realscript/debug/DebugInfo.h"
+#include "realscript/runtime/DebugHook.h"
 #include "realscript/runtime/Runtime.h"
 
 #include <atomic>
@@ -76,37 +77,13 @@ struct DebugStop {
     bool exceptionUncaught = true;
 };
 
-struct DebugValueWindow {
-    std::vector<runtime::Value>* values = nullptr;
-    std::size_t offset = 0;
-    std::size_t count = 0;
-
-    [[nodiscard]] std::size_t size() const noexcept { return count; }
-    [[nodiscard]] runtime::Value& operator[](std::size_t index) {
-        return (*values)[offset + index];
-    }
-    [[nodiscard]] const runtime::Value& operator[](std::size_t index) const {
-        return (*values)[offset + index];
-    }
-};
-
-struct DebugFrameView {
-    const bytecode::Module* module = nullptr;
-    const bytecode::Function* function = nullptr;
-    const SequencePoint* point = nullptr;
-    DebugValueWindow arguments;
-    DebugValueWindow locals;
-    DebugValueWindow registers;
-    bytecode::BlockId activeBlockId = 0;
-};
-
 using StopHandler = std::function<ResumeMode(const DebugStop&)>;
 
-class DebugController {
+class DebugController : public RuntimeDebugHook {
 public:
     DebugController() = default;
 
-    void bindProgram(const runtime::ProgramImage& program);
+    void bindProgram(const runtime::ProgramImage& program) override;
     void bindModules(const std::vector<bytecode::Module>& modules);
     [[nodiscard]] std::vector<Breakpoint> setBreakpoints(
         std::string sourcePath,
@@ -132,7 +109,7 @@ public:
 
     [[nodiscard]] bool onSequencePoint(
         const std::vector<DebugFrameView>& frames,
-        runtime::ManagedHeap* heap);
+        runtime::ManagedHeap* heap) override;
     [[nodiscard]] bool onException(
         const std::vector<DebugFrameView>& frames,
         runtime::ManagedHeap* heap,
@@ -140,7 +117,7 @@ public:
         std::string exceptionId,
         std::string description,
         bool isUncaught,
-        bool isRuntimeError);
+        bool isRuntimeError) override;
 
     [[nodiscard]] std::optional<runtime::Value> evaluate(
         const std::string& expression,
@@ -158,9 +135,9 @@ public:
     [[nodiscard]] DebugStop lastStop() const;
     [[nodiscard]] bool terminated() const;
 
-    void beginExecution();
-    void endExecution() noexcept;
-    [[nodiscard]] bool hasPendingInterruption() const noexcept;
+    void beginExecution() override;
+    void endExecution() noexcept override;
+    [[nodiscard]] bool hasPendingInterruption() const noexcept override;
     void runAtSafepoint(const std::function<void()>& callback) const;
 
 private:

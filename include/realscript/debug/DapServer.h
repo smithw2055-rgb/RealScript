@@ -46,6 +46,8 @@ public:
     [[nodiscard]] std::shared_ptr<DebugController> controller() const noexcept {
         return session_ ? session_->controller() : nullptr;
     }
+    [[nodiscard]] std::shared_ptr<const runtime::ProgramImage> program() const;
+    void setProgramImage(std::shared_ptr<const runtime::ProgramImage> program);
     void rebindProgram(std::shared_ptr<const runtime::ProgramImage> program);
 
     void bindFiberScheduler(
@@ -94,6 +96,7 @@ private:
     [[nodiscard]] tooling::Json serializeFrameTelemetrySample(
         const runtime::FrameTelemetrySample& sample) const;
 
+    mutable std::mutex programMutex_;
     std::shared_ptr<const runtime::ProgramImage> program_;
     std::shared_ptr<runtime::ManagedHeap> heap_;
     std::shared_ptr<DebugSession> session_;
@@ -129,6 +132,7 @@ public:
     [[nodiscard]] std::uint16_t boundPort() const noexcept {
         return boundPort_.load(std::memory_order_acquire);
     }
+    [[nodiscard]] std::string boundAddress() const;
     [[nodiscard]] std::shared_ptr<DebugSession> session() const noexcept {
         return session_;
     }
@@ -146,8 +150,10 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> stopRequested_{false};
     std::atomic<std::uint16_t> boundPort_{0};
+    std::string boundAddress_;
     std::intptr_t listenSocket_{-1};
     std::intptr_t activeClientSocket_{-1};
+    DapServer* activeServer_{nullptr};
 };
 
 } // namespace realscript::debug

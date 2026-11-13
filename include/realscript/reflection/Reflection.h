@@ -237,10 +237,12 @@ public:
 
     [[nodiscard]] const AttributeReflection* findAttributeOnTarget(
         std::string_view targetSpec,
-        std::string_view attributeName) const noexcept;
+        std::string_view attributeName,
+        bool allowNonPublic = false) const noexcept;
     [[nodiscard]] bool hasAttributeOnTarget(
         std::string_view targetSpec,
-        std::string_view attributeName) const noexcept;
+        std::string_view attributeName,
+        bool allowNonPublic = false) const noexcept;
 
     // Type-safe dynamic instantiation
     [[nodiscard]] std::optional<runtime::ObjectRef> instantiateObject(
@@ -249,7 +251,8 @@ public:
         const std::vector<runtime::Value>& constructorArgs,
         runtime::RuntimeError& error,
         bool runConstructor = true,
-        runtime::ExecutionOptions options = {}) const;
+        runtime::ExecutionOptions options = {},
+        bool allowNonPublic = false) const;
 
     [[nodiscard]] std::optional<runtime::ObjectRef> instantiateObject(
         runtime::EngineRuntime& runtime,
@@ -257,7 +260,8 @@ public:
         const std::vector<runtime::Value>& constructorArgs,
         runtime::RuntimeError& error,
         bool runConstructor = true,
-        runtime::ExecutionOptions options = {}) const;
+        runtime::ExecutionOptions options = {},
+        bool allowNonPublic = false) const;
 
     [[nodiscard]] std::optional<runtime::ObjectRef> instantiateUninitializedObject(
         runtime::ManagedHeap& heap,
@@ -274,58 +278,70 @@ public:
         const runtime::ManagedHeap& heap,
         runtime::ObjectRef object,
         std::string_view fieldName,
-        runtime::RuntimeError& error) const;
+        runtime::RuntimeError& error,
+        bool allowNonPublic = false) const;
 
     bool setField(
         runtime::ManagedHeap& heap,
         runtime::ObjectRef object,
         std::string_view fieldName,
         runtime::Value value,
-        runtime::RuntimeError& error) const;
+        runtime::RuntimeError& error,
+        bool allowNonPublic = false) const;
 
     [[nodiscard]] std::optional<runtime::Value> getField(
         const runtime::EngineRuntime& runtime,
         runtime::ObjectRef object,
         std::string_view fieldName,
-        runtime::RuntimeError& error) const;
+        runtime::RuntimeError& error,
+        runtime::ExecutionOptions options = {},
+        bool allowNonPublic = false) const;
 
     bool setField(
         runtime::EngineRuntime& runtime,
         runtime::ObjectRef object,
         std::string_view fieldName,
         runtime::Value value,
-        runtime::RuntimeError& error) const;
+        runtime::RuntimeError& error,
+        runtime::ExecutionOptions options = {},
+        bool allowNonPublic = false) const;
 
     [[nodiscard]] std::optional<runtime::Value> getField(
         const runtime::StructValue& structure,
         std::string_view fieldName,
-        runtime::RuntimeError& error) const;
+        runtime::RuntimeError& error,
+        bool allowNonPublic = false) const;
 
     bool setField(
         runtime::StructValue& structure,
         std::string_view fieldName,
         runtime::Value value,
         runtime::RuntimeError& error,
-        runtime::ManagedHeap* heap = nullptr) const;
+        runtime::ManagedHeap* heap = nullptr,
+        bool allowNonPublic = false) const;
 
     [[nodiscard]] std::optional<runtime::Value> getStructField(
         const runtime::Value& structValue,
         std::string_view fieldName,
-        runtime::RuntimeError& error) const;
+        runtime::RuntimeError& error,
+        bool allowNonPublic = false) const;
 
     bool setStructField(
         runtime::Value& structValue,
         std::string_view fieldName,
         runtime::Value value,
         runtime::RuntimeError& error,
-        runtime::ManagedHeap* heap = nullptr) const;
+        runtime::ManagedHeap* heap = nullptr,
+        bool allowNonPublic = false) const;
 
     [[nodiscard]] std::optional<runtime::Value> getStaticField(
         runtime::ManagedHeap& heap,
         std::string_view typeName,
         std::string_view fieldName,
         runtime::RuntimeError& error,
-        const runtime::EngineRuntime* runtime = nullptr) const;
+        const runtime::EngineRuntime* runtime = nullptr,
+        runtime::ExecutionOptions options = {},
+        bool allowNonPublic = false) const;
 
     bool setStaticField(
         runtime::ManagedHeap& heap,
@@ -333,7 +349,9 @@ public:
         std::string_view fieldName,
         runtime::Value value,
         runtime::RuntimeError& error,
-        const runtime::EngineRuntime* runtime = nullptr) const;
+        const runtime::EngineRuntime* runtime = nullptr,
+        runtime::ExecutionOptions options = {},
+        bool allowNonPublic = false) const;
 
     // Dynamic & polymorphic method invocation (static, instance, virtual vtable & interface slot dispatch)
     [[nodiscard]] runtime::ExecutionResult invokeMethod(
@@ -341,32 +359,49 @@ public:
         runtime::ObjectRef receiver,
         std::string_view methodName,
         const std::vector<runtime::Value>& arguments = {},
-        runtime::ExecutionOptions options = {}) const;
+        runtime::ExecutionOptions options = {},
+        bool allowNonPublic = false) const;
 
     [[nodiscard]] runtime::ExecutionResult invokeMethod(
         runtime::EngineRuntime& runtime,
         const MethodReflection& declaredMethod,
         runtime::ObjectRef receiver,
         const std::vector<runtime::Value>& arguments = {},
-        runtime::ExecutionOptions options = {}) const;
+        runtime::ExecutionOptions options = {},
+        bool allowNonPublic = false) const;
 
     [[nodiscard]] runtime::ExecutionResult invokeStaticMethod(
         runtime::EngineRuntime& runtime,
         std::string_view typeOrModuleName,
         std::string_view methodName,
         const std::vector<runtime::Value>& arguments = {},
-        runtime::ExecutionOptions options = {}) const;
+        runtime::ExecutionOptions options = {},
+        bool allowNonPublic = false) const;
 
     [[nodiscard]] runtime::ExecutionResult invokeMethod(
         runtime::EngineRuntime& runtime,
         std::string_view typeOrModuleName,
         std::string_view methodName,
         const std::vector<runtime::Value>& arguments = {},
-        runtime::ExecutionOptions options = {}) const;
+        runtime::ExecutionOptions options = {},
+        bool allowNonPublic = false) const;
 
 private:
     void buildFromProgram();
     void computeMetadataDigest() noexcept;
+
+    [[nodiscard]] const TypeReflection* resolveDeclaringTypeForField(
+        const TypeReflection& ownerType,
+        const FieldReflection& field) const noexcept;
+    [[nodiscard]] bool isStaticInitChainInitializedOnHeap(
+        const runtime::ManagedHeap& heap,
+        const TypeReflection& type) const noexcept;
+    [[nodiscard]] bool ensureStaticInitChain(
+        const TypeReflection& type,
+        runtime::ManagedHeap& heap,
+        const runtime::EngineRuntime* runtime,
+        const runtime::ExecutionOptions& options,
+        runtime::RuntimeError& error) const;
 
     [[nodiscard]] runtime::Value makeDefaultFieldValue(
         semantic::PrimitiveType type,

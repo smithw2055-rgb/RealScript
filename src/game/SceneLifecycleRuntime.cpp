@@ -625,7 +625,7 @@ struct HotReloadCoroBridge {
             runtime::AsyncRuntimeContext& ctx;
             void* prevInterp;
             ActiveResumeCall* prevCall;
-            debug::DebugController* dbg;
+            debug::RuntimeDebugHook* dbg;
             const runtime::ProgramImage* restoreProg;
             ~ScopeRestore() noexcept {
                 ctx.setActiveInterpreterState(prevInterp);

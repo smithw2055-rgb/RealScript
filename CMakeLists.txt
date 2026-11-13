@@ -59,10 +59,11 @@ function(realscript_add_layer_library target)
     realscript_enable_cxx_warnings(${target})
 endfunction()
 
-# Layer 1: Foundation (text & diagnostics)
+# Layer 1: Foundation (text, diagnostics & protocol JSON primitives)
 realscript_add_layer_library(realscript_layer_foundation
     src/text/Text.cpp
     src/diagnostics/Diagnostic.cpp
+    src/tooling/Json.cpp
 )
 
 # Layer 2: Compiler Core (syntax, semantic, mir, optimization, bytecode, compiler)
@@ -95,6 +96,7 @@ realscript_add_layer_library(realscript_layer_compiler_core
     src/compiler/TypeHierarchyAndContracts.cpp
     src/compiler/SequenceAndEventSynthesis.cpp
     src/compiler/MetadataAndValidation.cpp
+    src/debug/DebugInfo.cpp
     src/compiler/Compilation.cpp
     src/compiler/ModuleBuildCache.cpp
 )
@@ -107,6 +109,8 @@ realscript_add_layer_library(realscript_layer_runtime_core
     src/runtime/ProgramImage.cpp
     src/runtime/RuntimeServices.cpp
     src/runtime/Interpreter.cpp
+    src/runtime/InterpreterSlowOps.cpp
+    src/runtime/InterpreterFlatLoop.cpp
     src/runtime/ExecutionServices.cpp
     src/runtime/ManagedHeap.cpp
     src/runtime/ParallelJob.cpp
@@ -122,29 +126,23 @@ realscript_add_layer_library(realscript_layer_native_backends
     src/aot_cpp/AotSimdVectorizer.cpp
     src/aot_cpp/AotTypedEmitter.cpp
     src/aot_cpp/AotCpp.cpp
-    src/jit/Jit.cpp
+    src/jit/ToolchainJit.cpp
+    src/jit/StencilJitRuntime.cpp
+    src/jit/StencilJitX64.cpp
+    src/jit/StencilJitArm64.cpp
+    src/jit/StencilJit.cpp
     src/hot_reload/HotReload.cpp
 )
 
-# Layer 5: Debug Services (debug info, debugger, DAP server)
+# Layer 5: Debug Services (debugger & DAP server)
 realscript_add_layer_library(realscript_layer_debug
-    src/debug/DebugInfo.cpp
     src/debug/Debugger.cpp
     src/debug/DapServer.cpp
 )
 
-# Layer 6: Tooling & Language Server (JSON, LanguageService, LSP server)
-realscript_add_layer_library(realscript_layer_tooling
-    src/tooling/Json.cpp
-    src/tooling/Formatter.cpp
-    src/tooling/GovernanceLinter.cpp
-    src/tooling/GovernanceFuzzer.cpp
-    src/tooling/LanguageService.cpp
-    src/tooling/LspServer.cpp
-)
-
-# Layer 7: Game SDK & Scene Productization
+# Layer 6: Game SDK & Scene Productization
 realscript_add_layer_library(realscript_layer_game
+    src/game/RsBindParser.cpp
     src/game/GameApi.cpp
     src/game/ScriptObjectRuntime.cpp
     src/game/ScriptInvokeRuntime.cpp
@@ -156,6 +154,15 @@ realscript_add_layer_library(realscript_layer_game
     src/game/GameplayMetadata.cpp
     src/game/GameplayScripting.cpp
     src/game/GameplayStateCodec.cpp
+)
+
+# Layer 7: Tooling & Language Server (Formatter, Governance, scene-aware LanguageService & LSP)
+realscript_add_layer_library(realscript_layer_tooling
+    src/tooling/Formatter.cpp
+    src/tooling/GovernanceLinter.cpp
+    src/tooling/GovernanceFuzzer.cpp
+    src/tooling/LanguageService.cpp
+    src/tooling/LspServer.cpp
 )
 
 # Layer 8: Reflection & Sandboxed Mod Host
@@ -170,8 +177,8 @@ add_library(realscript_frontend STATIC
     $<TARGET_OBJECTS:realscript_layer_runtime_core>
     $<TARGET_OBJECTS:realscript_layer_native_backends>
     $<TARGET_OBJECTS:realscript_layer_debug>
-    $<TARGET_OBJECTS:realscript_layer_tooling>
     $<TARGET_OBJECTS:realscript_layer_game>
+    $<TARGET_OBJECTS:realscript_layer_tooling>
     $<TARGET_OBJECTS:realscript_layer_extensibility>
 )
 set_target_properties(realscript_frontend PROPERTIES
@@ -625,6 +632,10 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_v2_audit_regression_tests
         PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     realscript_add_cpp_test(
+        realscript_p1_audit_boundary_regression_tests
+        realscript.p1.audit-boundary-regressions
+        tests/p1_audit_boundary_regression_tests.cpp)
+    realscript_add_cpp_test(
         realscript_sprint2_module_build_cache_tests
         realscript.sprint2.module-build-cache
         tests/sprint2_module_build_cache_tests.cpp)
@@ -948,6 +959,28 @@ if(REALSCRIPT_BUILD_TESTS)
             -DREALSCRIPT_CONFIG=$<CONFIG>
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/install_consumer_test.cmake
     )
+
+    realscript_add_cpp_test(
+        realscript_p2_audit_architecture_regression_tests
+        realscript.p2.audit_architecture_regression
+        tests/p2_audit_architecture_regression_tests.cpp)
+    target_compile_definitions(
+        realscript_p2_audit_architecture_regression_tests
+        PRIVATE
+            REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+            REALSCRIPT_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
+            REALSCRIPT_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
+            REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_frontend>"
+            REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/p2-jit-cache"
+    )
+
+    realscript_add_cpp_test(
+        realscript_p3_audit_maintainability_regression_tests
+        realscript.p3.audit_maintainability_regression
+        tests/p3_audit_maintainability_regression_tests.cpp)
+    target_compile_definitions(
+        realscript_p3_audit_maintainability_regression_tests
+        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
 if(REALSCRIPT_INSTALL_SDK)

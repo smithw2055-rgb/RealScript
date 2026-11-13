@@ -75,6 +75,7 @@ Module Lowerer::lower(const semantic::SemanticModel& model) {
 Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
     Function result;
     result.symbolId = function.symbol.id;
+    result.accessibility = function.symbol.accessibility;
     result.moduleName = function.symbol.moduleName;
     result.name = function.symbol.ownerTypeName.empty() ? function.symbol.name
         : function.symbol.ownerTypeName + "." + function.symbol.name;
@@ -130,6 +131,7 @@ Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
     currentFunction_ = &result; nextValueId_ = 0;
     currentAsyncFunction_ = function.symbol.asyncFunction;
     currentAsyncReturnTypeName_ = semantic::storageReturnTypeNameOf(function.symbol);
+    currentStaticConstructorGuardId_.reset();
     breakTargets_.clear(); continueTargets_.clear();
     breakFinalizerDepths_.clear(); continueFinalizerDepths_.clear();
     finalizers_.clear();
@@ -171,20 +173,21 @@ Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
         emitReturn(std::nullopt, function.symbol.declarationSpan);
 
         setCurrentBlock(runBlock);
-        const auto trueVal = emitValue(
+        const auto falseVal = emitValue(
             Opcode::ConstantBool, semantic::PrimitiveType::Bool, {}, function.symbol.declarationSpan);
-        block(*currentBlockId_).instructions.back().boolImmediate = true;
+        block(*currentBlockId_).instructions.back().boolImmediate = false;
         const auto setName = "$intrinsic::static_set::" + std::to_string(guardId);
         Instruction setCall;
         setCall.resultType = semantic::PrimitiveType::Void;
         setCall.opcode = Opcode::Call;
-        setCall.operands = {trueVal};
+        setCall.operands = {falseVal};
         setCall.parameterTypes = {semantic::PrimitiveType::Bool};
         setCall.parameterTypeIds = {0};
         setCall.symbolId = semantic::stableTypeId(setName);
         setCall.symbolName = setName;
         setCall.sourceSpan = function.symbol.declarationSpan;
         block(*currentBlockId_).instructions.push_back(std::move(setCall));
+        currentStaticConstructorGuardId_ = guardId;
     }
     for (std::size_t i = 0; i < function.symbol.parameters.size(); ++i) {
         const auto& parameter = function.symbol.parameters[i];
@@ -228,6 +231,7 @@ Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
         }
     }
     currentAsyncFunction_ = false; currentAsyncReturnTypeName_.clear();
+    currentStaticConstructorGuardId_.reset();
     currentFunction_ = nullptr; clearCurrentBlock(); return result;
 }
 

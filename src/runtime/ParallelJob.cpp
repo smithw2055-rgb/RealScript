@@ -255,19 +255,96 @@ struct ScopedChunkPrngBinding {
         typeId == quatfTypeId());
 }
 
-[[nodiscard]] bool isInlineSafeCustomStruct(
+constexpr std::size_t kMaxParallelFlatStructDepth = 8u;
+constexpr std::size_t kMaxParallelFlatStructLeafSlots = 256u;
+
+[[nodiscard]] bool isFlatStackSafeCustomStruct(
     const ProgramImage& program,
     semantic::SymbolId typeId,
-    std::size_t depth = 0) noexcept {
-    if (isInlineBuiltInMathStruct(typeId)) return true;
-    if (typeId == 0 || depth > 4u) return false;
+    std::size_t depth = 0u,
+    std::size_t* ioLeafSlots = nullptr) noexcept {
+    if (isInlineBuiltInMathStruct(typeId)) {
+        if (ioLeafSlots) {
+            if (++(*ioLeafSlots) > kMaxParallelFlatStructLeafSlots) return false;
+        }
+        return true;
+    }
+    if (typeId == 0 || depth > kMaxParallelFlatStructDepth) return false;
     const auto* type = program.resolveType(typeId);
-    if (!type || type->kind != semantic::TypeKind::Struct) return false;
-    std::size_t instanceFieldCount = 0;
+    if (!type ||
+        type->kind != semantic::TypeKind::Struct ||
+        isSynthesizedRefWrapperTypeName(type->name)) {
+        return false;
+    }
+
+    if (depth == 0u) {
+        const FlatStructSchema* flatSchema = findFlatStructSchemaByTypeId(typeId);
+        if (!flatSchema || flatSchema->containsManagedReferences) {
+            return false;
+        }
+    }
+
+    std::size_t rootLeafSlots = 0u;
+    std::size_t* const leafSlots = ioLeafSlots ? ioLeafSlots : &rootLeafSlots;
+
+    std::size_t nonStaticFields = 0u;
     for (const auto& field : type->fields) {
-        if (field.staticField) continue;
-        ++instanceFieldCount;
-        if (instanceFieldCount > StructValue::MaxInlineFields) {
+        if (field.staticField || field.constField) continue;
+        ++nonStaticFields;
+        switch (field.type) {
+        case semantic::PrimitiveType::Bool:
+        case semantic::PrimitiveType::Byte:
+        case semantic::PrimitiveType::SByte:
+        case semantic::PrimitiveType::Short:
+        case semantic::PrimitiveType::UShort:
+        case semantic::PrimitiveType::Int:
+        case semantic::PrimitiveType::UInt:
+        case semantic::PrimitiveType::Long:
+        case semantic::PrimitiveType::ULong:
+        case semantic::PrimitiveType::Float:
+        case semantic::PrimitiveType::Double:
+        case semantic::PrimitiveType::Char:
+        case semantic::PrimitiveType::Enum:
+            if (++(*leafSlots) > kMaxParallelFlatStructLeafSlots) {
+                return false;
+            }
+            break;
+        case semantic::PrimitiveType::Struct: {
+            const semantic::SymbolId nestedTid =
+                field.typeName.empty() ? 0 : semantic::stableTypeId(field.typeName);
+            if (!isFlatStackSafeCustomStruct(program, nestedTid, depth + 1u, leafSlots)) {
+                return false;
+            }
+            break;
+        }
+        default:
+            return false;
+        }
+    }
+    if (nonStaticFields == 0u) {
+        if (++(*leafSlots) > kMaxParallelFlatStructLeafSlots) {
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] bool isInlineReturnSafeStruct(
+    const ProgramImage& program,
+    semantic::SymbolId typeId) noexcept {
+    if (isInlineBuiltInMathStruct(typeId)) return true;
+    if (typeId == 0) return false;
+    const auto* type = program.resolveType(typeId);
+    if (!type ||
+        type->kind != semantic::TypeKind::Struct ||
+        isSynthesizedRefWrapperTypeName(type->name)) {
+        return false;
+    }
+
+    std::size_t inlineFieldCount = 0u;
+    for (const auto& field : type->fields) {
+        if (field.staticField || field.constField) continue;
+        if (++inlineFieldCount > StructValue::MaxInlineFields) {
             return false;
         }
         switch (field.type) {
@@ -283,12 +360,15 @@ struct ScopedChunkPrngBinding {
         case semantic::PrimitiveType::Float:
         case semantic::PrimitiveType::Double:
         case semantic::PrimitiveType::Char:
-        case semantic::PrimitiveType::Enum:
             break;
         case semantic::PrimitiveType::Struct: {
             const semantic::SymbolId nestedTid =
                 field.typeName.empty() ? 0 : semantic::stableTypeId(field.typeName);
-            if (!isInlineBuiltInMathStruct(nestedTid)) {
+            if (nestedTid != fixedTypeId() &&
+                nestedTid != fixed16TypeId() &&
+                nestedTid != fixed64TypeId() &&
+                nestedTid != vec2TypeId() &&
+                nestedTid != vec2fTypeId()) {
                 return false;
             }
             break;
@@ -357,7 +437,7 @@ struct ScopedChunkPrngBinding {
     case semantic::PrimitiveType::Enum:
         return true;
     case semantic::PrimitiveType::Struct:
-        return isInlineSafeCustomStruct(program, typeId);
+        return isInlineReturnSafeStruct(program, typeId);
     default:
         return false;
     }
@@ -582,12 +662,12 @@ ParallelJobVerificationReport verifyParallelJobFunction(
         case semantic::PrimitiveType::Enum:
             break;
         case semantic::PrimitiveType::Struct:
-            if (!isInlineSafeCustomStruct(program, pTid)) {
+            if (!isFlatStackSafeCustomStruct(program, pTid)) {
                 addViolation(
                     *entryLoc, 0, 0, "param",
                     ParallelVerifyViolationKind::UnsupportedParameterType,
                     "Struct parameter " + std::to_string(p) +
-                        " exceeds inline zero-heap layout limits");
+                        " contains managed references or exceeds flat-stack parallel limits");
             }
             break;
         case semantic::PrimitiveType::Object: {
@@ -656,6 +736,143 @@ ParallelJobVerificationReport verifyParallelJobFunction(
         const auto& mod = *loc->module;
         const auto& fn = *loc->function;
 
+        if (curSymId != symbolId) {
+            bool validHelperReturn = true;
+            switch (fn.returnType) {
+            case semantic::PrimitiveType::Void:
+            case semantic::PrimitiveType::Bool:
+            case semantic::PrimitiveType::Byte:
+            case semantic::PrimitiveType::SByte:
+            case semantic::PrimitiveType::Short:
+            case semantic::PrimitiveType::UShort:
+            case semantic::PrimitiveType::Int:
+            case semantic::PrimitiveType::UInt:
+            case semantic::PrimitiveType::Long:
+            case semantic::PrimitiveType::ULong:
+            case semantic::PrimitiveType::Float:
+            case semantic::PrimitiveType::Double:
+            case semantic::PrimitiveType::Char:
+            case semantic::PrimitiveType::Enum:
+                break;
+            case semantic::PrimitiveType::Struct:
+                validHelperReturn = isFlatStackSafeCustomStruct(program, fn.returnTypeId);
+                break;
+            case semantic::PrimitiveType::Object: {
+                const auto* objType =
+                    fn.returnTypeId != 0 ? program.resolveType(fn.returnTypeId) : nullptr;
+                validHelperReturn = !(objType && objType->delegateType);
+                break;
+            }
+            case semantic::PrimitiveType::Array:
+                validHelperReturn = fn.returnTypeId != 0 &&
+                    allowedPackedArrayIds.find(fn.returnTypeId) != allowedPackedArrayIds.end();
+                break;
+            default:
+                validHelperReturn = false;
+                break;
+            }
+            if (!validHelperReturn) {
+                addViolation(
+                    *loc, 0, 0, "signature",
+                    ParallelVerifyViolationKind::InvalidKernelSignature,
+                    "Parallel helper return type uses unsupported or unsafe type '" +
+                        std::string(semantic::primitiveTypeName(fn.returnType)) + "'");
+            }
+
+            for (std::size_t p = 0; p < fn.parameterTypes.size(); ++p) {
+                const auto pType = fn.parameterTypes[p];
+                const auto pTid = p < fn.parameterTypeIds.size() ? fn.parameterTypeIds[p] : 0;
+                switch (pType) {
+                case semantic::PrimitiveType::Bool:
+                case semantic::PrimitiveType::Byte:
+                case semantic::PrimitiveType::SByte:
+                case semantic::PrimitiveType::Short:
+                case semantic::PrimitiveType::UShort:
+                case semantic::PrimitiveType::Int:
+                case semantic::PrimitiveType::UInt:
+                case semantic::PrimitiveType::Long:
+                case semantic::PrimitiveType::ULong:
+                case semantic::PrimitiveType::Float:
+                case semantic::PrimitiveType::Double:
+                case semantic::PrimitiveType::Char:
+                case semantic::PrimitiveType::Enum:
+                    break;
+                case semantic::PrimitiveType::Struct:
+                    if (!isFlatStackSafeCustomStruct(program, pTid)) {
+                        addViolation(
+                            *loc, 0, 0, "param",
+                            ParallelVerifyViolationKind::UnsupportedParameterType,
+                            "Helper parameter " + std::to_string(p) +
+                                " struct contains managed references or exceeds flat-stack parallel limits");
+                    }
+                    break;
+                case semantic::PrimitiveType::Object: {
+                    const auto* objType = pTid != 0 ? program.resolveType(pTid) : nullptr;
+                    if (objType && objType->delegateType) {
+                        addViolation(
+                            *loc, 0, 0, "param",
+                            ParallelVerifyViolationKind::UnsupportedParameterType,
+                            "Delegate helper parameter " + std::to_string(p) +
+                                " is forbidden in ParallelJob");
+                    }
+                    break;
+                }
+                case semantic::PrimitiveType::Array:
+                    if (pTid == 0 || allowedPackedArrayIds.find(pTid) == allowedPackedArrayIds.end()) {
+                        addViolation(
+                            *loc, 0, 0, "param",
+                            ParallelVerifyViolationKind::NonPackedArrayParameter,
+                            "Helper array parameter " + std::to_string(p) +
+                                " is not a P0 packed primitive/enum array");
+                    }
+                    break;
+                default:
+                    addViolation(
+                        *loc, 0, 0, "param",
+                        ParallelVerifyViolationKind::UnsupportedParameterType,
+                        "Helper parameter " + std::to_string(p) + " has unsupported parallel type '" +
+                            std::string(semantic::primitiveTypeName(pType)) + "'");
+                    break;
+                }
+            }
+        }
+
+        for (std::size_t l = 0; l < fn.localTypes.size(); ++l) {
+            const auto lType = fn.localTypes[l];
+            const auto lTid = l < fn.localTypeIds.size() ? fn.localTypeIds[l] : 0;
+            if (lType == semantic::PrimitiveType::Struct) {
+                if (!isFlatStackSafeCustomStruct(program, lTid)) {
+                    addViolation(
+                        *loc, 0, 0, "local",
+                        ParallelVerifyViolationKind::NonInlineStructMutation,
+                        "Local " + std::to_string(l) +
+                            " struct contains managed references or exceeds flat-stack parallel limits");
+                }
+            } else if (lType == semantic::PrimitiveType::Object) {
+                const auto* objType = lTid != 0 ? program.resolveType(lTid) : nullptr;
+                if (objType && objType->delegateType) {
+                    addViolation(
+                        *loc, 0, 0, "local",
+                        ParallelVerifyViolationKind::DelegateAllocationOrCombine,
+                        "Delegate local " + std::to_string(l) + " is forbidden in ParallelJob");
+                }
+            } else if (lType == semantic::PrimitiveType::Array) {
+                if (lTid == 0 || allowedPackedArrayIds.find(lTid) == allowedPackedArrayIds.end()) {
+                    addViolation(
+                        *loc, 0, 0, "local",
+                        ParallelVerifyViolationKind::NonPackedArrayParameter,
+                        "Local " + std::to_string(l) + " uses non-packed array type");
+                }
+            } else if (lType == semantic::PrimitiveType::String ||
+                       lType == semantic::PrimitiveType::Handle) {
+                addViolation(
+                    *loc, 0, 0, "local",
+                    ParallelVerifyViolationKind::StringAllocationOrMutation,
+                    "Local " + std::to_string(l) + " uses forbidden parallel type '" +
+                        std::string(semantic::primitiveTypeName(lType)) + "'");
+            }
+        }
+
         if (!fn.exceptionHandlers.empty()) {
             addViolation(
                 *loc, 0, 0, "exception-handler",
@@ -717,15 +934,57 @@ ParallelJobVerificationReport verifyParallelJobFunction(
                         ParallelVerifyViolationKind::StringAllocationOrMutation,
                         "ConstantString interns on ManagedHeap and is forbidden in ParallelJob");
                     break;
+                case bytecode::Opcode::LoadField: {
+                    const auto* objType =
+                        inst.typeIndex < mod.types.size() ? &mod.types[inst.typeIndex] : nullptr;
+                    if (objType && inst.index < objType->fields.size()) {
+                        const auto& field = objType->fields[inst.index];
+                        if (field.type == semantic::PrimitiveType::Struct) {
+                            const semantic::SymbolId fieldTid =
+                                field.typeName.empty() ? 0 : semantic::stableTypeId(field.typeName);
+                            if (!isFlatStackSafeCustomStruct(program, fieldTid)) {
+                                addViolation(
+                                    *loc, block.id, uInstIdx, opName,
+                                    ParallelVerifyViolationKind::NonInlineStructMutation,
+                                    "LoadField on struct containing managed references or exceeding flat-stack limits");
+                            }
+                        }
+                    }
+                    break;
+                }
+                case bytecode::Opcode::LoadStructField: {
+                    const auto* structType =
+                        inst.typeIndex < mod.types.size() ? &mod.types[inst.typeIndex] : nullptr;
+                    if (!structType || !isFlatStackSafeCustomStruct(program, structType->id)) {
+                        addViolation(
+                            *loc, block.id, uInstIdx, opName,
+                            ParallelVerifyViolationKind::NonInlineStructMutation,
+                            "LoadStructField on struct containing managed references or exceeding flat-stack limits");
+                    } else if (inst.index < structType->fields.size()) {
+                        const auto& field = structType->fields[inst.index];
+                        if (field.type == semantic::PrimitiveType::Struct) {
+                            const semantic::SymbolId fieldTid =
+                                field.typeName.empty() ? 0 : semantic::stableTypeId(field.typeName);
+                            if (!isFlatStackSafeCustomStruct(program, fieldTid)) {
+                                addViolation(
+                                    *loc, block.id, uInstIdx, opName,
+                                    ParallelVerifyViolationKind::NonInlineStructMutation,
+                                    "LoadStructField field struct contains managed references or exceeds flat-stack limits");
+                            }
+                        }
+                    }
+                    break;
+                }
                 case bytecode::Opcode::NewStruct:
                 case bytecode::Opcode::StoreStructField: {
                     const auto* structType =
                         inst.typeIndex < mod.types.size() ? &mod.types[inst.typeIndex] : nullptr;
-                    if (!structType || !isInlineSafeCustomStruct(program, structType->id)) {
+                    if (!structType || !isFlatStackSafeCustomStruct(program, structType->id)) {
                         addViolation(
                             *loc, block.id, uInstIdx, opName,
                             ParallelVerifyViolationKind::NonInlineStructMutation,
-                            std::string(opName) + " on non-inline struct allocates heap storage");
+                            std::string(opName) +
+                                " on struct containing managed references or exceeding flat-stack limits");
                     }
                     break;
                 }
@@ -835,6 +1094,30 @@ ParallelJobVerificationReport verifyParallelJobFunction(
                             "External host call '" + ref.name +
                                 "' is not whitelisted as a pure parallel host function");
                         break;
+                    }
+                    if (!isAllowedKernelReturnType(program, ref.returnType, ref.returnTypeId)) {
+                        addViolation(
+                            *loc, block.id, uInstIdx, opName,
+                            ParallelVerifyViolationKind::ImpureExternalHostCall,
+                            "External host call '" + ref.name +
+                                "' returns non-inline-safe or non-primitive type in ParallelJob");
+                        break;
+                    }
+                    for (std::size_t p = 0; p < ref.parameterTypes.size(); ++p) {
+                        const auto pType = ref.parameterTypes[p];
+                        const auto pTid =
+                            p < ref.parameterTypeIds.size() ? ref.parameterTypeIds[p] : 0;
+                        if ((pType == semantic::PrimitiveType::Struct &&
+                             !isInlineReturnSafeStruct(program, pTid)) ||
+                            pType == semantic::PrimitiveType::String ||
+                            pType == semantic::PrimitiveType::Handle) {
+                            addViolation(
+                                *loc, block.id, uInstIdx, opName,
+                                ParallelVerifyViolationKind::ImpureExternalHostCall,
+                                "External host call '" + ref.name +
+                                    "' takes non-inline struct or managed/handle parameter in ParallelJob");
+                            break;
+                        }
                     }
                     if (options.bindings != nullptr) {
                         const auto resolved = options.bindings->resolve(ref);
@@ -1772,6 +2055,8 @@ struct ParallelJobScheduler::Impl {
         };
         std::vector<ValidatedArrayArg> arrayArgs;
         arrayArgs.reserve(userArguments.size());
+        std::vector<Value> normalizedUserArguments;
+        normalizedUserArguments.reserve(userArguments.size());
 
         for (std::size_t u = 0; u < userArguments.size(); ++u) {
             const std::size_t pIdx = prefixParamCount + u;
@@ -1780,6 +2065,7 @@ struct ParallelJobScheduler::Impl {
                 ? report.parameterTypeIds[pIdx]
                 : 0;
             const Value& argVal = userArguments[u];
+            Value normalizedArg = argVal;
 
             if (expectedPrim == semantic::PrimitiveType::Array) {
                 if (std::holds_alternative<NullArray>(argVal)) {
@@ -1836,12 +2122,38 @@ struct ParallelJobScheduler::Impl {
                         return result;
                     }
                 }
+            } else if (expectedPrim == semantic::PrimitiveType::Struct) {
+                if (valueType(argVal) != semantic::PrimitiveType::Struct) {
+                    result.error.code = ErrorCode::TypeMismatch;
+                    result.error.message = "ParallelJob struct argument " + std::to_string(u) +
+                        " type mismatch";
+                    return result;
+                }
+                const auto actualStructTid = structValueTypeId(argVal);
+                if (!actualStructTid || *actualStructTid == 0 ||
+                    (expectedTid != 0 && *actualStructTid != expectedTid)) {
+                    result.error.code = ErrorCode::TypeMismatch;
+                    result.error.message = "ParallelJob struct argument " + std::to_string(u) +
+                        " runtime struct type mismatch";
+                    return result;
+                }
+                normalizedArg = detachFrameSliceValue(argVal);
+            } else if (expectedPrim == semantic::PrimitiveType::Enum) {
+                EnumValue enumVal{};
+                if (!argVal.tryGetEnum(enumVal) ||
+                    (expectedTid != 0 && enumVal.typeId != expectedTid)) {
+                    result.error.code = ErrorCode::TypeMismatch;
+                    result.error.message = "ParallelJob enum argument " + std::to_string(u) +
+                        " runtime enum type mismatch";
+                    return result;
+                }
             } else if (valueType(argVal) != expectedPrim) {
                 result.error.code = ErrorCode::TypeMismatch;
                 result.error.message = "ParallelJob scalar argument " + std::to_string(u) +
                     " type mismatch";
                 return result;
             }
+            normalizedUserArguments.push_back(std::move(normalizedArg));
         }
 
         // Cross-parameter ObjectRef non-aliasing check:
@@ -1913,9 +2225,9 @@ struct ParallelJobScheduler::Impl {
                 Interpreter& workerInterp = *workerInterpreters[workerSlot];
 
                 std::vector<Value> callArgs;
-                callArgs.resize(prefixParamCount + userArguments.size());
-                for (std::size_t u = 0; u < userArguments.size(); ++u) {
-                    callArgs[prefixParamCount + u] = userArguments[u];
+                callArgs.resize(prefixParamCount + normalizedUserArguments.size());
+                for (std::size_t u = 0; u < normalizedUserArguments.size(); ++u) {
+                    callArgs[prefixParamCount + u] = normalizedUserArguments[u];
                 }
 
                 for (;;) {

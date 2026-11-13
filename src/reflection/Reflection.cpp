@@ -795,6 +795,7 @@ void ReflectionRegistry::buildFromProgram() {
 
             MethodReflection mf;
             mf.symbolId = fn.symbolId;
+            mf.accessibility = fn.accessibility;
             mf.moduleName = mod.name;
             mf.name = fn.name;
             mf.qualifiedName = mod.name + "::" + fn.name;
@@ -844,6 +845,8 @@ void ReflectionRegistry::computeMetadataDigest() noexcept {
         hashU64(h, t.typeId);
         hashString(h, t.canonicalName);
         hashByte(h, static_cast<std::uint8_t>(t.kind));
+        hashByte(h, static_cast<std::uint8_t>(t.accessibility));
+        hashByte(h, t.isSynthetic ? 1u : 0u);
         hashU64(h, t.baseTypeId);
         hashU64(h, static_cast<std::uint64_t>(t.implementedInterfaces.size()));
         for (const auto& iface : t.implementedInterfaces) {
@@ -862,6 +865,8 @@ void ReflectionRegistry::computeMetadataDigest() noexcept {
             hashU64(h, f.id);
             hashString(h, f.name);
             hashByte(h, static_cast<std::uint8_t>(f.type));
+            hashByte(h, static_cast<std::uint8_t>(f.accessibility));
+            hashByte(h, f.isSynthetic ? 1u : 0u);
             hashU64(h, static_cast<std::uint64_t>(f.offsetIndex));
             hashU64(h, static_cast<std::uint64_t>(f.attributes.size()));
             for (const auto& a : f.attributes) {
@@ -872,11 +877,29 @@ void ReflectionRegistry::computeMetadataDigest() noexcept {
         for (const auto& m : t.methods) {
             hashU64(h, m.symbolId);
             hashString(h, m.name);
+            hashByte(h, static_cast<std::uint8_t>(m.accessibility));
+            hashByte(h, m.isSynthetic ? 1u : 0u);
             hashU64(h, static_cast<std::uint64_t>(m.parameters.size()));
             hashU64(h, static_cast<std::uint64_t>(m.attributes.size()));
             for (const auto& a : m.attributes) {
                 hashString(h, a.name);
             }
+        }
+    }
+    hashU64(h, static_cast<std::uint64_t>(moduleFunctions_.size()));
+    for (const auto& mf : moduleFunctions_) {
+        hashU64(h, mf.symbolId);
+        hashString(h, mf.qualifiedName);
+        hashByte(h, static_cast<std::uint8_t>(mf.accessibility));
+        hashByte(h, mf.isSynthetic ? 1u : 0u);
+        hashU64(h, static_cast<std::uint64_t>(mf.parameters.size()));
+        for (const auto& p : mf.parameters) {
+            hashByte(h, static_cast<std::uint8_t>(p.type));
+            hashU64(h, p.typeId);
+        }
+        hashU64(h, static_cast<std::uint64_t>(mf.attributes.size()));
+        for (const auto& a : mf.attributes) {
+            hashString(h, a.name);
         }
     }
     metadataDigest_ = h;
@@ -1012,22 +1035,149 @@ std::vector<AnnotatedMethodMatch> ReflectionRegistry::findMethodsWithAttribute(
     return out;
 }
 
+namespace {
+
+[[nodiscard]] bool isPubliclyAccessibleType(const TypeReflection& type) noexcept {
+    return !type.isSynthetic && type.accessibility == semantic::Accessibility::Public;
+}
+
+} // namespace
+
 const AttributeReflection* ReflectionRegistry::findAttributeOnTarget(
     std::string_view targetSpec,
-    std::string_view attributeName) const noexcept {
+    std::string_view attributeName,
+    bool allowNonPublic) const noexcept {
     if (targetSpec.empty() || attributeName.empty()) return nullptr;
     const std::string key(targetSpec);
 
-    // 1. Direct compiler target key match (e.g. "Mod::Type::field:hp" or "Mod::Type::method:Foo#1")
+    const auto parseMethodSpec = [](std::string_view spec,
+                                    std::string& outName,
+                                    std::optional<std::size_t>& outArity) {
+        outArity.reset();
+        if (const auto hashPos = spec.find('#'); hashPos != std::string_view::npos) {
+            outName = std::string(spec.substr(0, hashPos));
+            const std::string arityStr(spec.substr(hashPos + 1));
+            if (!arityStr.empty()) {
+                outArity = static_cast<std::size_t>(std::strtoull(arityStr.c_str(), nullptr, 10));
+            }
+        } else {
+            outName = std::string(spec);
+        }
+    };
+
+    const auto checkFieldVisible = [&](const TypeReflection& owner,
+                                       const FieldReflection& fld) -> bool {
+        if (allowNonPublic) return true;
+        if (!isPubliclyAccessibleType(owner)) return false;
+        if (const auto* decl = resolveDeclaringTypeForField(owner, fld)) {
+            if (!isPubliclyAccessibleType(*decl)) return false;
+        }
+        return !fld.isBackingField && !fld.isSynthetic &&
+            fld.accessibility == semantic::Accessibility::Public;
+    };
+
+    const auto checkMethodVisible = [&](const TypeReflection& owner,
+                                        const MethodReflection& m) -> bool {
+        if (allowNonPublic) return true;
+        if (!isPubliclyAccessibleType(owner)) return false;
+        if (m.ownerTypeId != 0) {
+            if (const auto* decl = findType(m.ownerTypeId)) {
+                if (!isPubliclyAccessibleType(*decl)) return false;
+            }
+        }
+        return !m.isSynthetic && !m.isPropertyAccessor &&
+            m.accessibility == semantic::Accessibility::Public;
+    };
+
+    // 1. Direct compiler target key match (gated by member/type visibility unless allowNonPublic)
     if (const auto directIt = attributesByTarget_.find(key);
         directIt != attributesByTarget_.end()) {
-        for (const auto& attr : directIt->second) {
-            if (attr.name == attributeName) return &attr;
+        if (allowNonPublic) {
+            for (const auto& attr : directIt->second) {
+                if (attr.name == attributeName) return &attr;
+            }
         }
+    }
+
+    // 1b. Canonical "::field:", "::property:", "::method:", "::ctor:", "::function:" target keys
+    if (const auto pos = targetSpec.find("::field:"); pos != std::string_view::npos) {
+        const auto ownerPart = targetSpec.substr(0, pos);
+        const auto memberPart = targetSpec.substr(pos + 8);
+        if (const auto* owner = findType(ownerPart)) {
+            if (const auto* fld = owner->findField(memberPart)) {
+                if (checkFieldVisible(*owner, *fld)) {
+                    return fld->findAttribute(attributeName);
+                }
+            }
+        }
+        return nullptr;
+    }
+    if (const auto pos = targetSpec.find("::property:"); pos != std::string_view::npos) {
+        const auto ownerPart = targetSpec.substr(0, pos);
+        const auto memberPart = targetSpec.substr(pos + 11);
+        if (const auto* owner = findType(ownerPart)) {
+            if (allowNonPublic || isPubliclyAccessibleType(*owner)) {
+                if (const auto* prop = owner->findProperty(memberPart)) {
+                    if (allowNonPublic || prop->accessibility == semantic::Accessibility::Public) {
+                        return prop->findAttribute(attributeName);
+                    }
+                }
+            }
+        }
+        return nullptr;
+    }
+    if (const auto pos = targetSpec.find("::method:"); pos != std::string_view::npos) {
+        const auto ownerPart = targetSpec.substr(0, pos);
+        const auto memberPart = targetSpec.substr(pos + 9);
+        if (const auto* owner = findType(ownerPart)) {
+            std::string cleanMethod;
+            std::optional<std::size_t> arity;
+            parseMethodSpec(memberPart, cleanMethod, arity);
+            if (const auto* m = owner->findMethod(cleanMethod, arity)) {
+                if (checkMethodVisible(*owner, *m)) {
+                    return m->findAttribute(attributeName);
+                }
+            }
+        }
+        return nullptr;
+    }
+    if (const auto pos = targetSpec.find("::ctor:"); pos != std::string_view::npos) {
+        const auto ownerPart = targetSpec.substr(0, pos);
+        const auto memberPart = targetSpec.substr(pos + 7);
+        if (const auto* owner = findType(ownerPart)) {
+            if (allowNonPublic || isPubliclyAccessibleType(*owner)) {
+                std::string cleanName;
+                std::optional<std::size_t> arity;
+                parseMethodSpec(memberPart, cleanName, arity);
+                for (const auto& ctor : owner->constructors) {
+                    if (arity.has_value() && ctor.parameters.size() != *arity) continue;
+                    if (!allowNonPublic && (ctor.isSynthetic || ctor.accessibility != semantic::Accessibility::Public)) {
+                        continue;
+                    }
+                    if (const auto* a = ctor.findAttribute(attributeName)) return a;
+                }
+            }
+        }
+        return nullptr;
+    }
+    if (const auto pos = targetSpec.find("::function:"); pos != std::string_view::npos) {
+        const auto modPart = targetSpec.substr(0, pos);
+        const auto fnPart = targetSpec.substr(pos + 11);
+        std::string cleanFn;
+        std::optional<std::size_t> arity;
+        parseMethodSpec(fnPart, cleanFn, arity);
+        if (const auto* modFn = findModuleFunction(modPart, cleanFn, arity)) {
+            if (allowNonPublic ||
+                (!modFn->isSynthetic && modFn->accessibility == semantic::Accessibility::Public)) {
+                return modFn->findAttribute(attributeName);
+            }
+        }
+        return nullptr;
     }
 
     // 2. Type lookup by canonical or short name
     if (const auto* t = findType(targetSpec)) {
+        if (!allowNonPublic && !isPubliclyAccessibleType(*t)) return nullptr;
         return t->findAttribute(attributeName);
     }
 
@@ -1047,25 +1197,35 @@ const AttributeReflection* ReflectionRegistry::findAttributeOnTarget(
     }
 
     if (!ownerPart.empty() && !memberPart.empty()) {
+        std::string cleanMember;
+        std::optional<std::size_t> arity;
+        parseMethodSpec(memberPart, cleanMember, arity);
         if (const auto* owner = findType(ownerPart)) {
-            if (const auto* fld = owner->findField(memberPart)) {
-                if (const auto* a = fld->findAttribute(attributeName)) return a;
-            }
-            if (const auto* prop = owner->findProperty(memberPart)) {
-                if (const auto* a = prop->findAttribute(attributeName)) return a;
-            }
-            std::optional<std::size_t> arity;
-            std::string cleanMethod = memberPart;
-            if (const auto hashPos = memberPart.find('#'); hashPos != std::string::npos) {
-                cleanMethod = memberPart.substr(0, hashPos);
-                arity = static_cast<std::size_t>(std::strtoull(memberPart.c_str() + hashPos + 1, nullptr, 10));
-            }
-            if (const auto* m = owner->findMethod(cleanMethod, arity)) {
-                if (const auto* a = m->findAttribute(attributeName)) return a;
+            if (allowNonPublic || isPubliclyAccessibleType(*owner)) {
+                if (!arity.has_value()) {
+                    if (const auto* fld = owner->findField(memberPart)) {
+                        if (checkFieldVisible(*owner, *fld)) {
+                            if (const auto* a = fld->findAttribute(attributeName)) return a;
+                        }
+                    }
+                    if (const auto* prop = owner->findProperty(memberPart)) {
+                        if (allowNonPublic || prop->accessibility == semantic::Accessibility::Public) {
+                            if (const auto* a = prop->findAttribute(attributeName)) return a;
+                        }
+                    }
+                }
+                if (const auto* m = owner->findMethod(cleanMember, arity)) {
+                    if (checkMethodVisible(*owner, *m)) {
+                        if (const auto* a = m->findAttribute(attributeName)) return a;
+                    }
+                }
             }
         }
-        if (const auto* modFn = findModuleFunction(ownerPart, memberPart)) {
-            if (const auto* a = modFn->findAttribute(attributeName)) return a;
+        if (const auto* modFn = findModuleFunction(ownerPart, cleanMember, arity)) {
+            if (allowNonPublic ||
+                (!modFn->isSynthetic && modFn->accessibility == semantic::Accessibility::Public)) {
+                if (const auto* a = modFn->findAttribute(attributeName)) return a;
+            }
         }
     }
     return nullptr;
@@ -1073,8 +1233,9 @@ const AttributeReflection* ReflectionRegistry::findAttributeOnTarget(
 
 bool ReflectionRegistry::hasAttributeOnTarget(
     std::string_view targetSpec,
-    std::string_view attributeName) const noexcept {
-    return findAttributeOnTarget(targetSpec, attributeName) != nullptr;
+    std::string_view attributeName,
+    bool allowNonPublic) const noexcept {
+    return findAttributeOnTarget(targetSpec, attributeName, allowNonPublic) != nullptr;
 }
 
 // ============================================================================
@@ -1477,13 +1638,181 @@ std::optional<runtime::ObjectRef> ReflectionRegistry::instantiateUninitializedOb
     return instantiateUninitializedObject(heap, type->typeId, error);
 }
 
+namespace {
+
+[[nodiscard]] bool isStaticConstructorInitializedOnHeap(
+    const runtime::ManagedHeap& heap,
+    const TypeReflection& type) noexcept {
+    if (!type.staticConstructorSymbolId.has_value()) {
+        return true;
+    }
+    const auto guardId = semantic::stableTypeId(type.canonicalName + "::cctor_guard");
+    const auto guardVal = heap.getStaticField(guardId);
+    if (!guardVal.has_value()) {
+        return false;
+    }
+    bool initialized = false;
+    return guardVal->tryGetBool(initialized) && initialized;
+}
+
+[[nodiscard]] bool ensureStaticConstructorInitialized(
+    const TypeReflection& type,
+    runtime::ManagedHeap& heap,
+    const runtime::EngineRuntime* runtime,
+    const runtime::ExecutionOptions& options,
+    runtime::RuntimeError& error) {
+    if (isStaticConstructorInitializedOnHeap(heap, type)) {
+        return true;
+    }
+    if (!runtime) {
+        error.code = runtime::ErrorCode::InvalidArguments;
+        error.message = "type '" + type.canonicalName +
+            "' has an uninitialized static constructor; pass an EngineRuntime to initialize static state";
+        return false;
+    }
+    if (runtime->heap().get() != &heap) {
+        error.code = runtime::ErrorCode::InvalidObjectReference;
+        error.message = "heap mismatch during static constructor initialization for type '" +
+            type.canonicalName + "'";
+        return false;
+    }
+    const auto guardId = semantic::stableTypeId(type.canonicalName + "::cctor_guard");
+    if (heap.hasStaticField(guardId)) {
+        heap.removeStaticField(guardId);
+    }
+    auto cctorRes = runtime->invoke(*type.staticConstructorSymbolId, {}, options);
+    if (!cctorRes.succeeded) {
+        heap.removeStaticField(guardId);
+        error = std::move(cctorRes.error);
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] const MethodReflection* findMethodBySymbolId(
+    const TypeReflection& type,
+    semantic::SymbolId symbolId) noexcept {
+    for (const auto& m : type.methods) {
+        if (m.symbolId == symbolId) return &m;
+    }
+    return nullptr;
+}
+
+[[nodiscard]] bool checkFieldAccessibility(
+    const TypeReflection& type,
+    const TypeReflection* declaringType,
+    const FieldReflection& field,
+    std::string_view requestedName,
+    bool forWrite,
+    bool allowNonPublic,
+    runtime::RuntimeError& error) {
+    if (allowNonPublic) {
+        return true;
+    }
+    if (!isPubliclyAccessibleType(type)) {
+        error.code = runtime::ErrorCode::CapabilityDenied;
+        error.message = "type '" + type.canonicalName + "' is non-public";
+        return false;
+    }
+    if (declaringType && !isPubliclyAccessibleType(*declaringType)) {
+        error.code = runtime::ErrorCode::CapabilityDenied;
+        error.message = "declaring type '" + declaringType->canonicalName + "' is non-public";
+        return false;
+    }
+    if (field.isBackingField) {
+        if (requestedName != field.backedPropertyName) {
+            error.code = runtime::ErrorCode::CapabilityDenied;
+            error.message = "synthetic backing field '" + field.name + "' on '" +
+                type.canonicalName + "' is non-public";
+            return false;
+        }
+        const auto* prop = type.findProperty(field.backedPropertyName);
+        if (!prop || prop->accessibility != semantic::Accessibility::Public) {
+            error.code = runtime::ErrorCode::CapabilityDenied;
+            error.message = "property '" + std::string(requestedName) + "' on '" +
+                type.canonicalName + "' is non-public";
+            return false;
+        }
+        const auto accessorId = forWrite ? prop->setterSymbolId : prop->getterSymbolId;
+        if (!accessorId.has_value()) {
+            error.code = runtime::ErrorCode::InvalidArguments;
+            error.message = "property '" + prop->name + "' on '" + type.canonicalName +
+                (forWrite ? "' has no setter" : "' has no getter");
+            return false;
+        }
+        const auto* accessor = findMethodBySymbolId(type, *accessorId);
+        if (accessor && accessor->accessibility != semantic::Accessibility::Public) {
+            error.code = runtime::ErrorCode::CapabilityDenied;
+            error.message = "property '" + prop->name + "' on '" + type.canonicalName +
+                (forWrite ? "' has a non-public setter" : "' has a non-public getter");
+            return false;
+        }
+        return true;
+    }
+    if (field.isSynthetic || field.accessibility != semantic::Accessibility::Public) {
+        error.code = runtime::ErrorCode::CapabilityDenied;
+        error.message = "field '" + field.name + "' on '" + type.canonicalName + "' is non-public";
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+const TypeReflection* ReflectionRegistry::resolveDeclaringTypeForField(
+    const TypeReflection& ownerType,
+    const FieldReflection& field) const noexcept {
+    if (field.declaringTypeId != 0 && field.declaringTypeId != ownerType.typeId) {
+        if (const auto* resolved = findType(field.declaringTypeId)) {
+            return resolved;
+        }
+    }
+    return &ownerType;
+}
+
+bool ReflectionRegistry::isStaticInitChainInitializedOnHeap(
+    const runtime::ManagedHeap& heap,
+    const TypeReflection& type) const noexcept {
+    const TypeReflection* cursor = &type;
+    std::unordered_set<semantic::SymbolId> visited;
+    while (cursor && visited.insert(cursor->typeId).second) {
+        if (!isStaticConstructorInitializedOnHeap(heap, *cursor)) {
+            return false;
+        }
+        cursor = findType(cursor->baseTypeId);
+    }
+    return true;
+}
+
+bool ReflectionRegistry::ensureStaticInitChain(
+    const TypeReflection& type,
+    runtime::ManagedHeap& heap,
+    const runtime::EngineRuntime* runtime,
+    const runtime::ExecutionOptions& options,
+    runtime::RuntimeError& error) const {
+    std::vector<const TypeReflection*> chain;
+    const TypeReflection* cursor = &type;
+    std::unordered_set<semantic::SymbolId> visited;
+    while (cursor && visited.insert(cursor->typeId).second) {
+        chain.push_back(cursor);
+        cursor = findType(cursor->baseTypeId);
+    }
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        if (!ensureStaticConstructorInitialized(**it, heap, runtime, options, error)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::optional<runtime::ObjectRef> ReflectionRegistry::instantiateObject(
     runtime::EngineRuntime& runtime,
     semantic::SymbolId typeId,
     const std::vector<runtime::Value>& constructorArgs,
     runtime::RuntimeError& error,
     bool runConstructor,
-    runtime::ExecutionOptions options) const {
+    runtime::ExecutionOptions options,
+    bool allowNonPublic) const {
     auto heap = runtime.heap();
     if (!heap) {
         error.code = runtime::ErrorCode::InvalidObjectReference;
@@ -1496,6 +1825,11 @@ std::optional<runtime::ObjectRef> ReflectionRegistry::instantiateObject(
     if (!type) {
         error.code = runtime::ErrorCode::FunctionNotFound;
         error.message = "reflected typeId " + std::to_string(typeId) + " was not found";
+        return std::nullopt;
+    }
+    if (!allowNonPublic && !isPubliclyAccessibleType(*type)) {
+        error.code = runtime::ErrorCode::CapabilityDenied;
+        error.message = "type '" + type->canonicalName + "' is non-public";
         return std::nullopt;
     }
 
@@ -1518,20 +1852,21 @@ std::optional<runtime::ObjectRef> ReflectionRegistry::instantiateObject(
         return std::nullopt;
     }
 
-    if (type->staticConstructorSymbolId.has_value()) {
-        auto cctorRes = runtime.invoke(*type->staticConstructorSymbolId, {}, options);
-        if (!cctorRes.succeeded) {
-            error = std::move(cctorRes.error);
-            return std::nullopt;
-        }
+    if (!ensureStaticInitChain(*type, *heap, &runtime, options, error)) {
+        return std::nullopt;
     }
 
     if (!constructorArgs.empty() || !type->constructors.empty()) {
         const MethodReflection* matchedCtor = nullptr;
+        bool sawNonPublicArityMatch = false;
         std::vector<runtime::Value> coercedArgs;
         std::vector<runtime::PersistentRoot> argRoots;
         for (const auto& ctor : type->constructors) {
             if (ctor.parameters.size() != constructorArgs.size()) continue;
+            if (!allowNonPublic && ctor.accessibility != semantic::Accessibility::Public) {
+                sawNonPublicArityMatch = true;
+                continue;
+            }
             coercedArgs.clear();
             argRoots.clear();
             coercedArgs.reserve(constructorArgs.size());
@@ -1560,8 +1895,12 @@ std::optional<runtime::ObjectRef> ReflectionRegistry::instantiateObject(
             }
         }
         if (!matchedCtor) {
-            error.code = runtime::ErrorCode::InvalidArguments;
-            error.message = "no matching constructor found on type '" + type->canonicalName + "'";
+            error.code = sawNonPublicArityMatch
+                ? runtime::ErrorCode::CapabilityDenied
+                : runtime::ErrorCode::InvalidArguments;
+            error.message = sawNonPublicArityMatch
+                ? ("matching constructor on type '" + type->canonicalName + "' is non-public")
+                : ("no matching constructor found on type '" + type->canonicalName + "'");
             return std::nullopt;
         }
 
@@ -1587,22 +1926,24 @@ std::optional<runtime::ObjectRef> ReflectionRegistry::instantiateObject(
     const std::vector<runtime::Value>& constructorArgs,
     runtime::RuntimeError& error,
     bool runConstructor,
-    runtime::ExecutionOptions options) const {
+    runtime::ExecutionOptions options,
+    bool allowNonPublic) const {
     const auto* type = findType(typeName);
     if (!type) {
         error.code = runtime::ErrorCode::FunctionNotFound;
-        error.message = "reflected type '" + std::string(typeName) + "' was not found";
+        error.message = "type '" + std::string(typeName) + "' was not found";
         return std::nullopt;
     }
     return instantiateObject(
-        runtime, type->typeId, constructorArgs, error, runConstructor, std::move(options));
+        runtime, type->typeId, constructorArgs, error, runConstructor, std::move(options), allowNonPublic);
 }
 
 std::optional<runtime::Value> ReflectionRegistry::getField(
     const runtime::ManagedHeap& heap,
     runtime::ObjectRef object,
     std::string_view fieldName,
-    runtime::RuntimeError& error) const {
+    runtime::RuntimeError& error,
+    bool allowNonPublic) const {
     if (!object.valid() || object.kind != runtime::ObjectKind::Record ||
         object.heapId != static_cast<std::uint32_t>(heap.heapId()) ||
         !heap.isAlive(object)) {
@@ -1624,6 +1965,10 @@ std::optional<runtime::Value> ReflectionRegistry::getField(
             type->canonicalName + "'";
         return std::nullopt;
     }
+    const auto* declaringType = resolveDeclaringTypeForField(*type, *field);
+    if (!checkFieldAccessibility(*type, declaringType, *field, fieldName, /*forWrite=*/false, allowNonPublic, error)) {
+        return std::nullopt;
+    }
     if (field->isConst) {
         if (auto cv = evaluateConstantFieldValue(*field, nullptr, error)) {
             return cv;
@@ -1631,6 +1976,12 @@ std::optional<runtime::Value> ReflectionRegistry::getField(
         return makeDefaultFieldValue(field->type, field->fieldTypeId);
     }
     if (field->isStatic) {
+        if (!isStaticInitChainInitializedOnHeap(heap, *declaringType)) {
+            error.code = runtime::ErrorCode::InvalidArguments;
+            error.message = "type '" + declaringType->canonicalName +
+                "' has an uninitialized static constructor; pass an EngineRuntime to initialize static state";
+            return std::nullopt;
+        }
         if (auto sv = heap.getStaticField(field->id)) {
             return sv;
         }
@@ -1653,7 +2004,8 @@ bool ReflectionRegistry::setField(
     runtime::ObjectRef object,
     std::string_view fieldName,
     runtime::Value value,
-    runtime::RuntimeError& error) const {
+    runtime::RuntimeError& error,
+    bool allowNonPublic) const {
     if (!object.valid() || object.kind != runtime::ObjectKind::Record ||
         object.heapId != static_cast<std::uint32_t>(heap.heapId()) ||
         !heap.isAlive(object)) {
@@ -1675,6 +2027,10 @@ bool ReflectionRegistry::setField(
             type->canonicalName + "'";
         return false;
     }
+    const auto* declaringType = resolveDeclaringTypeForField(*type, *field);
+    if (!checkFieldAccessibility(*type, declaringType, *field, fieldName, /*forWrite=*/true, allowNonPublic, error)) {
+        return false;
+    }
     if (field->isConst || field->isReadonly) {
         error.code = runtime::ErrorCode::InvalidArguments;
         error.message = "field '" + field->name + "' is constant or readonly";
@@ -1687,6 +2043,12 @@ bool ReflectionRegistry::setField(
     }
 
     if (field->isStatic) {
+        if (!isStaticInitChainInitializedOnHeap(heap, *declaringType)) {
+            error.code = runtime::ErrorCode::InvalidArguments;
+            error.message = "type '" + declaringType->canonicalName +
+                "' has an uninitialized static constructor; pass an EngineRuntime to initialize static state";
+            return false;
+        }
         heap.setStaticField(field->id, std::move(coerced));
         return true;
     }
@@ -1697,14 +2059,35 @@ std::optional<runtime::Value> ReflectionRegistry::getField(
     const runtime::EngineRuntime& runtime,
     runtime::ObjectRef object,
     std::string_view fieldName,
-    runtime::RuntimeError& error) const {
-    if (!runtime.heap()) {
+    runtime::RuntimeError& error,
+    runtime::ExecutionOptions options,
+    bool allowNonPublic) const {
+    auto heap = runtime.heap();
+    if (!heap) {
         error.code = runtime::ErrorCode::InvalidObjectReference;
         error.message = "EngineRuntime has no ManagedHeap";
         return std::nullopt;
     }
-    bindHeap(runtime.heap());
-    return getField(*runtime.heap(), object, fieldName, error);
+    bindHeap(heap);
+    if (object.valid() && object.kind == runtime::ObjectKind::Record &&
+        object.heapId == static_cast<std::uint32_t>(heap->heapId()) &&
+        heap->isAlive(object)) {
+        if (const auto actualTid = heap->objectTypeId(object)) {
+            if (const auto* type = findType(*actualTid)) {
+                if (const auto* field = type->findField(fieldName);
+                    field && field->isStatic && !field->isConst) {
+                    const auto* declaringType = resolveDeclaringTypeForField(*type, *field);
+                    if (!checkFieldAccessibility(*type, declaringType, *field, fieldName, /*forWrite=*/false, allowNonPublic, error)) {
+                        return std::nullopt;
+                    }
+                    if (!ensureStaticInitChain(*declaringType, *heap, &runtime, options, error)) {
+                        return std::nullopt;
+                    }
+                }
+            }
+        }
+    }
+    return getField(*heap, object, fieldName, error, allowNonPublic);
 }
 
 bool ReflectionRegistry::setField(
@@ -1712,20 +2095,42 @@ bool ReflectionRegistry::setField(
     runtime::ObjectRef object,
     std::string_view fieldName,
     runtime::Value value,
-    runtime::RuntimeError& error) const {
-    if (!runtime.heap()) {
+    runtime::RuntimeError& error,
+    runtime::ExecutionOptions options,
+    bool allowNonPublic) const {
+    auto heap = runtime.heap();
+    if (!heap) {
         error.code = runtime::ErrorCode::InvalidObjectReference;
         error.message = "EngineRuntime has no ManagedHeap";
         return false;
     }
-    bindHeap(runtime.heap());
-    return setField(*runtime.heap(), object, fieldName, std::move(value), error);
+    bindHeap(heap);
+    if (object.valid() && object.kind == runtime::ObjectKind::Record &&
+        object.heapId == static_cast<std::uint32_t>(heap->heapId()) &&
+        heap->isAlive(object)) {
+        if (const auto actualTid = heap->objectTypeId(object)) {
+            if (const auto* type = findType(*actualTid)) {
+                if (const auto* field = type->findField(fieldName);
+                    field && field->isStatic && !field->isConst && !field->isReadonly) {
+                    const auto* declaringType = resolveDeclaringTypeForField(*type, *field);
+                    if (!checkFieldAccessibility(*type, declaringType, *field, fieldName, /*forWrite=*/true, allowNonPublic, error)) {
+                        return false;
+                    }
+                    if (!ensureStaticInitChain(*declaringType, *heap, &runtime, options, error)) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    return setField(*heap, object, fieldName, std::move(value), error, allowNonPublic);
 }
 
 std::optional<runtime::Value> ReflectionRegistry::getStructField(
     const runtime::Value& structValue,
     std::string_view fieldName,
-    runtime::RuntimeError& error) const {
+    runtime::RuntimeError& error,
+    bool allowNonPublic) const {
     const auto tid = runtime::structValueTypeId(structValue);
     const auto* type = tid ? findType(*tid) : nullptr;
     if (!type || type->kind != semantic::TypeKind::Struct) {
@@ -1738,6 +2143,10 @@ std::optional<runtime::Value> ReflectionRegistry::getStructField(
         error.code = runtime::ErrorCode::FunctionNotFound;
         error.message = "struct field '" + std::string(fieldName) + "' was not found on '" +
             type->canonicalName + "'";
+        return std::nullopt;
+    }
+    const auto* declaringType = resolveDeclaringTypeForField(*type, *field);
+    if (!checkFieldAccessibility(*type, declaringType, *field, fieldName, /*forWrite=*/false, allowNonPublic, error)) {
         return std::nullopt;
     }
     if (field->isConst) {
@@ -1767,7 +2176,8 @@ bool ReflectionRegistry::setStructField(
     std::string_view fieldName,
     runtime::Value value,
     runtime::RuntimeError& error,
-    runtime::ManagedHeap* heap) const {
+    runtime::ManagedHeap* heap,
+    bool allowNonPublic) const {
     const auto tid = runtime::structValueTypeId(structValue);
     const auto* type = tid ? findType(*tid) : nullptr;
     if (!type || type->kind != semantic::TypeKind::Struct) {
@@ -1776,11 +2186,18 @@ bool ReflectionRegistry::setStructField(
         return false;
     }
     const auto* field = type->findField(fieldName);
-    if (!field || field->isStatic || field->isConst || field->isReadonly) {
-        error.code = field ? runtime::ErrorCode::InvalidArguments : runtime::ErrorCode::FunctionNotFound;
-        error.message = field
-            ? ("struct field '" + field->name + "' is not writable")
-            : ("struct field '" + std::string(fieldName) + "' was not found");
+    if (!field) {
+        error.code = runtime::ErrorCode::FunctionNotFound;
+        error.message = "struct field '" + std::string(fieldName) + "' was not found";
+        return false;
+    }
+    const auto* declaringType = resolveDeclaringTypeForField(*type, *field);
+    if (!checkFieldAccessibility(*type, declaringType, *field, fieldName, /*forWrite=*/true, allowNonPublic, error)) {
+        return false;
+    }
+    if (field->isStatic || field->isConst || field->isReadonly) {
+        error.code = runtime::ErrorCode::InvalidArguments;
+        error.message = "struct field '" + field->name + "' is not writable";
         return false;
     }
 
@@ -1822,8 +2239,9 @@ bool ReflectionRegistry::setStructField(
 std::optional<runtime::Value> ReflectionRegistry::getField(
     const runtime::StructValue& structure,
     std::string_view fieldName,
-    runtime::RuntimeError& error) const {
-    return getStructField(runtime::Value{structure}, fieldName, error);
+    runtime::RuntimeError& error,
+    bool allowNonPublic) const {
+    return getStructField(runtime::Value{structure}, fieldName, error, allowNonPublic);
 }
 
 bool ReflectionRegistry::setField(
@@ -1831,9 +2249,10 @@ bool ReflectionRegistry::setField(
     std::string_view fieldName,
     runtime::Value value,
     runtime::RuntimeError& error,
-    runtime::ManagedHeap* heap) const {
+    runtime::ManagedHeap* heap,
+    bool allowNonPublic) const {
     runtime::Value wrapped{structure};
-    if (!setStructField(wrapped, fieldName, std::move(value), error, heap)) {
+    if (!setStructField(wrapped, fieldName, std::move(value), error, heap, allowNonPublic)) {
         return false;
     }
     if (const auto* updated = std::get_if<runtime::StructValue>(&wrapped)) {
@@ -1850,7 +2269,9 @@ std::optional<runtime::Value> ReflectionRegistry::getStaticField(
     std::string_view typeName,
     std::string_view fieldName,
     runtime::RuntimeError& error,
-    const runtime::EngineRuntime* runtime) const {
+    const runtime::EngineRuntime* runtime,
+    runtime::ExecutionOptions options,
+    bool allowNonPublic) const {
     const auto* type = findType(typeName);
     if (!type) {
         error.code = runtime::ErrorCode::FunctionNotFound;
@@ -1862,6 +2283,10 @@ std::optional<runtime::Value> ReflectionRegistry::getStaticField(
         error.code = runtime::ErrorCode::FunctionNotFound;
         error.message = "static field '" + std::string(fieldName) + "' was not found on '" +
             type->canonicalName + "'";
+        return std::nullopt;
+    }
+    const auto* declaringType = resolveDeclaringTypeForField(*type, *field);
+    if (!checkFieldAccessibility(*type, declaringType, *field, fieldName, /*forWrite=*/false, allowNonPublic, error)) {
         return std::nullopt;
     }
     if (field->isConst) {
@@ -1876,12 +2301,8 @@ std::optional<runtime::Value> ReflectionRegistry::getStaticField(
         error.message = "field '" + field->name + "' is an instance field, not static";
         return std::nullopt;
     }
-    if (runtime && type->staticConstructorSymbolId.has_value()) {
-        auto cctorRes = runtime->invoke(*type->staticConstructorSymbolId);
-        if (!cctorRes.succeeded) {
-            error = std::move(cctorRes.error);
-            return std::nullopt;
-        }
+    if (!ensureStaticInitChain(*declaringType, heap, runtime, options, error)) {
+        return std::nullopt;
     }
     if (auto existing = heap.getStaticField(field->id)) {
         return existing;
@@ -1900,7 +2321,9 @@ bool ReflectionRegistry::setStaticField(
     std::string_view fieldName,
     runtime::Value value,
     runtime::RuntimeError& error,
-    const runtime::EngineRuntime* runtime) const {
+    const runtime::EngineRuntime* runtime,
+    runtime::ExecutionOptions options,
+    bool allowNonPublic) const {
     const auto* type = findType(typeName);
     if (!type) {
         error.code = runtime::ErrorCode::FunctionNotFound;
@@ -1912,6 +2335,10 @@ bool ReflectionRegistry::setStaticField(
         error.code = runtime::ErrorCode::FunctionNotFound;
         error.message = "static field '" + std::string(fieldName) + "' was not found on '" +
             type->canonicalName + "'";
+        return false;
+    }
+    const auto* declaringType = resolveDeclaringTypeForField(*type, *field);
+    if (!checkFieldAccessibility(*type, declaringType, *field, fieldName, /*forWrite=*/true, allowNonPublic, error)) {
         return false;
     }
     if (field->isConst || field->isReadonly) {
@@ -1929,12 +2356,8 @@ bool ReflectionRegistry::setStaticField(
     if (!validateAndCoerceValue(value, field->type, field->fieldTypeId, &heap, coerced, error)) {
         return false;
     }
-    if (runtime && type->staticConstructorSymbolId.has_value()) {
-        auto cctorRes = runtime->invoke(*type->staticConstructorSymbolId);
-        if (!cctorRes.succeeded) {
-            error = std::move(cctorRes.error);
-            return false;
-        }
+    if (!ensureStaticInitChain(*declaringType, heap, runtime, options, error)) {
+        return false;
     }
     heap.setStaticField(field->id, std::move(coerced));
     return true;
@@ -1945,7 +2368,8 @@ runtime::ExecutionResult ReflectionRegistry::invokeMethod(
     const MethodReflection& declaredMethod,
     runtime::ObjectRef receiver,
     const std::vector<runtime::Value>& arguments,
-    runtime::ExecutionOptions options) const {
+    runtime::ExecutionOptions options,
+    bool allowNonPublic) const {
     auto heap = runtime.heap();
     if (!heap) {
         return makeFailedExecution(
@@ -1953,6 +2377,13 @@ runtime::ExecutionResult ReflectionRegistry::invokeMethod(
             "EngineRuntime has no ManagedHeap");
     }
     bindHeap(heap);
+
+    if (!allowNonPublic &&
+        (declaredMethod.isSynthetic || declaredMethod.accessibility != semantic::Accessibility::Public)) {
+        return makeFailedExecution(
+            runtime::ErrorCode::CapabilityDenied,
+            "method '" + declaredMethod.name + "' is non-public");
+    }
 
     if (declaredMethod.isStatic) {
         return invokeStaticMethod(
@@ -1962,7 +2393,8 @@ runtime::ExecutionResult ReflectionRegistry::invokeMethod(
                 : declaredMethod.moduleName,
             declaredMethod.name,
             arguments,
-            std::move(options));
+            std::move(options),
+            allowNonPublic);
     }
 
     if (!receiver.valid() || receiver.kind != runtime::ObjectKind::Record ||
@@ -1979,6 +2411,19 @@ runtime::ExecutionResult ReflectionRegistry::invokeMethod(
         return makeFailedExecution(
             runtime::ErrorCode::TypeMismatch,
             "receiver runtime type is not registered in ReflectionRegistry");
+    }
+    if (!allowNonPublic && !isPubliclyAccessibleType(*actualType)) {
+        return makeFailedExecution(
+            runtime::ErrorCode::CapabilityDenied,
+            "type '" + actualType->canonicalName + "' is non-public");
+    }
+    if (declaredMethod.ownerTypeId != 0) {
+        if (const auto* ownerType = findType(declaredMethod.ownerTypeId);
+            !allowNonPublic && ownerType && !isPubliclyAccessibleType(*ownerType)) {
+            return makeFailedExecution(
+                runtime::ErrorCode::CapabilityDenied,
+                "declaring type '" + ownerType->canonicalName + "' is non-public");
+        }
     }
 
     if (declaredMethod.ownerTypeId != 0 &&
@@ -2063,7 +2508,8 @@ runtime::ExecutionResult ReflectionRegistry::invokeMethod(
     runtime::ObjectRef receiver,
     std::string_view methodName,
     const std::vector<runtime::Value>& arguments,
-    runtime::ExecutionOptions options) const {
+    runtime::ExecutionOptions options,
+    bool allowNonPublic) const {
     auto heap = runtime.heap();
     if (!heap) {
         return makeFailedExecution(
@@ -2087,7 +2533,13 @@ runtime::ExecutionResult ReflectionRegistry::invokeMethod(
             runtime::ErrorCode::TypeMismatch,
             "receiver runtime type is not registered in ReflectionRegistry");
     }
+    if (!allowNonPublic && !isPubliclyAccessibleType(*cursor)) {
+        return makeFailedExecution(
+            runtime::ErrorCode::CapabilityDenied,
+            "type '" + cursor->canonicalName + "' is non-public");
+    }
 
+    bool sawNonPublicMatch = false;
     std::unordered_set<semantic::SymbolId> visited;
     while (cursor && visited.insert(cursor->typeId).second) {
         for (const auto& candidate : cursor->methods) {
@@ -2111,10 +2563,23 @@ runtime::ExecutionResult ReflectionRegistry::invokeMethod(
                 }
             }
             if (match) {
-                return invokeMethod(runtime, candidate, receiver, arguments, std::move(options));
+                if (!allowNonPublic &&
+                    (!isPubliclyAccessibleType(*cursor) ||
+                     candidate.isSynthetic ||
+                     candidate.accessibility != semantic::Accessibility::Public)) {
+                    sawNonPublicMatch = true;
+                    continue;
+                }
+                return invokeMethod(runtime, candidate, receiver, arguments, std::move(options), allowNonPublic);
             }
         }
         cursor = findType(cursor->baseTypeId);
+    }
+
+    if (sawNonPublicMatch) {
+        return makeFailedExecution(
+            runtime::ErrorCode::CapabilityDenied,
+            "instance method '" + std::string(methodName) + "' is non-public");
     }
 
     return makeFailedExecution(
@@ -2128,10 +2593,12 @@ runtime::ExecutionResult ReflectionRegistry::invokeStaticMethod(
     std::string_view typeOrModuleName,
     std::string_view methodName,
     const std::vector<runtime::Value>& arguments,
-    runtime::ExecutionOptions options) const {
+    runtime::ExecutionOptions options,
+    bool allowNonPublic) const {
     auto heap = runtime.heap();
     if (heap) bindHeap(heap);
 
+    bool sawNonPublicMatch = false;
     if (const auto* type = findType(typeOrModuleName)) {
         for (const auto& candidate : type->methods) {
             if (!candidate.isStatic || candidate.name != methodName ||
@@ -2161,11 +2628,27 @@ runtime::ExecutionResult ReflectionRegistry::invokeStaticMethod(
                 coercedArgs.push_back(std::move(coerced));
             }
             if (!match) continue;
+            const TypeReflection* declaringType = candidate.ownerTypeId != 0
+                ? findType(candidate.ownerTypeId)
+                : nullptr;
+            if (!declaringType) declaringType = type;
+            if (!allowNonPublic &&
+                (!isPubliclyAccessibleType(*type) ||
+                 !isPubliclyAccessibleType(*declaringType) ||
+                 candidate.isSynthetic ||
+                 candidate.accessibility != semantic::Accessibility::Public)) {
+                sawNonPublicMatch = true;
+                continue;
+            }
 
-            if (type->staticConstructorSymbolId.has_value() &&
-                *type->staticConstructorSymbolId != candidate.symbolId) {
-                auto cctorRes = runtime.invoke(*type->staticConstructorSymbolId, {}, options);
-                if (!cctorRes.succeeded) return cctorRes;
+            if (heap) {
+                runtime::RuntimeError cctorErr;
+                const bool isSelfCctor = declaringType->staticConstructorSymbolId.has_value() &&
+                    *declaringType->staticConstructorSymbolId == candidate.symbolId;
+                if (!isSelfCctor &&
+                    !ensureStaticInitChain(*declaringType, *heap, &runtime, options, cctorErr)) {
+                    return makeFailedExecution(cctorErr.code, std::move(cctorErr.message));
+                }
             }
             return runtime.invoke(candidate.symbolId, coercedArgs, std::move(options));
         }
@@ -2199,8 +2682,20 @@ runtime::ExecutionResult ReflectionRegistry::invokeStaticMethod(
             coercedArgs.push_back(std::move(coerced));
         }
         if (match) {
+            if (!allowNonPublic &&
+                (fn.isSynthetic || fn.accessibility != semantic::Accessibility::Public)) {
+                sawNonPublicMatch = true;
+                continue;
+            }
             return runtime.invoke(fn.symbolId, coercedArgs, std::move(options));
         }
+    }
+
+    if (sawNonPublicMatch) {
+        return makeFailedExecution(
+            runtime::ErrorCode::CapabilityDenied,
+            "static method or module function '" + std::string(typeOrModuleName) + "::" +
+                std::string(methodName) + "' is non-public");
     }
 
     return makeFailedExecution(
@@ -2214,9 +2709,10 @@ runtime::ExecutionResult ReflectionRegistry::invokeMethod(
     std::string_view typeOrModuleName,
     std::string_view methodName,
     const std::vector<runtime::Value>& arguments,
-    runtime::ExecutionOptions options) const {
+    runtime::ExecutionOptions options,
+    bool allowNonPublic) const {
     return invokeStaticMethod(
-        runtime, typeOrModuleName, methodName, arguments, std::move(options));
+        runtime, typeOrModuleName, methodName, arguments, std::move(options), allowNonPublic);
 }
 
 // ============================================================================
@@ -2358,7 +2854,8 @@ void registerReflectBindings(
                 err.message = "Reflect.HasType expects a string typeName";
                 return std::nullopt;
             }
-            return runtime::Value{reflection->findType(*typeName) != nullptr};
+            const auto* t = reflection->findType(*typeName);
+            return runtime::Value{t != nullptr && isPubliclyAccessibleType(*t)};
         };
 
     const runtime::ExternalFunction hasAttrFn =
@@ -2490,8 +2987,17 @@ void registerReflectBindings(
             return runtime::Value{attr->getBool(key).value_or(fallback)};
         };
 
+    const auto isScriptVisibleField = [](const FieldReflection& f) noexcept {
+        return f.accessibility == semantic::Accessibility::Public &&
+            !f.isBackingField && !f.isSynthetic;
+    };
+    const auto isScriptVisibleMethod = [](const MethodReflection& m) noexcept {
+        return m.accessibility == semantic::Accessibility::Public &&
+            !m.isSynthetic && !m.isPropertyAccessor;
+    };
+
     const runtime::ExternalFunction getFieldCountFn =
-        [reflection, resolveHeapForObject](
+        [reflection, resolveHeapForObject, isScriptVisibleField](
             const bytecode::FunctionReference&,
             runtime::ValueSpan args,
             runtime::RuntimeError& err) -> std::optional<runtime::Value> {
@@ -2508,12 +3014,16 @@ void registerReflectBindings(
                 return std::nullopt;
             }
             const auto* t = reflection->findType(*typeName);
-            if (!t) return runtime::Value{std::int64_t{0}};
-            return runtime::Value{static_cast<std::int64_t>(t->fields.size())};
+            if (!t || !isPubliclyAccessibleType(*t)) return runtime::Value{std::int64_t{0}};
+            std::int64_t publicCount = 0;
+            for (const auto& f : t->fields) {
+                if (isScriptVisibleField(f)) ++publicCount;
+            }
+            return runtime::Value{publicCount};
         };
 
     const runtime::ExternalFunction getFieldNameFn =
-        [reflection, resolveHeapForObject](
+        [reflection, resolveHeapForObject, isScriptVisibleField](
             const bytecode::FunctionReference&,
             runtime::ValueSpan args,
             runtime::RuntimeError& err) -> std::optional<runtime::Value> {
@@ -2531,17 +3041,23 @@ void registerReflectBindings(
                 return std::nullopt;
             }
             const auto* t = reflection->findType(*typeName);
-            if (!t || idx < 0 || static_cast<std::size_t>(idx) >= t->fields.size()) {
-                err.code = runtime::ErrorCode::IndexOutOfRange;
-                err.message = "Reflect.GetFieldName index out of range";
-                return std::nullopt;
+            if (t && isPubliclyAccessibleType(*t) && idx >= 0) {
+                std::int64_t cur = 0;
+                for (const auto& f : t->fields) {
+                    if (!isScriptVisibleField(f)) continue;
+                    if (cur == idx) {
+                        return makeReturnStringValue(f.name, h.get());
+                    }
+                    ++cur;
+                }
             }
-            const auto& f = t->fields[static_cast<std::size_t>(idx)];
-            return makeReturnStringValue(f.name, h.get());
+            err.code = runtime::ErrorCode::IndexOutOfRange;
+            err.message = "Reflect.GetFieldName index out of range";
+            return std::nullopt;
         };
 
     const runtime::ExternalFunction getMethodCountFn =
-        [reflection, resolveHeapForObject](
+        [reflection, resolveHeapForObject, isScriptVisibleMethod](
             const bytecode::FunctionReference&,
             runtime::ValueSpan args,
             runtime::RuntimeError& err) -> std::optional<runtime::Value> {
@@ -2558,12 +3074,16 @@ void registerReflectBindings(
                 return std::nullopt;
             }
             const auto* t = reflection->findType(*typeName);
-            if (!t) return runtime::Value{std::int64_t{0}};
-            return runtime::Value{static_cast<std::int64_t>(t->methods.size())};
+            if (!t || !isPubliclyAccessibleType(*t)) return runtime::Value{std::int64_t{0}};
+            std::int64_t publicCount = 0;
+            for (const auto& m : t->methods) {
+                if (isScriptVisibleMethod(m)) ++publicCount;
+            }
+            return runtime::Value{publicCount};
         };
 
     const runtime::ExternalFunction getMethodNameFn =
-        [reflection, resolveHeapForObject](
+        [reflection, resolveHeapForObject, isScriptVisibleMethod](
             const bytecode::FunctionReference&,
             runtime::ValueSpan args,
             runtime::RuntimeError& err) -> std::optional<runtime::Value> {
@@ -2581,12 +3101,19 @@ void registerReflectBindings(
                 return std::nullopt;
             }
             const auto* t = reflection->findType(*typeName);
-            if (!t || idx < 0 || static_cast<std::size_t>(idx) >= t->methods.size()) {
-                err.code = runtime::ErrorCode::IndexOutOfRange;
-                err.message = "Reflect.GetMethodName index out of range";
-                return std::nullopt;
+            if (t && isPubliclyAccessibleType(*t) && idx >= 0) {
+                std::int64_t cur = 0;
+                for (const auto& m : t->methods) {
+                    if (!isScriptVisibleMethod(m)) continue;
+                    if (cur == idx) {
+                        return makeReturnStringValue(m.name, h.get());
+                    }
+                    ++cur;
+                }
             }
-            return makeReturnStringValue(t->methods[static_cast<std::size_t>(idx)].name, h.get());
+            err.code = runtime::ErrorCode::IndexOutOfRange;
+            err.message = "Reflect.GetMethodName index out of range";
+            return std::nullopt;
         };
 
     const runtime::ExternalFunction typeNameOfFn =

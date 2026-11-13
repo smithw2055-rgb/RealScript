@@ -1,8 +1,12 @@
 #pragma once
 
+#include "realscript/Version.h"
 #include "realscript/aot_cpp/RuntimeAbi.h"
+#include "realscript/runtime/AsyncHandles.h"
 #include "realscript/runtime/Runtime.h"
+#if !defined(REALSCRIPT_AOT_NO_ASYNC_INLINES)
 #include "realscript/runtime/AsyncRuntime.h"
+#endif
 #include "realscript/semantic/Semantic.h"
 
 #include <array>
@@ -52,6 +56,10 @@ namespace realscript::aot {
 
 constexpr std::uint32_t RuntimeAbiMajor = 2;
 constexpr std::uint32_t RuntimeAbiMinor = 0;
+static_assert(
+    RuntimeAbiMajor == realscript::kNativeModuleAbiMajor &&
+        RuntimeAbiMinor == realscript::kNativeModuleAbiMinor,
+    "AOT RuntimeAbi version must stay synchronized with realscript/Version.h");
 
 struct GeneratedFieldLayout {
     std::size_t byteOffset = 0;
@@ -1798,12 +1806,14 @@ public:
         semantic::SymbolId returnStructTypeId,
         runtime::Value& outResult);
 
+#if !defined(REALSCRIPT_AOT_NO_ASYNC_INLINES)
     [[nodiscard]] inline bool isResumingCoroutine(
         semantic::SymbolId functionSymbolId) const noexcept {
         if (RS_AOT_LIKELY(resumingFramePtr_ == nullptr)) return false;
         return resumingCoroutine_.valid() &&
                resumingFramePtr_->functionSymbolId == functionSymbolId;
     }
+#endif
     [[nodiscard]] inline bool enterResumingScalarCoroutine(
         semantic::SymbolId functionSymbolId,
         void* outScalarBuffer,
@@ -1830,6 +1840,7 @@ public:
         std::size_t refCount,
         std::uint32_t& outResumeBlockId,
         runtime::CoroutineFrameHandle& outActiveCoroutine);
+#if !defined(REALSCRIPT_AOT_NO_ASYNC_INLINES)
     [[nodiscard]] inline bool canSkipAwaitSuspendFast(
         std::int64_t packedAwaitable) const noexcept {
         const auto h = runtime::AwaitableHandle::unpack64(
@@ -1839,6 +1850,7 @@ public:
                asyncRuntime_->awaitables().isValid(h) &&
                asyncRuntime_->awaitables().isCompleted(h);
     }
+#endif
     [[nodiscard]] bool awaitSuspendScalar(
         semantic::SymbolId functionSymbolId,
         semantic::SymbolId returnStructTypeId,
@@ -1912,6 +1924,7 @@ public:
         semantic::SymbolId returnStructTypeId,
         std::int64_t& outPackedResult);
 
+#if !defined(REALSCRIPT_AOT_NO_ASYNC_INLINES)
     // Zero-boxing TrustedRelease inline intrinsics for RealScript.Async::Async.__*
     [[nodiscard]] inline bool asyncIntrinsicYieldFast(
         std::int64_t tokenPacked,
@@ -2120,6 +2133,7 @@ public:
             asyncRuntime_->awaitables().readyContinuationCount(runtime::ResumeQueue::Update));
         return true;
     }
+#endif
     [[nodiscard]] runtime::ShadowStack& shadowStack() noexcept;
     [[nodiscard]] const runtime::RuntimeError& error() const noexcept;
     [[nodiscard]] const runtime::RuntimeStatistics& statistics() const noexcept;

@@ -29,6 +29,7 @@ bool hasSequenceResultMetadata(const Version& version) noexcept {
 }
 
 constexpr std::uint32_t kInlineMetadataTrailerMagic = 0x52534944u; // "RSID"
+constexpr std::uint32_t kFunctionAccessMetadataTrailerMagic = 0x52534641u; // "RSFA"
 
 bool hasInlineDependencyMetadata(const Module& mod) noexcept {
     return mod.version.major == 0 && mod.version.minor >= 7 &&
@@ -101,6 +102,18 @@ public:
     [[nodiscard]] bool empty() const noexcept { return position_ == end_; }
     [[nodiscard]] std::size_t remaining() const noexcept {
         return valid_ && position_ <= end_ ? end_ - position_ : 0;
+    }
+    [[nodiscard]] std::uint32_t peekU32() const noexcept {
+        if (!valid_ || position_ + 4 > end_) {
+            return 0;
+        }
+        std::uint32_t result = 0;
+        for (int shift = 0; shift < 32; shift += 8) {
+            result |= static_cast<std::uint32_t>(
+                          data_[position_ + static_cast<std::size_t>(shift / 8)]) <<
+                      shift;
+        }
+        return result;
     }
     std::uint8_t u8() {
         if (!require(1)) return 0;
@@ -1057,6 +1070,15 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
             metadataSection.u64(st.bodyFingerprint);
         }
     }
+    if (!module.languageMetadata.nonPublicFunctions.empty()) {
+        metadataSection.u32(kFunctionAccessMetadataTrailerMagic);
+        metadataSection.u32(static_cast<std::uint32_t>(
+            module.languageMetadata.nonPublicFunctions.size()));
+        for (const auto& entry : module.languageMetadata.nonPublicFunctions) {
+            metadataSection.u64(entry.symbolId);
+            metadataSection.u8(entry.accessibility);
+        }
+    }
 
     Writer writer;
     writer.bytes("RSBC", 4);
@@ -1373,7 +1395,8 @@ bool decodeModule(
         }
         if (reader.valid() && !reader.empty() &&
             module.version.major == 0 && module.version.minor >= 7 &&
-            reader.remaining() >= 12) {
+            reader.remaining() >= 12 &&
+            reader.peekU32() == kInlineMetadataTrailerMagic) {
             const auto magic = reader.u32();
             if (!reader.valid() || magic != kInlineMetadataTrailerMagic) {
                 diagnostics.report("RS5010", "invalid language metadata section", {});
@@ -1418,6 +1441,28 @@ bool decodeModule(
                     return false;
                 }
                 module.languageMetadata.functionInlineStamps.push_back(st);
+            }
+        }
+        if (reader.valid() && !reader.empty() &&
+            reader.remaining() >= 8 &&
+            reader.peekU32() == kFunctionAccessMetadataTrailerMagic) {
+            (void)reader.u32();
+            const auto fnAccessCount = reader.u32();
+            if (!reader.valid() || fnAccessCount > reader.remaining() / 9) {
+                diagnostics.report("RS5010", "truncated function accessibility metadata", {});
+                return false;
+            }
+            module.languageMetadata.nonPublicFunctions.reserve(fnAccessCount);
+            for (std::uint32_t index = 0; index < fnAccessCount; ++index) {
+                compiler::LanguageFunctionAccessibility entry;
+                entry.symbolId = reader.u64();
+                entry.accessibility = reader.u8();
+                if (!reader.valid() ||
+                    entry.accessibility > static_cast<std::uint8_t>(semantic::Accessibility::Private)) {
+                    diagnostics.report("RS5010", "invalid function accessibility entry", {});
+                    return false;
+                }
+                module.languageMetadata.nonPublicFunctions.push_back(entry);
             }
         }
         if (!reader.valid() || !reader.empty()) {
@@ -1990,6 +2035,18 @@ bool decodeModule(
             return false;
         }
         module.functions.push_back(std::move(record.function));
+    }
+    if (!module.languageMetadata.nonPublicFunctions.empty()) {
+        std::unordered_map<semantic::SymbolId, semantic::Accessibility> fnAccessMap;
+        fnAccessMap.reserve(module.languageMetadata.nonPublicFunctions.size());
+        for (const auto& entry : module.languageMetadata.nonPublicFunctions) {
+            fnAccessMap[entry.symbolId] = static_cast<semantic::Accessibility>(entry.accessibility);
+        }
+        for (auto& fn : module.functions) {
+            if (const auto it = fnAccessMap.find(fn.symbolId); it != fnAccessMap.end()) {
+                fn.accessibility = it->second;
+            }
+        }
     }
 
     {

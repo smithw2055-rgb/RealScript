@@ -1,7 +1,6 @@
 #include "realscript/compiler/ModuleBuildCache.h"
 
 #include "realscript/Version.h"
-#include "realscript/aot_cpp/AotRuntime.h"
 #include "realscript/semantic/Semantic.h"
 #include "realscript/syntax/Syntax.h"
 #include "realscript/text/Text.h"
@@ -45,7 +44,7 @@ constexpr std::uint32_t kMirOverlayVersion = 1u;
 constexpr std::uint32_t kStandaloneMirVersion = 1u;
 constexpr std::uint32_t kOptArtifactVersion = 1u;
 constexpr std::uint32_t kGraphMetaVersion = 1u;
-constexpr std::uint32_t kAotBundleVersion = 2u;
+constexpr std::uint32_t kAotBundleVersion = 3u;
 
 void mixBytes(std::uint64_t& state, const void* data, std::size_t length) noexcept {
     const auto* ptr = static_cast<const unsigned char*>(data);
@@ -134,8 +133,8 @@ std::uint64_t compilerAndAbiVersionFingerprint() noexcept {
     const bytecode::Version bcVer{};
     mixU64(h, bcVer.major);
     mixU64(h, bcVer.minor);
-    mixU64(h, aot::RuntimeAbiMajor);
-    mixU64(h, aot::RuntimeAbiMinor);
+    mixU64(h, realscript::kNativeModuleAbiMajor);
+    mixU64(h, realscript::kNativeModuleAbiMinor);
     return h;
 }
 
@@ -4061,12 +4060,20 @@ CachedBuildResult ModuleBuildCache::build(
     return out;
 }
 
-CachedAotBuildResult ModuleBuildCache::buildAot(
+CachedAotBuildResult ModuleBuildCache::buildAotWithGenerator(
     const std::vector<SourceFile>& sources,
     ModuleBuildCacheOptions cacheOptions,
-    aot::GenerationOptions aotOptions) const {
+    aot::GenerationOptions aotOptions,
+    AotGeneratorCallback generatorCallback) const {
     CachedAotBuildResult out;
     if (sources.empty()) return out;
+    if (!generatorCallback) {
+        out.diagnostics.report(
+            "RS0000",
+            "ModuleBuildCache::buildAotWithGenerator invoked without an AOT generator callback",
+            {});
+        return out;
+    }
 
     const std::filesystem::path activeCacheDir =
         cacheOptions.cacheDirectory.empty() ? cacheDirectory_ : cacheOptions.cacheDirectory;
@@ -4230,8 +4237,7 @@ CachedAotBuildResult ModuleBuildCache::buildAot(
     out.diagnostics = std::move(modRes.diagnostics);
     if (!out.succeeded()) return out;
 
-    aot::CppGenerator generator;
-    out.program = generator.generate(modRes.mirModules, out.diagnostics, aotOptions);
+    out.program = generatorCallback(modRes.mirModules, out.diagnostics, aotOptions);
     if (!out.succeeded()) return out;
 
     if (useDiskCache) {
