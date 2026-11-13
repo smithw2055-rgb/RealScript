@@ -21,6 +21,12 @@ bool isLambdaParameter(
 }
 
 void collectLambdaCaptureNames(
+    const syntax::StatementSyntax& statement,
+    std::vector<std::unordered_set<std::string>>& parameterScopes,
+    std::unordered_set<std::string>& names,
+    bool insideLambda = false);
+
+void collectLambdaCaptureNames(
     const syntax::ExpressionSyntax& expression,
     bool insideLambda,
     std::vector<std::unordered_set<std::string>>& parameterScopes,
@@ -49,8 +55,11 @@ void collectLambdaCaptureNames(
             parameters.insert(parameter.text);
         }
         parameterScopes.push_back(std::move(parameters));
-        collectLambdaCaptureNames(
-            *lambda.body, true, parameterScopes, names);
+        if (lambda.blockBody) {
+            collectLambdaCaptureNames(*lambda.blockBody, parameterScopes, names, true);
+        } else if (lambda.body) {
+            collectLambdaCaptureNames(*lambda.body, true, parameterScopes, names);
+        }
         parameterScopes.pop_back();
         return;
     }
@@ -148,6 +157,19 @@ void collectLambdaCaptureNames(
         visit(arr.initialValues);
         return;
     }
+    case syntax::SyntaxKind::ConditionalExpression: {
+        const auto& cond = static_cast<const
+            syntax::ConditionalExpressionSyntax&>(expression);
+        collectLambdaCaptureNames(*cond.condition, insideLambda, parameterScopes, names);
+        collectLambdaCaptureNames(*cond.whenTrue, insideLambda, parameterScopes, names);
+        collectLambdaCaptureNames(*cond.whenFalse, insideLambda, parameterScopes, names);
+        return;
+    }
+    case syntax::SyntaxKind::TypeBinaryExpression:
+        collectLambdaCaptureNames(*static_cast<const
+            syntax::TypeBinaryExpressionSyntax&>(expression).expression,
+            insideLambda, parameterScopes, names);
+        return;
     default:
         return;
     }
@@ -156,18 +178,23 @@ void collectLambdaCaptureNames(
 void collectLambdaCaptureNames(
     const syntax::StatementSyntax& statement,
     std::vector<std::unordered_set<std::string>>& parameterScopes,
-    std::unordered_set<std::string>& names) {
+    std::unordered_set<std::string>& names,
+    bool insideLambda) {
     const auto expression = [&](const auto& value) {
         if (value) collectLambdaCaptureNames(
-            *value, false, parameterScopes, names);
+            *value, insideLambda, parameterScopes, names);
     };
     switch (statement.kind()) {
-    case syntax::SyntaxKind::BlockStatement:
+    case syntax::SyntaxKind::BlockStatement: {
+        const bool pushed = !parameterScopes.empty();
+        if (pushed) parameterScopes.emplace_back();
         for (const auto& child : static_cast<const
              syntax::BlockStatementSyntax&>(statement).statements) {
-            collectLambdaCaptureNames(*child, parameterScopes, names);
+            if (child) collectLambdaCaptureNames(*child, parameterScopes, names, insideLambda);
         }
+        if (pushed) parameterScopes.pop_back();
         return;
+    }
     case syntax::SyntaxKind::ReturnStatement:
         expression(static_cast<const
             syntax::ReturnStatementSyntax&>(statement).expression);
@@ -177,39 +204,44 @@ void collectLambdaCaptureNames(
             syntax::IfStatementSyntax&>(statement);
         expression(value.condition);
         collectLambdaCaptureNames(
-            *value.thenStatement, parameterScopes, names);
+            *value.thenStatement, parameterScopes, names, insideLambda);
         if (value.elseStatement) collectLambdaCaptureNames(
-            *value.elseStatement, parameterScopes, names);
+            *value.elseStatement, parameterScopes, names, insideLambda);
         return;
     }
     case syntax::SyntaxKind::WhileStatement: {
         const auto& value = static_cast<const
             syntax::WhileStatementSyntax&>(statement);
         expression(value.condition);
-        collectLambdaCaptureNames(*value.body, parameterScopes, names);
+        collectLambdaCaptureNames(*value.body, parameterScopes, names, insideLambda);
         return;
     }
     case syntax::SyntaxKind::ForStatement: {
         const auto& value = static_cast<const
             syntax::ForStatementSyntax&>(statement);
+        const bool pushed = !parameterScopes.empty();
+        if (pushed) parameterScopes.emplace_back();
         if (value.initializer) collectLambdaCaptureNames(
-            *value.initializer, parameterScopes, names);
+            *value.initializer, parameterScopes, names, insideLambda);
         expression(value.condition);
         expression(value.increment);
-        collectLambdaCaptureNames(*value.body, parameterScopes, names);
+        collectLambdaCaptureNames(*value.body, parameterScopes, names, insideLambda);
+        if (pushed) parameterScopes.pop_back();
         return;
     }
     case syntax::SyntaxKind::ForeachStatement: {
         const auto& value = static_cast<const
             syntax::ForeachStatementSyntax&>(statement);
         expression(value.collection);
-        collectLambdaCaptureNames(*value.body, parameterScopes, names);
+        parameterScopes.push_back({value.identifierToken.text});
+        collectLambdaCaptureNames(*value.body, parameterScopes, names, insideLambda);
+        parameterScopes.pop_back();
         return;
     }
     case syntax::SyntaxKind::DoWhileStatement: {
         const auto& value = static_cast<const
             syntax::DoWhileStatementSyntax&>(statement);
-        collectLambdaCaptureNames(*value.body, parameterScopes, names);
+        collectLambdaCaptureNames(*value.body, parameterScopes, names, insideLambda);
         expression(value.condition);
         return;
     }
@@ -221,7 +253,7 @@ void collectLambdaCaptureNames(
             expression(section.label);
             for (const auto& child : section.statements) {
                 collectLambdaCaptureNames(
-                    *child, parameterScopes, names);
+                    *child, parameterScopes, names, insideLambda);
             }
         }
         return;
@@ -237,14 +269,34 @@ void collectLambdaCaptureNames(
         expression(value.handler);
         return;
     }
-    case syntax::SyntaxKind::VariableDeclarationStatement:
-        expression(static_cast<const
-            syntax::VariableDeclarationStatementSyntax&>(statement).initializer);
+    case syntax::SyntaxKind::VariableDeclarationStatement: {
+        const auto& vd = static_cast<const
+            syntax::VariableDeclarationStatementSyntax&>(statement);
+        expression(vd.initializer);
+        if (!parameterScopes.empty()) {
+            parameterScopes.back().insert(vd.identifierToken.text);
+        }
         return;
+    }
     case syntax::SyntaxKind::ExpressionStatement:
         expression(static_cast<const
             syntax::ExpressionStatementSyntax&>(statement).expression);
         return;
+    case syntax::SyntaxKind::TryStatement: {
+        const auto& ts = static_cast<const
+            syntax::TryStatementSyntax&>(statement);
+        collectLambdaCaptureNames(ts.body, parameterScopes, names, insideLambda);
+        for (const auto& cc : ts.catches) {
+            const bool pushedCatch = !parameterScopes.empty() && cc.identifierToken && !cc.identifierToken->text.empty();
+            if (pushedCatch) parameterScopes.push_back({cc.identifierToken->text});
+            collectLambdaCaptureNames(cc.body, parameterScopes, names, insideLambda);
+            if (pushedCatch) parameterScopes.pop_back();
+        }
+        if (ts.finallyBody) {
+            collectLambdaCaptureNames(*ts.finallyBody, parameterScopes, names, insideLambda);
+        }
+        return;
+    }
     default:
         return;
     }
@@ -674,6 +726,15 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
         std::vector<std::unordered_set<std::string>> parameterScopes;
         collectLambdaCaptureNames(
             *input.body, parameterScopes, capturedVariableNames_);
+    } else if (input.eventLambda) {
+        std::vector<std::unordered_set<std::string>> parameterScopes;
+        if (input.eventLambda->blockBody) {
+            collectLambdaCaptureNames(
+                *input.eventLambda->blockBody, parameterScopes, capturedVariableNames_, false);
+        } else if (input.eventLambda->body) {
+            collectLambdaCaptureNames(
+                *input.eventLambda->body, false, parameterScopes, capturedVariableNames_);
+        }
     }
     loopDepth_ = 0;
     breakableDepth_ = 0;
@@ -842,23 +903,27 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
             }
         }
     } else if (input.eventLambda) {
-        result.body = std::make_unique<BoundBlockStatement>();
-        result.body->span = input.eventLambda->span();
-        if (input.symbol.returnType == PrimitiveType::Void) {
-            auto statement = std::make_unique<BoundExpressionStatement>();
-            statement->span = input.eventLambda->body->span();
-            statement->expression = bindExpression(
-                *input.eventLambda->body);
-            result.body->statements.push_back(std::move(statement));
+        if (input.eventLambda->blockBody) {
+            result.body = bindBlockStatement(*input.eventLambda->blockBody, false);
         } else {
-            auto statement = std::make_unique<BoundReturnStatement>();
-            statement->span = input.eventLambda->body->span();
-            statement->expression = bindTargetExpression(
-                *input.eventLambda->body,
-                input.symbol.returnType,
-                input.symbol.returnTypeName,
-                "lambda return value");
-            result.body->statements.push_back(std::move(statement));
+            result.body = std::make_unique<BoundBlockStatement>();
+            result.body->span = input.eventLambda->span();
+            if (input.symbol.returnType == PrimitiveType::Void) {
+                auto statement = std::make_unique<BoundExpressionStatement>();
+                statement->span = input.eventLambda->body->span();
+                statement->expression = bindExpression(
+                    *input.eventLambda->body);
+                result.body->statements.push_back(std::move(statement));
+            } else {
+                auto statement = std::make_unique<BoundReturnStatement>();
+                statement->span = input.eventLambda->body->span();
+                statement->expression = bindTargetExpression(
+                    *input.eventLambda->body,
+                    input.symbol.returnType,
+                    input.symbol.returnTypeName,
+                    "lambda return value");
+                result.body->statements.push_back(std::move(statement));
+            }
         }
     } else if (input.sequenceCancellation) {
         result.body = bindSequenceCancellation(input);
@@ -890,7 +955,8 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                     stmt->expression = std::move(assignment);
                     ctorFieldInitializers.push_back(std::move(stmt));
                 }
-            } else if (const auto* thisVar = lookupVariable("this")) {
+            } else if (const auto* thisVarPtr = lookupVariable("this")) {
+                const VariableSymbol thisVar = *thisVarPtr;
                 for (const auto& field : currentOwnerType_->fields) {
                     if ((initializer && field.declaringTypeId != currentOwnerType_->id) ||
                         field.staticField || field.constField ||
@@ -904,7 +970,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                         assignment->span = field.declarationSpan;
                         assignment->type = field.type;
                         assignment->typeName = field.typeName;
-                        assignment->variable = *thisVar;
+                        assignment->variable = thisVar;
                         assignment->ownerType = *currentOwnerType_;
                         assignment->field = field;
                         assignment->expression = std::move(value);
@@ -917,7 +983,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                         assignment->span = field.declarationSpan;
                         assignment->type = field.type;
                         assignment->typeName = field.typeName;
-                        assignment->receiver = makeVariableAccess(*thisVar, field.declarationSpan);
+                        assignment->receiver = makeVariableAccess(thisVar, field.declarationSpan);
                         assignment->ownerType = *currentOwnerType_;
                         assignment->field = field;
                         assignment->expression = std::move(value);
@@ -1053,7 +1119,7 @@ VariableSymbol Binder::allocateTempVariable(
 std::unique_ptr<BoundExpression> Binder::makeVariableAccess(
     const VariableSymbol& variable,
     text::TextSpan span) {
-    if (storageTypeOf(variable) != variable.type) {
+    if (hasWrappedStorage(variable)) {
         const auto wrapper = visibleTypes_.find(
             storageTypeNameOf(variable));
         if (wrapper != visibleTypes_.end() &&

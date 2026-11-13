@@ -1687,7 +1687,11 @@ std::unique_ptr<ExpressionSyntax> Parser::parseEventHandler() {
         peek(1).kind == SyntaxKind::ArrowToken) {
         lambda->parameterTokens.push_back(nextToken());
         lambda->arrowToken = nextToken();
-        lambda->body = parseExpression();
+        if (current().kind == SyntaxKind::OpenBraceToken) {
+            lambda->blockBody = std::make_unique<BlockStatementSyntax>(parseBlockStatement());
+        } else {
+            lambda->body = parseExpression();
+        }
         return lambda;
     }
     if (current().kind == SyntaxKind::OpenParenToken) {
@@ -1703,7 +1707,11 @@ std::unique_ptr<ExpressionSyntax> Parser::parseEventHandler() {
         }
         lambda->closeParenToken = match(SyntaxKind::CloseParenToken);
         lambda->arrowToken = match(SyntaxKind::ArrowToken);
-        lambda->body = parseExpression();
+        if (current().kind == SyntaxKind::OpenBraceToken) {
+            lambda->blockBody = std::make_unique<BlockStatementSyntax>(parseBlockStatement());
+        } else {
+            lambda->body = parseExpression();
+        }
         return lambda;
     }
     return parseExpression();
@@ -2480,6 +2488,53 @@ std::unique_ptr<ExpressionSyntax> Parser::parsePrimaryExpression() {
         return root ? std::move(root) : makeStringLiteral("", token.span);
     }
     case SyntaxKind::IdentifierToken:
+        if (current().text == "nameof" &&
+            peek(1).kind == SyntaxKind::OpenParenToken) {
+            // Check if tokens inside nameof(...) form a valid C# symbol chain: (this.|base.|Ident.)* Ident
+            std::size_t off = 2;
+            if (peek(off).kind == SyntaxKind::ThisKeyword ||
+                peek(off).kind == SyntaxKind::BaseKeyword) {
+                if (peek(off + 1).kind == SyntaxKind::DotToken) {
+                    off += 2;
+                }
+            }
+            bool validNameof = false;
+            std::string lastIdent;
+            if (isIdentifierLike(peek(off).kind)) {
+                lastIdent = peek(off).text;
+                ++off;
+                validNameof = true;
+                while (peek(off).kind == SyntaxKind::DotToken) {
+                    ++off;
+                    if (!isIdentifierLike(peek(off).kind)) {
+                        validNameof = false;
+                        break;
+                    }
+                    lastIdent = peek(off).text;
+                    ++off;
+                }
+                if (validNameof && peek(off).kind != SyntaxKind::CloseParenToken) {
+                    validNameof = false;
+                }
+            }
+            if (validNameof) {
+                const auto kwTok = nextToken(); // nameof
+                (void)nextToken();              // (
+                SyntaxToken closeTok{};
+                for (std::size_t consumeIdx = 2; consumeIdx <= off; ++consumeIdx) {
+                    closeTok = nextToken();
+                }
+                const text::TextSpan fullSpan{
+                    kwTok.span.start,
+                    closeTok.span.end() - kwTok.span.start};
+                auto lit = std::make_unique<LiteralExpressionSyntax>();
+                lit->literalToken.kind = SyntaxKind::StringLiteralToken;
+                lit->literalToken.span = fullSpan;
+                lit->literalToken.text = "\"" + lastIdent + "\"";
+                lit->literalToken.value = std::move(lastIdent);
+                return lit;
+            }
+        }
         if (peek(1).kind == SyntaxKind::OpenParenToken ||
             isGenericCallStart()) {
             return parseCallExpression();

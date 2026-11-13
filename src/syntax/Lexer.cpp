@@ -20,10 +20,56 @@ void Lexer::advance(std::size_t count) noexcept {
 }
 
 void Lexer::skipTrivia() {
+    if (position_ == 0 &&
+        static_cast<unsigned char>(current()) == 0xEFu &&
+        static_cast<unsigned char>(peek(1)) == 0xBBu &&
+        static_cast<unsigned char>(peek(2)) == 0xBFu) {
+        advance(3);
+    }
     for (;;) {
         if (current() == ' ' || current() == '\t' || current() == '\r' || current() == '\n') {
             advance();
             continue;
+        }
+        if (current() == '#') {
+            bool atLineStart = true;
+            std::size_t back = position_;
+            while (back > 0) {
+                const char prev = source_.at(back - 1);
+                if (prev == '\n' || prev == '\r') break;
+                if (prev == ' ' || prev == '\t') {
+                    --back;
+                    continue;
+                }
+                if (back == 3 &&
+                    static_cast<unsigned char>(source_.at(0)) == 0xEFu &&
+                    static_cast<unsigned char>(source_.at(1)) == 0xBBu &&
+                    static_cast<unsigned char>(source_.at(2)) == 0xBFu) {
+                    break;
+                }
+                atLineStart = false;
+                break;
+            }
+            if (atLineStart) {
+                std::size_t kwOff = 1;
+                while (peek(kwOff) == ' ' || peek(kwOff) == '\t') {
+                    ++kwOff;
+                }
+                std::size_t kwLen = 0;
+                while ((peek(kwOff + kwLen) >= 'a' && peek(kwOff + kwLen) <= 'z') ||
+                       (peek(kwOff + kwLen) >= 'A' && peek(kwOff + kwLen) <= 'Z')) {
+                    ++kwLen;
+                }
+                const auto kwView = source_.view({position_ + kwOff, kwLen});
+                if (kwView == "region" || kwView == "endregion" ||
+                    kwView == "pragma" || kwView == "nullable" || kwView == "line") {
+                    advance(kwOff + kwLen);
+                    while (current() != '\0' && current() != '\r' && current() != '\n') {
+                        advance();
+                    }
+                    continue;
+                }
+            }
         }
         if (current() == '/' && peek(1) == '/') {
             advance(2);
@@ -163,6 +209,34 @@ SyntaxToken Lexer::lexString() {
     return {SyntaxKind::StringLiteralToken, span, std::string(source_.view(span)), std::move(value), false};
 }
 
+SyntaxToken Lexer::lexVerbatimString() {
+    const auto start = position_;
+    advance(2); // skip @"
+    std::string value;
+    bool terminated = false;
+
+    while (current() != '\0') {
+        if (current() == '"') {
+            if (peek(1) == '"') {
+                value.push_back('"');
+                advance(2);
+                continue;
+            }
+            advance();
+            terminated = true;
+            break;
+        }
+        value.push_back(current());
+        advance();
+    }
+
+    const auto span = text::TextSpan{start, position_ - start};
+    if (!terminated) {
+        diagnostics_.report("RS1001", "unterminated string literal", span);
+    }
+    return {SyntaxKind::StringLiteralToken, span, std::string(source_.view(span)), std::move(value), false};
+}
+
 SyntaxToken Lexer::lexInterpolatedString() {
     const auto start = position_;
     advance(2); // skip $"
@@ -287,6 +361,9 @@ SyntaxToken Lexer::nextToken() {
     }
     if (current() == '$' && peek(1) == '"') {
         return lexInterpolatedString();
+    }
+    if (current() == '@' && peek(1) == '"') {
+        return lexVerbatimString();
     }
     if ((current() >= 'a' && current() <= 'z') ||
         (current() >= 'A' && current() <= 'Z') || current() == '_') {

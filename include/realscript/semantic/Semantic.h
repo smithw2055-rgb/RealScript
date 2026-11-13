@@ -130,6 +130,12 @@ struct VariableSymbol {
         : variable.storageTypeName;
 }
 
+[[nodiscard]] inline bool hasWrappedStorage(
+    const VariableSymbol& variable) noexcept {
+    return storageTypeOf(variable) != variable.type ||
+        storageTypeNameOf(variable) != variable.typeName;
+}
+
 struct FieldSymbol {
     std::string name;
     Accessibility accessibility = Accessibility::Public;
@@ -1287,6 +1293,7 @@ private:
     bool declareVariable(VariableSymbol variable, text::TextSpan span);
     void pushScope(text::TextSpan span = {});
     void popScope();
+    [[nodiscard]] bool probeOverloadLambdaBody(const FunctionBindingInput& lb);
     [[nodiscard]] std::unique_ptr<BoundErrorExpression> makeError(
         text::TextSpan span) const;
 

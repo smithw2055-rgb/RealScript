@@ -555,8 +555,7 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
         const auto& value = static_cast<const semantic::BoundVariableDeclarationStatement&>(statement);
         if (value.initializer) {
             const auto initializer = lowerExpression(*value.initializer);
-            if (semantic::storageTypeOf(value.variable) !=
-                    value.variable.type &&
+            if (semantic::hasWrappedStorage(value.variable) &&
                 value.variable.modifier ==
                     semantic::ParameterModifier::None) {
                 const auto cell = emitValue(

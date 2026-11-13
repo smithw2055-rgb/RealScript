@@ -223,6 +223,7 @@ private:
     [[nodiscard]] SyntaxToken lexNumber();
     [[nodiscard]] SyntaxToken lexIdentifierOrKeyword();
     [[nodiscard]] SyntaxToken lexString();
+    [[nodiscard]] SyntaxToken lexVerbatimString();
     [[nodiscard]] SyntaxToken lexInterpolatedString();
     [[nodiscard]] char current() const noexcept;
     [[nodiscard]] char peek(std::size_t offset) const noexcept;
@@ -316,13 +317,21 @@ struct NameExpressionSyntax final : ExpressionSyntax {
     [[nodiscard]] text::TextSpan span() const noexcept override { return identifierToken.span; }
 };
 
+struct BlockStatementSyntax;
+
 struct LambdaExpressionSyntax final : ExpressionSyntax {
+    LambdaExpressionSyntax();
+    ~LambdaExpressionSyntax() override;
+    LambdaExpressionSyntax(LambdaExpressionSyntax&&) noexcept;
+    LambdaExpressionSyntax& operator=(LambdaExpressionSyntax&&) noexcept;
+
     std::optional<SyntaxToken> openParenToken;
     std::vector<SyntaxToken> parameterTokens;
     std::vector<SyntaxToken> commaTokens;
     std::optional<SyntaxToken> closeParenToken;
     SyntaxToken arrowToken;
     std::unique_ptr<ExpressionSyntax> body;
+    std::unique_ptr<BlockStatementSyntax> blockBody;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override {
         return SyntaxKind::LambdaExpression;

@@ -1306,11 +1306,15 @@ private:
         const std::string& sourceName,
         std::vector<ParsedUnit*>& queue) {
         switch (expression.kind()) {
-        case syntax::SyntaxKind::LambdaExpression:
-            rewriteExpression(
-                *static_cast<syntax::LambdaExpressionSyntax&>(expression).body,
-                moduleName, sourceName, queue);
+        case syntax::SyntaxKind::LambdaExpression: {
+            auto& lam = static_cast<syntax::LambdaExpressionSyntax&>(expression);
+            if (lam.blockBody) {
+                rewriteStatement(*lam.blockBody, moduleName, sourceName, queue);
+            } else if (lam.body) {
+                rewriteExpression(*lam.body, moduleName, sourceName, queue);
+            }
             return;
+        }
         case syntax::SyntaxKind::UnaryExpression:
             rewriteExpression(
                 *static_cast<syntax::UnaryExpressionSyntax&>(expression).operand,

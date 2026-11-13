@@ -707,6 +707,186 @@ int main()
         "BindingRegistry::resolve failed to strip generic suffix on leading-underscore function");
 }
 
+void testReviewFixesClosureUnwrapCapturesAndOverloadProbes() {
+    {
+        realscript::compiler::Compilation compilation({{
+            "phase20-review-fixes.rs",
+            R"(
+module Phase20.ReviewFixes;
+
+delegate void VoidInt(int x);
+delegate int IntUnary(int x);
+delegate int IntThunk();
+
+class BaseTag { }
+class DerivedTag : BaseTag { }
+
+class OverloadTarget
+{
+    public int ctorResult;
+
+    public OverloadTarget(VoidInt v)
+    {
+        v(5);
+        ctorResult = 100;
+    }
+
+    public OverloadTarget(IntUnary f)
+    {
+        ctorResult = f(5);
+    }
+
+    public int ApplyMember(VoidInt v)
+    {
+        v(2);
+        return 200;
+    }
+
+    public int ApplyMember(IntUnary f)
+    {
+        return f(3);
+    }
+}
+
+int ApplyFree(VoidInt v)
+{
+    v(4);
+    return 300;
+}
+
+int ApplyFree(IntUnary f)
+{
+    return f(6);
+}
+
+class Host
+{
+    private int secret;
+    private OverloadTarget cachedTarget;
+    event VoidInt OnPing;
+
+    public Host(int initialSecret)
+    {
+        secret = initialSecret;
+        cachedTarget = new OverloadTarget(x => secret + x); // ctorResult = 3 + 5 = 8
+    }
+
+    private int Scale(int v)
+    {
+        return secret * v;
+    }
+
+    public int Run()
+    {
+        int acc = 0;
+        int bonus = 2;
+        OnPing += x => { acc = acc + x + bonus; };
+        OnPing(10); // acc = 12
+
+        // RS-1: nested lambdas accessing/mutating outer local, private field, private method & method-group delegate
+        IntThunk nestedPrivate = () =>
+        {
+            int mid = 1;
+            IntUnary inner = x =>
+            {
+                mid = mid + 1;       // 1 -> 2
+                secret = secret + 1; // 3 -> 4
+                IntUnary mg = Scale;
+                return Scale(x) + mg(1) + mid; // 4*2 + 4*1 + 2 = 14
+            };
+            return inner(2);
+        };
+        acc = acc + nestedPrivate(); // acc = 26, secret = 4
+
+        // RS-2: ternary, is type-binary, try/catch, and for-loop captures
+        bool flag = true;
+        int a = 5;
+        int b = 9;
+        IntUnary tern = x => flag ? (x + a) : b;
+        acc = acc + tern(1); // +6 = 32
+
+        BaseTag tag = new DerivedTag();
+        IntThunk isFn = () => (tag is DerivedTag) ? a : 0;
+        acc = acc + isFn(); // +5 = 37
+
+        try
+        {
+            int inTry = 10;
+            IntThunk tryFn = () => inTry + bonus;
+            acc = acc + tryFn(); // +12 = 49
+        }
+        catch
+        {
+            acc = -1000;
+        }
+
+        for (int i = 0; i < 2; i = i + 1)
+        {
+            int step = i + 1;
+            IntThunk loopFn = () => step + bonus; // (1+2) + (2+2) = 7
+            acc = acc + loopFn();
+        }
+        // acc = 56
+
+        // RS-3: overload resolution across free function, member method, and constructor
+        int fVoid = ApplyFree(x => { acc = acc + x; }); // +4 -> 60, returns 300
+        int fRet = ApplyFree(x => { return x * 4; });     // returns 24
+
+        OverloadTarget tVoid = new OverloadTarget(x => { acc = acc + x; }); // +5 -> 65, ctorResult=100
+        OverloadTarget tRet = new OverloadTarget(x => { return x * 4; });    // ctorResult=20
+
+        int mVoid = tRet.ApplyMember(x => { acc = acc + x; }); // +2 -> 67, returns 200
+        int mRet = tRet.ApplyMember(x => { return x * 4; });   // returns 12
+
+        string verb = @"a""b"; // Length = 3
+        cachedTarget = new OverloadTarget(x => { acc = acc + x; }); // +5 -> 72, ctorResult=100
+
+        return acc + fVoid + fRet + tVoid.ctorResult + tRet.ctorResult + mVoid + mRet + cachedTarget.ctorResult + verb.Length;
+        // 72 + 300 + 24 + 100 + 20 + 200 + 12 + 100 + 3 = 831
+    }
+}
+
+int main()
+{
+    Host h = new Host(3);
+    return h.Run();
+}
+)"}});
+        const auto build = compilation.build();
+        require(!build.diagnostics.hasErrors(),
+            "review fixes fixture compilation failed:\n" +
+                diagnosticsText(build.diagnostics));
+        realscript::bytecode::Lowerer lowerer;
+        auto module = lowerer.lower(build.modules.front());
+        realscript::runtime::Interpreter interpreter({std::move(module)});
+        const auto result = interpreter.invoke("Phase20.ReviewFixes::main");
+        require(result.succeeded &&
+                std::holds_alternative<std::int64_t>(result.value) &&
+                std::get<std::int64_t>(result.value) == 831,
+            "review fixes execution returned wrong value");
+    }
+
+    {
+        realscript::compiler::Compilation badComp({{
+            "phase20-review-missing-return.rs",
+            R"(
+module Phase20.ReviewFixes.Negative;
+
+delegate int IntUnary(int x);
+
+int TakeIntFn(IntUnary f) { return f(1); }
+
+int main()
+{
+    return TakeIntFn(x => { if (x > 0) { return 1; } });
+}
+)"}});
+        const auto badBuild = badComp.build();
+        require(badBuild.diagnostics.hasErrors(),
+            "non-void block lambda missing return path should be rejected");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -724,6 +904,7 @@ int main() {
         testDelegateReferenceParameters();
         testDelegateHeapSnapshotRestore();
         testOverloadedDelegateAndMixedCallsAndGenericBindingResolve();
+        testReviewFixesClosureUnwrapCapturesAndOverloadProbes();
         std::cout << "Phase 20 delegate tests passed\n";
         return 0;
     } catch (const std::exception& error) {

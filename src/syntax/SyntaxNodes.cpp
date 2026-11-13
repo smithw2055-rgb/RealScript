@@ -68,13 +68,21 @@ text::TextSpan TypeSyntax::span() const noexcept {
     return name.span;
 }
 
+LambdaExpressionSyntax::LambdaExpressionSyntax() = default;
+LambdaExpressionSyntax::~LambdaExpressionSyntax() = default;
+LambdaExpressionSyntax::LambdaExpressionSyntax(LambdaExpressionSyntax&&) noexcept = default;
+LambdaExpressionSyntax& LambdaExpressionSyntax::operator=(LambdaExpressionSyntax&&) noexcept = default;
+
 text::TextSpan LambdaExpressionSyntax::span() const noexcept {
     const auto start = openParenToken
         ? openParenToken->span
         : parameterTokens.empty()
             ? arrowToken.span
             : parameterTokens.front().span;
-    return combine(start, body->span());
+    if (blockBody) {
+        return combine(start, blockBody->span());
+    }
+    return body ? combine(start, body->span()) : combine(start, arrowToken.span);
 }
 
 text::TextSpan UnaryExpressionSyntax::span() const noexcept {
