@@ -74,6 +74,8 @@ const char* objectKindName(ObjectKind kind) noexcept {
 #pragma warning(push)
 #pragma warning(disable : 4324)
 #endif
+struct DomainGcState;
+
 struct alignas(64) HeapSyncState {
     static constexpr std::uint32_t kInvalidShardSlot = 0xFFFFFFFFu;
 
@@ -82,15 +84,24 @@ struct alignas(64) HeapSyncState {
     bool (*markPoolFn)(void*) = nullptr;
     std::uint64_t heapIdValue = 0;
     std::uint32_t shardIndex = 0;
+    std::uint8_t domainId = 0;
+    std::shared_ptr<DomainGcState> domainGcState;
     std::atomic<std::uint32_t> shardSlot{kInvalidShardSlot};
     std::atomic<std::uint32_t> stringShardSlot{kInvalidShardSlot};
     std::atomic<std::uint32_t> parallelLockFreeDepth{0};
 
-    HeapSyncState(void* impl, bool (*markFn)(void*), std::uint64_t heapId) noexcept
+    HeapSyncState(
+        void* impl,
+        bool (*markFn)(void*),
+        std::uint64_t heapId,
+        std::uint8_t domId = 0u,
+        std::shared_ptr<DomainGcState> gcStatePtr = {}) noexcept
         : ownerImpl(impl),
           markPoolFn(markFn),
           heapIdValue(heapId),
-          shardIndex(static_cast<std::uint32_t>(heapId & 63u)) {}
+          shardIndex(static_cast<std::uint32_t>(heapId & 63u)),
+          domainId(static_cast<std::uint8_t>(domId & detail::kPoolDomainMask)),
+          domainGcState(std::move(gcStatePtr)) {}
 };
 
 constexpr std::size_t kHeapPoolMarkerShardCount = 64;
@@ -100,30 +111,119 @@ struct alignas(64) HeapPoolMarkerShard {
     std::vector<std::shared_ptr<HeapSyncState>> entries;
     std::atomic<std::size_t> activeCount{0};
 };
+
+struct alignas(64) ValuePoolSweepCoordinator {
+    std::mutex sweepMutex;
+    std::atomic<std::uint64_t> requestedEpoch{0};
+    std::atomic<std::uint64_t> completedEpoch{0};
+};
+
+struct alignas(64) MutatorSweepCoordinator {
+    static constexpr std::uint64_t kSweepActiveBit = std::uint64_t{1} << 63u;
+    static constexpr std::uint64_t kActiveMutatorMask = ~kSweepActiveBit;
+
+    std::atomic<std::uint64_t> state{0};
+    std::atomic<bool> deferredSweepPending{false};
+    std::mutex waitMutex;
+    std::condition_variable cv;
+};
+
+struct DomainGcState final : detail::DomainGcRuntimeState {
+    explicit DomainGcState(std::uint8_t id) noexcept
+        : domainId(id) {}
+
+    std::uint8_t domainId = 0u;
+    ValuePoolSweepCoordinator sweepCoord;
+    MutatorSweepCoordinator mutatorCoord;
+    std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount> heapPoolMarkerShards;
+    std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount> liveStringHeapShards;
+};
 #if defined(_MSC_VER)
 #pragma warning(pop)
 #endif
 
-std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>& localHeapPoolMarkerShards() noexcept {
-    static auto* shards = new std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>();
-    return *shards;
+std::shared_ptr<DomainGcState> defaultDomainGcState() {
+    static std::shared_ptr<DomainGcState> s = std::make_shared<DomainGcState>(std::uint8_t{0u});
+    return s;
 }
 
-std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>& heapPoolMarkerShards() noexcept {
-    if (const auto* b = detail::externalValuePoolBridge(); b && b->heapPoolMarkerShardsPtr) {
-        return *static_cast<std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>*>(b->heapPoolMarkerShardsPtr);
+std::shared_ptr<detail::DomainGcRuntimeState> domainGcStateFactory(std::uint8_t domainId) {
+    if (domainId == 0u) {
+        return defaultDomainGcState();
+    }
+    return std::make_shared<DomainGcState>(domainId);
+}
+
+std::shared_ptr<DomainGcState> getOrCreateDomainGcState(
+    ValuePoolDomain::Impl* domImpl) {
+    if (!domImpl) {
+        return defaultDomainGcState();
+    }
+    auto base = detail::ValuePoolDomainAccess::getOrCreateGcState(
+        domImpl, &domainGcStateFactory);
+    return base
+        ? std::static_pointer_cast<DomainGcState>(base)
+        : defaultDomainGcState();
+}
+
+std::shared_ptr<DomainGcState> findDomainGcStateByDomainId(std::uint8_t domainId) {
+    const std::uint8_t masked = static_cast<std::uint8_t>(domainId & detail::kPoolDomainMask);
+    if (masked == 0u) {
+        return defaultDomainGcState();
+    }
+    if (auto existing = detail::ValuePoolDomainAccess::getGcStateByDomainId(masked)) {
+        return std::static_pointer_cast<DomainGcState>(existing);
+    }
+    if (auto domPtr = detail::ValuePoolDomainAccess::tryLockDomainById(masked)) {
+        return getOrCreateDomainGcState(detail::ValuePoolDomainAccess::impl(domPtr.get()));
+    }
+    return nullptr;
+}
+
+std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>& localHeapPoolMarkerShards() noexcept {
+    return defaultDomainGcState()->heapPoolMarkerShards;
+}
+
+std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>& heapPoolMarkerShardsFor(
+    std::uint8_t domainId,
+    DomainGcState* cachedState = nullptr) noexcept {
+    const std::uint8_t masked = static_cast<std::uint8_t>(domainId & detail::kPoolDomainMask);
+    if (masked == 0u) {
+        if (const auto* b = detail::externalValuePoolBridge(); b && b->heapPoolMarkerShardsPtr) {
+            return *static_cast<std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>*>(
+                b->heapPoolMarkerShardsPtr);
+        }
+        return localHeapPoolMarkerShards();
+    }
+    if (cachedState) {
+        return cachedState->heapPoolMarkerShards;
+    }
+    if (auto st = findDomainGcStateByDomainId(masked)) {
+        return st->heapPoolMarkerShards;
     }
     return localHeapPoolMarkerShards();
 }
 
 std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>& localLiveStringHeapShards() noexcept {
-    static auto* shards = new std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>();
-    return *shards;
+    return defaultDomainGcState()->liveStringHeapShards;
 }
 
-std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>& liveStringHeapShards() noexcept {
-    if (const auto* b = detail::externalValuePoolBridge(); b && b->liveStringHeapShardsPtr) {
-        return *static_cast<std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>*>(b->liveStringHeapShardsPtr);
+std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>& liveStringHeapShardsFor(
+    std::uint8_t domainId,
+    DomainGcState* cachedState = nullptr) noexcept {
+    const std::uint8_t masked = static_cast<std::uint8_t>(domainId & detail::kPoolDomainMask);
+    if (masked == 0u) {
+        if (const auto* b = detail::externalValuePoolBridge(); b && b->liveStringHeapShardsPtr) {
+            return *static_cast<std::array<HeapPoolMarkerShard, kHeapPoolMarkerShardCount>*>(
+                b->liveStringHeapShardsPtr);
+        }
+        return localLiveStringHeapShards();
+    }
+    if (cachedState) {
+        return cachedState->liveStringHeapShards;
+    }
+    if (auto st = findDomainGcStateByDomainId(masked)) {
+        return st->liveStringHeapShards;
     }
     return localLiveStringHeapShards();
 }
@@ -133,7 +233,7 @@ void registerHeapSyncInPoolShard(const std::shared_ptr<HeapSyncState>& sync) {
     if (sync->shardSlot.load(std::memory_order_relaxed) != HeapSyncState::kInvalidShardSlot) {
         return;
     }
-    auto& shard = heapPoolMarkerShards()[sync->shardIndex];
+    auto& shard = heapPoolMarkerShardsFor(sync->domainId, sync->domainGcState.get())[sync->shardIndex];
     std::lock_guard<std::mutex> shardLock(shard.mutex);
     if (sync->shardSlot.load(std::memory_order_relaxed) != HeapSyncState::kInvalidShardSlot) {
         return;
@@ -148,7 +248,7 @@ void unregisterHeapSyncFromPoolShard(HeapSyncState& sync) noexcept {
     if (sync.shardSlot.load(std::memory_order_relaxed) == HeapSyncState::kInvalidShardSlot) {
         return;
     }
-    auto& shard = heapPoolMarkerShards()[sync.shardIndex];
+    auto& shard = heapPoolMarkerShardsFor(sync.domainId, sync.domainGcState.get())[sync.shardIndex];
     std::lock_guard<std::mutex> shardLock(shard.mutex);
     const std::uint32_t slot = sync.shardSlot.load(std::memory_order_relaxed);
     if (slot < shard.entries.size() && shard.entries[slot].get() == &sync) {
@@ -168,7 +268,7 @@ void registerHeapSyncInStringShard(const std::shared_ptr<HeapSyncState>& sync) {
     if (sync->stringShardSlot.load(std::memory_order_relaxed) != HeapSyncState::kInvalidShardSlot) {
         return;
     }
-    auto& shard = liveStringHeapShards()[sync->shardIndex];
+    auto& shard = liveStringHeapShardsFor(sync->domainId, sync->domainGcState.get())[sync->shardIndex];
     std::lock_guard<std::mutex> shardLock(shard.mutex);
     if (sync->stringShardSlot.load(std::memory_order_relaxed) != HeapSyncState::kInvalidShardSlot) {
         return;
@@ -183,7 +283,7 @@ void unregisterHeapSyncFromStringShard(HeapSyncState& sync) noexcept {
     if (sync.stringShardSlot.load(std::memory_order_relaxed) == HeapSyncState::kInvalidShardSlot) {
         return;
     }
-    auto& shard = liveStringHeapShards()[sync.shardIndex];
+    auto& shard = liveStringHeapShardsFor(sync.domainId, sync.domainGcState.get())[sync.shardIndex];
     std::lock_guard<std::mutex> shardLock(shard.mutex);
     const std::uint32_t slot = sync.stringShardSlot.load(std::memory_order_relaxed);
     if (slot < shard.entries.size() && shard.entries[slot].get() == &sync) {
@@ -198,86 +298,72 @@ void unregisterHeapSyncFromStringShard(HeapSyncState& sync) noexcept {
     sync.stringShardSlot.store(HeapSyncState::kInvalidShardSlot, std::memory_order_release);
 }
 
-#if defined(_MSC_VER)
-#pragma warning(push)
-#pragma warning(disable : 4324)
-#endif
-struct alignas(64) ValuePoolSweepCoordinator {
-    std::mutex sweepMutex;
-    std::atomic<std::uint64_t> requestedEpoch{0};
-    std::atomic<std::uint64_t> completedEpoch{0};
-};
-
-struct alignas(64) MutatorSweepCoordinator {
-    static constexpr std::uint64_t kSweepActiveBit = std::uint64_t{1} << 63u;
-    static constexpr std::uint64_t kActiveMutatorMask = ~kSweepActiveBit;
-
-    std::atomic<std::uint64_t> state{0};
-    std::atomic<bool> deferredSweepPending{false};
-    std::mutex waitMutex;
-    std::condition_variable cv;
-};
-#if defined(_MSC_VER)
-#pragma warning(pop)
-#endif
-
-ValuePoolSweepCoordinator& valuePoolSweepCoordinator() noexcept {
-    static auto* coord = new ValuePoolSweepCoordinator();
-    return *coord;
+std::uint32_t& tlsMutatorDepthRef(std::uint8_t domId) noexcept {
+    thread_local std::array<std::uint32_t, detail::kMaxPoolDomains> depths{};
+    return depths[domId & detail::kPoolDomainMask];
 }
 
-MutatorSweepCoordinator& mutatorSweepCoordinator() noexcept {
-    static auto* mc = new MutatorSweepCoordinator();
-    return *mc;
+std::uint32_t& tlsHeapSyncLockDepthRef(std::uint8_t domId) noexcept {
+    thread_local std::array<std::uint32_t, detail::kMaxPoolDomains> depths{};
+    return depths[domId & detail::kPoolDomainMask];
 }
 
-std::uint32_t& tlsMutatorDepthRef() noexcept {
-    thread_local std::uint32_t depth = 0;
-    return depth;
-}
-
-std::uint32_t& tlsHeapSyncLockDepthRef() noexcept {
-    thread_local std::uint32_t depth = 0;
-    return depth;
-}
-
-std::size_t reclaimPoolValuesInternal(
+std::size_t reclaimPoolValuesForDomainImpl(
+    ValuePoolDomain::Impl* domainImpl,
     const ShadowStack* activeShadowStack,
     bool waitIfBusy) noexcept;
 
-void enterHeapSyncLockLocal() noexcept {
-    if (const auto* b = detail::externalValuePoolBridge(); b && b->enterHeapSyncLockFn) {
-        b->enterHeapSyncLockFn();
-        return;
+void enterHeapSyncLockLocal(std::uint8_t domId) noexcept {
+    const std::uint8_t masked = static_cast<std::uint8_t>(domId & detail::kPoolDomainMask);
+    if (masked == 0u) {
+        if (const auto* b = detail::externalValuePoolBridge(); b && b->enterHeapSyncLockFn) {
+            b->enterHeapSyncLockFn();
+            return;
+        }
     }
-    ++tlsHeapSyncLockDepthRef();
+    ++tlsHeapSyncLockDepthRef(masked);
 }
 
-void leaveHeapSyncLockLocal(bool flushDeferred) noexcept {
-    if (const auto* b = detail::externalValuePoolBridge(); b && b->leaveHeapSyncLockFn) {
-        b->leaveHeapSyncLockFn(flushDeferred);
-        return;
+void leaveHeapSyncLockLocal(std::uint8_t domId, bool flushDeferred) noexcept {
+    const std::uint8_t masked = static_cast<std::uint8_t>(domId & detail::kPoolDomainMask);
+    if (masked == 0u) {
+        if (const auto* b = detail::externalValuePoolBridge(); b && b->leaveHeapSyncLockFn) {
+            b->leaveHeapSyncLockFn(flushDeferred);
+            return;
+        }
     }
-    auto& depth = tlsHeapSyncLockDepthRef();
-    if (depth > 0u && --depth == 0u && flushDeferred && tlsMutatorDepthRef() == 0u) {
-        if (mutatorSweepCoordinator().deferredSweepPending.exchange(
-                false, std::memory_order_acq_rel)) {
-            (void)reclaimPoolValuesInternal(nullptr, /*waitIfBusy=*/false);
+    auto& depth = tlsHeapSyncLockDepthRef(masked);
+    if (depth > 0u && --depth == 0u && flushDeferred && tlsMutatorDepthRef(masked) == 0u) {
+        if (auto st = findDomainGcStateByDomainId(masked)) {
+            if (st->mutatorCoord.deferredSweepPending.exchange(
+                    false, std::memory_order_acq_rel)) {
+                (void)detail::reclaimDomainPoolValuesById(masked, nullptr, /*waitIfBusy=*/false);
+            }
         }
     }
 }
 
 class HeapSyncMutexGuard {
 public:
-    explicit HeapSyncMutexGuard(std::mutex& m, bool flushDeferredOnUnlock = true)
-        : mutex_(m), flushDeferred_(flushDeferredOnUnlock) {
+    explicit HeapSyncMutexGuard(HeapSyncState& sync, bool flushDeferredOnUnlock = true)
+        : mutex_(sync.mutex),
+          domainId_(sync.domainId),
+          flushDeferred_(flushDeferredOnUnlock) {
         mutex_.lock();
-        enterHeapSyncLockLocal();
+        enterHeapSyncLockLocal(domainId_);
+    }
+
+    explicit HeapSyncMutexGuard(std::mutex& m, bool flushDeferredOnUnlock = true)
+        : mutex_(m),
+          domainId_(detail::currentThreadDomainIdFast()),
+          flushDeferred_(flushDeferredOnUnlock) {
+        mutex_.lock();
+        enterHeapSyncLockLocal(domainId_);
     }
 
     ~HeapSyncMutexGuard() noexcept {
         mutex_.unlock();
-        leaveHeapSyncLockLocal(flushDeferred_);
+        leaveHeapSyncLockLocal(domainId_, flushDeferred_);
     }
 
     HeapSyncMutexGuard(const HeapSyncMutexGuard&) = delete;
@@ -285,6 +371,7 @@ public:
 
 private:
     std::mutex& mutex_;
+    std::uint8_t domainId_ = 0u;
     bool flushDeferred_ = true;
 };
 
@@ -292,17 +379,18 @@ class HeapReadOrDisjointGuard {
 public:
     explicit HeapReadOrDisjointGuard(HeapSyncState& sync)
         : sync_(sync),
+          domainId_(sync.domainId),
           locked_(sync.parallelLockFreeDepth.load(std::memory_order_acquire) == 0u) {
         if (locked_) {
             sync_.mutex.lock();
-            enterHeapSyncLockLocal();
+            enterHeapSyncLockLocal(domainId_);
         }
     }
 
     ~HeapReadOrDisjointGuard() noexcept {
         if (locked_) {
             sync_.mutex.unlock();
-            leaveHeapSyncLockLocal(/*flushDeferred=*/true);
+            leaveHeapSyncLockLocal(domainId_, /*flushDeferred=*/true);
         }
     }
 
@@ -311,6 +399,7 @@ public:
 
 private:
     HeapSyncState& sync_;
+    std::uint8_t domainId_ = 0u;
     bool locked_ = true;
 };
 
@@ -404,6 +493,7 @@ void transferActiveShadowStack(ShadowStack* from, ShadowStack* to) noexcept {
         to->inlineFrames_ = from->inlineFrames_;
         to->overflowFrames_ = std::move(from->overflowFrames_);
         to->frameCount_ = from->frameCount_;
+        to->domainId_ = from->domainId_;
         from->inlineFrames_ = {};
         from->frameCount_ = 0;
 
@@ -420,6 +510,7 @@ void transferActiveShadowStack(ShadowStack* from, ShadowStack* to) noexcept {
     to->inlineFrames_ = from->inlineFrames_;
     to->overflowFrames_ = std::move(from->overflowFrames_);
     to->frameCount_ = from->frameCount_;
+    to->domainId_ = from->domainId_;
     from->inlineFrames_ = {};
     from->frameCount_ = 0;
     if (to->frameCount_ > 0) {
@@ -428,7 +519,8 @@ void transferActiveShadowStack(ShadowStack* from, ShadowStack* to) noexcept {
 }
 
 ShadowStack::ShadowStack() noexcept
-    : instanceId_(nextShadowStackId()) {}
+    : instanceId_(nextShadowStackId()),
+      domainId_(detail::currentThreadDomainIdFast()) {}
 
 ShadowStack::~ShadowStack() noexcept {
     if (registryShard_ != nullptr) {
@@ -437,13 +529,15 @@ ShadowStack::~ShadowStack() noexcept {
 }
 
 ShadowStack::ShadowStack(const ShadowStack& other)
-    : instanceId_(nextShadowStackId()) {
+    : instanceId_(nextShadowStackId()),
+      domainId_(other.domainId_) {
     if (other.registryShard_ != nullptr) {
         auto* otherShard = static_cast<ThreadShadowStackShard*>(other.registryShard_);
         std::lock_guard<std::mutex> lock(otherShard->mutex);
         inlineFrames_ = other.inlineFrames_;
         overflowFrames_ = other.overflowFrames_;
         frameCount_ = other.frameCount_;
+        domainId_ = other.domainId_;
     } else {
         inlineFrames_ = other.inlineFrames_;
         overflowFrames_ = other.overflowFrames_;
@@ -459,12 +553,14 @@ ShadowStack& ShadowStack::operator=(const ShadowStack& other) {
     std::array<FrameRoots, InlineFrameCapacity> inlineCopy{};
     std::vector<FrameRoots> overflowCopy;
     std::size_t countCopy = 0;
+    std::uint8_t domCopy = other.domainId_;
     if (other.registryShard_ != nullptr && other.registryShard_ != registryShard_) {
         auto* otherShard = static_cast<ThreadShadowStackShard*>(other.registryShard_);
         std::lock_guard<std::mutex> lock(otherShard->mutex);
         inlineCopy = other.inlineFrames_;
         overflowCopy = other.overflowFrames_;
         countCopy = other.frameCount_;
+        domCopy = other.domainId_;
     } else if (other.registryShard_ == nullptr) {
         inlineCopy = other.inlineFrames_;
         overflowCopy = other.overflowFrames_;
@@ -479,10 +575,12 @@ ShadowStack& ShadowStack::operator=(const ShadowStack& other) {
                 inlineFrames_ = other.inlineFrames_;
                 overflowFrames_ = other.overflowFrames_;
                 frameCount_ = other.frameCount_;
+                domainId_ = other.domainId_;
             } else {
                 inlineFrames_ = inlineCopy;
                 overflowFrames_ = std::move(overflowCopy);
                 frameCount_ = countCopy;
+                domainId_ = domCopy;
             }
             instanceId_ = nextShadowStackId();
         }
@@ -494,6 +592,7 @@ ShadowStack& ShadowStack::operator=(const ShadowStack& other) {
     inlineFrames_ = inlineCopy;
     overflowFrames_ = std::move(overflowCopy);
     frameCount_ = countCopy;
+    domainId_ = domCopy;
     instanceId_ = nextShadowStackId();
     if (frameCount_ > 0) {
         registerActiveShadowStack(this);
@@ -502,7 +601,8 @@ ShadowStack& ShadowStack::operator=(const ShadowStack& other) {
 }
 
 ShadowStack::ShadowStack(ShadowStack&& other) noexcept
-    : instanceId_(nextShadowStackId()) {
+    : instanceId_(nextShadowStackId()),
+      domainId_(other.domainId_) {
     transferActiveShadowStack(&other, this);
     other.instanceId_ = nextShadowStackId();
 }
@@ -516,6 +616,17 @@ ShadowStack& ShadowStack::operator=(ShadowStack&& other) noexcept {
     transferActiveShadowStack(&other, this);
     other.instanceId_ = nextShadowStackId();
     return *this;
+}
+
+void ShadowStack::setDomainId(std::uint8_t id) noexcept {
+    const std::uint8_t masked = static_cast<std::uint8_t>(id & detail::kPoolDomainMask);
+    if (registryShard_ != nullptr) {
+        auto* shard = static_cast<ThreadShadowStackShard*>(registryShard_);
+        std::lock_guard<std::mutex> lock(shard->mutex);
+        domainId_ = masked;
+        return;
+    }
+    domainId_ = masked;
 }
 
 void ShadowStack::pushFrame(
@@ -2343,23 +2454,54 @@ public:
         if (!pool.freeList.empty()) {
             outHandle = pool.freeList.back();
             pool.freeList.pop_back();
+            const std::uint32_t pageIdx = outHandle >> 10;
+            if (pageIdx < pool.liveCountPerPage.size()) {
+                ++pool.liveCountPerPage[pageIdx];
+            }
             return resolve(cls, outHandle);
         }
         const std::size_t stride = classStride(cls);
-        if (pool.cursor >= kBlocksPerPage) {
-            pool.pages.push_back(std::make_unique<Value[]>(kBlocksPerPage * stride));
+        if (pool.cursor >= kBlocksPerPage ||
+            pool.currentPageIdx >= pool.pages.size() ||
+            !pool.pages[pool.currentPageIdx]) {
+            std::uint32_t nextPageIdx = 0u;
+            if (!pool.emptyPageIndices.empty()) {
+                nextPageIdx = pool.emptyPageIndices.back();
+                pool.emptyPageIndices.pop_back();
+                pool.pages[nextPageIdx] = std::make_unique<Value[]>(kBlocksPerPage * stride);
+                pool.liveCountPerPage[nextPageIdx] = 0u;
+            } else {
+                nextPageIdx = static_cast<std::uint32_t>(pool.pages.size());
+                pool.pages.push_back(std::make_unique<Value[]>(kBlocksPerPage * stride));
+                pool.liveCountPerPage.push_back(0u);
+            }
+            pool.currentPageIdx = nextPageIdx;
             pool.cursor = 0;
         }
-        const auto pageIdx = static_cast<std::uint32_t>(pool.pages.size() - 1);
+        const std::uint32_t pageIdx = pool.currentPageIdx;
         const auto blockIdx = static_cast<std::uint32_t>(pool.cursor++);
+        ++pool.liveCountPerPage[pageIdx];
         outHandle = (pageIdx << 10) | blockIdx;
         return &pool.pages[pageIdx][blockIdx * stride];
     }
 
     void deallocate(std::uint16_t cls, std::uint32_t handle, std::uint32_t usedCount) noexcept {
-        (void)usedCount;
         if (cls == kZeroClass || handle == CompactSlot::kInvalidHandle) return;
-        classes_[cls].freeList.push_back(handle);
+        auto& pool = classes_[cls];
+        const std::uint32_t pageIdx = handle >> 10;
+        const std::uint32_t blockIdx = handle & 0x3FFu;
+        const std::size_t stride = classStride(cls);
+        if (pageIdx < pool.pages.size() && pool.pages[pageIdx]) {
+            const std::size_t clearCount = std::min<std::size_t>(usedCount, stride);
+            Value* ptr = &pool.pages[pageIdx][blockIdx * stride];
+            for (std::size_t i = 0; i < clearCount; ++i) {
+                ptr[i] = Value{};
+            }
+        }
+        if (pageIdx < pool.liveCountPerPage.size() && pool.liveCountPerPage[pageIdx] > 0u) {
+            --pool.liveCountPerPage[pageIdx];
+        }
+        pool.freeList.push_back(handle);
     }
 
     [[nodiscard]] Value* resolve(std::uint16_t cls, std::uint32_t handle) const noexcept {
@@ -2367,19 +2509,87 @@ public:
         return &classes_[cls].pages[handle >> 10][(handle & 0x3FFu) * stride];
     }
 
+    std::size_t trimExcess() noexcept {
+        std::size_t reclaimed = 0;
+        for (std::uint16_t cls = 0; cls < classes_.size(); ++cls) {
+            auto& pool = classes_[cls];
+            if (pool.pages.empty()) continue;
+            const std::size_t stride = classStride(cls);
+            const std::size_t pageBytes = kBlocksPerPage * stride * sizeof(Value);
+            bool anyLive = false;
+            for (std::size_t p = 0; p < pool.pages.size(); ++p) {
+                if (pool.pages[p] &&
+                    p < pool.liveCountPerPage.size() &&
+                    pool.liveCountPerPage[p] > 0u) {
+                    anyLive = true;
+                    break;
+                }
+            }
+            if (!anyLive) {
+                for (const auto& pagePtr : pool.pages) {
+                    if (pagePtr) reclaimed += pageBytes;
+                }
+                std::vector<std::unique_ptr<Value[]>>().swap(pool.pages);
+                std::vector<std::uint16_t>().swap(pool.liveCountPerPage);
+                std::vector<std::uint32_t>().swap(pool.emptyPageIndices);
+                std::vector<std::uint32_t>().swap(pool.freeList);
+                pool.cursor = kBlocksPerPage;
+                pool.currentPageIdx = 0xFFFFFFFFu;
+                continue;
+            }
+            std::vector<std::uint8_t> reclaimedPages(pool.pages.size(), 0u);
+            bool anyReclaimed = false;
+            for (std::size_t p = 0; p < pool.pages.size(); ++p) {
+                if (pool.pages[p] &&
+                    (p >= pool.liveCountPerPage.size() || pool.liveCountPerPage[p] == 0u)) {
+                    pool.pages[p].reset();
+                    reclaimedPages[p] = 1u;
+                    reclaimed += pageBytes;
+                    anyReclaimed = true;
+                    if (pool.currentPageIdx == p) {
+                        pool.currentPageIdx = 0xFFFFFFFFu;
+                        pool.cursor = kBlocksPerPage;
+                    }
+                    pool.emptyPageIndices.push_back(static_cast<std::uint32_t>(p));
+                }
+            }
+            if (anyReclaimed && !pool.freeList.empty()) {
+                pool.freeList.erase(
+                    std::remove_if(
+                        pool.freeList.begin(),
+                        pool.freeList.end(),
+                        [&](std::uint32_t handle) {
+                            const std::uint32_t pIdx = handle >> 10;
+                            return pIdx < reclaimedPages.size() && reclaimedPages[pIdx] != 0u;
+                        }),
+                    pool.freeList.end());
+            }
+            if (pool.freeList.capacity() > pool.freeList.size() * 2u + 64u) {
+                pool.freeList.shrink_to_fit();
+            }
+        }
+        return reclaimed;
+    }
+
     void clear() noexcept {
         for (auto& c : classes_) {
             c.pages.clear();
+            c.liveCountPerPage.clear();
+            c.emptyPageIndices.clear();
             c.freeList.clear();
             c.cursor = kBlocksPerPage;
+            c.currentPageIdx = 0xFFFFFFFFu;
         }
     }
 
 private:
     struct ClassArena {
         std::vector<std::unique_ptr<Value[]>> pages;
+        std::vector<std::uint16_t> liveCountPerPage;
+        std::vector<std::uint32_t> emptyPageIndices;
         std::vector<std::uint32_t> freeList;
         std::size_t cursor = kBlocksPerPage;
+        std::uint32_t currentPageIdx = 0xFFFFFFFFu;
     };
     std::array<ClassArena, 3> classes_;
     Value emptyValue_{};
@@ -2457,6 +2667,25 @@ public:
         freeIds_.push_back(id);
     }
 
+    std::size_t trimExcess() noexcept {
+        std::size_t reclaimed = 0;
+        std::size_t freedCount = 0;
+        for (const auto id : freeIds_) {
+            if (id < blocks_.size()) {
+                ++freedCount;
+                reclaimed += blocks_[id].cap;
+                blocks_[id].reset();
+            }
+        }
+        if (freedCount == blocks_.size()) {
+            std::vector<AlignedBlock>().swap(blocks_);
+            std::vector<std::uint32_t>().swap(freeIds_);
+        } else if (freeIds_.capacity() > freeIds_.size() * 2u + 64u) {
+            freeIds_.shrink_to_fit();
+        }
+        return reclaimed;
+    }
+
     void clear() noexcept {
         blocks_.clear();
         freeIds_.clear();
@@ -2509,6 +2738,29 @@ public:
         } else {
             largeFreeIds_.push_back(id);
         }
+    }
+
+    std::size_t trimExcess() noexcept {
+        std::size_t reclaimed = 0;
+        const auto trimList = [&](const std::vector<std::uint32_t>& ids) {
+            for (const auto id : ids) {
+                if (id < buffers_.size()) {
+                    const std::size_t cap = buffers_[id].capacity();
+                    if (cap > 0u) {
+                        reclaimed += cap * sizeof(Value);
+                        std::vector<Value>().swap(buffers_[id]);
+                    }
+                }
+            }
+        };
+        trimList(smallFreeIds_);
+        trimList(largeFreeIds_);
+        if (smallFreeIds_.size() + largeFreeIds_.size() == buffers_.size()) {
+            std::vector<std::vector<Value>>().swap(buffers_);
+            std::vector<std::uint32_t>().swap(smallFreeIds_);
+            std::vector<std::uint32_t>().swap(largeFreeIds_);
+        }
+        return reclaimed;
     }
 
     void clear() noexcept {
@@ -2575,6 +2827,26 @@ public:
         return strings_[id];
     }
 
+    std::size_t trimExcess() noexcept {
+        std::size_t reclaimed = 0;
+        for (const auto id : freeIds_) {
+            if (id < strings_.size()) {
+                const std::size_t cap = strings_[id].capacity();
+                if (cap > 15u) {
+                    reclaimed += cap;
+                    std::string().swap(strings_[id]);
+                } else {
+                    strings_[id].clear();
+                }
+            }
+        }
+        if (freeIds_.size() == strings_.size()) {
+            std::vector<std::string>().swap(strings_);
+            std::vector<std::uint32_t>().swap(freeIds_);
+        }
+        return reclaimed;
+    }
+
     void clear() noexcept {
         strings_.clear();
         freeIds_.clear();
@@ -2607,6 +2879,18 @@ public:
 
     [[nodiscard]] NativeRawColumnView& get(std::uint32_t id) noexcept { return views_[id]; }
     [[nodiscard]] const NativeRawColumnView& get(std::uint32_t id) const noexcept { return views_[id]; }
+
+    std::size_t trimExcess() noexcept {
+        if (freeIds_.size() == views_.size() && !views_.empty()) {
+            const std::size_t bytes =
+                views_.capacity() * sizeof(NativeRawColumnView) +
+                freeIds_.capacity() * sizeof(std::uint32_t);
+            std::vector<NativeRawColumnView>().swap(views_);
+            std::vector<std::uint32_t>().swap(freeIds_);
+            return bytes;
+        }
+        return 0u;
+    }
 
     void clear() noexcept {
         views_.clear();
@@ -2643,6 +2927,7 @@ public:
         const std::size_t cardCount =
             (elementCount + ManagedHeap::kCardElements - 1) >> ManagedHeap::kCardElementShift;
         const auto wordCount = static_cast<std::uint32_t>((cardCount + 7) >> 3);
+        ++liveSliceCount_;
         auto& bucket = freeByWordCount_[wordCount];
         if (!bucket.empty()) {
             const std::uint32_t handle = bucket.back();
@@ -2659,11 +2944,34 @@ public:
 
     void deallocate(std::uint32_t handle) {
         if (handle >= slices_.size()) return;
+        if (liveSliceCount_ > 0u) --liveSliceCount_;
         freeByWordCount_[slices_[handle].wordCount].push_back(handle);
     }
 
     [[nodiscard]] CardSlice& get(std::uint32_t handle) noexcept { return slices_[handle]; }
     [[nodiscard]] const CardSlice& get(std::uint32_t handle) const noexcept { return slices_[handle]; }
+
+    std::size_t trimExcess() noexcept {
+        if (liveSliceCount_ == 0u) {
+            const std::size_t bytes =
+                (pages_.size() * kWordsPerPage + totalOversizedWords_) * sizeof(std::uint64_t);
+            std::vector<std::unique_ptr<std::uint64_t[]>>().swap(pages_);
+            std::vector<std::unique_ptr<std::uint64_t[]>>().swap(oversizedPages_);
+            cursor_ = kWordsPerPage;
+            std::vector<CardSlice>().swap(slices_);
+            freeByWordCount_.clear();
+            totalOversizedWords_ = 0u;
+            return bytes;
+        }
+        for (auto it = freeByWordCount_.begin(); it != freeByWordCount_.end();) {
+            if (it->second.empty()) {
+                it = freeByWordCount_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        return 0u;
+    }
 
     void clear() noexcept {
         pages_.clear();
@@ -2671,6 +2979,8 @@ public:
         cursor_ = kWordsPerPage;
         slices_.clear();
         freeByWordCount_.clear();
+        liveSliceCount_ = 0u;
+        totalOversizedWords_ = 0u;
     }
 
 private:
@@ -2679,6 +2989,7 @@ private:
     std::uint64_t* allocateAlignedWords(std::uint32_t wordCount) {
         if (wordCount > kWordsPerPage) {
             oversizedPages_.push_back(std::make_unique<std::uint64_t[]>(wordCount));
+            totalOversizedWords_ += wordCount;
             return oversizedPages_.back().get();
         }
         if (cursor_ + wordCount > kWordsPerPage) {
@@ -2695,6 +3006,8 @@ private:
     std::size_t cursor_ = kWordsPerPage;
     std::vector<CardSlice> slices_;
     std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> freeByWordCount_;
+    std::size_t liveSliceCount_ = 0u;
+    std::size_t totalOversizedWords_ = 0u;
 };
 
 struct ManagedHeap::Impl {
@@ -2758,6 +3071,7 @@ struct ManagedHeap::Impl {
 
     static bool markPoolCallback(void* rawImpl) {
         auto* self = static_cast<Impl*>(rawImpl);
+        ScopedValuePoolDomain domainScope(self->valuePoolDomain.get());
         const bool foundAny = self->markAllReachablePoolValues();
         if (!foundAny) {
             self->mayContainPoolValues.store(false, std::memory_order_relaxed);
@@ -2765,11 +3079,25 @@ struct ManagedHeap::Impl {
         return foundAny;
     }
 
+    static std::shared_ptr<HeapSyncState> makeSyncState(
+        Impl* implPtr,
+        bool (*markFn)(void*),
+        std::uint64_t id,
+        ValuePoolDomain* domain) {
+        auto* domImpl = detail::ValuePoolDomainAccess::impl(domain);
+        const std::uint8_t domId = domain ? domain->domainId() : 0u;
+        auto gcState = getOrCreateDomainGcState(domImpl);
+        return std::make_shared<HeapSyncState>(
+            implPtr, markFn, id, domId, std::move(gcState));
+    }
+
     explicit Impl(HeapConfig value)
-        : config(value),
+        : config(std::move(value)),
           heapId(nextHeapId()),
-          syncState(std::make_shared<HeapSyncState>(this, &Impl::markPoolCallback, heapId)),
-          nextCollectionThreshold(value.initialCollectionThresholdBytes) {
+          valuePoolDomain(
+              config.valuePoolDomain ? config.valuePoolDomain : ValuePoolDomain::defaultDomain()),
+          syncState(makeSyncState(this, &Impl::markPoolCallback, heapId, valuePoolDomain.get())),
+          nextCollectionThreshold(config.initialCollectionThresholdBytes) {
         typeLayouts.push_back(TypeLayoutEntry{}); // layoutId 0: default empty
         if (config.initialCollectionThresholdBytes == 0) {
             config.initialCollectionThresholdBytes = 1;
@@ -2783,7 +3111,9 @@ struct ManagedHeap::Impl {
     ~Impl() {
         if (syncState) {
             {
-                HeapSyncMutexGuard instanceLock(syncState->mutex, /*flushDeferredOnUnlock=*/false);
+                HeapSyncMutexGuard instanceLock(*syncState, /*flushDeferredOnUnlock=*/false);
+                pendingValueLifecycleSweeps.clear();
+                pendingWrapperSweeps.clear();
                 syncState->ownerImpl = nullptr;
             }
             unregisterHeapSyncFromPoolShard(*syncState);
@@ -2914,6 +3244,7 @@ struct ManagedHeap::Impl {
             (void)typeName;
             for (const auto& v : table.values) markOne(v);
         }
+        for (const auto& entry : pendingValueLifecycleSweeps) markOne(entry.value);
         for (const auto& slot : slots) {
             if (!slot.occupied()) continue;
             const auto count = slotValueCount(slot);
@@ -3037,6 +3368,7 @@ struct ManagedHeap::Impl {
 
     HeapConfig config;
     std::uint64_t heapId = 0;
+    std::shared_ptr<ValuePoolDomain> valuePoolDomain;
     std::shared_ptr<HeapSyncState> syncState;
     std::atomic<bool> mayContainPoolValues{false};
     std::atomic<std::uint64_t> gcAndLayoutEpoch{1};
@@ -3077,6 +3409,199 @@ struct ManagedHeap::Impl {
     std::unordered_map<semantic::SymbolId, semantic::SymbolId> typeBaseIds;
     std::unordered_map<std::uint32_t, std::uint64_t> observerDirtyMasks;
     NativeWrapperSweepCallback nativeWrapperSweepCallback;
+    std::atomic<bool> hasValueLifecycleTypes{false};
+    std::unordered_set<semantic::SymbolId> valueLifecycleTypes;
+    ValueLifecycleSweepCallback valueLifecycleSweepCallback;
+
+    struct PendingValueLifecycleSweep {
+        Value value;
+        RootToken rootToken = 0;
+    };
+    std::vector<PendingValueLifecycleSweep> pendingValueLifecycleSweeps;
+
+    [[nodiscard]] bool flatSchemaMayContainValueLifecycleUnlocked(
+        const FlatStructSchema& sc,
+        int depth = 0) const noexcept {
+        if (sc.structTypeId != 0 &&
+            valueLifecycleTypes.find(sc.structTypeId) != valueLifecycleTypes.end()) {
+            return true;
+        }
+        if (depth >= 16) {
+            return false;
+        }
+        for (const auto& df : sc.directFields) {
+            if (df.typeId != 0 && valueLifecycleTypes.find(df.typeId) != valueLifecycleTypes.end()) {
+                return true;
+            }
+            if (df.subSchemaId != 0) {
+                if (const auto* subSc = getFlatStructSchema(df.subSchemaId)) {
+                    if (flatSchemaMayContainValueLifecycleUnlocked(*subSc, depth + 1)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool blittableSchemaMayContainValueLifecycleUnlocked(
+        std::uint32_t schemaId,
+        int depth = 0) const noexcept {
+        const auto* sc = localBlittableRegistry().getByIdLockFree(schemaId);
+        if (!sc) {
+            return false;
+        }
+        if (sc->structTypeId != 0 &&
+            valueLifecycleTypes.find(sc->structTypeId) != valueLifecycleTypes.end()) {
+            return true;
+        }
+        if (depth >= 16) {
+            return false;
+        }
+        for (const auto& f : sc->fields) {
+            if (f.fieldTypeId != 0 &&
+                valueLifecycleTypes.find(f.fieldTypeId) != valueLifecycleTypes.end()) {
+                return true;
+            }
+            if (f.nestedSchemaId != 0 &&
+                blittableSchemaMayContainValueLifecycleUnlocked(f.nestedSchemaId, depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void collectValueLifecycleValuesUnlocked(const Value& value, int depth = 0) {
+        if (depth > 16 || value.rawTag() != ValueTag::Struct) {
+            return;
+        }
+        const auto& s = value.asStructUnchecked();
+        if (s.typeId != 0 && valueLifecycleTypes.find(s.typeId) != valueLifecycleTypes.end()) {
+            Value detached = detachFrameSliceValue(value);
+            RootToken token = nextRootToken++;
+            if (token == 0) {
+                token = nextRootToken++;
+            }
+            pinHeapValueIfNeededUnlocked(detached);
+            persistentRoots.emplace(token, detached);
+            pendingValueLifecycleSweeps.push_back(
+                PendingValueLifecycleSweep{std::move(detached), token});
+        }
+        const std::size_t n = s.fieldCount();
+        for (std::size_t i = 0; i < n; ++i) {
+            if (const auto fv = structValueFieldAt(s, i)) {
+                collectValueLifecycleValuesUnlocked(*fv, depth + 1);
+            }
+        }
+    }
+
+    void collectValueLifecycleFromSlotUnlocked(CompactSlot& slot) {
+        const auto kind = slot.kind();
+        if (kind != ObjectKind::Record && kind != ObjectKind::Array) {
+            return;
+        }
+        const auto st = slot.storage();
+        if (st == SlotStorage::SlabValues || st == SlotStorage::HeapValues) {
+            if (!slot.payload.s.data) {
+                return;
+            }
+            for (std::uint32_t i = 0; i < slot.payload.s.length; ++i) {
+                collectValueLifecycleValuesUnlocked(slot.payload.s.data[i]);
+            }
+            return;
+        }
+        if (st == SlotStorage::FlatStruct) {
+            if (!slot.payload.s.data || slot.payload.s.length == 0) {
+                return;
+            }
+            const auto* sc = getFlatStructSchema(slot.auxMeta);
+            if (!sc || !flatSchemaMayContainValueLifecycleUnlocked(*sc)) {
+                return;
+            }
+            for (std::uint32_t i = 0; i < slot.payload.s.length; ++i) {
+                const Value elem = reconstructDetachedStructFromLeaves(
+                    *sc,
+                    slot.payload.s.data + static_cast<std::size_t>(i) * sc->flatSlotCount);
+                collectValueLifecycleValuesUnlocked(elem);
+            }
+            return;
+        }
+        if (st == SlotStorage::PackedStruct) {
+            if (!slot.payload.s.data || slot.payload.s.length == 0) {
+                return;
+            }
+            const semantic::SymbolId elemTid = slot.payload.s.layoutId < typeLayouts.size()
+                ? typeLayouts[slot.payload.s.layoutId].elementTypeId
+                : 0;
+            const std::uint32_t schemaId = slot.payload.s.cardHandle;
+            const bool maybeLifecycle =
+                (elemTid != 0 && valueLifecycleTypes.find(elemTid) != valueLifecycleTypes.end()) ||
+                (schemaId != 0 && blittableSchemaMayContainValueLifecycleUnlocked(schemaId));
+            if (!maybeLifecycle) {
+                return;
+            }
+            const auto encoding = unpackPackedEncoding(slot.auxMeta);
+            for (std::uint32_t i = 0; i < slot.payload.s.length; ++i) {
+                const Value elem = readPackedElementValue(
+                    slot.payload.s.data,
+                    i,
+                    encoding,
+                    elemTid,
+                    schemaId);
+                collectValueLifecycleValuesUnlocked(elem);
+            }
+        }
+    }
+
+    void flushPendingValueLifecycleSweeps() {
+        std::vector<PendingValueLifecycleSweep> pending;
+        ValueLifecycleSweepCallback callback;
+        {
+            HeapSyncMutexGuard heapLock(syncState->mutex);
+            if (pendingValueLifecycleSweeps.empty()) {
+                return;
+            }
+            pending.swap(pendingValueLifecycleSweeps);
+            callback = valueLifecycleSweepCallback;
+            if (!callback) {
+                for (const auto& entry : pending) {
+                    if (entry.rootToken != 0) {
+                        persistentRoots.erase(entry.rootToken);
+                    }
+                }
+                return;
+            }
+        }
+        ScopedValuePoolDomain domainScope(valuePoolDomain.get());
+        std::size_t nextIdx = 0;
+        struct UnpinGuard {
+            Impl* owner;
+            const std::vector<PendingValueLifecycleSweep>& items;
+            std::size_t& idx;
+            UnpinGuard(Impl* o, const std::vector<PendingValueLifecycleSweep>& p, std::size_t& i) noexcept
+                : owner(o), items(p), idx(i) {}
+            ~UnpinGuard() {
+                if (idx >= items.size() || !owner || !owner->syncState) {
+                    return;
+                }
+                HeapSyncMutexGuard heapLock(owner->syncState->mutex);
+                for (; idx < items.size(); ++idx) {
+                    if (items[idx].rootToken != 0) {
+                        owner->persistentRoots.erase(items[idx].rootToken);
+                    }
+                }
+            }
+        } unpinGuard(this, pending, nextIdx);
+
+        for (; nextIdx < pending.size(); ++nextIdx) {
+            const auto& entry = pending[nextIdx];
+            callback(entry.value);
+            if (entry.rootToken != 0) {
+                HeapSyncMutexGuard heapLock(syncState->mutex);
+                persistentRoots.erase(entry.rootToken);
+            }
+        }
+    }
 
     struct PendingWrapperSweep {
         NativeHandle handle{};
@@ -3099,6 +3624,7 @@ struct ManagedHeap::Impl {
         if (!callback) {
             return;
         }
+        ScopedValuePoolDomain domainScope(valuePoolDomain.get());
         for (const auto& entry : pending) {
             if (!NativeHandleRegistry::shouldDispatchSweepNotification(
                     entry.handle, entry.heapId, entry.wrapper)) {
@@ -3635,6 +4161,9 @@ struct ManagedHeap::Impl {
                 }
             }
         }
+        if (hasValueLifecycleTypes.load(std::memory_order_relaxed)) {
+            collectValueLifecycleFromSlotUnlocked(slot);
+        }
         const auto bytes = slotSizeBytes(slotIdx, slot);
         releaseSlotPayload(slotIdx, slot);
         ++slot.generation;
@@ -4120,9 +4649,82 @@ ManagedHeap::~ManagedHeap() = default;
 ManagedHeap::ManagedHeap(ManagedHeap&&) noexcept = default;
 ManagedHeap& ManagedHeap::operator=(ManagedHeap&&) noexcept = default;
 
+const std::shared_ptr<ValuePoolDomain>& ManagedHeap::valuePoolDomain() const noexcept {
+    return impl_->valuePoolDomain;
+}
+
+void ManagedHeap::registerValueLifecycleType(semantic::SymbolId typeId) {
+    if (typeId == 0) {
+        return;
+    }
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    if (impl_->valueLifecycleTypes.insert(typeId).second) {
+        impl_->hasValueLifecycleTypes.store(true, std::memory_order_release);
+    }
+}
+
+void ManagedHeap::setValueLifecycleSweepCallback(ValueLifecycleSweepCallback callback) {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    impl_->valueLifecycleSweepCallback = std::move(callback);
+}
+
+bool ManagedHeap::hasRegisteredValueLifecycleTypes() const noexcept {
+    return impl_->hasValueLifecycleTypes.load(std::memory_order_acquire);
+}
+
+std::size_t ManagedHeap::trimExcessCapacity() noexcept {
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    std::size_t reclaimed = 0u;
+    reclaimed += impl_->slabPool.trimExcess();
+    reclaimed += impl_->packedBuffers.trimExcess();
+    reclaimed += impl_->largeBuffers.trimExcess();
+    reclaimed += impl_->stringPool.trimExcess();
+    reclaimed += impl_->rawColumns.trimExcess();
+    reclaimed += impl_->cardArena.trimExcess();
+    if (!impl_->observerDirtyMasks.empty()) {
+        std::size_t deadMasks = 0u;
+        for (auto it = impl_->observerDirtyMasks.begin();
+             it != impl_->observerDirtyMasks.end();) {
+            const std::uint32_t idx = it->first;
+            if (idx >= impl_->slots.size() || !impl_->slots[idx].occupied()) {
+                it = impl_->observerDirtyMasks.erase(it);
+                ++deadMasks;
+            } else {
+                ++it;
+            }
+        }
+        reclaimed += deadMasks * (sizeof(std::uint32_t) + sizeof(std::uint64_t) + 16u);
+        if (impl_->observerDirtyMasks.empty()) {
+            reclaimed += impl_->observerDirtyMasks.bucket_count() * sizeof(void*);
+            std::unordered_map<std::uint32_t, std::uint64_t>().swap(impl_->observerDirtyMasks);
+        }
+    }
+    if (impl_->phase == GcPhase::Idle) {
+        if (impl_->markStack.empty() && impl_->markStack.capacity() > 64u) {
+            reclaimed += impl_->markStack.capacity() * sizeof(ObjectRef);
+            std::vector<ObjectRef>().swap(impl_->markStack);
+        }
+        if (impl_->youngWorkQueue.empty() && impl_->youngWorkQueue.capacity() > 64u) {
+            reclaimed += impl_->youngWorkQueue.capacity() * sizeof(ObjectRef);
+            std::vector<ObjectRef>().swap(impl_->youngWorkQueue);
+        }
+        if (impl_->nurserySlots.empty() && impl_->nurserySlots.capacity() > 64u) {
+            reclaimed += impl_->nurserySlots.capacity() * sizeof(std::uint32_t);
+            std::vector<std::uint32_t>().swap(impl_->nurserySlots);
+        }
+        if (impl_->rememberedSet.empty() && impl_->rememberedSet.capacity() > 64u) {
+            reclaimed += impl_->rememberedSet.capacity() * sizeof(ObjectRef);
+            std::vector<ObjectRef>().swap(impl_->rememberedSet);
+        }
+    }
+    return reclaimed;
+}
+
 std::optional<ObjectRef> ManagedHeap::allocateString(
     std::string value,
     RuntimeError* error) {
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const auto size = Impl::BaseObjectSizeBytes + value.size();
     return impl_->allocateStringSlot(std::move(value), size, error);
@@ -4131,6 +4733,7 @@ std::optional<ObjectRef> ManagedHeap::allocateString(
 std::optional<ObjectRef> ManagedHeap::internString(
     std::string_view value,
     RuntimeError* error) {
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const std::string key(value);
     const auto found = impl_->internedStrings.find(key);
@@ -4258,6 +4861,7 @@ std::optional<ObjectRef> ManagedHeap::allocateTypedArray(
         setHeapError(error, ErrorCode::OutOfMemory, "managed array is too large");
         return std::nullopt;
     }
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     return impl_->allocateArraySlot(
         arrayTypeId,
@@ -4279,6 +4883,7 @@ std::optional<ObjectRef> ManagedHeap::allocateRecord(
         return std::nullopt;
     }
     std::vector<Value> fields(fieldCount);
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const std::uint32_t layoutId = impl_->internUntypedAllRefRecordLayout(fieldCount);
     return impl_->allocateRecordValuesSlot(
@@ -4314,6 +4919,7 @@ std::optional<ObjectRef> ManagedHeap::allocateObject(
     referenceFields.erase(
         std::unique(referenceFields.begin(), referenceFields.end()),
         referenceFields.end());
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const std::uint32_t layoutId = impl_->internTypedRecordLayout(typeId, referenceFields);
     return impl_->allocateRecordValuesSlot(
@@ -4340,6 +4946,7 @@ std::optional<ObjectRef> ManagedHeap::allocateObjectFromTemplate(
         setHeapError(error, ErrorCode::OutOfMemory, "managed object is too large");
         return std::nullopt;
     }
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     const std::uint32_t layoutId = impl_->internTemplateRecordLayout(typeId, referenceFields);
     const std::size_t sizeBytes = Impl::BaseObjectSizeBytes + storage;
@@ -4397,26 +5004,48 @@ std::optional<std::string> ManagedHeap::tryCopyStringGlobal(ObjectRef reference)
     if (!reference.valid() || reference.kind != ObjectKind::String) {
         return std::nullopt;
     }
-    auto& shard = liveStringHeapShards()[reference.heapId & 63u];
-    if (shard.activeCount.load(std::memory_order_acquire) == 0) {
+    const auto tryCopyInShard = [&](HeapPoolMarkerShard& shard) -> std::optional<std::string> {
+        if (shard.activeCount.load(std::memory_order_acquire) == 0) {
+            return std::nullopt;
+        }
+        std::vector<std::shared_ptr<HeapSyncState>> candidates;
+        {
+            std::lock_guard<std::mutex> shardLock(shard.mutex);
+            for (const auto& entry : shard.entries) {
+                if (entry && static_cast<std::uint32_t>(entry->heapIdValue) == reference.heapId) {
+                    candidates.push_back(entry);
+                }
+            }
+        }
+        for (const auto& sync : candidates) {
+            HeapSyncMutexGuard instanceLock(*sync);
+            auto* impl = static_cast<Impl*>(sync->ownerImpl);
+            if (!impl) continue;
+            const auto* slot = impl->getSlot(reference);
+            if (!slot || slot->kind() != ObjectKind::String) continue;
+            return std::string(impl->slotStringView(*slot));
+        }
         return std::nullopt;
-    }
-    std::vector<std::shared_ptr<HeapSyncState>> candidates;
-    {
-        std::lock_guard<std::mutex> shardLock(shard.mutex);
-        for (const auto& entry : shard.entries) {
-            if (entry && static_cast<std::uint32_t>(entry->heapIdValue) == reference.heapId) {
-                candidates.push_back(entry);
+    };
+    const std::size_t shardIdx = reference.heapId & 63u;
+    const std::uint8_t preferredDom = detail::currentThreadDomainIdFast();
+    if (preferredDom != 0u) {
+        if (auto gcState = findDomainGcStateByDomainId(preferredDom)) {
+            if (auto found = tryCopyInShard(gcState->liveStringHeapShards[shardIdx])) {
+                return found;
             }
         }
     }
-    for (const auto& sync : candidates) {
-        HeapSyncMutexGuard instanceLock(sync->mutex);
-        auto* impl = static_cast<Impl*>(sync->ownerImpl);
-        if (!impl) continue;
-        const auto* slot = impl->getSlot(reference);
-        if (!slot || slot->kind() != ObjectKind::String) continue;
-        return std::string(impl->slotStringView(*slot));
+    if (auto found = tryCopyInShard(liveStringHeapShardsFor(0u)[shardIdx])) {
+        return found;
+    }
+    for (std::uint8_t domId = 1u; domId < detail::kMaxPoolDomains; ++domId) {
+        if (domId == preferredDom) continue;
+        if (auto gcState = findDomainGcStateByDomainId(domId)) {
+            if (auto found = tryCopyInShard(gcState->liveStringHeapShards[shardIdx])) {
+                return found;
+            }
+        }
     }
     return std::nullopt;
 }
@@ -4449,9 +5078,52 @@ namespace {
     return 0;
 }
 
+[[nodiscard]] constexpr std::uint8_t defaultPackedShiftForEncoding(PackedElemEncoding enc) noexcept {
+    switch (enc) {
+    case PackedElemEncoding::Bool:
+    case PackedElemEncoding::Byte:
+    case PackedElemEncoding::SByte:
+        return 0u;
+    case PackedElemEncoding::Short:
+    case PackedElemEncoding::UShort:
+    case PackedElemEncoding::Char:
+        return 1u;
+    case PackedElemEncoding::Int32:
+    case PackedElemEncoding::UInt32:
+    case PackedElemEncoding::Float32:
+    case PackedElemEncoding::EnumInline:
+        return 2u;
+    case PackedElemEncoding::Int64:
+    case PackedElemEncoding::UInt64:
+    case PackedElemEncoding::Float64:
+    case PackedElemEncoding::Int64Wide:
+    case PackedElemEncoding::EnumWide:
+        return 3u;
+    default:
+        return 0u;
+    }
+}
+
 [[nodiscard]] bool validateRawColumnView(
     const NativeRawColumnView& view,
     semantic::SymbolId elementTypeId) noexcept {
+    if (view.mode == RawColumnMode::ScalarPacked) {
+        if (view.strideBytes == 0 || view.packedEncoding == PackedElemEncoding::None) {
+            return false;
+        }
+        if (view.count > 0 && !view.basePtr) {
+            return false;
+        }
+        if (elementTypeId != 0 && view.elementTypeId != 0 &&
+            view.elementTypeId != elementTypeId) {
+            return false;
+        }
+        const std::size_t naturalSize = packedElementStride(
+            view.packedEncoding,
+            defaultPackedShiftForEncoding(view.packedEncoding),
+            view.blittableSchemaId);
+        return naturalSize > 0u && view.strideBytes >= naturalSize;
+    }
     if (elementTypeId == 0 || view.structTypeId != elementTypeId ||
         view.fields.empty() || view.strideBytes == 0) {
         return false;
@@ -4866,6 +5538,7 @@ std::optional<semantic::SymbolId> ManagedHeap::arrayElementTypeId(ObjectRef refe
 }
 
 std::optional<Value> ManagedHeap::arrayGet(ObjectRef reference, std::size_t index) const {
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     semantic::SymbolId rawStructTypeId = 0;
     std::size_t rawFieldCount = 0;
     std::array<Value, 16> stackFields{};
@@ -4899,6 +5572,14 @@ std::optional<Value> ManagedHeap::arrayGet(ObjectRef reference, std::size_t inde
         const auto& view = impl_->rawColumns.get(slot->payload.s.handle);
         if (index >= view.count || (!view.basePtr && view.count > 0)) return std::nullopt;
         const auto* elemBase = static_cast<const std::uint8_t*>(view.basePtr) + index * view.strideBytes;
+        if (view.mode == RawColumnMode::ScalarPacked) {
+            return readPackedElementValue(
+                elemBase,
+                0u,
+                view.packedEncoding,
+                view.elementTypeId,
+                view.blittableSchemaId);
+        }
         rawStructTypeId = view.structTypeId;
         rawFieldCount = view.fields.size();
         if (rawFieldCount <= 16) {
@@ -5212,6 +5893,7 @@ bool ManagedHeap::arraySetPrevalidated(
                 slot->payload.s.cardHandle);
         }
     }
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array) {
@@ -5220,12 +5902,23 @@ bool ManagedHeap::arraySetPrevalidated(
     if (slot->storage() == SlotStorage::RawColumn) {
         const auto& view = impl_->rawColumns.get(slot->payload.s.handle);
         if (view.readOnly || index >= view.count || !view.basePtr) return false;
+        auto* elemBase = static_cast<std::uint8_t*>(view.basePtr) + index * view.strideBytes;
+        if (view.mode == RawColumnMode::ScalarPacked) {
+            bool needsWiden = false;
+            return writePackedElementValue(
+                elemBase,
+                0u,
+                view.packedEncoding,
+                view.elementTypeId,
+                value,
+                needsWiden,
+                view.blittableSchemaId);
+        }
         const auto* s = std::get_if<StructValue>(&value);
         if (!s || !s->valid() || s->typeId != view.structTypeId ||
             s->fieldCount() != view.fields.size()) {
             return false;
         }
-        auto* elemBase = static_cast<std::uint8_t*>(view.basePtr) + index * view.strideBytes;
         for (std::size_t i = 0; i < view.fields.size(); ++i) {
             const auto fieldVal = structValueFieldAt(*s, i);
             if (!fieldVal || !writeNativeFieldToBytes(elemBase, view.fields[i], *fieldVal)) {
@@ -5351,6 +6044,7 @@ bool ManagedHeap::arraySet(
             return false;
         }
     }
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Array) {
@@ -5367,8 +6061,29 @@ bool ManagedHeap::arraySet(
         }
         if (view.readOnly || !view.basePtr) {
             setHeapError(error, ErrorCode::CapabilityDenied,
-                "cannot write to a read-only native ECS column view");
+                view.mode == RawColumnMode::ScalarPacked
+                    ? "cannot write to a read-only native buffer view"
+                    : "cannot write to a read-only native ECS column view");
             return false;
+        }
+        auto* elemBase = static_cast<std::uint8_t*>(view.basePtr) + index * view.strideBytes;
+        if (view.mode == RawColumnMode::ScalarPacked) {
+            bool needsWiden = false;
+            if (!writePackedElementValue(
+                    elemBase,
+                    0u,
+                    view.packedEncoding,
+                    view.elementTypeId,
+                    value,
+                    needsWiden,
+                    view.blittableSchemaId)) {
+                setHeapError(error, ErrorCode::TypeMismatch,
+                    needsWiden
+                        ? "value exceeds native buffer view scalar element width"
+                        : "managed array element type mismatch for native buffer view");
+                return false;
+            }
+            return true;
         }
         const auto* s = std::get_if<StructValue>(&value);
         if (!s || !s->valid() || s->typeId != view.structTypeId ||
@@ -5377,7 +6092,6 @@ bool ManagedHeap::arraySet(
                 "managed array struct element type mismatch for raw ECS column");
             return false;
         }
-        auto* elemBase = static_cast<std::uint8_t*>(view.basePtr) + index * view.strideBytes;
         for (std::size_t i = 0; i < view.fields.size(); ++i) {
             const auto fieldVal = structValueFieldAt(*s, i);
             if (!fieldVal || !writeNativeFieldToBytes(elemBase, view.fields[i], *fieldVal)) {
@@ -5574,6 +6288,7 @@ bool ManagedHeap::fieldSet(
     std::size_t index,
     Value value,
     RuntimeError* error) {
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Record) {
@@ -5610,6 +6325,7 @@ bool ManagedHeap::fieldSetFast(
     const Value& value,
     semantic::SymbolId expectedTypeId,
     semantic::PrimitiveType expectedFieldType) noexcept {
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Record ||
@@ -5709,6 +6425,10 @@ std::uint64_t ManagedHeap::consumeDirtyMask(ObjectRef reference) noexcept {
 }
 
 namespace {
+
+std::size_t reclaimPoolValuesInternal(
+    const ShadowStack* activeShadowStack,
+    bool waitIfBusy) noexcept;
 
 struct CrossHeapStringCopy {
     bool isNull = false;
@@ -5984,6 +6704,7 @@ ManagedHeap::RootToken ManagedHeap::addPersistentRoot(ObjectRef reference) {
 }
 
 ManagedHeap::RootToken ManagedHeap::addPersistentRoot(Value value) {
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     if (value.rawTag() == ValueTag::Struct && value.asStructUnchecked().isFrameSlice()) {
         value = detachFrameSliceValue(value);
     }
@@ -6009,6 +6730,7 @@ bool ManagedHeap::updatePersistentRoot(
 }
 
 bool ManagedHeap::updatePersistentRoot(RootToken token, Value value) {
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     if (token == 0 || !impl_->validRootValue(value)) return false;
     const auto found = impl_->persistentRoots.find(token);
@@ -6051,6 +6773,7 @@ std::optional<Value> ManagedHeap::getStaticField(semantic::SymbolId id) const {
 }
 
 void ManagedHeap::setStaticField(semantic::SymbolId id, Value value) {
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     if (value.rawTag() == ValueTag::Struct && value.asStructUnchecked().isFrameSlice()) {
         value = detachFrameSliceValue(value);
     }
@@ -6086,6 +6809,7 @@ bool ManagedHeap::setNativeEcsComponent(
     std::string_view canonicalTypeName,
     std::int64_t entityId,
     Value component) {
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     if (component.rawTag() == ValueTag::Struct && component.asStructUnchecked().isFrameSlice()) {
         component = detachFrameSliceValue(component);
     }
@@ -6207,6 +6931,7 @@ bool ManagedHeap::setNativeEcsComponentByDenseIndex(
     std::string_view canonicalTypeName,
     std::size_t denseIndex,
     Value component) {
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     if (component.rawTag() == ValueTag::Struct && component.asStructUnchecked().isFrameSlice()) {
         component = detachFrameSliceValue(component);
     }
@@ -6234,6 +6959,7 @@ std::optional<ObjectRef> ManagedHeap::allocateRawColumnArray(
     semantic::SymbolId elementTypeId,
     NativeRawColumnView view,
     RuntimeError* error) {
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     if (!validateRawColumnView(view, elementTypeId)) {
         setHeapError(error, ErrorCode::InvalidArguments,
             "raw ECS column view metadata is invalid");
@@ -6312,7 +7038,8 @@ bool ManagedHeap::readRawColumnFields(
         return false;
     }
     const auto& view = impl_->rawColumns.get(slot->payload.s.handle);
-    if (index >= view.count || !view.basePtr || view.fields.size() > maxFields) {
+    if (view.mode != RawColumnMode::EcsFields ||
+        index >= view.count || !view.basePtr || view.fields.size() > maxFields) {
         return false;
     }
     const auto* elemBase = static_cast<const std::uint8_t*>(view.basePtr) + index * view.strideBytes;
@@ -6337,6 +7064,11 @@ bool ManagedHeap::writeRawColumnFields(
         return false;
     }
     const auto& view = impl_->rawColumns.get(slot->payload.s.handle);
+    if (view.mode != RawColumnMode::EcsFields) {
+        setHeapError(error, ErrorCode::TypeMismatch,
+            "raw field write is only valid on native ECS column views");
+        return false;
+    }
     if (index >= view.count) {
         setHeapError(error, ErrorCode::IndexOutOfRange,
             "array element index is out of range");
@@ -6363,6 +7095,182 @@ bool ManagedHeap::writeRawColumnFields(
     return true;
 }
 
+std::optional<ObjectRef> ManagedHeap::allocateNativeBufferView(
+    semantic::SymbolId arrayTypeId,
+    const NativeBufferViewDesc& desc,
+    RuntimeError* error) {
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
+    if (desc.elementCount > 0 && !desc.data) {
+        setHeapError(error, ErrorCode::InvalidArguments,
+            "native buffer view data pointer cannot be null when elementCount > 0");
+        return std::nullopt;
+    }
+    semantic::PrimitiveType effectiveElementType = desc.elementType;
+    if (effectiveElementType == semantic::PrimitiveType::Error && desc.elementTypeId != 0) {
+        effectiveElementType = semantic::PrimitiveType::Struct;
+    }
+    if (semantic::isExactType(effectiveElementType)
+            ? desc.elementTypeId == 0
+            : desc.elementTypeId != 0) {
+        setHeapError(error, ErrorCode::InvalidArguments,
+            "native buffer view element type metadata is invalid");
+        return std::nullopt;
+    }
+    PackedStorageSpec spec{};
+    if (!tryClassifyPackedArray(effectiveElementType, desc.elementTypeId, nullptr, spec) ||
+        spec.encoding == PackedElemEncoding::None ||
+        spec.strideBytes == 0u) {
+        setHeapError(error, ErrorCode::InvalidArguments,
+            "native buffer view only supports scalar, enum, math struct, or [Blittable] struct elements");
+        return std::nullopt;
+    }
+    const std::size_t naturalSize = static_cast<std::size_t>(spec.strideBytes);
+    if (desc.strideBytes != 0u && desc.strideBytes < naturalSize) {
+        setHeapError(error, ErrorCode::InvalidArguments,
+            "native buffer view strideBytes is smaller than the element size");
+        return std::nullopt;
+    }
+    const std::size_t effectiveStride = desc.strideBytes != 0u ? desc.strideBytes : naturalSize;
+    if (effectiveStride != 0u &&
+        desc.elementCount > std::numeric_limits<std::size_t>::max() / effectiveStride) {
+        setHeapError(error, ErrorCode::InvalidArguments,
+            "native buffer view byte span overflows size_t");
+        return std::nullopt;
+    }
+
+    NativeRawColumnView view;
+    view.basePtr = desc.data;
+    view.count = desc.elementCount;
+    view.strideBytes = effectiveStride;
+    view.structTypeId = desc.elementTypeId;
+    view.readOnly = desc.readOnly;
+    view.mode = RawColumnMode::ScalarPacked;
+    view.elementType = effectiveElementType;
+    view.elementTypeId = desc.elementTypeId;
+    view.packedEncoding = spec.encoding;
+    view.blittableSchemaId = spec.schemaId;
+
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    const std::uint32_t layoutId = impl_->internArrayLayout(
+        arrayTypeId, effectiveElementType, desc.elementTypeId);
+    const auto slotIndex = impl_->acquireSlot(Impl::BaseObjectSizeBytes, error);
+    if (!slotIndex) {
+        return std::nullopt;
+    }
+    auto& slot = impl_->slots[*slotIndex];
+    const std::uint32_t rawHandle = impl_->rawColumns.acquire(std::move(view));
+    slot.auxMeta = 0;
+    slot.payload.s = {layoutId, 0u, nullptr, rawHandle, CompactSlot::kInvalidHandle};
+    return impl_->finalizeSlotAllocation(
+        *slotIndex,
+        ObjectKind::Array,
+        SlotStorage::RawColumn,
+        Impl::BaseObjectSizeBytes);
+}
+
+std::optional<ObjectRef> ManagedHeap::allocateNativeBufferView(
+    const NativeBufferViewDesc& desc,
+    RuntimeError* error) {
+    return allocateNativeBufferView(0, desc, error);
+}
+
+bool ManagedHeap::revokeNativeBufferView(ObjectRef reference) noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array ||
+        slot->storage() != SlotStorage::RawColumn) {
+        return false;
+    }
+    const auto& view = impl_->rawColumns.get(slot->payload.s.handle);
+    if (view.mode != RawColumnMode::ScalarPacked) {
+        return false;
+    }
+    const std::uint32_t slotIdx = reference.slot;
+    const auto bytes = impl_->slotSizeBytes(slotIdx, *slot);
+    impl_->releaseSlotPayload(slotIdx, *slot);
+    ++slot->generation;
+    if (slot->generation == 0) {
+        slot->generation = 1;
+    }
+    impl_->freeSlots.push_back(slotIdx);
+    --impl_->statistics.liveObjects;
+    impl_->statistics.liveBytes -= bytes;
+    ++impl_->statistics.objectsReclaimed;
+    impl_->statistics.bytesReclaimed += bytes;
+    impl_->gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
+    return true;
+}
+
+bool ManagedHeap::isNativeBufferViewRevoked(ObjectRef reference) const noexcept {
+    HeapReadOrDisjointGuard heapLock(*impl_->syncState);
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array ||
+        slot->storage() != SlotStorage::RawColumn) {
+        return true;
+    }
+    const auto& view = impl_->rawColumns.get(slot->payload.s.handle);
+    return view.mode != RawColumnMode::ScalarPacked;
+}
+
+bool ManagedHeap::tryGetNativeBufferPointer(
+    ObjectRef reference,
+    void*& outData,
+    std::size_t* outElementCount,
+    bool* outReadOnly) const noexcept {
+    outData = nullptr;
+    if (outElementCount) {
+        *outElementCount = 0;
+    }
+    if (outReadOnly) {
+        *outReadOnly = false;
+    }
+    HeapReadOrDisjointGuard heapLock(*impl_->syncState);
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array ||
+        slot->storage() != SlotStorage::RawColumn) {
+        return false;
+    }
+    const auto& view = impl_->rawColumns.get(slot->payload.s.handle);
+    if (view.mode != RawColumnMode::ScalarPacked) {
+        return false;
+    }
+    outData = view.basePtr;
+    if (outElementCount) {
+        *outElementCount = view.count;
+    }
+    if (outReadOnly) {
+        *outReadOnly = view.readOnly;
+    }
+    return true;
+}
+
+void* ManagedHeap::tryGetNativeBufferPointer(ObjectRef reference) const noexcept {
+    void* data = nullptr;
+    return tryGetNativeBufferPointer(reference, data, nullptr, nullptr) ? data : nullptr;
+}
+
+void* ManagedHeap::tryGetNativeBufferPointer(
+    ObjectRef reference,
+    std::size_t* outElementCount,
+    bool* outReadOnly) const noexcept {
+    void* data = nullptr;
+    return tryGetNativeBufferPointer(reference, data, outElementCount, outReadOnly) ? data : nullptr;
+}
+
+Value ManagedHeap::makeNativeSpanValue(
+    semantic::SymbolId spanTypeId,
+    ObjectRef bufferRef,
+    std::int32_t offset,
+    std::int32_t length) const {
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
+    const std::array<Value, 3> fields{
+        Value{bufferRef},
+        Value{static_cast<std::int64_t>(offset)},
+        Value{static_cast<std::int64_t>(length)},
+    };
+    return Value{makeStructValueFromFields(spanTypeId, ValueSpan(fields.data(), fields.size()))};
+}
+
 void ManagedHeap::requestCollection() noexcept {
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     impl_->requested = true;
@@ -6379,6 +7287,7 @@ GcPhase ManagedHeap::phase() const noexcept {
 std::size_t ManagedHeap::step(
     const ShadowStack& shadowStack,
     std::size_t workBudget) {
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     bool shouldSweepPools = false;
     std::size_t performed = 0;
     {
@@ -6389,6 +7298,7 @@ std::size_t ManagedHeap::step(
         (void)reclaimPoolValuesInternal(&shadowStack, /*waitIfBusy=*/false);
     }
     impl_->flushPendingWrapperSweeps();
+    impl_->flushPendingValueLifecycleSweeps();
     return performed;
 }
 
@@ -6403,6 +7313,7 @@ IncrementalGcBudgetStats ManagedHeap::collectIncrementalWithBudget(
     std::chrono::nanoseconds budget,
     std::size_t checkInterval,
     bool forceStartIfIdle) {
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     const auto startTime = std::chrono::steady_clock::now();
     bool shouldSweepPools = false;
     IncrementalGcBudgetStats stats{};
@@ -6415,6 +7326,7 @@ IncrementalGcBudgetStats ManagedHeap::collectIncrementalWithBudget(
         (void)reclaimPoolValuesInternal(&roots, /*waitIfBusy=*/false);
     }
     impl_->flushPendingWrapperSweeps();
+    impl_->flushPendingValueLifecycleSweeps();
     const auto endTime = std::chrono::steady_clock::now();
     stats.elapsed = detail::clampDurationToNanoseconds(endTime - startTime);
     stats.elapsedNanoseconds = static_cast<std::uint64_t>(
@@ -6453,6 +7365,7 @@ bool ManagedHeap::isWallClockCycleActive() const noexcept {
 }
 
 void ManagedHeap::finishWallClockCycleForDeterminism(const ShadowStack& shadowStack) {
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     bool shouldSweepPools = false;
     {
         HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
@@ -6470,6 +7383,7 @@ void ManagedHeap::finishWallClockCycleForDeterminism(const ShadowStack& shadowSt
         (void)reclaimPoolValuesInternal(&shadowStack, /*waitIfBusy=*/false);
     }
     impl_->flushPendingWrapperSweeps();
+    impl_->flushPendingValueLifecycleSweeps();
 }
 
 void ManagedHeap::pushActiveShadowStack(const ShadowStack* stack) noexcept {
@@ -6491,6 +7405,7 @@ void ManagedHeap::popActiveShadowStack(const ShadowStack* stack) noexcept {
 }
 
 void ManagedHeap::collectFull(const ShadowStack& shadowStack) {
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     bool shouldSweepPools = false;
     {
         HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
@@ -6508,6 +7423,7 @@ void ManagedHeap::collectFull(const ShadowStack& shadowStack) {
         (void)reclaimPoolValuesInternal(&shadowStack, /*waitIfBusy=*/false);
     }
     impl_->flushPendingWrapperSweeps();
+    impl_->flushPendingValueLifecycleSweeps();
 }
 
 void ManagedHeap::collect(const RootSet& roots) {
@@ -6522,6 +7438,7 @@ std::size_t ManagedHeap::nurserySize() const noexcept {
 std::size_t ManagedHeap::collectYoung(
     const ShadowStack& shadowStack,
     std::size_t workBudget) {
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     bool shouldSweepPools = false;
     std::size_t stepResult = 0;
     bool handledIncremental = false;
@@ -6716,6 +7633,7 @@ std::size_t ManagedHeap::collectYoung(
         (void)reclaimPoolValuesInternal(&shadowStack, /*waitIfBusy=*/false);
     }
     impl_->flushPendingWrapperSweeps();
+    impl_->flushPendingValueLifecycleSweeps();
     return stepResult;
 }
 
@@ -7205,6 +8123,7 @@ HeapSnapshot ManagedHeap::snapshot(const ShadowStack* shadowStack) const {
 bool ManagedHeap::restore(
     const HeapSnapshot& snapshot,
     RuntimeError* error) {
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     if (snapshot.heapId != impl_->heapId) {
         setHeapError(error, ErrorCode::InvalidObjectReference,
@@ -8026,7 +8945,10 @@ namespace detail {
 std::shared_ptr<void> createValuePoolRootSync(
     void* owner,
     ValuePoolRootMarkFn markFn) {
-    return std::make_shared<HeapSyncState>(owner, markFn, nextHeapId());
+    ValuePoolDomain::Impl* domImpl = ValuePoolDomainAccess::currentDomainImpl();
+    const std::uint8_t domId = ValuePoolDomainAccess::domainIdOf(domImpl);
+    auto gcState = getOrCreateDomainGcState(domImpl);
+    return std::make_shared<HeapSyncState>(owner, markFn, nextHeapId(), domId, std::move(gcState));
 }
 
 void activateValuePoolRootSync(const std::shared_ptr<void>& syncHandle) {
@@ -8043,7 +8965,7 @@ void detachValuePoolRootSyncOwner(const std::shared_ptr<void>& syncHandle) noexc
     if (!syncHandle) return;
     auto* sync = static_cast<HeapSyncState*>(syncHandle.get());
     {
-        HeapSyncMutexGuard lk(sync->mutex, /*flushDeferredOnUnlock=*/false);
+        HeapSyncMutexGuard lk(*sync, /*flushDeferredOnUnlock=*/false);
         sync->ownerImpl = nullptr;
     }
     unregisterHeapSyncFromPoolShard(*sync);
@@ -8051,26 +8973,38 @@ void detachValuePoolRootSyncOwner(const std::shared_ptr<void>& syncHandle) noexc
 
 void lockValuePoolRootSync(const std::shared_ptr<void>& syncHandle) {
     if (!syncHandle) return;
-    static_cast<HeapSyncState*>(syncHandle.get())->mutex.lock();
-    enterHeapSyncLockLocal();
+    auto* sync = static_cast<HeapSyncState*>(syncHandle.get());
+    sync->mutex.lock();
+    enterHeapSyncLockLocal(sync->domainId);
 }
 
 void unlockValuePoolRootSync(const std::shared_ptr<void>& syncHandle) noexcept {
     if (!syncHandle) return;
-    static_cast<HeapSyncState*>(syncHandle.get())->mutex.unlock();
-    leaveHeapSyncLockLocal(/*flushDeferred=*/true);
+    auto* sync = static_cast<HeapSyncState*>(syncHandle.get());
+    sync->mutex.unlock();
+    leaveHeapSyncLockLocal(sync->domainId, /*flushDeferred=*/true);
 }
 
 void enterInterpreterMutator() noexcept {
-    if (const auto* b = externalValuePoolBridge(); b && b->enterMutatorFn) {
-        b->enterMutatorFn();
-        return;
+    const std::uint8_t domId = static_cast<std::uint8_t>(
+        currentThreadDomainIdFast() & kPoolDomainMask);
+    if (domId == 0u) {
+        if (const auto* b = externalValuePoolBridge(); b && b->enterMutatorFn) {
+            b->enterMutatorFn();
+            return;
+        }
     }
-    auto& depth = tlsMutatorDepthRef();
+    auto& depth = tlsMutatorDepthRef(domId);
     if (depth++ > 0u) {
         return;
     }
-    auto& mc = mutatorSweepCoordinator();
+    std::shared_ptr<DomainGcState> gcState = (domId == 0u)
+        ? defaultDomainGcState()
+        : findDomainGcStateByDomainId(domId);
+    if (!gcState) {
+        gcState = getOrCreateDomainGcState(ValuePoolDomainAccess::currentDomainImpl());
+    }
+    auto& mc = gcState->mutatorCoord;
     std::uint64_t cur = mc.state.load(std::memory_order_relaxed);
     while (true) {
         if ((cur & MutatorSweepCoordinator::kSweepActiveBit) == 0u) {
@@ -8093,15 +9027,25 @@ void enterInterpreterMutator() noexcept {
 }
 
 void leaveInterpreterMutator() noexcept {
-    if (const auto* b = externalValuePoolBridge(); b && b->leaveMutatorFn) {
-        b->leaveMutatorFn();
-        return;
+    const std::uint8_t domId = static_cast<std::uint8_t>(
+        currentThreadDomainIdFast() & kPoolDomainMask);
+    if (domId == 0u) {
+        if (const auto* b = externalValuePoolBridge(); b && b->leaveMutatorFn) {
+            b->leaveMutatorFn();
+            return;
+        }
     }
-    auto& depth = tlsMutatorDepthRef();
+    auto& depth = tlsMutatorDepthRef(domId);
     if (depth == 0u || --depth > 0u) {
         return;
     }
-    auto& mc = mutatorSweepCoordinator();
+    std::shared_ptr<DomainGcState> gcState = (domId == 0u)
+        ? defaultDomainGcState()
+        : findDomainGcStateByDomainId(domId);
+    if (!gcState) {
+        return;
+    }
+    auto& mc = gcState->mutatorCoord;
     const std::uint64_t prev = mc.state.fetch_sub(1u, std::memory_order_acq_rel);
     const std::uint64_t remaining =
         (prev & MutatorSweepCoordinator::kActiveMutatorMask) - 1u;
@@ -8112,9 +9056,39 @@ void leaveInterpreterMutator() noexcept {
             }
             mc.cv.notify_all();
         } else if (mc.deferredSweepPending.exchange(false, std::memory_order_acq_rel)) {
-            (void)reclaimPoolValuesInternal(nullptr, /*waitIfBusy=*/false);
+            (void)reclaimDomainPoolValuesById(domId, nullptr, /*waitIfBusy=*/false);
         }
     }
+}
+
+std::size_t reclaimDomainPoolValues(
+    ValuePoolDomain::Impl* domainImpl,
+    const ShadowStack* activeShadowStack,
+    bool waitIfBusy) noexcept {
+    if (!domainImpl) {
+        return 0u;
+    }
+    const std::uint8_t domId = ValuePoolDomainAccess::domainIdOf(domainImpl);
+    if (domId == 0u) {
+        if (const auto* b = externalValuePoolBridge(); b && b->reclaimPoolValuesFn) {
+            return b->reclaimPoolValuesFn(activeShadowStack, waitIfBusy);
+        }
+    }
+    return reclaimPoolValuesForDomainImpl(domainImpl, activeShadowStack, waitIfBusy);
+}
+
+std::size_t reclaimDomainPoolValuesById(
+    std::uint8_t domainId,
+    const ShadowStack* activeShadowStack,
+    bool waitIfBusy) noexcept {
+    const std::uint8_t masked = static_cast<std::uint8_t>(domainId & kPoolDomainMask);
+    if (auto domain = ValuePoolDomainAccess::tryLockDomainById(masked)) {
+        return reclaimDomainPoolValues(
+            ValuePoolDomainAccess::impl(domain.get()),
+            activeShadowStack,
+            waitIfBusy);
+    }
+    return 0u;
 }
 
 std::size_t hostReclaimPoolValuesBridge(
@@ -8138,30 +9112,41 @@ void hostTransferShadowStackBridge(void* from, void* to) noexcept {
 }
 
 void hostEnterHeapSyncLockBridge() noexcept {
-    enterHeapSyncLockLocal();
+    enterHeapSyncLockLocal(0u);
 }
 
 void hostLeaveHeapSyncLockBridge(bool flushDeferred) noexcept {
-    leaveHeapSyncLockLocal(flushDeferred);
+    leaveHeapSyncLockLocal(0u, flushDeferred);
 }
 
 } // namespace detail
 
 namespace {
 
-std::size_t reclaimPoolValuesInternal(
+std::size_t reclaimPoolValuesForDomainImpl(
+    ValuePoolDomain::Impl* domainImpl,
     const ShadowStack* activeShadowStack,
     bool waitIfBusy) noexcept {
-    if (const auto* b = detail::externalValuePoolBridge(); b && b->reclaimPoolValuesFn) {
-        return b->reclaimPoolValuesFn(activeShadowStack, waitIfBusy);
+    if (!domainImpl) {
+        domainImpl = detail::ValuePoolDomainAccess::currentDomainImpl();
     }
-    if (!hasAnyPinnedPoolValues()) return 0u;
-    auto& mc = mutatorSweepCoordinator();
-    if (tlsHeapSyncLockDepthRef() > 0u) {
+    if (!domainImpl) {
+        return 0u;
+    }
+    if (!detail::ValuePoolDomainAccess::anyPoolHasPinnedSlots(domainImpl)) {
+        return 0u;
+    }
+    const std::uint8_t domId = detail::ValuePoolDomainAccess::domainIdOf(domainImpl);
+    auto gcState = getOrCreateDomainGcState(domainImpl);
+    if (!gcState) {
+        return 0u;
+    }
+    auto& mc = gcState->mutatorCoord;
+    if (tlsHeapSyncLockDepthRef(domId) > 0u) {
         mc.deferredSweepPending.store(true, std::memory_order_release);
         return 0u;
     }
-    const std::uint64_t selfContribution = (tlsMutatorDepthRef() > 0u) ? 1ULL : 0ULL;
+    const std::uint64_t selfContribution = (tlsMutatorDepthRef(domId) > 0u) ? 1ULL : 0ULL;
 
     // Never cross-thread scan concurrently mutating ShadowStacks or ObjectFastViews
     // when another mutator thread is active. Defer to the mutator safe point instead.
@@ -8176,7 +9161,7 @@ std::size_t reclaimPoolValuesInternal(
         }
     }
 
-    auto& coord = valuePoolSweepCoordinator();
+    auto& coord = gcState->sweepCoord;
     (void)coord.requestedEpoch.fetch_add(1, std::memory_order_acq_rel);
 
     std::unique_lock<std::mutex> sweepLock(coord.sweepMutex, std::defer_lock);
@@ -8234,18 +9219,25 @@ std::size_t reclaimPoolValuesInternal(
         }
     } sweepBitGuard{mc};
 
+    auto domainOwner = detail::ValuePoolDomainAccess::tryLockDomainById(domId);
+    if (!domainOwner || detail::ValuePoolDomainAccess::impl(domainOwner.get()) != domainImpl) {
+        return 0u;
+    }
+    ScopedValuePoolDomain domainScope(domainOwner.get());
+
     std::size_t totalReclaimed = 0u;
     for (int pass = 0; pass < 2; ++pass) {
         const std::uint64_t targetEpoch = coord.requestedEpoch.load(std::memory_order_acquire);
-        if (!hasAnyPinnedPoolValues()) {
+        if (!detail::ValuePoolDomainAccess::anyPoolHasPinnedSlots(domainImpl)) {
             coord.completedEpoch.store(targetEpoch, std::memory_order_release);
             break;
         }
 
-        beginValuePoolGcMark();
-        if (activeShadowStack) {
-            activeShadowStack->visitRoots([](const Value& value) {
-                markStackRootValueInPools(value);
+        detail::ValuePoolDomainAccess::beginPoolGcMarkForImpl(domainImpl);
+        if (activeShadowStack &&
+            (activeShadowStack->domainId() & detail::kPoolDomainMask) == domId) {
+            activeShadowStack->visitRoots([domainImpl](const Value& value) {
+                detail::ValuePoolDomainAccess::markStackRootValueInDomain(domainImpl, value);
             });
         }
         {
@@ -8269,9 +9261,11 @@ std::size_t reclaimPoolValuesInternal(
                 if (!shard) continue;
                 std::lock_guard<std::mutex> shardLock(shard->mutex);
                 for (const ShadowStack* stack : shard->stacks) {
-                    if (stack && stack != activeShadowStack) {
-                        stack->visitRoots([](const Value& value) {
-                            markStackRootValueInPools(value);
+                    if (stack && stack != activeShadowStack &&
+                        (stack->domainId() & detail::kPoolDomainMask) == domId) {
+                        stack->visitRoots([domainImpl](const Value& value) {
+                            detail::ValuePoolDomainAccess::markStackRootValueInDomain(
+                                domainImpl, value);
                         });
                     }
                 }
@@ -8280,7 +9274,7 @@ std::size_t reclaimPoolValuesInternal(
 
         std::vector<std::shared_ptr<HeapSyncState>> heapSyncSnapshot;
         {
-            auto& markerShards = heapPoolMarkerShards();
+            auto& markerShards = heapPoolMarkerShardsFor(domId, gcState.get());
             for (auto& shard : markerShards) {
                 if (shard.activeCount.load(std::memory_order_acquire) == 0) continue;
                 std::lock_guard<std::mutex> shardLock(shard.mutex);
@@ -8292,13 +9286,14 @@ std::size_t reclaimPoolValuesInternal(
         }
         for (const auto& sync : heapSyncSnapshot) {
             if (!sync) continue;
-            HeapSyncMutexGuard instanceLock(sync->mutex, /*flushDeferredOnUnlock=*/false);
+            HeapSyncMutexGuard instanceLock(*sync, /*flushDeferredOnUnlock=*/false);
             if (sync->ownerImpl && sync->markPoolFn) {
                 (void)sync->markPoolFn(sync->ownerImpl);
             }
         }
 
-        totalReclaimed += finishValuePoolGcSweep();
+        totalReclaimed += detail::ValuePoolDomainAccess::finishPoolGcSweepForImpl(domainImpl);
+        detail::ValuePoolDomainAccess::incrementCollectionCount(domainImpl);
         coord.completedEpoch.store(targetEpoch, std::memory_order_release);
         if (coord.requestedEpoch.load(std::memory_order_acquire) == targetEpoch) {
             break;
@@ -8307,12 +9302,26 @@ std::size_t reclaimPoolValuesInternal(
     return totalReclaimed;
 }
 
+std::size_t reclaimPoolValuesInternal(
+    const ShadowStack* activeShadowStack,
+    bool waitIfBusy) noexcept {
+    auto* domImpl = detail::ValuePoolDomainAccess::currentDomainImpl();
+    const std::uint8_t domId = detail::ValuePoolDomainAccess::domainIdOf(domImpl);
+    if (domId == 0u) {
+        if (const auto* b = detail::externalValuePoolBridge(); b && b->reclaimPoolValuesFn) {
+            return b->reclaimPoolValuesFn(activeShadowStack, waitIfBusy);
+        }
+    }
+    return reclaimPoolValuesForDomainImpl(domImpl, activeShadowStack, waitIfBusy);
+}
+
 } // namespace
 
 bool ManagedHeap::migrateTypeLayouts(
     const std::vector<TypeLayoutMigration>& migrations,
     LayoutMigrationStats* outStats,
     RuntimeError* error) {
+    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     LayoutMigrationStats localStats{};
     if (migrations.empty()) {
         if (outStats) *outStats = localStats;

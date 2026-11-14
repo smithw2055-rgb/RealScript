@@ -448,6 +448,7 @@ public:
     static constexpr std::uint32_t InlineBit = 0x80000000u;
     static constexpr std::uint32_t FrameSliceBit = 0x40000000u;
     static constexpr std::uint32_t ModeMask = 0xC0000000u;
+    static constexpr std::uint32_t PoolIdMask = 0x3FFFFFFFu;
     static constexpr std::uint32_t FrameOffsetMask = 0x00FFFFFFu;
 
     constexpr StructStorageHandle() noexcept = default;
@@ -470,10 +471,10 @@ public:
     [[nodiscard]] long use_count() const noexcept { return isStoragePtr() ? 2 : 0; }
 
     [[nodiscard]] constexpr std::uint32_t inlineArenaIndex() const noexcept {
-        return (raw_ & InlineBit) != 0 ? (raw_ & ~InlineBit) : 0u;
+        return (raw_ & InlineBit) != 0 ? (raw_ & PoolIdMask) : 0u;
     }
     constexpr void setInlineArenaIndex(std::uint32_t idx) noexcept {
-        raw_ = InlineBit | (idx & ~InlineBit);
+        raw_ = InlineBit | (idx & PoolIdMask);
     }
 
     [[nodiscard]] constexpr std::uint8_t frameSliceBank() const noexcept {
@@ -1917,9 +1918,78 @@ struct RuntimeError {
     std::vector<std::string> symbolizedStackTrace;
 };
 
+namespace detail {
+struct ValuePoolDomainAccess;
+} // namespace detail
+
+struct ValuePoolStats {
+    std::size_t liveStrings = 0;
+    std::size_t liveInlineStructs = 0;
+    std::size_t liveHeapStructs = 0;
+    std::size_t allocatedPages = 0;
+    std::uint64_t collectionCount = 0;
+};
+
+class ValuePoolDomain {
+public:
+    struct Impl;
+
+    ~ValuePoolDomain();
+    ValuePoolDomain(const ValuePoolDomain&) = delete;
+    ValuePoolDomain& operator=(const ValuePoolDomain&) = delete;
+    ValuePoolDomain(ValuePoolDomain&&) = delete;
+    ValuePoolDomain& operator=(ValuePoolDomain&&) = delete;
+
+    [[nodiscard]] static std::shared_ptr<ValuePoolDomain> defaultDomain();
+    [[nodiscard]] static std::shared_ptr<ValuePoolDomain> create();
+    [[nodiscard]] static ValuePoolDomain* currentThreadDomain() noexcept;
+
+    [[nodiscard]] std::uint8_t domainId() const noexcept;
+    [[nodiscard]] std::uint64_t domainEpoch() const noexcept;
+
+    void collectGarbage();
+    [[nodiscard]] ValuePoolStats stats() const noexcept;
+
+private:
+    ValuePoolDomain(std::uint8_t id, std::uint64_t epoch);
+    friend struct detail::ValuePoolDomainAccess;
+    friend class ScopedValuePoolDomain;
+
+    std::unique_ptr<Impl> impl_;
+};
+
+class ScopedValuePoolDomain {
+public:
+    explicit ScopedValuePoolDomain(ValuePoolDomain* domain) noexcept;
+    explicit ScopedValuePoolDomain(const std::shared_ptr<ValuePoolDomain>& domain) noexcept
+        : ScopedValuePoolDomain(domain.get()) {}
+    ~ScopedValuePoolDomain() noexcept;
+
+    ScopedValuePoolDomain(const ScopedValuePoolDomain&) = delete;
+    ScopedValuePoolDomain& operator=(const ScopedValuePoolDomain&) = delete;
+    ScopedValuePoolDomain(ScopedValuePoolDomain&&) = delete;
+    ScopedValuePoolDomain& operator=(ScopedValuePoolDomain&&) = delete;
+
+private:
+    ValuePoolDomain* previous_ = nullptr;
+    bool switched_ = false;
+};
+
+using ValueLifecycleSweepCallback = std::function<void(const Value&)>;
+
+struct NativeBufferViewDesc {
+    void* data = nullptr;
+    std::size_t elementCount = 0;
+    semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
+    semantic::SymbolId elementTypeId = 0;
+    std::size_t strideBytes = 0;
+    bool readOnly = false;
+};
+
 struct HeapConfig {
     std::size_t initialCollectionThresholdBytes = 64 * 1024;
     std::size_t maximumHeapBytes = 64 * 1024 * 1024;
+    std::shared_ptr<ValuePoolDomain> valuePoolDomain = nullptr;
 };
 
 enum class GcPhase {
@@ -2016,6 +2086,40 @@ struct NativeFieldLayout {
     semantic::SymbolId scriptTypeId = 0;
 };
 
+enum class PackedElemEncoding : std::uint8_t {
+    None       = 0,
+    Bool       = 1,  // 1B (uint8_t 0/1)
+    Byte       = 2,  // 1B (uint8_t)
+    SByte      = 3,  // 1B (int8_t)
+    Short      = 4,  // 2B (int16_t)
+    UShort     = 5,  // 2B (uint16_t)
+    Char       = 6,  // 2B (uint16_t)
+    Int32      = 7,  // 4B (int32_t, sign-extended to int64_t in Value)
+    UInt32     = 8,  // 4B (uint32_t)
+    Float32    = 9,  // 4B (float)
+    EnumInline = 10, // 4B (int32_t + elementTypeId)
+    Int64      = 11, // 8B (LongValue int64_t)
+    UInt64     = 12, // 8B (ULongValue uint64_t)
+    Float64    = 13, // 8B (double)
+    Int64Wide       = 14, // 8B (PrimitiveType::Int host values outside int32 range)
+    EnumWide        = 15, // 8B (int64_t + elementTypeId)
+    Fixed24_8       = 16, // 4B (FixedValue::raw int32_t)
+    Fixed48_16      = 17, // 8B (Fixed16Value::raw int64_t)
+    Fixed32_32      = 18, // 8B (Fixed64Value::raw int64_t)
+    Vec2            = 19, // 8B (Vec2Value: 2 * int32_t)
+    Vec3            = 20, // 12B (Vec3Value: 3 * int32_t)
+    Quat            = 21, // 16B (QuatValue: 4 * int32_t)
+    Vec2f           = 22, // 8B (Vec2fValue: 2 * float)
+    Vec3f           = 23, // 12B (Vec3fValue: 3 * float)
+    Quatf           = 24, // 16B (QuatfValue: 4 * float)
+    BlittableStruct = 25, // NB (flat unboxed user-defined blittable struct)
+};
+
+enum class RawColumnMode : std::uint8_t {
+    EcsFields = 0,
+    ScalarPacked = 1,
+};
+
 struct NativeRawColumnView {
     void* basePtr = nullptr;
     std::size_t count = 0;
@@ -2023,6 +2127,11 @@ struct NativeRawColumnView {
     semantic::SymbolId structTypeId = 0;
     std::vector<NativeFieldLayout> fields;
     bool readOnly = false;
+    RawColumnMode mode = RawColumnMode::EcsFields;
+    semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
+    semantic::SymbolId elementTypeId = 0;
+    PackedElemEncoding packedEncoding = PackedElemEncoding::None;
+    std::uint32_t blittableSchemaId = 0xFFFFFFFFu;
 };
 
 class ShadowStack {
@@ -2105,6 +2214,8 @@ public:
 
     [[nodiscard]] std::size_t frameCount() const noexcept { return frameCount_; }
     [[nodiscard]] std::uint64_t instanceId() const noexcept { return instanceId_; }
+    [[nodiscard]] std::uint8_t domainId() const noexcept { return domainId_; }
+    void setDomainId(std::uint8_t id) noexcept;
 
     struct FrameRoots {
         const std::vector<Value>* arguments = nullptr;
@@ -2124,35 +2235,7 @@ private:
     std::uint64_t instanceId_ = 0;
     void* registryShard_ = nullptr;
     std::uint32_t registrySlot_ = InvalidRegistrySlot;
-};
-
-enum class PackedElemEncoding : std::uint8_t {
-    None       = 0,
-    Bool       = 1,  // 1B (uint8_t 0/1)
-    Byte       = 2,  // 1B (uint8_t)
-    SByte      = 3,  // 1B (int8_t)
-    Short      = 4,  // 2B (int16_t)
-    UShort     = 5,  // 2B (uint16_t)
-    Char       = 6,  // 2B (uint16_t)
-    Int32      = 7,  // 4B (int32_t, sign-extended to int64_t in Value)
-    UInt32     = 8,  // 4B (uint32_t)
-    Float32    = 9,  // 4B (float)
-    EnumInline = 10, // 4B (int32_t + elementTypeId)
-    Int64      = 11, // 8B (LongValue int64_t)
-    UInt64     = 12, // 8B (ULongValue uint64_t)
-    Float64    = 13, // 8B (double)
-    Int64Wide       = 14, // 8B (PrimitiveType::Int host values outside int32 range)
-    EnumWide        = 15, // 8B (int64_t + elementTypeId)
-    Fixed24_8       = 16, // 4B (FixedValue::raw int32_t)
-    Fixed48_16      = 17, // 8B (Fixed16Value::raw int64_t)
-    Fixed32_32      = 18, // 8B (Fixed64Value::raw int64_t)
-    Vec2            = 19, // 8B (Vec2Value: 2 * int32_t)
-    Vec3            = 20, // 12B (Vec3Value: 3 * int32_t)
-    Quat            = 21, // 16B (QuatValue: 4 * int32_t)
-    Vec2f           = 22, // 8B (Vec2fValue: 2 * float)
-    Vec3f           = 23, // 12B (Vec3fValue: 3 * float)
-    Quatf           = 24, // 16B (QuatfValue: 4 * float)
-    BlittableStruct = 25, // NB (flat unboxed user-defined blittable struct)
+    std::uint8_t domainId_ = 0;
 };
 
 struct BlittableFieldInput {
@@ -2356,6 +2439,8 @@ public:
     ManagedHeap(const ManagedHeap&) = delete;
     ManagedHeap& operator=(const ManagedHeap&) = delete;
 
+    [[nodiscard]] const std::shared_ptr<ValuePoolDomain>& valuePoolDomain() const noexcept;
+
     [[nodiscard]] std::optional<ObjectRef> allocateString(
         std::string value,
         RuntimeError* error = nullptr);
@@ -2434,6 +2519,9 @@ public:
         CrossHeapAccessPolicy policy,
         RuntimeError* error = nullptr) const;
     void setNativeWrapperSweepCallback(NativeWrapperSweepCallback callback);
+    void registerValueLifecycleType(semantic::SymbolId typeId);
+    void setValueLifecycleSweepCallback(ValueLifecycleSweepCallback callback);
+    [[nodiscard]] bool hasRegisteredValueLifecycleTypes() const noexcept;
     [[nodiscard]] static std::optional<std::string> tryCopyStringGlobal(ObjectRef reference);
     [[nodiscard]] std::optional<std::size_t> arrayLength(ObjectRef reference) const;
     [[nodiscard]] std::optional<semantic::SymbolId> arrayTypeId(
@@ -2564,6 +2652,31 @@ public:
         std::size_t fieldCount,
         RuntimeError* error = nullptr) noexcept;
 
+    [[nodiscard]] std::optional<ObjectRef> allocateNativeBufferView(
+        semantic::SymbolId arrayTypeId,
+        const NativeBufferViewDesc& desc,
+        RuntimeError* error = nullptr);
+    [[nodiscard]] std::optional<ObjectRef> allocateNativeBufferView(
+        const NativeBufferViewDesc& desc,
+        RuntimeError* error = nullptr);
+    bool revokeNativeBufferView(ObjectRef reference) noexcept;
+    [[nodiscard]] bool isNativeBufferViewRevoked(ObjectRef reference) const noexcept;
+    [[nodiscard]] void* tryGetNativeBufferPointer(ObjectRef reference) const noexcept;
+    [[nodiscard]] void* tryGetNativeBufferPointer(
+        ObjectRef reference,
+        std::size_t* outElementCount,
+        bool* outReadOnly = nullptr) const noexcept;
+    [[nodiscard]] bool tryGetNativeBufferPointer(
+        ObjectRef reference,
+        void*& outData,
+        std::size_t* outElementCount = nullptr,
+        bool* outReadOnly = nullptr) const noexcept;
+    [[nodiscard]] Value makeNativeSpanValue(
+        semantic::SymbolId spanTypeId,
+        ObjectRef bufferRef,
+        std::int32_t offset,
+        std::int32_t length) const;
+
     void requestCollection() noexcept;
     [[nodiscard]] bool collectionRequested() const noexcept;
     [[nodiscard]] GcPhase phase() const noexcept;
@@ -2602,6 +2715,7 @@ public:
     void collect(const RootSet& roots = RootSet{});
     std::size_t collectYoung(const ShadowStack& shadowStack, std::size_t workBudget = 0);
     [[nodiscard]] std::size_t nurserySize() const noexcept;
+    std::size_t trimExcessCapacity() noexcept;
 
     bool readPackedIntArray(
         ObjectRef reference,
@@ -3343,6 +3457,11 @@ public:
     Interpreter(
         std::shared_ptr<const ProgramImage> program,
         std::shared_ptr<ManagedHeap> heap);
+    ~Interpreter();
+    Interpreter(const Interpreter& other);
+    Interpreter& operator=(const Interpreter& other);
+    Interpreter(Interpreter&& other) noexcept;
+    Interpreter& operator=(Interpreter&& other) noexcept;
 
     void setExternalResolver(ExternalFunction resolver);
     void setBindingRegistry(std::shared_ptr<const BindingRegistry> bindings);
@@ -3369,6 +3488,9 @@ public:
         ExecutionOptions options) const;
 
 private:
+    struct DispatchTarget;
+    void registerValueLifecycleHooks();
+
     std::shared_ptr<const ProgramImage> program_;
     RuntimeError programError_;
     ExternalFunction externalResolver_;
@@ -3376,6 +3498,7 @@ private:
     std::shared_ptr<ManagedHeap> heap_;
     std::shared_ptr<AsyncRuntimeContext> asyncRuntime_;
     mutable std::shared_ptr<void> resumeEnv_;
+    std::shared_ptr<DispatchTarget> dispatchTarget_;
 };
 
 class EngineRuntime {

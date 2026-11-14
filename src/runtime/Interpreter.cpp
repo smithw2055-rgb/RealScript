@@ -12,6 +12,20 @@ void resumeInterpreterCoroutineCallback(
     CoroutineFrameHandle frameHandle,
     CoroutineFrame& frame,
     AsyncRuntimeContext& asyncContext) {
+    ManagedHeap* resumeHeap = nullptr;
+    if (auto* envPtr = static_cast<InterpreterResumeEnv*>(runnerContext)) {
+        resumeHeap = envPtr->heap.get();
+    }
+    if (!resumeHeap) {
+        if (void* activeRaw = asyncContext.activeInterpreterState()) {
+            resumeHeap = static_cast<State*>(activeRaw)->heap;
+        }
+    }
+    if (!resumeHeap) {
+        resumeHeap = asyncContext.awaitables().heap();
+    }
+    ScopedValuePoolDomain domainScope(
+        resumeHeap ? resumeHeap->valuePoolDomain().get() : nullptr);
     detail::ActiveMutatorScope activeMutatorScope;
     const auto faultUnresolvedFrame = [&](const RuntimeError& err) {
         if (auto* f = asyncContext.coroutines().resolve(frameHandle)) {
@@ -153,6 +167,10 @@ void resumeInterpreterCoroutineCallback(
         resumeOpts.debugger == nullptr;
     state.determinism = DeterminismSession(std::move(resumeOpts.determinism));
     state.heap = env->heap.get();
+    state.shadowStack.setDomainId(
+        (state.heap && state.heap->valuePoolDomain())
+            ? state.heap->valuePoolDomain()->domainId()
+            : 0u);
     state.debugger = resumeOpts.debugger.get();
     state.asyncRuntime = &asyncContext;
     state.awaitScheduler = resumeOpts.awaitScheduler;
@@ -191,13 +209,195 @@ void resumeInterpreterCoroutineCallback(
 
 using namespace interp_detail;
 
+namespace {
+
+thread_local bool tlsInValueLifecycleDispose = false;
+
+[[nodiscard]] bool endsWithSv(std::string_view text, std::string_view suffix) noexcept {
+    return text.size() >= suffix.size() &&
+        text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+[[nodiscard]] bool isValueLifecycleAttrName(std::string_view attrName) noexcept {
+    if (attrName == "ValueLifecycle" || attrName == "ValueLifecycleAttribute") {
+        return true;
+    }
+    return endsWithSv(attrName, "::ValueLifecycle") ||
+        endsWithSv(attrName, ".ValueLifecycle") ||
+        endsWithSv(attrName, "::ValueLifecycleAttribute") ||
+        endsWithSv(attrName, ".ValueLifecycleAttribute");
+}
+
+[[nodiscard]] bool targetMatchesLifecycleStruct(
+    std::string_view attrTarget,
+    std::string_view candidate) noexcept {
+    if (attrTarget.empty() || candidate.empty()) {
+        return false;
+    }
+    if (attrTarget == candidate) {
+        return true;
+    }
+    return candidate.size() > attrTarget.size() + 2u &&
+        candidate.compare(0, attrTarget.size(), attrTarget) == 0 &&
+        candidate[attrTarget.size()] == '_' &&
+        candidate[attrTarget.size() + 1u] == '_';
+}
+
+} // namespace
+
+struct Interpreter::DispatchTarget {
+    Interpreter* interpreter = nullptr;
+};
+
+void Interpreter::registerValueLifecycleHooks() {
+    if (!program_ || !heap_) {
+        return;
+    }
+    std::vector<std::string> attrTargets;
+    for (const auto& mod : program_->modules()) {
+        for (const auto& attr : mod.languageMetadata.attributes) {
+            if (isValueLifecycleAttrName(attr.name) && !attr.target.empty()) {
+                attrTargets.push_back(attr.target);
+            }
+        }
+    }
+
+    std::unordered_map<semantic::SymbolId, semantic::SymbolId> disposeByTypeId;
+    for (const auto& mod : program_->modules()) {
+        for (const auto& ts : mod.types) {
+            if (ts.kind != semantic::TypeKind::Struct || ts.id == 0) {
+                continue;
+            }
+            const std::string canonical = semantic::canonicalTypeName(ts);
+            bool hasLifecycle = ts.hasValueLifecycle;
+            if (!hasLifecycle) {
+                for (const auto& target : attrTargets) {
+                    if (targetMatchesLifecycleStruct(target, canonical) ||
+                        targetMatchesLifecycleStruct(target, ts.name)) {
+                        hasLifecycle = true;
+                        break;
+                    }
+                }
+            }
+            if (!hasLifecycle) {
+                continue;
+            }
+
+            heap_->registerValueLifecycleType(ts.id);
+
+            semantic::SymbolId disposeId = 0;
+            for (const auto& m : ts.methods) {
+                // Non-static struct methods may include an implicit `this` entry in `m.parameters`.
+                if (m.staticMethod || m.parameters.size() > 1u || m.id == 0) {
+                    continue;
+                }
+                if (m.name == "Dispose" ||
+                    endsWithSv(m.name, ".Dispose") ||
+                    endsWithSv(m.name, "::Dispose")) {
+                    if (program_->resolveFunction(m.id) != nullptr) {
+                        disposeId = m.id;
+                        break;
+                    }
+                }
+            }
+            if (disposeId == 0) {
+                if (const auto found = program_->findFunction(canonical + ".Dispose")) {
+                    disposeId = *found;
+                } else if (const auto foundScope = program_->findFunction(canonical + "::Dispose")) {
+                    disposeId = *foundScope;
+                }
+            }
+            if (disposeId != 0) {
+                disposeByTypeId.emplace(ts.id, disposeId);
+            }
+        }
+    }
+
+    if (disposeByTypeId.empty()) {
+        return;
+    }
+    if (!dispatchTarget_) {
+        dispatchTarget_ = std::make_shared<DispatchTarget>(DispatchTarget{this});
+    } else {
+        dispatchTarget_->interpreter = this;
+    }
+
+    heap_->setValueLifecycleSweepCallback(
+        [weakTarget = std::weak_ptr<DispatchTarget>(dispatchTarget_),
+         disposeMap = std::move(disposeByTypeId)](const Value& sweptValue) {
+            if (tlsInValueLifecycleDispose || sweptValue.rawTag() != ValueTag::Struct) {
+                return;
+            }
+            const auto target = weakTarget.lock();
+            if (!target || !target->interpreter || !target->interpreter->program_) {
+                return;
+            }
+            const auto& st = sweptValue.asStructUnchecked();
+            const auto it = disposeMap.find(st.typeId);
+            if (it == disposeMap.end() || it->second == 0) {
+                return;
+            }
+            const auto* loc = target->interpreter->program_->resolveFunction(it->second);
+            if (!loc || !loc->function) {
+                return;
+            }
+            struct ReentrancyGuard {
+                bool& flag;
+                explicit ReentrancyGuard(bool& f) noexcept : flag(f) { flag = true; }
+                ~ReentrancyGuard() noexcept { flag = false; }
+                ReentrancyGuard(const ReentrancyGuard&) = delete;
+                ReentrancyGuard& operator=(const ReentrancyGuard&) = delete;
+            } guard(tlsInValueLifecycleDispose);
+
+            try {
+                ExecutionOptions opts;
+                opts.limits.instructionBudget = 1'000'000;
+                opts.limits.recursionLimit = 128;
+                std::vector<Value> args;
+                if (!loc->function->parameterTypes.empty()) {
+                    if (loc->function->parameterTypes[0] == semantic::PrimitiveType::Object) {
+                        // Mutable struct methods lower `this` as a single-field reference-wrapper class.
+                        const semantic::SymbolId wrapperTypeId =
+                            loc->function->parameterTypeIds.empty()
+                                ? 0
+                                : loc->function->parameterTypeIds[0];
+                        if (wrapperTypeId == 0 || !target->interpreter->heap_) {
+                            return;
+                        }
+                        std::vector<std::size_t> refFields;
+                        if (sweptValue.isTraceable()) {
+                            refFields.push_back(0);
+                        }
+                        RuntimeError allocErr;
+                        const auto wrappedThis = target->interpreter->heap_->allocateObject(
+                            wrapperTypeId,
+                            std::vector<Value>{sweptValue},
+                            std::move(refFields),
+                            &allocErr);
+                        if (!wrappedThis) {
+                            return;
+                        }
+                        args.push_back(*wrappedThis);
+                    } else {
+                        args.push_back(sweptValue);
+                    }
+                }
+                (void)target->interpreter->invoke(it->second, args, std::move(opts));
+            } catch (...) {
+                // Sweep finalizers must never propagate errors out of GC cycles.
+            }
+        });
+}
+
 Interpreter::Interpreter(std::vector<bytecode::Module> modules)
     : heap_(std::make_shared<ManagedHeap>()),
-      asyncRuntime_(std::make_shared<AsyncRuntimeContext>(heap_.get())) {
+      asyncRuntime_(std::make_shared<AsyncRuntimeContext>(heap_.get())),
+      dispatchTarget_(std::make_shared<DispatchTarget>(DispatchTarget{this})) {
     auto linked = ProgramImage::link(std::move(modules), programError_);
     if (linked) {
         program_ = std::make_shared<ProgramImage>(std::move(*linked));
         if (heap_) heap_->registerTypeHierarchy(*program_);
+        registerValueLifecycleHooks();
     }
 }
 
@@ -209,13 +409,86 @@ Interpreter::Interpreter(
     std::shared_ptr<ManagedHeap> heap)
     : program_(std::move(program)),
       heap_(heap ? std::move(heap) : std::make_shared<ManagedHeap>()),
-      asyncRuntime_(std::make_shared<AsyncRuntimeContext>(heap_.get())) {
+      asyncRuntime_(std::make_shared<AsyncRuntimeContext>(heap_.get())),
+      dispatchTarget_(std::make_shared<DispatchTarget>(DispatchTarget{this})) {
     if (!program_) {
         programError_.code = ErrorCode::InvalidProgram;
         programError_.message = "interpreter has no linked program image";
     } else if (heap_) {
         heap_->registerTypeHierarchy(*program_);
+        registerValueLifecycleHooks();
     }
+}
+
+Interpreter::~Interpreter() {
+    if (dispatchTarget_) {
+        dispatchTarget_->interpreter = nullptr;
+    }
+}
+
+Interpreter::Interpreter(const Interpreter& other)
+    : program_(other.program_),
+      programError_(other.programError_),
+      externalResolver_(other.externalResolver_),
+      bindings_(other.bindings_),
+      heap_(other.heap_),
+      asyncRuntime_(other.asyncRuntime_),
+      dispatchTarget_(std::make_shared<DispatchTarget>(DispatchTarget{this})) {
+    registerValueLifecycleHooks();
+}
+
+Interpreter& Interpreter::operator=(const Interpreter& other) {
+    if (this == &other) {
+        return *this;
+    }
+    if (dispatchTarget_) {
+        dispatchTarget_->interpreter = nullptr;
+    }
+    program_ = other.program_;
+    programError_ = other.programError_;
+    externalResolver_ = other.externalResolver_;
+    bindings_ = other.bindings_;
+    heap_ = other.heap_;
+    asyncRuntime_ = other.asyncRuntime_;
+    resumeEnv_.reset();
+    dispatchTarget_ = std::make_shared<DispatchTarget>(DispatchTarget{this});
+    registerValueLifecycleHooks();
+    return *this;
+}
+
+Interpreter::Interpreter(Interpreter&& other) noexcept
+    : program_(std::move(other.program_)),
+      programError_(std::move(other.programError_)),
+      externalResolver_(std::move(other.externalResolver_)),
+      bindings_(std::move(other.bindings_)),
+      heap_(std::move(other.heap_)),
+      asyncRuntime_(std::move(other.asyncRuntime_)),
+      resumeEnv_(std::move(other.resumeEnv_)),
+      dispatchTarget_(std::move(other.dispatchTarget_)) {
+    if (dispatchTarget_) {
+        dispatchTarget_->interpreter = this;
+    }
+}
+
+Interpreter& Interpreter::operator=(Interpreter&& other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    if (dispatchTarget_) {
+        dispatchTarget_->interpreter = nullptr;
+    }
+    program_ = std::move(other.program_);
+    programError_ = std::move(other.programError_);
+    externalResolver_ = std::move(other.externalResolver_);
+    bindings_ = std::move(other.bindings_);
+    heap_ = std::move(other.heap_);
+    asyncRuntime_ = std::move(other.asyncRuntime_);
+    resumeEnv_ = std::move(other.resumeEnv_);
+    dispatchTarget_ = std::move(other.dispatchTarget_);
+    if (dispatchTarget_) {
+        dispatchTarget_->interpreter = this;
+    }
+    return *this;
 }
 
 void Interpreter::setExternalResolver(ExternalFunction resolver) {
@@ -225,7 +498,10 @@ void Interpreter::setExternalResolver(ExternalFunction resolver) {
 
 void Interpreter::setHeap(std::shared_ptr<ManagedHeap> heap) {
     heap_ = heap ? std::move(heap) : std::make_shared<ManagedHeap>();
-    if (program_ && heap_) heap_->registerTypeHierarchy(*program_);
+    if (program_ && heap_) {
+        heap_->registerTypeHierarchy(*program_);
+        registerValueLifecycleHooks();
+    }
     if (asyncRuntime_) asyncRuntime_->setHeap(heap_.get());
     resumeEnv_.reset();
 }
@@ -279,6 +555,7 @@ ExecutionResult Interpreter::invoke(
         missing.error.message = "entry function was not found";
         return missing;
     }
+    ScopedValuePoolDomain domainScope(heap_ ? heap_->valuePoolDomain().get() : nullptr);
     detail::ActiveMutatorScope activeMutatorScope;
     auto& tlsScratch = tlsInvokeScratch;
     std::array<InlineCallCacheEntry, 64> fallbackInlineCache;
@@ -392,6 +669,10 @@ ExecutionResult Interpreter::invoke(
     }
     state.determinism = DeterminismSession(std::move(options.determinism));
     state.heap = heap_.get();
+    state.shadowStack.setDomainId(
+        (state.heap && state.heap->valuePoolDomain())
+            ? state.heap->valuePoolDomain()->domainId()
+            : 0u);
     state.debugger = options.debugger.get();
     state.asyncRuntime = asyncRuntime_.get();
     state.awaitScheduler = options.awaitScheduler;

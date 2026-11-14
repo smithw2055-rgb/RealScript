@@ -69,6 +69,93 @@ void releaseFlatStackBank(std::uint8_t bankId) noexcept;
 [[nodiscard]] void* localLiveStringHeapShardsPtr() noexcept;
 [[nodiscard]] void* localHeapStructAllocCounterPtr() noexcept;
 
+// 30-bit pool ID layout:
+//   bits 29..24 (6 bits): domainId (0 = defaultDomain, 1..63 = dynamic/recycled)
+//   bits 23..20 (4 bits): shardIdx (0..15)
+//   bits 19..0 (20 bits): localIdx (1..1,048,575; 0 reserved invalid)
+inline constexpr std::uint32_t kPoolDomainBits = 6u;
+inline constexpr std::uint32_t kMaxPoolDomains = 1u << kPoolDomainBits; // 64
+inline constexpr std::uint32_t kPoolDomainMask = kMaxPoolDomains - 1u;
+inline constexpr std::uint32_t kPoolShardBits = 4u;
+inline constexpr std::uint32_t kPoolShardCount = 1u << kPoolShardBits; // 16
+inline constexpr std::uint32_t kPoolShardMask = kPoolShardCount - 1u;
+inline constexpr std::uint32_t kPoolLocalBits = 20u;
+inline constexpr std::uint32_t kPoolLocalMask = (1u << kPoolLocalBits) - 1u;
+inline constexpr std::uint32_t kPoolShardShift = kPoolLocalBits;                  // 20
+inline constexpr std::uint32_t kPoolDomainShift = kPoolLocalBits + kPoolShardBits; // 24
+
+[[nodiscard]] constexpr std::uint32_t encodeDomainPoolId(
+    std::uint8_t domainId,
+    std::uint32_t shardIdx,
+    std::uint32_t localSlot) noexcept {
+    return (static_cast<std::uint32_t>(domainId & kPoolDomainMask) << kPoolDomainShift) |
+        ((shardIdx & kPoolShardMask) << kPoolShardShift) |
+        ((localSlot + 1u) & kPoolLocalMask);
+}
+
+[[nodiscard]] constexpr bool decodeDomainPoolId(
+    std::uint32_t id,
+    std::uint8_t& outDomainId,
+    std::uint32_t& outShardIdx,
+    std::uint32_t& outLocalSlot) noexcept {
+    if ((id & 0xC0000000u) != 0u) return false;
+    const std::uint32_t rawLocal = id & kPoolLocalMask;
+    if (rawLocal == 0u) return false;
+    outDomainId = static_cast<std::uint8_t>((id >> kPoolDomainShift) & kPoolDomainMask);
+    outShardIdx = (id >> kPoolShardShift) & kPoolShardMask;
+    outLocalSlot = rawLocal - 1u;
+    return true;
+}
+
+struct DomainGcRuntimeState {
+    virtual ~DomainGcRuntimeState() = default;
+};
+
+struct ValuePoolDomainAccess {
+    [[nodiscard]] static ValuePoolDomain::Impl* impl(ValuePoolDomain* domain) noexcept;
+    [[nodiscard]] static const ValuePoolDomain::Impl* impl(const ValuePoolDomain* domain) noexcept;
+    [[nodiscard]] static ValuePoolDomain::Impl* currentDomainImpl() noexcept;
+    [[nodiscard]] static std::shared_ptr<ValuePoolDomain> tryLockDomainById(
+        std::uint8_t domainId) noexcept;
+    [[nodiscard]] static std::uint8_t domainIdOf(
+        const ValuePoolDomain::Impl* domainImpl) noexcept;
+    [[nodiscard]] static std::uint64_t domainEpochOf(
+        const ValuePoolDomain::Impl* domainImpl) noexcept;
+
+    using GcStateFactoryFn = std::shared_ptr<DomainGcRuntimeState> (*)(std::uint8_t domainId);
+    [[nodiscard]] static std::shared_ptr<DomainGcRuntimeState> getOrCreateGcState(
+        ValuePoolDomain::Impl* domainImpl,
+        GcStateFactoryFn factory);
+    [[nodiscard]] static std::shared_ptr<DomainGcRuntimeState> getGcStateByDomainId(
+        std::uint8_t domainId) noexcept;
+
+    [[nodiscard]] static bool poolGcMarkInProgress(
+        const ValuePoolDomain::Impl* domainImpl) noexcept;
+    [[nodiscard]] static bool anyPoolHasPinnedSlots(
+        const ValuePoolDomain::Impl* domainImpl) noexcept;
+    static void beginPoolGcMarkForImpl(ValuePoolDomain::Impl* domainImpl) noexcept;
+    static void markValueInDomain(
+        ValuePoolDomain::Impl* domainImpl,
+        const Value& value) noexcept;
+    static void markStackRootValueInDomain(
+        ValuePoolDomain::Impl* domainImpl,
+        const Value& value) noexcept;
+    static std::size_t finishPoolGcSweepForImpl(
+        ValuePoolDomain::Impl* domainImpl) noexcept;
+    static void incrementCollectionCount(
+        ValuePoolDomain::Impl* domainImpl) noexcept;
+};
+
+[[nodiscard]] std::uint8_t currentThreadDomainIdFast() noexcept;
+std::size_t reclaimDomainPoolValues(
+    ValuePoolDomain::Impl* domainImpl,
+    const ShadowStack* activeShadowStack,
+    bool waitIfBusy) noexcept;
+std::size_t reclaimDomainPoolValuesById(
+    std::uint8_t domainId,
+    const ShadowStack* activeShadowStack,
+    bool waitIfBusy) noexcept;
+
 std::size_t hostReclaimPoolValuesBridge(const void* activeShadowStack, bool waitIfBusy) noexcept;
 void hostRegisterShadowStackBridge(void* stack) noexcept;
 void hostUnregisterShadowStackBridge(void* stack) noexcept;
