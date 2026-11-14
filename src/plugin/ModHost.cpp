@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <utility>
 
@@ -1149,6 +1150,10 @@ MarshalResult marshalCrossHeapValue(
     const runtime::ManagedHeap* sourceHeap,
     runtime::ManagedHeap* targetHeap,
     std::uint32_t maxDepth) {
+    std::optional<runtime::ScopedValuePoolDomain> targetDomainScope;
+    if (targetHeap && targetHeap->valuePoolDomain()) {
+        targetDomainScope.emplace(targetHeap->valuePoolDomain());
+    }
     return marshalCrossHeapImpl(value, sourceHeap, targetHeap, 0u, maxDepth);
 }
 
@@ -1433,11 +1438,14 @@ ModLoadReport ModHost::loadMods(const std::vector<ModPackage>& packages) {
         }
         sandbox->program = std::make_shared<const runtime::ProgramImage>(std::move(*linkedImage));
 
+        auto modDomain = runtime::ValuePoolDomain::create();
+        runtime::ScopedValuePoolDomain modDomainScope(modDomain);
+
         const std::size_t maxBytes = std::max<std::size_t>(manifest.maxHeapBytes, 1024u);
         const std::size_t initThreshold = std::max<std::size_t>(
             512u, std::min<std::size_t>(maxBytes / 2u, 64u * 1024u));
         sandbox->heap = std::make_shared<runtime::ManagedHeap>(
-            runtime::HeapConfig{initThreshold, maxBytes});
+            runtime::HeapConfig{initThreshold, maxBytes, std::move(modDomain)});
 
         sandbox->reflection = std::make_shared<reflection::ReflectionRegistry>(
             sandbox->program, sandbox->heap);
@@ -1806,6 +1814,11 @@ EventPublishReport ModHost::publishEvent(
             continue;
         }
 
+        std::optional<runtime::ScopedValuePoolDomain> modDomainScope;
+        if (sandbox->heap && sandbox->heap->valuePoolDomain()) {
+            modDomainScope.emplace(sandbox->heap->valuePoolDomain());
+        }
+
         std::vector<runtime::Value> marshaledArgs;
         std::vector<runtime::PersistentRoot> argRoots;
         marshaledArgs.reserve(payload.size());
@@ -1916,6 +1929,11 @@ ModEndpointResult ModHost::invokeModEndpoint(
 
     const runtime::ManagedHeap* effectiveCallerHeap = callerHeap ? callerHeap : hostHeap_.get();
     runtime::ManagedHeap* effectiveReturnHeap = resultTargetHeap ? resultTargetHeap : hostHeap_.get();
+
+    std::optional<runtime::ScopedValuePoolDomain> modDomainScope;
+    if (sandbox->heap && sandbox->heap->valuePoolDomain()) {
+        modDomainScope.emplace(sandbox->heap->valuePoolDomain());
+    }
 
     std::vector<runtime::Value> marshaledArgs;
     std::vector<runtime::PersistentRoot> argRoots;

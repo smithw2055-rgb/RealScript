@@ -1000,8 +1000,10 @@ bool tryPackInlineStructFields(
         outVal.packedOffsetsAndLengths = 0;
         entry.nestedFieldMask = 0;
     }
+    const std::uint32_t arenaIdx = detail::allocateInlineArenaEntry(entry);
+    if (arenaIdx == 0u) return false;
     outVal.inlineSlotCount = static_cast<std::uint8_t>(slotCursor);
-    outVal.storage.setInlineArenaIndex(detail::allocateInlineArenaEntry(entry));
+    outVal.storage.setInlineArenaIndex(arenaIdx);
     return true;
 }
 
