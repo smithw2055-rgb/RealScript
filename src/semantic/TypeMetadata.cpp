@@ -1,5 +1,8 @@
 #include "realscript/semantic/Semantic.h"
 
+#include <algorithm>
+#include <string_view>
+
 namespace realscript::semantic {
 namespace {
 
@@ -232,6 +235,242 @@ std::string referenceWrapperTypeName(
     return moduleName.empty()
         ? simpleName
         : moduleName + "::" + simpleName;
+}
+
+namespace {
+
+[[nodiscard]] constexpr std::uint32_t alignUpBlittable(
+    std::uint32_t offset,
+    std::uint32_t align) noexcept {
+    return (offset + align - 1u) & ~(align - 1u);
+}
+
+[[nodiscard]] bool isNativeHandleName(std::string_view name) noexcept {
+    if (name == "NativeHandle") return true;
+    constexpr std::string_view suffix = "::NativeHandle";
+    return name.size() >= suffix.size() &&
+        name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+[[nodiscard]] bool classifyBuiltinMathStruct(
+    SymbolId typeId,
+    std::uint32_t& outSize,
+    std::uint32_t& outAlign) noexcept {
+    static const SymbolId kFixed = stableTypeId("RealScript.Math::Fixed");
+    static const SymbolId kFixed16 = stableTypeId("RealScript.Math::Fixed16");
+    static const SymbolId kFixed64 = stableTypeId("RealScript.Math::Fixed64");
+    static const SymbolId kVec2 = stableTypeId("RealScript.Math::Vec2");
+    static const SymbolId kVec3 = stableTypeId("RealScript.Math::Vec3");
+    static const SymbolId kQuat = stableTypeId("RealScript.Math::Quat");
+    static const SymbolId kVec2f = stableTypeId("RealScript.Math::Vec2f");
+    static const SymbolId kVec3f = stableTypeId("RealScript.Math::Vec3f");
+    static const SymbolId kQuatf = stableTypeId("RealScript.Math::Quatf");
+    if (typeId == kFixed)   { outSize = 4u;  outAlign = 4u; return true; }
+    if (typeId == kFixed16) { outSize = 8u;  outAlign = 8u; return true; }
+    if (typeId == kFixed64) { outSize = 8u;  outAlign = 8u; return true; }
+    if (typeId == kVec2)    { outSize = 8u;  outAlign = 4u; return true; }
+    if (typeId == kVec3)    { outSize = 12u; outAlign = 4u; return true; }
+    if (typeId == kQuat)    { outSize = 16u; outAlign = 4u; return true; }
+    if (typeId == kVec2f)   { outSize = 8u;  outAlign = 4u; return true; }
+    if (typeId == kVec3f)   { outSize = 12u; outAlign = 4u; return true; }
+    if (typeId == kQuatf)   { outSize = 16u; outAlign = 4u; return true; }
+    return false;
+}
+
+template <typename LookupFn>
+[[nodiscard]] std::optional<BlittableStructLayout> computeBlittableLayoutImpl(
+    const TypeSymbol& type,
+    const LookupFn& lookupType,
+    std::unordered_set<SymbolId>& visiting,
+    std::uint32_t depth,
+    std::string* outReason) {
+    const auto fail = [&](std::string msg) -> std::optional<BlittableStructLayout> {
+        if (outReason && outReason->empty()) *outReason = std::move(msg);
+        return std::nullopt;
+    };
+
+    const SymbolId typeId = type.id != 0 ? type.id : stableTypeId(type);
+    if (depth > 16u) {
+        return fail("blittable struct nesting exceeds maximum depth (16)");
+    }
+    if (type.kind != TypeKind::Struct) {
+        return fail("type '" + canonicalTypeName(type) + "' is not a struct");
+    }
+    if (type.hasValueLifecycle) {
+        return fail("struct '" + canonicalTypeName(type) + "' has [ValueLifecycle] and cannot be blittable");
+    }
+    if (isNativeHandleName(type.name) || isNativeHandleName(canonicalTypeName(type))) {
+        return fail("type '" + canonicalTypeName(type) + "' is a native handle and cannot be blittable");
+    }
+    if (typeId != 0 && !visiting.insert(typeId).second) {
+        return fail("recursive struct cycle involving '" + canonicalTypeName(type) + "'");
+    }
+
+    struct ScopeErase {
+        std::unordered_set<SymbolId>& set;
+        SymbolId id;
+        ~ScopeErase() {
+            if (id != 0) set.erase(id);
+        }
+    } guard{visiting, typeId};
+
+    std::uint32_t offset = 0u;
+    std::uint32_t maxAlign = 1u;
+    std::vector<BlittableFieldLayout> fields;
+
+    for (const auto& field : type.fields) {
+        if (field.staticField || field.constField) continue;
+        if (field.name.rfind("$sequence_", 0) == 0) {
+            return fail("blittable struct '" + canonicalTypeName(type) + "' cannot contain state-machine fields");
+        }
+        if (isNativeHandleName(field.typeName) || field.type == PrimitiveType::Handle) {
+            return fail("field '" + field.name + "' uses NativeHandle which is not blittable");
+        }
+
+        std::uint32_t fSize = 0u;
+        std::uint32_t fAlign = 1u;
+        SymbolId fTypeId = 0u;
+        bool isNested = false;
+
+        switch (field.type) {
+        case PrimitiveType::Bool:
+        case PrimitiveType::Byte:
+        case PrimitiveType::SByte:
+            fSize = 1u;
+            fAlign = 1u;
+            break;
+        case PrimitiveType::Short:
+        case PrimitiveType::UShort:
+        case PrimitiveType::Char:
+            fSize = 2u;
+            fAlign = 2u;
+            break;
+        case PrimitiveType::Int:
+        case PrimitiveType::UInt:
+        case PrimitiveType::Float:
+            fSize = 4u;
+            fAlign = 4u;
+            break;
+        case PrimitiveType::Enum:
+            if (field.typeName.empty()) {
+                return fail("enum field '" + field.name + "' is missing canonical type identity");
+            }
+            fTypeId = stableTypeId(field.typeName);
+            fSize = 4u;
+            fAlign = 4u;
+            break;
+        case PrimitiveType::Long:
+        case PrimitiveType::ULong:
+        case PrimitiveType::Double:
+            fSize = 8u;
+            fAlign = 8u;
+            break;
+        case PrimitiveType::Struct: {
+            if (field.typeName.empty()) {
+                return fail("struct field '" + field.name + "' has unresolved type");
+            }
+            fTypeId = stableTypeId(field.typeName);
+            if (classifyBuiltinMathStruct(fTypeId, fSize, fAlign)) {
+                break;
+            }
+            const TypeSymbol* nestedType = lookupType(fTypeId, field.typeName);
+            if (!nestedType) {
+                return fail("struct field '" + field.name + "' references unknown type '" + field.typeName + "'");
+            }
+            if (nestedType->hasValueLifecycle) {
+                return fail("field '" + field.name + "' has [ValueLifecycle] struct type '" +
+                    field.typeName + "' which is not blittable");
+            }
+            auto nestedLayout = computeBlittableLayoutImpl(
+                *nestedType, lookupType, visiting, depth + 1u, outReason);
+            if (!nestedLayout) {
+                return std::nullopt;
+            }
+            fSize = nestedLayout->strideBytes;
+            fAlign = nestedLayout->alignBytes;
+            fTypeId = nestedLayout->typeId;
+            isNested = true;
+            break;
+        }
+        default:
+            return fail("field '" + field.name + "' of type '" +
+                (field.typeName.empty() ? std::string(primitiveTypeName(field.type)) : field.typeName) +
+                "' is not blittable");
+        }
+
+        offset = alignUpBlittable(offset, fAlign);
+        maxAlign = std::max(maxAlign, fAlign);
+        fields.push_back(BlittableFieldLayout{
+            field.name,
+            field.type,
+            fTypeId,
+            offset,
+            fSize,
+            fAlign,
+            isNested,
+        });
+        offset += fSize;
+    }
+
+    if (fields.empty()) {
+        return fail("blittable struct '" + canonicalTypeName(type) + "' must have at least one instance field");
+    }
+    const std::uint32_t stride = alignUpBlittable(offset, maxAlign);
+    if (stride == 0u || stride > (1u << 20u)) {
+        return fail("blittable struct '" + canonicalTypeName(type) + "' exceeds maximum blittable stride");
+    }
+
+    return BlittableStructLayout{typeId, stride, maxAlign, std::move(fields)};
+}
+
+} // namespace
+
+std::optional<BlittableStructLayout> computeBlittableStructLayout(
+    const TypeSymbol& type,
+    const TypeSymbolMap& visibleTypes,
+    std::string* outReason) {
+    if (outReason) outReason->clear();
+    std::unordered_map<SymbolId, const TypeSymbol*> byId;
+    byId.reserve(visibleTypes.size());
+    for (const auto& [name, sym] : visibleTypes) {
+        (void)name;
+        const SymbolId sid = sym.id != 0 ? sym.id : stableTypeId(sym);
+        if (sid != 0) byId[sid] = &sym;
+    }
+    const auto lookup = [&](SymbolId tid, const std::string& name) -> const TypeSymbol* {
+        if (const auto it = byId.find(tid); it != byId.end()) return it->second;
+        if (const auto it = visibleTypes.find(name); it != visibleTypes.end()) return &it->second;
+        return nullptr;
+    };
+    std::unordered_set<SymbolId> visiting;
+    return computeBlittableLayoutImpl(type, lookup, visiting, 0u, outReason);
+}
+
+std::optional<BlittableStructLayout> computeBlittableStructLayout(
+    const TypeSymbol& type,
+    const std::unordered_map<SymbolId, const TypeSymbol*>& typesById,
+    std::string* outReason) {
+    if (outReason) outReason->clear();
+    const auto lookup = [&](SymbolId tid, const std::string&) -> const TypeSymbol* {
+        const auto it = typesById.find(tid);
+        return it != typesById.end() ? it->second : nullptr;
+    };
+    std::unordered_set<SymbolId> visiting;
+    return computeBlittableLayoutImpl(type, lookup, visiting, 0u, outReason);
+}
+
+std::optional<BlittableStructLayout> computeBlittableStructLayout(
+    const TypeSymbol& type,
+    const std::vector<TypeSymbol>& moduleTypes,
+    std::string* outReason) {
+    if (outReason) outReason->clear();
+    std::unordered_map<SymbolId, const TypeSymbol*> byId;
+    byId.reserve(moduleTypes.size());
+    for (const auto& sym : moduleTypes) {
+        const SymbolId sid = sym.id != 0 ? sym.id : stableTypeId(sym);
+        if (sid != 0) byId[sid] = &sym;
+    }
+    return computeBlittableStructLayout(type, byId, outReason);
 }
 
 } // namespace realscript::semantic

@@ -1,6 +1,7 @@
 #include "realscript/bytecode/Bytecode.h"
 #include "realscript/compiler/Compilation.h"
 #include "realscript/compiler/ModuleBuildCache.h"
+#include "realscript/compiler/ProjectConfig.h"
 #include "realscript/diagnostics/Diagnostic.h"
 #include "realscript/mir/Mir.h"
 #include "realscript/optimization/Optimizer.h"
@@ -129,16 +130,21 @@ void printUsage() {
     std::cerr
         << "usage: rsc <file.rscript>... "
            "[--check|--tokens|--mir|--symbols|--bytecode] "
+           "[--project <realscript.project.json>] [--no-project-config] "
            "[--cache-dir <directory>] [--cache-stats]\n"
         << "       rsc <file.rscript>... --format [--write|-i|--stdout|-o <output.rscript>]\n"
         << "       rsc <file.rscript>... --check-format\n"
-        << "       rsc <file.rscript>... --lint [--lint-deny-warnings] [--project <realscript.project.json>]\n"
+        << "       rsc <file.rscript>... --lint [--lint-deny-warnings] "
+           "[--project <realscript.project.json>] [--no-project-config]\n"
         << "       rsc <file.rscript>... --emit-bytecode <module.rsbc> "
+           "[--project <realscript.project.json>] [--no-project-config] "
            "[--cache-dir <directory>] [--cache-stats]\n"
         << "       rsc <file.rscript>... --emit-bytecode-dir <directory> "
+           "[--project <realscript.project.json>] [--no-project-config] "
            "[--cache-dir <directory>] [--cache-stats]\n"
         << "       rsc <module.rsbc> --disassemble\n"
         << "       rsc <file.rscript>... --run <module::function> "
+           "[--project <realscript.project.json>] [--no-project-config] "
            "[--cache-dir <directory>] [--cache-stats]\n";
 }
 
@@ -271,6 +277,7 @@ int main(int argc, char** argv) {
     std::string formatOutputPath;
     std::string cacheDirectory;
     std::string projectConfigPath;
+    bool noProjectConfig = false;
     realscript::optimization::Options optimizationOptions;
     optimizationOptions.level = realscript::optimization::Level::None;
     bool optimizationReport = false;
@@ -323,6 +330,8 @@ int main(int argc, char** argv) {
                 printUsage();
                 return 2;
             }
+        } else if (argument == "--no-project-config") {
+            noProjectConfig = true;
         } else if (argument == "--indent-width") {
             if (index + 1 >= argc) {
                 printUsage();
@@ -566,13 +575,33 @@ int main(int argc, char** argv) {
                 sources.push_back({path, readFile(path)});
             }
 
+            realscript::compiler::CompilationOptions projectOptions;
+            realscript::diagnostics::DiagnosticBag projectDiagnostics;
+            std::optional<std::filesystem::path> explicitProjectPath;
+            if (!projectConfigPath.empty()) {
+                explicitProjectPath = std::filesystem::path(projectConfigPath);
+            }
+            if (!realscript::compiler::resolveAndApplyProjectConfigForInputs(
+                    sources,
+                    explicitProjectPath,
+                    noProjectConfig,
+                    projectOptions,
+                    &projectDiagnostics) ||
+                projectDiagnostics.hasErrors()) {
+                printDiagnostics(projectDiagnostics);
+                return 1;
+            }
+            printDiagnostics(projectDiagnostics);
+
             realscript::compiler::ModuleBuildCacheOptions cacheOptions;
             cacheOptions.cacheDirectory = cacheDirectory;
             cacheOptions.optimizationOptions = optimizationOptions;
             cacheOptions.flags = realscript::compiler::kBuildCacheFlagPreserveDebugInfo |
-                (deterministic ? realscript::compiler::kBuildCacheFlagDeterministic : 0u);
+                (deterministic ? realscript::compiler::kBuildCacheFlagDeterministic : 0u) |
+                (noProjectConfig ? realscript::compiler::kBuildCacheFlagNoProjectConfig : 0u);
             cacheOptions.retainMirModules = (mode == "--mir");
 
+            realscript::compiler::ScopedProjectCompilationOptions scopedProject(projectOptions);
             realscript::compiler::ModuleBuildCache buildCache(cacheDirectory);
             auto cached = buildCache.build(sources, cacheOptions);
 
@@ -661,13 +690,30 @@ int main(int argc, char** argv) {
 
         std::vector<realscript::compiler::SourceFile> loadedSources;
         loadedSources.reserve(paths.size());
-        realscript::compiler::Compilation compilation;
         for (const auto& path : paths) {
             requireScriptExtension(path);
-            auto text = readFile(path);
-            loadedSources.push_back({path, text});
-            compilation.addSource({path, std::move(text)});
+            loadedSources.push_back({path, readFile(path)});
         }
+
+        realscript::compiler::CompilationOptions compilationOptions;
+        realscript::diagnostics::DiagnosticBag projectDiagnostics;
+        std::optional<std::filesystem::path> explicitProjectPath;
+        if (!projectConfigPath.empty()) {
+            explicitProjectPath = std::filesystem::path(projectConfigPath);
+        }
+        if (!realscript::compiler::resolveAndApplyProjectConfigForInputs(
+                loadedSources,
+                explicitProjectPath,
+                noProjectConfig,
+                compilationOptions,
+                &projectDiagnostics) ||
+            projectDiagnostics.hasErrors()) {
+            printDiagnostics(projectDiagnostics);
+            return 1;
+        }
+        printDiagnostics(projectDiagnostics);
+
+        realscript::compiler::Compilation compilation(loadedSources, compilationOptions);
         auto result = compilation.build();
         if (!result.diagnostics.hasErrors() &&
             optimizationOptions.level != realscript::optimization::Level::None) {
@@ -776,7 +822,9 @@ int main(int argc, char** argv) {
         printDiagnostics(result.diagnostics);
 #if !defined(REALSCRIPT_HAS_TOOLING) || REALSCRIPT_HAS_TOOLING
         if (lintRequested) {
-            const auto lintCfg = discoverLintConfig(projectConfigPath, paths);
+            const auto lintCfg = noProjectConfig
+                ? realscript::tooling::LintConfig{}
+                : discoverLintConfig(projectConfigPath, paths);
             realscript::tooling::GovernanceLinter linter(lintCfg);
             const auto lintDiags = linter.lintWorkspace(loadedSources, &result);
             printLintDiagnostics(lintDiags);

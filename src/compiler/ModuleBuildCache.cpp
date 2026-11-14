@@ -1,4 +1,5 @@
 #include "realscript/compiler/ModuleBuildCache.h"
+#include "realscript/compiler/ProjectConfig.h"
 
 #include "CompilationInternal.h"
 #include "realscript/Version.h"
@@ -151,6 +152,157 @@ void mixOptimizationOptions(
     mixU8(h, opt.enableStructFieldForwarding ? 1u : 0u);
     mixU8(h, opt.enableDevirtualization ? 1u : 0u);
     mixU64(h, static_cast<std::uint64_t>(opt.maxInlineInstructions));
+}
+
+void mixCompilationOptions(
+    std::uint64_t& h,
+    const CompilationOptions& opts) {
+    mixU8(h, opts.allowDefaultBuiltinPacks ? 1u : 0u);
+    mixU64(h, opts.projectConfigFingerprint);
+    mixString(h, opts.projectConfigPath);
+    {
+        std::vector<std::string> sortedDisabled(
+            opts.disabledPacks.begin(), opts.disabledPacks.end());
+        std::sort(sortedDisabled.begin(), sortedDisabled.end());
+        mixU64(h, static_cast<std::uint64_t>(sortedDisabled.size()));
+        for (const auto& d : sortedDisabled) {
+            mixString(h, d);
+        }
+    }
+    {
+        std::vector<std::pair<std::string, std::string>> packEntries;
+        packEntries.reserve(opts.extraPacks.size());
+        for (const auto& ep : opts.extraPacks) {
+            std::string body = ep.sourceProvider ? ep.sourceProvider() : std::string{};
+            packEntries.emplace_back(ep.moduleName + "@" + ep.virtualSourcePath, std::move(body));
+        }
+        std::sort(packEntries.begin(), packEntries.end());
+        mixU64(h, static_cast<std::uint64_t>(packEntries.size()));
+        for (const auto& [id, body] : packEntries) {
+            mixString(h, id);
+            mixString(h, body);
+        }
+    }
+    mixU64(h, static_cast<std::uint64_t>(opts.macroPlugins.size()));
+    for (const auto& mp : opts.macroPlugins) {
+        if (!mp) {
+            mixU8(h, 0u);
+            continue;
+        }
+        mixU8(h, 1u);
+        mixString(h, mp->name());
+        mixU64(h, mp->fingerprint());
+        auto mNames = mp->macroNames();
+        std::sort(mNames.begin(), mNames.end());
+        mixU64(h, static_cast<std::uint64_t>(mNames.size()));
+        for (const auto& mn : mNames) {
+            mixString(h, mn);
+        }
+    }
+}
+
+[[nodiscard]] bool resolveEffectiveProjectOptions(
+    const std::vector<SourceFile>& sources,
+    std::uint64_t flags,
+    CompilationOptions& outOpts,
+    diagnostics::DiagnosticBag& diagnostics) {
+    if (const auto* scoped = ScopedProjectCompilationOptions::current()) {
+        outOpts = *scoped;
+        return true;
+    }
+    outOpts = CompilationOptions{};
+    if ((flags & kBuildCacheFlagNoProjectConfig) != 0) {
+        return true;
+    }
+    return resolveAndApplyProjectConfigForInputs(
+        sources, std::nullopt, false, outOpts, &diagnostics);
+}
+
+[[nodiscard]] bool expandProjectSources(
+    const std::vector<SourceFile>& sources,
+    const CompilationOptions& opts,
+    std::vector<SourceFile>& outSources,
+    diagnostics::DiagnosticBag& diagnostics) {
+    outSources = sources;
+    if (opts.extraPacks.empty() && opts.macroPlugins.empty()) {
+        return true;
+    }
+
+    struct ParsedMacroHolder {
+        std::shared_ptr<text::SourceText> sourceText;
+        std::shared_ptr<syntax::CompilationUnitSyntax> syntaxTree;
+        std::string moduleName;
+        std::vector<std::string> imports;
+        std::string sourcePath;
+    };
+    std::unordered_set<std::string> existingModules;
+    std::vector<ParsedMacroHolder> holders;
+    auto ingestForMacros = [&](const SourceFile& sf) {
+        auto st = std::make_shared<text::SourceText>(sf.content, sf.path);
+        diagnostics::DiagnosticBag parseIgnored;
+        syntax::Parser parser(*st, parseIgnored);
+        auto cu = std::make_shared<syntax::CompilationUnitSyntax>(parser.parseCompilationUnit());
+        std::string modName = cu->moduleDeclaration ? cu->moduleDeclaration->fullName() : std::string("$global");
+        existingModules.insert(modName);
+        if (!opts.macroPlugins.empty()) {
+            std::vector<std::string> imps;
+            for (const auto& imp : cu->imports) {
+                imps.push_back(imp.fullName());
+            }
+            holders.push_back(ParsedMacroHolder{
+                std::move(st),
+                std::move(cu),
+                std::move(modName),
+                std::move(imps),
+                sf.path});
+        }
+    };
+    for (const auto& sf : sources) {
+        ingestForMacros(sf);
+    }
+    for (const auto& ep : opts.extraPacks) {
+        if (opts.disabledPacks.find(ep.moduleName) != opts.disabledPacks.end()) {
+            continue;
+        }
+        if (existingModules.find(ep.moduleName) != existingModules.end()) {
+            continue;
+        }
+        if (!ep.sourceProvider) {
+            continue;
+        }
+        SourceFile packSource{
+            ep.virtualSourcePath.empty() ? (ep.moduleName + ".rscript") : ep.virtualSourcePath,
+            ep.sourceProvider(),
+        };
+        ingestForMacros(packSource);
+        outSources.push_back(std::move(packSource));
+    }
+
+    if (!opts.macroPlugins.empty()) {
+        std::vector<MacroAstUnitView> views;
+        views.reserve(holders.size());
+        for (const auto& h : holders) {
+            views.push_back(MacroAstUnitView{
+                h.sourcePath,
+                h.moduleName,
+                h.imports,
+                h.sourceText.get(),
+                h.syntaxTree.get()});
+        }
+        MacroExpansionContext ctx{views};
+        std::vector<SourceFile> generated;
+        for (const auto& plugin : opts.macroPlugins) {
+            if (!plugin) continue;
+            plugin->expand(ctx, generated, diagnostics);
+        }
+        for (auto& g : generated) {
+            outSources.push_back(std::move(g));
+        }
+        if (diagnostics.hasErrors()) {
+            return false;
+        }
+    }
+    return true;
 }
 
 constexpr std::array<const char*, 6> kBuiltinModuleNames = {
@@ -3387,9 +3539,21 @@ CachedBuildResult ModuleBuildCache::build(
         options.cacheDirectory.empty() ? cacheDirectory_ : options.cacheDirectory;
     const bool useDiskCache = !activeCacheDir.empty();
 
-    auto graph = extractModuleGraph(sources, options.optimizationOptions, options.flags);
+    CompilationOptions projectCompOpts;
+    if (!resolveEffectiveProjectOptions(sources, options.flags, projectCompOpts, out.diagnostics)) {
+        return out;
+    }
+    std::vector<SourceFile> effectiveSources;
+    if (!expandProjectSources(sources, projectCompOpts, effectiveSources, out.diagnostics)) {
+        return out;
+    }
+    CompilationOptions compRunOpts = projectCompOpts;
+    compRunOpts.extraPacks.clear();
+    compRunOpts.macroPlugins.clear();
+
+    auto graph = extractModuleGraph(effectiveSources, options.optimizationOptions, options.flags);
     if (graph.diagnostics.hasErrors()) {
-        Compilation fallback(sources);
+        Compilation fallback(effectiveSources, compRunOpts);
         auto fullRes = fallback.build();
         out.diagnostics = std::move(fullRes.diagnostics);
         if (!out.diagnostics.hasErrors()) {
@@ -3675,6 +3839,7 @@ CachedBuildResult ModuleBuildCache::build(
 
         std::uint64_t optHash = 14695981039346656037ull;
         mixOptimizationOptions(optHash, options.optimizationOptions);
+        mixCompilationOptions(optHash, projectCompOpts);
         mixU64(optHash, options.flags);
         keySpec.flags = optHash;
 
@@ -3752,6 +3917,7 @@ CachedBuildResult ModuleBuildCache::build(
         std::uint64_t gk = 14695981039346656037ull;
         mixU64(gk, compilerAndAbiVersionFingerprint());
         mixOptimizationOptions(gk, options.optimizationOptions);
+        mixCompilationOptions(gk, projectCompOpts);
         mixU64(gk, options.flags);
         mixU64(gk, static_cast<std::uint64_t>(neededBuiltins.size()));
         for (const auto& bName : neededBuiltins) mixString(gk, bName);
@@ -3842,6 +4008,17 @@ CachedBuildResult ModuleBuildCache::build(
         if (builtinUnopt.find(bName) != builtinUnopt.end()) return;
         std::uint64_t bKey = 14695981039346656037ull;
         mixU64(bKey, compilerAndAbiVersionFingerprint());
+        mixU8(bKey, projectCompOpts.allowDefaultBuiltinPacks ? 1u : 0u);
+        mixU64(bKey, projectCompOpts.projectConfigFingerprint);
+        if (!projectCompOpts.disabledPacks.empty()) {
+            std::vector<std::string> sortedDisabled(
+                projectCompOpts.disabledPacks.begin(), projectCompOpts.disabledPacks.end());
+            std::sort(sortedDisabled.begin(), sortedDisabled.end());
+            mixU64(bKey, static_cast<std::uint64_t>(sortedDisabled.size()));
+            for (const auto& dp : sortedDisabled) {
+                mixString(bKey, dp);
+            }
+        }
         mixString(bKey, bName);
         const auto bDir = activeCacheDir / "_builtins";
         const auto unoptFile = bDir / (sanitizeFilename(bName) + "_" + hex64(bKey) + ".unopt");
@@ -3860,7 +4037,7 @@ CachedBuildResult ModuleBuildCache::build(
         Compilation probe({SourceFile{
             "$builtin_probe.rscript",
             "module __RsBuiltinProbe;\nimport " + bName + ";\npublic int __p() { return 0; }\n",
-        }});
+        }}, compRunOpts);
         auto probeRes = probe.build();
         for (auto& m : probeRes.modules) {
             if (m.name != bName) continue;
@@ -3906,6 +4083,7 @@ CachedBuildResult ModuleBuildCache::build(
         auto runCompilationSet = [&](bool allowUpstreamStubs, bool& outAnyStubAdded) -> BuildResult {
             outAnyStubAdded = false;
             Compilation compilation;
+            compilation.setOptions(compRunOpts);
             for (const auto& modName : graph.topologicalOrder) {
                 const auto& info = graph.modules.at(modName);
                 if (dirtyModules.find(modName) != dirtyModules.end()) {
@@ -4074,6 +4252,7 @@ CachedBuildResult ModuleBuildCache::build(
                 expandSet.insert(deps.begin(), deps.end());
             }
             Compilation expandComp;
+            expandComp.setOptions(compRunOpts);
             for (const auto& modName : graph.topologicalOrder) {
                 if (expandSet.find(modName) != expandSet.end()) {
                     for (const auto& sf : graph.modules.at(modName).sources) {
@@ -4241,9 +4420,19 @@ CachedAotBuildResult ModuleBuildCache::buildAotWithGenerator(
         cacheOptions.flags |= kBuildCacheFlagNoLineDirectives;
     }
 
+    CompilationOptions projectCompOpts;
+    if (!resolveEffectiveProjectOptions(sources, cacheOptions.flags, projectCompOpts, out.diagnostics)) {
+        return out;
+    }
+    std::vector<SourceFile> effectiveSources;
+    if (!expandProjectSources(sources, projectCompOpts, effectiveSources, out.diagnostics)) {
+        return out;
+    }
+
     const auto computeAotKey = [&](const std::vector<std::pair<std::string, std::uint64_t>>& modKeys) {
         std::uint64_t aotKey = 14695981039346656037ull;
         mixU64(aotKey, compilerAndAbiVersionFingerprint());
+        mixCompilationOptions(aotKey, projectCompOpts);
         mixString(aotKey, aotOptions.programName);
         mixString(aotKey, aotOptions.cppNamespace);
         mixString(aotKey, aotOptions.querySymbol);
@@ -4261,7 +4450,7 @@ CachedAotBuildResult ModuleBuildCache::buildAotWithGenerator(
     // Fast-path check: extract module graph & verify module cache entries + AOT bundle on disk
     if (useDiskCache) {
         auto graph = extractModuleGraph(
-            sources, cacheOptions.optimizationOptions, cacheOptions.flags);
+            effectiveSources, cacheOptions.optimizationOptions, cacheOptions.flags);
         if (!graph.diagnostics.hasErrors()) {
             std::unordered_map<std::string, std::set<std::string>> transitiveDeps;
             for (const auto& modName : graph.topologicalOrder) {
@@ -4276,6 +4465,7 @@ CachedAotBuildResult ModuleBuildCache::buildAotWithGenerator(
 
             std::uint64_t optHash = 14695981039346656037ull;
             mixOptimizationOptions(optHash, cacheOptions.optimizationOptions);
+            mixCompilationOptions(optHash, projectCompOpts);
             mixU64(optHash, cacheOptions.flags);
 
             bool allModulesIntactOnDisk = true;

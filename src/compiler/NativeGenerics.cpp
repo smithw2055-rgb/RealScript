@@ -148,7 +148,7 @@ std::string nativeBuiltinGenericSource(
     const std::string second = "__RsBuiltinTypeArg1";
     std::ostringstream source;
     if (name == "ResourceHandle") {
-        source << "public struct " << generatedName << " : IDisposable {"
+        source << "[ValueLifecycle] public struct " << generatedName << " : IDisposable {"
             << "public " << first << " __target;"
             << "public long __leaseId;"
             << "public long __resourceId;"

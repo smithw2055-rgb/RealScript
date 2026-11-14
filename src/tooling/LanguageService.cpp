@@ -45,6 +45,309 @@ std::string functionDetail(const semantic::FunctionSymbol& function) {
 
 } // namespace
 
+LanguageService::LanguageService()
+    : session_(std::make_shared<compiler::CompilerSession>()) {
+    compilationOptions_.session = session_;
+}
+
+compiler::CompilationOptions LanguageService::effectiveCompilationOptions() const {
+    compiler::CompilationOptions opts = compilationOptions_;
+    if (!opts.session) {
+        opts.session = session_;
+    }
+    return opts;
+}
+
+void LanguageService::setCompilationOptions(compiler::CompilationOptions options) {
+    if (!options.session) {
+        options.session = session_;
+    } else {
+        session_ = options.session;
+    }
+    compilationOptions_ = std::move(options);
+    explicitCompilationOptions_ = true;
+    structuralDirty_ = true;
+    dirty_ = true;
+    hasCachedDefinitions_ = false;
+    hasCachedDiagnostics_ = false;
+}
+
+std::uint64_t LanguageService::computeDeclarationSkeletonHash(
+    const std::string& path,
+    const Document& doc) const {
+    const auto& tokens = documentTokens(path, doc);
+    std::uint64_t hash = 14695981039346656037ull;
+    const auto mixU64 = [&](std::uint64_t v) noexcept {
+        for (unsigned shift = 0; shift < 64u; shift += 8u) {
+            hash ^= static_cast<std::uint8_t>((v >> shift) & 0xFFu);
+            hash *= 1099511628211ull;
+        }
+    };
+    const auto mixToken = [&](const syntax::SyntaxToken& tok) noexcept {
+        mixU64(static_cast<std::uint64_t>(tok.kind));
+        mixU64(static_cast<std::uint64_t>(tok.text.size()));
+        for (unsigned char ch : tok.text) {
+            hash ^= static_cast<std::uint64_t>(ch);
+            hash *= 1099511628211ull;
+        }
+    };
+
+    enum class BraceKind {
+        TypeBody,
+        EnumBody,
+        AccessorContainer,
+        KeepBlock,
+    };
+    struct BraceFrame {
+        BraceKind kind = BraceKind::KeepBlock;
+        bool genericOrInline = false;
+    };
+    std::vector<BraceFrame> braceStack;
+    const auto enclosingGenericOrInline = [&]() noexcept -> bool {
+        for (const auto& f : braceStack) {
+            if (f.genericOrInline) return true;
+        }
+        return false;
+    };
+
+    int parenDepth = 0;
+    int bracketDepth = 0;
+    bool headerStarted = false;
+    bool startsWithControlFlow = false;
+    bool sawEqualsAtZeroDepth = false;
+    bool hasCallableParens = false;
+    bool pendingAttrInline = false;
+    bool pendingTypeGeneric = false;
+    bool pendingCallableGeneric = false;
+    syntax::SyntaxKind pendingTypeKind = syntax::SyntaxKind::BadToken;
+    int attrBracketStartDepth = 0;
+    bool inAttributeBrackets = false;
+
+    const auto resetDeclState = [&]() noexcept {
+        headerStarted = false;
+        startsWithControlFlow = false;
+        sawEqualsAtZeroDepth = false;
+        hasCallableParens = false;
+        pendingAttrInline = false;
+        pendingTypeGeneric = false;
+        pendingCallableGeneric = false;
+        pendingTypeKind = syntax::SyntaxKind::BadToken;
+    };
+
+    const auto isControlFlowKeyword = [](syntax::SyntaxKind k) noexcept {
+        using SK = syntax::SyntaxKind;
+        switch (k) {
+        case SK::IfKeyword:
+        case SK::ElseKeyword:
+        case SK::WhileKeyword:
+        case SK::ForKeyword:
+        case SK::ForeachKeyword:
+        case SK::DoKeyword:
+        case SK::SwitchKeyword:
+        case SK::TryKeyword:
+        case SK::CatchKeyword:
+        case SK::FinallyKeyword:
+        case SK::ReturnKeyword:
+        case SK::ThrowKeyword:
+        case SK::BreakKeyword:
+        case SK::ContinueKeyword:
+            return true;
+        default:
+            return false;
+        }
+    };
+
+    const std::size_t n = tokens.size();
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto& tok = tokens[i];
+        if (tok.kind == syntax::SyntaxKind::EndOfFileToken) break;
+
+        if (tok.kind == syntax::SyntaxKind::OpenBracketToken) {
+            mixToken(tok);
+            if (parenDepth == 0 && !sawEqualsAtZeroDepth && bracketDepth == 0 &&
+                i + 1 < n && tokens[i + 1].kind == syntax::SyntaxKind::IdentifierToken) {
+                inAttributeBrackets = true;
+                attrBracketStartDepth = bracketDepth;
+            }
+            ++bracketDepth;
+            continue;
+        }
+        if (tok.kind == syntax::SyntaxKind::CloseBracketToken) {
+            mixToken(tok);
+            if (bracketDepth > 0) --bracketDepth;
+            if (inAttributeBrackets && bracketDepth == attrBracketStartDepth) {
+                inAttributeBrackets = false;
+            }
+            continue;
+        }
+        if (inAttributeBrackets) {
+            mixToken(tok);
+            if (tok.kind == syntax::SyntaxKind::IdentifierToken &&
+                (tok.text == "Inline" || tok.text == "InlineAttribute")) {
+                pendingAttrInline = true;
+            }
+            continue;
+        }
+
+        if (tok.kind == syntax::SyntaxKind::OpenParenToken) {
+            mixToken(tok);
+            ++parenDepth;
+            continue;
+        }
+        if (tok.kind == syntax::SyntaxKind::CloseParenToken) {
+            mixToken(tok);
+            if (parenDepth > 0) --parenDepth;
+            if (parenDepth == 0 && bracketDepth == 0 &&
+                !sawEqualsAtZeroDepth && !startsWithControlFlow) {
+                hasCallableParens = true;
+            }
+            continue;
+        }
+
+        if (parenDepth == 0 && bracketDepth == 0) {
+            if (!headerStarted &&
+                tok.kind != syntax::SyntaxKind::OpenBraceToken &&
+                tok.kind != syntax::SyntaxKind::CloseBraceToken &&
+                tok.kind != syntax::SyntaxKind::SemicolonToken) {
+                headerStarted = true;
+                if (isControlFlowKeyword(tok.kind)) {
+                    startsWithControlFlow = true;
+                }
+            }
+
+            if (tok.kind == syntax::SyntaxKind::ClassKeyword ||
+                tok.kind == syntax::SyntaxKind::StructKeyword ||
+                tok.kind == syntax::SyntaxKind::InterfaceKeyword ||
+                tok.kind == syntax::SyntaxKind::EnumKeyword) {
+                pendingTypeKind = tok.kind;
+                mixToken(tok);
+                continue;
+            }
+
+            if (tok.kind == syntax::SyntaxKind::LessToken && !sawEqualsAtZeroDepth) {
+                if (pendingTypeKind == syntax::SyntaxKind::ClassKeyword ||
+                    pendingTypeKind == syntax::SyntaxKind::StructKeyword ||
+                    pendingTypeKind == syntax::SyntaxKind::InterfaceKeyword) {
+                    pendingTypeGeneric = true;
+                } else if (!hasCallableParens) {
+                    int angleDepth = 1;
+                    std::size_t scan = i + 1;
+                    while (scan < n && angleDepth > 0) {
+                        const auto sk = tokens[scan].kind;
+                        if (sk == syntax::SyntaxKind::LessToken) ++angleDepth;
+                        else if (sk == syntax::SyntaxKind::GreaterToken) --angleDepth;
+                        else if (sk == syntax::SyntaxKind::SemicolonToken ||
+                                 sk == syntax::SyntaxKind::OpenBraceToken ||
+                                 sk == syntax::SyntaxKind::EndOfFileToken) {
+                            angleDepth = -1;
+                            break;
+                        }
+                        ++scan;
+                    }
+                    if (angleDepth == 0 && scan < n &&
+                        tokens[scan].kind == syntax::SyntaxKind::OpenParenToken) {
+                        pendingCallableGeneric = true;
+                    }
+                }
+            }
+
+            if (tok.kind == syntax::SyntaxKind::EqualsToken) {
+                sawEqualsAtZeroDepth = true;
+            }
+
+            if (tok.kind == syntax::SyntaxKind::SemicolonToken) {
+                mixToken(tok);
+                resetDeclState();
+                continue;
+            }
+
+            if (tok.kind == syntax::SyntaxKind::OpenBraceToken) {
+                const bool inEnum = !braceStack.empty() &&
+                    braceStack.back().kind == BraceKind::EnumBody;
+                const bool inTypeBody = !braceStack.empty() &&
+                    braceStack.back().kind == BraceKind::TypeBody;
+                const bool inAccessorContainer = !braceStack.empty() &&
+                    braceStack.back().kind == BraceKind::AccessorContainer;
+
+                if (pendingTypeKind == syntax::SyntaxKind::EnumKeyword) {
+                    mixToken(tok);
+                    braceStack.push_back(BraceFrame{BraceKind::EnumBody, false});
+                    resetDeclState();
+                    continue;
+                }
+                if (pendingTypeKind == syntax::SyntaxKind::ClassKeyword ||
+                    pendingTypeKind == syntax::SyntaxKind::StructKeyword ||
+                    pendingTypeKind == syntax::SyntaxKind::InterfaceKeyword) {
+                    mixToken(tok);
+                    braceStack.push_back(BraceFrame{
+                        BraceKind::TypeBody,
+                        pendingTypeGeneric || pendingAttrInline || enclosingGenericOrInline()});
+                    resetDeclState();
+                    continue;
+                }
+                if (!inEnum && inTypeBody && !hasCallableParens &&
+                    !sawEqualsAtZeroDepth && !startsWithControlFlow) {
+                    mixToken(tok);
+                    braceStack.push_back(BraceFrame{
+                        BraceKind::AccessorContainer,
+                        pendingAttrInline || enclosingGenericOrInline()});
+                    resetDeclState();
+                    continue;
+                }
+
+                const bool isCallableBody =
+                    (braceStack.empty() || inTypeBody) &&
+                    hasCallableParens && !sawEqualsAtZeroDepth && !startsWithControlFlow;
+                const bool isAccessorBody =
+                    inAccessorContainer && !sawEqualsAtZeroDepth && !startsWithControlFlow;
+
+                if ((isCallableBody || isAccessorBody) &&
+                    !pendingAttrInline &&
+                    !pendingCallableGeneric &&
+                    !enclosingGenericOrInline()) {
+                    std::size_t scan = i + 1;
+                    int bodyDepth = 1;
+                    while (scan < n && bodyDepth > 0 &&
+                           tokens[scan].kind != syntax::SyntaxKind::EndOfFileToken) {
+                        if (tokens[scan].kind == syntax::SyntaxKind::OpenBraceToken) {
+                            ++bodyDepth;
+                        } else if (tokens[scan].kind == syntax::SyntaxKind::CloseBraceToken) {
+                            --bodyDepth;
+                        }
+                        ++scan;
+                    }
+                    if (bodyDepth == 0) {
+                        mixU64(0xB0D75C1B0D75C1B0ull);
+                        i = scan - 1;
+                        resetDeclState();
+                        continue;
+                    }
+                }
+
+                mixToken(tok);
+                braceStack.push_back(BraceFrame{
+                    BraceKind::KeepBlock,
+                    pendingAttrInline || pendingCallableGeneric || enclosingGenericOrInline()});
+                resetDeclState();
+                continue;
+            }
+
+            if (tok.kind == syntax::SyntaxKind::CloseBraceToken) {
+                mixToken(tok);
+                if (!braceStack.empty()) {
+                    braceStack.pop_back();
+                }
+                resetDeclState();
+                continue;
+            }
+        }
+
+        mixToken(tok);
+    }
+
+    return hash;
+}
+
 void LanguageService::initDocument(
     const std::string& path,
     std::string content,
@@ -309,12 +612,15 @@ void LanguageService::open(std::string rawPath, std::string content, std::int64_
     initDocument(path, std::move(content), version, doc);
     if (!existedInOpen && !existedInWorkspace) {
         structuralDirty_ = true;
+        hasCachedDefinitions_ = false;
+        hasCachedDiagnostics_ = false;
     } else {
         dirtyPaths_.insert(path);
     }
+    if (!existedInOpen) {
+        tryAutoDiscoverProjectConfig(path);
+    }
     dirty_ = true;
-    hasCachedDefinitions_ = false;
-    hasCachedDiagnostics_ = false;
 }
 
 void LanguageService::update(std::string path, std::string content, std::int64_t version) {
@@ -338,8 +644,11 @@ bool LanguageService::applyContentChanges(
             dirtyPaths_.insert(path);
         } else {
             structuralDirty_ = true;
+            hasCachedDefinitions_ = false;
+            hasCachedDiagnostics_ = false;
         }
         initDocument(path, std::move(seedContent), version, documents_[path]);
+        tryAutoDiscoverProjectConfig(path);
         it = documents_.find(path);
     } else {
         dirtyPaths_.insert(path);
@@ -379,8 +688,6 @@ bool LanguageService::applyContentChanges(
     }
     initDocument(path, std::move(content), version, it->second);
     dirty_ = true;
-    hasCachedDefinitions_ = false;
-    hasCachedDiagnostics_ = false;
     return true;
 }
 
@@ -624,6 +931,87 @@ bool LanguageService::loadProjectConfigJson(
     return true;
 }
 
+bool LanguageService::applyCompilerProjectConfigFile(
+    const std::filesystem::path& configPath,
+    diagnostics::DiagnosticBag* diagnostics) {
+    const auto loaded = compiler::loadProjectConfigFile(configPath, diagnostics);
+    if (!loaded) return false;
+    compiler::CompilationOptions nextOpts;
+    nextOpts.session = session_;
+    if (!compiler::applyProjectConfigToOptions(*loaded, nextOpts, diagnostics)) {
+        return false;
+    }
+    compilationOptions_ = std::move(nextOpts);
+    return true;
+}
+
+void LanguageService::tryAutoDiscoverProjectConfig(const std::string& normalizedPath) {
+    if (explicitCompilationOptions_ || normalizedPath.empty()) return;
+    if (normalizedPath.rfind("untitled:", 0) == 0 ||
+        normalizedPath.rfind("inmemory:", 0) == 0) {
+        return;
+    }
+    std::error_code ec;
+    const std::filesystem::path fsPath(normalizedPath);
+    const bool hasDir = fsPath.has_parent_path() && !fsPath.parent_path().empty();
+    if (!hasDir && !std::filesystem::exists(fsPath, ec)) {
+        return;
+    }
+    const auto discovered = compiler::discoverProjectConfigFile(fsPath);
+    if (!discovered) return;
+    const std::string normCfg = normalizeDocPath(discovered->generic_string());
+    if (normCfg == autoDiscoveredConfigPath_) return;
+    if (applyCompilerProjectConfigFile(*discovered, nullptr)) {
+        autoDiscoveredConfigPath_ = normCfg;
+        std::string jsonText;
+        if (readFileContents(*discovered, jsonText)) {
+            const std::string parentDir = discovered->has_parent_path()
+                ? discovered->parent_path().generic_string()
+                : std::string{};
+            (void)loadProjectConfigJson(jsonText, parentDir, !ambientDocuments_.empty());
+        }
+        structuralDirty_ = true;
+        dirty_ = true;
+        hasCachedDefinitions_ = false;
+        hasCachedDiagnostics_ = false;
+    }
+}
+
+bool LanguageService::loadProjectConfig(
+    const std::filesystem::path& pathOrDir,
+    diagnostics::DiagnosticBag* diagnostics) {
+    std::optional<std::filesystem::path> foundConfig;
+    std::error_code ec;
+    if (!pathOrDir.empty() &&
+        std::filesystem::is_regular_file(pathOrDir, ec) && !ec) {
+        foundConfig = pathOrDir;
+    } else if (!pathOrDir.empty() && pathOrDir.extension() == ".json") {
+        foundConfig = pathOrDir;
+    } else {
+        foundConfig = compiler::discoverProjectConfigFile(pathOrDir);
+    }
+    if (!foundConfig) return false;
+
+    if (!applyCompilerProjectConfigFile(*foundConfig, diagnostics)) {
+        return false;
+    }
+    explicitCompilationOptions_ = true;
+    autoDiscoveredConfigPath_ = normalizeDocPath(foundConfig->generic_string());
+
+    std::string jsonText;
+    if (readFileContents(*foundConfig, jsonText)) {
+        const std::string parentDir = foundConfig->has_parent_path()
+            ? foundConfig->parent_path().generic_string()
+            : std::string{};
+        (void)loadProjectConfigJson(jsonText, parentDir, false);
+    }
+    structuralDirty_ = true;
+    dirty_ = true;
+    hasCachedDefinitions_ = false;
+    hasCachedDiagnostics_ = false;
+    return true;
+}
+
 bool LanguageService::loadProjectConfigFile(const std::string& configPath, bool merge) {
     const std::string normConfig = normalizeDocPath(configPath);
     if (normConfig.empty()) return false;
@@ -633,7 +1021,21 @@ bool LanguageService::loadProjectConfigFile(const std::string& configPath, bool 
     const std::string parentDir = fsConfig.has_parent_path()
         ? fsConfig.parent_path().generic_string()
         : std::string{};
-    return loadProjectConfigJson(jsonText, parentDir, merge);
+    bool compilerApplied = false;
+    if (!explicitCompilationOptions_) {
+        compilerApplied = applyCompilerProjectConfigFile(fsConfig, nullptr);
+        if (compilerApplied) {
+            autoDiscoveredConfigPath_ = normConfig;
+        }
+    }
+    const bool toolingApplied = loadProjectConfigJson(jsonText, parentDir, merge);
+    if (compilerApplied && !toolingApplied) {
+        structuralDirty_ = true;
+        dirty_ = true;
+        hasCachedDefinitions_ = false;
+        hasCachedDiagnostics_ = false;
+    }
+    return compilerApplied || toolingApplied;
 }
 
 void LanguageService::setLintConfig(LintConfig config) {
@@ -996,6 +1398,14 @@ void LanguageService::recordFullBuildGraph() {
             break;
         }
     }
+    docSkeletonHashes_.clear();
+    for (const auto& [path, hdr] : docHeaders_) {
+        (void)hdr;
+        if (const auto* d = document(path)) {
+            docSkeletonHashes_[path] = computeDeclarationSkeletonHash(path, *d);
+        }
+    }
+    hasLastValidBuild_ = true;
     dirtyPaths_.clear();
     structuralDirty_ = false;
 }
@@ -1006,6 +1416,7 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
         return false;
     }
 
+    bool skeletonPreserved = hasLastValidBuild_;
     std::set<std::string> dirtyModules;
     for (const auto& path : dirtyPaths_) {
         const auto* docPtr = document(path);
@@ -1017,11 +1428,23 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
             newHdr.imports != oldHdrIt->second.imports) {
             return false;
         }
+        if (skeletonPreserved) {
+            const auto skIt = docSkeletonHashes_.find(path);
+            if (skIt == docSkeletonHashes_.end() ||
+                skIt->second != computeDeclarationSkeletonHash(path, *docPtr)) {
+                skeletonPreserved = false;
+            }
+        }
         dirtyModules.insert(newHdr.moduleName);
     }
     if (dirtyModules.size() != 1) return false;
     const std::string& dirtyMod = *dirtyModules.begin();
     if (moduleSymbolSlices_.find(dirtyMod) == moduleSymbolSlices_.end()) return false;
+
+    const auto revCheckIt = reverseImports_.find(dirtyMod);
+    if (revCheckIt != reverseImports_.end() && !revCheckIt->second.empty() && !skeletonPreserved) {
+        return false;
+    }
 
     // Collect transitive imports of dirtyMod
     std::set<std::string> subgraphModules;
@@ -1030,7 +1453,8 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
         auto curr = std::move(queue.back());
         queue.pop_back();
         if (curr == "RealScript.Math" || curr == "RealScript.Fiber" ||
-            curr == "RealScript.Async" || curr == "RealScript.Resource") {
+            curr == "RealScript.Async" || curr == "RealScript.Resource" ||
+            curr == "RealScript.Weak" || curr == "RealScript.Memory") {
             continue;
         }
         if (!subgraphModules.insert(curr).second) continue;
@@ -1042,12 +1466,14 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
         }
     }
 
-    // If subgraph is smaller than total workspace, run subgraph Compilation
-    if (subgraphModules.size() >= moduleToPaths_.size()) {
+    if (moduleToPaths_.size() <= 1 || subgraphModules.size() > moduleToPaths_.size()) {
+        return false;
+    }
+    if (subgraphModules.size() == moduleToPaths_.size() && !skeletonPreserved) {
         return false;
     }
 
-    compiler::Compilation subCompilation;
+    std::vector<compiler::SourceFile> subSources;
     std::set<std::string> dirtyModPaths;
     for (const auto& modName : subgraphModules) {
         const auto pathsIt = moduleToPaths_.find(modName);
@@ -1055,11 +1481,14 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
         for (const auto& p : pathsIt->second) {
             const auto* doc = document(p);
             if (!doc) return false;
-            subCompilation.addSource({p, doc->content});
+            subSources.push_back({p, doc->content});
             if (modName == dirtyMod) dirtyModPaths.insert(p);
         }
     }
 
+    compiler::Compilation subCompilation(
+        std::move(subSources),
+        effectiveCompilationOptions());
     auto subResult = subCompilation.build(&snapshot_);
 
     const compiler::ModuleBuildInfo* newBuildInfo = nullptr;
@@ -1246,12 +1675,14 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
         }
     }
     auto slice = moduleSymbolSlices_[dirtyMod];
+    const std::size_t oldStart = slice.first;
+    const std::size_t oldCount = slice.second;
+    bool movedToTail = false;
     if (slice.second == 0) {
         slice.first = result_.symbols.size();
     } else if (slice.first + slice.second < result_.symbols.size()) {
         // Move dirtyMod slice to the end once so subsequent edits are O(1) tail resize
-        const std::size_t oldStart = slice.first;
-        const std::size_t oldCount = slice.second;
+        movedToTail = true;
         result_.symbols.erase(
             result_.symbols.begin() + static_cast<std::ptrdiff_t>(oldStart),
             result_.symbols.begin() + static_cast<std::ptrdiff_t>(oldStart + oldCount));
@@ -1271,10 +1702,51 @@ bool LanguageService::tryIncrementalSubgraphRebuild() {
         std::make_move_iterator(newModSymbols.end()));
     moduleSymbolSlices_[dirtyMod] = slice;
 
+    for (const auto& dp : dirtyModPaths) {
+        if (const auto* d = document(dp)) {
+            docSkeletonHashes_[dp] = computeDeclarationSkeletonHash(dp, *d);
+        }
+    }
+
+    if (skeletonPreserved && hasCachedDiagnostics_) {
+        updateCachedDiagnosticsForPaths(dirtyModPaths, subResult.diagnostics);
+        if (hasCachedDefinitions_) {
+            if (movedToTail && oldCount > 0) {
+                const std::size_t oldEnd = oldStart + oldCount;
+                for (auto& [occPath, idxList] : cachedOccByPath_) {
+                    (void)occPath;
+                    for (auto& occIdx : idxList) {
+                        if (occIdx >= oldEnd) occIdx -= oldCount;
+                    }
+                }
+            }
+            for (const auto& dp : dirtyModPaths) {
+                cachedOccByPath_.erase(dp);
+            }
+            for (std::size_t offset = 0; offset < slice.second; ++offset) {
+                const std::size_t symIdx = slice.first + offset;
+                const auto& occ = result_.symbols[symIdx];
+                if (!occ.sourceName.empty()) {
+                    cachedOccByPath_[occ.sourceName].push_back(symIdx);
+                }
+            }
+            updateCachedDefinitionsForPaths(dirtyModPaths, subResult);
+        }
+        const auto allProjectPaths = documentPaths();
+        std::size_t skippedPeers = 0;
+        for (const auto& projPath : allProjectPaths) {
+            if (dirtyModPaths.find(projPath) == dirtyModPaths.end()) {
+                ++skippedPeers;
+            }
+        }
+        peerRevalidationSkips_ += skippedPeers;
+    } else {
+        hasCachedDefinitions_ = false;
+        hasCachedDiagnostics_ = false;
+    }
+
     dirtyPaths_.clear();
     manifestDirty_ = true;
-    hasCachedDefinitions_ = false;
-    hasCachedDiagnostics_ = false;
     dirty_ = false;
     return true;
 }
@@ -1283,8 +1755,42 @@ void LanguageService::rebuild() {
     if (tryIncrementalSubgraphRebuild()) {
         return;
     }
-    compiler::Compilation compilation;
     const auto allProjectPaths = documentPaths();
+    bool skeletonPreservedFallback =
+        hasLastValidBuild_ && !structuralDirty_ && !dirtyPaths_.empty() &&
+        hasCachedDiagnostics_ && (allProjectPaths.size() > dirtyPaths_.size());
+    std::set<std::string> savedDirtyPaths;
+    std::set<std::string> uneditedPeerPaths;
+    if (skeletonPreservedFallback) {
+        savedDirtyPaths = dirtyPaths_;
+        for (const auto& p : savedDirtyPaths) {
+            const auto* d = document(p);
+            const auto hdrIt = docHeaders_.find(p);
+            const auto skIt = docSkeletonHashes_.find(p);
+            if (!d || hdrIt == docHeaders_.end() || skIt == docSkeletonHashes_.end()) {
+                skeletonPreservedFallback = false;
+                break;
+            }
+            const auto newHdr = parseDocHeader(*d);
+            if (newHdr.moduleName != hdrIt->second.moduleName ||
+                newHdr.imports != hdrIt->second.imports ||
+                computeDeclarationSkeletonHash(p, *d) != skIt->second) {
+                skeletonPreservedFallback = false;
+                break;
+            }
+        }
+        if (skeletonPreservedFallback) {
+            for (const auto& projPath : allProjectPaths) {
+                if (savedDirtyPaths.find(projPath) == savedDirtyPaths.end()) {
+                    uneditedPeerPaths.insert(projPath);
+                }
+            }
+            if (uneditedPeerPaths.empty()) {
+                skeletonPreservedFallback = false;
+            }
+        }
+    }
+
     std::unordered_set<std::string> activeStubModules;
     for (const auto& path : allProjectPaths) {
         if (isDeclarationStubPath(path)) {
@@ -1294,6 +1800,7 @@ void LanguageService::rebuild() {
         }
     }
 
+    std::vector<compiler::SourceFile> allSources;
     std::vector<std::string> ambientPaths;
     ambientPaths.reserve(ambientDocuments_.size());
     for (const auto& [path, docVal] : ambientDocuments_) {
@@ -1308,15 +1815,17 @@ void LanguageService::rebuild() {
         ambientPaths.push_back(path);
     }
     std::sort(ambientPaths.begin(), ambientPaths.end());
+    allSources.reserve(ambientPaths.size() + allProjectPaths.size());
     for (const auto& path : ambientPaths) {
-        compilation.addSource({path, ambientDocuments_.at(path).content});
+        allSources.push_back({path, ambientDocuments_.at(path).content});
     }
 
     for (const auto& path : allProjectPaths) {
         if (const auto* d = document(path)) {
-            compilation.addSource({path, d->content});
+            allSources.push_back({path, d->content});
         }
     }
+    compiler::Compilation compilation(std::move(allSources), effectiveCompilationOptions());
     result_ = compilation.build(hasSnapshot_ ? &snapshot_ : nullptr);
     if (!result_.snapshot.modules.empty()) {
         for (auto& [modName, cachedMod] : result_.snapshot.modules) {
@@ -1326,8 +1835,26 @@ void LanguageService::rebuild() {
     }
     recordFullBuildGraph();
     manifestDirty_ = true;
-    hasCachedDefinitions_ = false;
-    hasCachedDiagnostics_ = false;
+
+    if (skeletonPreservedFallback) {
+        updateCachedDiagnosticsForPaths(savedDirtyPaths, result_.diagnostics);
+        if (hasCachedDefinitions_) {
+            cachedOccByPath_.clear();
+            for (std::size_t occIdx = 0; occIdx < result_.symbols.size(); ++occIdx) {
+                const auto& occ = result_.symbols[occIdx];
+                if (!occ.sourceName.empty()) {
+                    cachedOccByPath_[occ.sourceName].push_back(occIdx);
+                }
+            }
+            updateCachedDefinitionsForPaths(savedDirtyPaths, result_);
+        }
+        peerRevalidationSkips_ += uneditedPeerPaths.size();
+    } else {
+        hasCachedDiagnostics_ = false;
+        populateCachedDiagnostics();
+        hasCachedDefinitions_ = false;
+        (void)allDefinitionsRef();
+    }
     dirty_ = false;
 }
 
@@ -1454,6 +1981,104 @@ const std::vector<DocumentSymbol>& LanguageService::allDefinitionsRef() const {
     return cachedDefinitions_;
 }
 
+void LanguageService::updateCachedDefinitionsForPaths(
+    const std::set<std::string>& targetPaths,
+    const compiler::BuildResult& buildResult) const {
+    if (targetPaths.empty()) return;
+    cachedDefinitions_.erase(
+        std::remove_if(
+            cachedDefinitions_.begin(),
+            cachedDefinitions_.end(),
+            [&](const DocumentSymbol& sym) {
+                return targetPaths.find(sym.location.path) != targetPaths.end();
+            }),
+        cachedDefinitions_.end());
+
+    std::unordered_set<semantic::SymbolId> seen;
+    seen.reserve(cachedDefinitions_.size() + 64);
+    for (const auto& sym : cachedDefinitions_) {
+        seen.insert(sym.id);
+    }
+    std::unordered_set<std::string> generatedNames;
+    for (const auto& module : buildResult.modules) {
+        for (const auto& instance : module.languageMetadata.genericInstantiations) {
+            generatedNames.insert(instance.generatedName);
+        }
+    }
+
+    auto append = [&](semantic::SymbolId id, semantic::SymbolKind kind,
+                      std::string name, std::string detail,
+                      const std::string& path, text::TextSpan span) {
+        if (id == 0 || path.empty() ||
+            targetPaths.find(path) == targetPaths.end() ||
+            document(path) == nullptr ||
+            !identifier(name) || generatedNames.find(name) != generatedNames.end() ||
+            !seen.insert(id).second) {
+            return;
+        }
+        cachedDefinitions_.push_back({id, kind, std::move(name), std::move(detail), {path, rangeFor(path, span)}});
+    };
+
+    for (const auto& occurrence : buildResult.symbols) {
+        if (occurrence.definition &&
+            targetPaths.find(occurrence.sourceName) != targetPaths.end()) {
+            append(occurrence.id, occurrence.kind, occurrence.name, occurrence.detail,
+                occurrence.sourceName, occurrence.span);
+        }
+    }
+    for (const auto& module : buildResult.modules) {
+        for (const auto& type : module.types) {
+            if (type.synthetic) continue;
+            append(type.id, semantic::SymbolKind::Type, type.name,
+                semantic::canonicalTypeName(type), type.sourceName, type.declarationSpan);
+            for (const auto& field : type.fields) {
+                if (field.synthetic) continue;
+                append(field.id, semantic::SymbolKind::Field, field.name,
+                    typeDetail(field.type, field.typeName), field.sourceName, field.declarationSpan);
+            }
+            for (const auto& member : type.enumMembers) {
+                append(member.id, semantic::SymbolKind::EnumMember, member.name,
+                    std::to_string(member.value), member.sourceName, member.declarationSpan);
+            }
+            for (const auto& property : type.properties) {
+                append(property.id, semantic::SymbolKind::Property, property.name,
+                    typeDetail(property.type, property.typeName), property.sourceName, property.declarationSpan);
+            }
+            for (const auto& method : type.methods) {
+                if (method.synthetic) continue;
+                append(method.id, semantic::SymbolKind::Function, method.name,
+                    functionDetail(method), method.sourceName, method.declarationSpan);
+            }
+            for (const auto& constructor : type.constructors) {
+                if (constructor.synthetic) continue;
+                append(constructor.id, semantic::SymbolKind::Function, type.name,
+                    functionDetail(constructor), constructor.sourceName, constructor.declarationSpan);
+            }
+            if (type.staticConstructor && !type.staticConstructor->synthetic) {
+                append(type.staticConstructor->id, semantic::SymbolKind::Function, type.name,
+                    functionDetail(*type.staticConstructor), type.staticConstructor->sourceName,
+                    type.staticConstructor->declarationSpan);
+            }
+        }
+        for (const auto& function : module.functions) {
+            append(function.symbolId, semantic::SymbolKind::Function, function.name,
+                module.name + "::" + function.name,
+                function.debugInfo.sourceName,
+                function.debugInfo.declaration.span);
+        }
+    }
+
+    std::sort(cachedDefinitions_.begin(), cachedDefinitions_.end(), [](const auto& left, const auto& right) {
+        if (left.location.path != right.location.path) return left.location.path < right.location.path;
+        return left.location.range.span.start < right.location.range.span.start;
+    });
+    cachedDefById_.clear();
+    for (std::size_t idx = 0; idx < cachedDefinitions_.size(); ++idx) {
+        cachedDefById_[cachedDefinitions_[idx].id] = idx;
+    }
+    hasCachedDefinitions_ = true;
+}
+
 std::vector<DocumentSymbol> LanguageService::allDefinitions() const {
     return allDefinitionsRef();
 }
@@ -1527,97 +2152,127 @@ std::optional<DocumentSymbol> LanguageService::resolve(
     return nearest ? std::optional<DocumentSymbol>(*nearest) : std::optional<DocumentSymbol>(matches.front());
 }
 
+void LanguageService::populateCachedDiagnostics() const {
+    cachedDiagnosticsByPath_.clear();
+    const auto& items = result_.diagnostics.items();
+    if (!items.empty()) {
+        std::vector<std::string> projPaths;
+        std::vector<std::string> openPaths;
+        std::string primaryDoc;
+        std::unordered_set<std::string> succeededModules;
+        bool sourcelessContextInitialized = false;
+
+        const auto ensureSourcelessContext = [&]() {
+            if (sourcelessContextInitialized) return;
+            sourcelessContextInitialized = true;
+            projPaths = documentPaths();
+            openPaths = openDocumentPaths();
+            const auto& fallbackPool = openPaths.empty() ? projPaths : openPaths;
+            primaryDoc = fallbackPool.empty() ? std::string{} : fallbackPool.front();
+            for (const auto& m : result_.modules) {
+                succeededModules.insert(m.name);
+            }
+        };
+
+        const auto inferOwnerForSourceless = [&](const diagnostics::Diagnostic& item, bool& outHasValidSpan) -> std::string {
+            ensureSourcelessContext();
+            outHasValidSpan = false;
+            std::string quotedToken;
+            const std::size_t q1 = item.message.find('\'');
+            if (q1 != std::string::npos) {
+                const std::size_t q2 = item.message.find('\'', q1 + 1);
+                if (q2 != std::string::npos && q2 > q1 + 1) {
+                    quotedToken = item.message.substr(q1 + 1, q2 - q1 - 1);
+                }
+            }
+
+            std::vector<std::string> spanTokenMatches;
+            std::vector<std::string> failedModCandidates;
+            for (const auto& candPath : projPaths) {
+                const auto* docPtr = document(candPath);
+                if (!docPtr) continue;
+                const auto hdrIt = docHeaders_.find(candPath);
+                const bool modFailed = (hdrIt == docHeaders_.end()) ||
+                    (succeededModules.find(hdrIt->second.moduleName) == succeededModules.end());
+                if (!modFailed) continue;
+                if (item.span.end() <= docPtr->content.size()) {
+                    failedModCandidates.push_back(candPath);
+                    if (!quotedToken.empty() && item.span.length > 0) {
+                        const std::string_view slice(
+                            docPtr->content.data() + item.span.start,
+                            item.span.length);
+                        if (slice.find(quotedToken) != std::string_view::npos) {
+                            spanTokenMatches.push_back(candPath);
+                        }
+                    }
+                }
+            }
+            if (spanTokenMatches.size() == 1) {
+                outHasValidSpan = true;
+                return spanTokenMatches.front();
+            }
+            if (failedModCandidates.size() == 1) {
+                outHasValidSpan = (item.span.length > 0);
+                return failedModCandidates.front();
+            }
+            return primaryDoc;
+        };
+
+        for (const auto& item : items) {
+            if (!item.sourceName.empty()) {
+                const std::string itemPath = normalizeDocPath(item.sourceName);
+                cachedDiagnosticsByPath_[itemPath].push_back(
+                    {item.code, item.message, item.severity, {itemPath, rangeFor(itemPath, item.span)}, std::nullopt});
+            } else {
+                bool validSpan = false;
+                const std::string ownerPath = inferOwnerForSourceless(item, validSpan);
+                if (!ownerPath.empty()) {
+                    cachedDiagnosticsByPath_[ownerPath].push_back({
+                        item.code,
+                        item.message,
+                        item.severity,
+                        {ownerPath, validSpan ? rangeFor(ownerPath, item.span) : debug::SourceRange{}},
+                        std::nullopt,
+                    });
+                }
+            }
+        }
+    }
+    hasCachedDiagnostics_ = true;
+}
+
+void LanguageService::updateCachedDiagnosticsForPaths(
+    const std::set<std::string>& targetPaths,
+    const diagnostics::DiagnosticBag& sourceBag) const {
+    for (const auto& targetPath : targetPaths) {
+        cachedDiagnosticsByPath_.erase(targetPath);
+    }
+    for (const auto& item : sourceBag.items()) {
+        std::string itemPath;
+        if (!item.sourceName.empty()) {
+            itemPath = normalizeDocPath(item.sourceName);
+        } else if (targetPaths.size() == 1) {
+            itemPath = *targetPaths.begin();
+        }
+        if (!itemPath.empty() && targetPaths.find(itemPath) != targetPaths.end()) {
+            cachedDiagnosticsByPath_[itemPath].push_back({
+                item.code,
+                item.message,
+                item.severity,
+                {itemPath, rangeFor(itemPath, item.span)},
+                std::nullopt,
+            });
+        }
+    }
+    hasCachedDiagnostics_ = true;
+}
+
 std::vector<LanguageDiagnostic> LanguageService::diagnostics(const std::string& rawPath) {
     const std::string path = normalizeDocPath(rawPath);
     if (!contains(path)) return {};
     (void)build();
     if (!hasCachedDiagnostics_) {
-        cachedDiagnosticsByPath_.clear();
-        const auto& items = result_.diagnostics.items();
-        if (!items.empty()) {
-            std::vector<std::string> projPaths;
-            std::vector<std::string> openPaths;
-            std::string primaryDoc;
-            std::unordered_set<std::string> succeededModules;
-            bool sourcelessContextInitialized = false;
-
-            const auto ensureSourcelessContext = [&]() {
-                if (sourcelessContextInitialized) return;
-                sourcelessContextInitialized = true;
-                projPaths = documentPaths();
-                openPaths = openDocumentPaths();
-                const auto& fallbackPool = openPaths.empty() ? projPaths : openPaths;
-                primaryDoc = fallbackPool.empty() ? std::string{} : fallbackPool.front();
-                for (const auto& m : result_.modules) {
-                    succeededModules.insert(m.name);
-                }
-            };
-
-            const auto inferOwnerForSourceless = [&](const diagnostics::Diagnostic& item, bool& outHasValidSpan) -> std::string {
-                ensureSourcelessContext();
-                outHasValidSpan = false;
-                std::string quotedToken;
-                const std::size_t q1 = item.message.find('\'');
-                if (q1 != std::string::npos) {
-                    const std::size_t q2 = item.message.find('\'', q1 + 1);
-                    if (q2 != std::string::npos && q2 > q1 + 1) {
-                        quotedToken = item.message.substr(q1 + 1, q2 - q1 - 1);
-                    }
-                }
-
-                std::vector<std::string> spanTokenMatches;
-                std::vector<std::string> failedModCandidates;
-                for (const auto& candPath : projPaths) {
-                    const auto* docPtr = document(candPath);
-                    if (!docPtr) continue;
-                    const auto hdrIt = docHeaders_.find(candPath);
-                    const bool modFailed = (hdrIt == docHeaders_.end()) ||
-                        (succeededModules.find(hdrIt->second.moduleName) == succeededModules.end());
-                    if (!modFailed) continue;
-                    if (item.span.end() <= docPtr->content.size()) {
-                        failedModCandidates.push_back(candPath);
-                        if (!quotedToken.empty() && item.span.length > 0) {
-                            const std::string_view slice(
-                                docPtr->content.data() + item.span.start,
-                                item.span.length);
-                            if (slice.find(quotedToken) != std::string_view::npos) {
-                                spanTokenMatches.push_back(candPath);
-                            }
-                        }
-                    }
-                }
-                if (spanTokenMatches.size() == 1) {
-                    outHasValidSpan = true;
-                    return spanTokenMatches.front();
-                }
-                if (failedModCandidates.size() == 1) {
-                    outHasValidSpan = (item.span.length > 0);
-                    return failedModCandidates.front();
-                }
-                return primaryDoc;
-            };
-
-            for (const auto& item : items) {
-                if (!item.sourceName.empty()) {
-                    const std::string itemPath = normalizeDocPath(item.sourceName);
-                    cachedDiagnosticsByPath_[itemPath].push_back(
-                        {item.code, item.message, item.severity, {itemPath, rangeFor(itemPath, item.span)}, std::nullopt});
-                } else {
-                    bool validSpan = false;
-                    const std::string ownerPath = inferOwnerForSourceless(item, validSpan);
-                    if (!ownerPath.empty()) {
-                        cachedDiagnosticsByPath_[ownerPath].push_back({
-                            item.code,
-                            item.message,
-                            item.severity,
-                            {ownerPath, validSpan ? rangeFor(ownerPath, item.span) : debug::SourceRange{}},
-                            std::nullopt,
-                        });
-                    }
-                }
-            }
-        }
-        hasCachedDiagnostics_ = true;
+        populateCachedDiagnostics();
     }
     const auto it = cachedDiagnosticsByPath_.find(path);
     std::vector<LanguageDiagnostic> out =

@@ -74,6 +74,8 @@ class ICompilerMacroPlugin {
 public:
     virtual ~ICompilerMacroPlugin() = default;
     [[nodiscard]] virtual std::string name() const = 0;
+    [[nodiscard]] virtual std::vector<std::string> macroNames() const { return {}; }
+    [[nodiscard]] virtual std::uint64_t fingerprint() const { return 0; }
     virtual void expand(
         const MacroExpansionContext& context,
         std::vector<SourceFile>& outGeneratedSources,
@@ -129,6 +131,8 @@ struct CompilationOptions {
     std::unordered_set<std::string> disabledPacks;
     std::vector<ModulePack> extraPacks;
     std::vector<std::shared_ptr<const ICompilerMacroPlugin>> macroPlugins;
+    std::uint64_t projectConfigFingerprint = 0;
+    std::string projectConfigPath;
 };
 
 class Compilation {
