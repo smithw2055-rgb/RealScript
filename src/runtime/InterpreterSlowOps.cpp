@@ -239,6 +239,27 @@ bool consume(
     return true;
 }
 
+bool checkCrossHeapRefAccess(
+    State& state,
+    const ObjectRef& reference,
+    bool isWrite,
+    std::string_view context) {
+    if (reference.isStackSlotRef() || !state.heap || !reference.valid()) {
+        return true;
+    }
+    if (reference.heapId != 0 &&
+        reference.heapId != static_cast<std::uint32_t>(state.heap->heapId()) &&
+        (isWrite || state.crossHeapPolicy != CrossHeapAccessPolicy::AllowReadWrite)) {
+        return fail(
+            state,
+            ErrorCode::CrossHeapAccessViolation,
+            std::string(context) + (isWrite
+                ? " rejected cross-heap mutation by active CrossHeapAccessPolicy"
+                : " rejected cross-heap access by active CrossHeapAccessPolicy"));
+    }
+    return true;
+}
+
 bool expectType(
     State& state,
     const Value& value,
@@ -251,9 +272,14 @@ bool expectType(
                 return fail(state, ErrorCode::InvalidObjectReference,
                     std::string(context) + " contains an expired stack slot reference");
             }
-        } else if (!state.heap || !state.heap->isAlive(*reference)) {
-            return fail(state, ErrorCode::InvalidObjectReference,
-                std::string(context) + " contains an invalid managed object reference");
+        } else {
+            if (!checkCrossHeapRefAccess(state, *reference, false, context)) {
+                return false;
+            }
+            if (!state.heap || !state.heap->isAlive(*reference)) {
+                return fail(state, ErrorCode::InvalidObjectReference,
+                    std::string(context) + " contains an invalid managed object reference");
+            }
         }
     }
     if (valueType(value) != type) {
@@ -399,6 +425,9 @@ bool expectObject(
         }
         return fail(state, ErrorCode::InvalidObjectReference,
             context + " contains an invalid stack slot reference");
+    }
+    if (!checkCrossHeapRefAccess(state, *reference, false, context)) {
+        return false;
     }
     if (!state.heap || !state.heap->isAlive(*reference)) {
         return fail(state, ErrorCode::InvalidObjectReference,
@@ -548,6 +577,13 @@ bool valuesEqual(State& state, const Value& left, const Value& right, bool& equa
     }
     if (valueType(left) == semantic::PrimitiveType::Object ||
         valueType(left) == semantic::PrimitiveType::Array) {
+        const auto checkAccess = [&](const Value& value) {
+            const auto* reference = std::get_if<ObjectRef>(&value);
+            return !reference || checkCrossHeapRefAccess(state, *reference, false, "reference equality");
+        };
+        if (!checkAccess(left) || !checkAccess(right)) {
+            return false;
+        }
         const auto validate = [&](const Value& value) {
             const auto* reference = std::get_if<ObjectRef>(&value);
             return !reference || (state.heap && state.heap->isAlive(*reference));
@@ -774,6 +810,9 @@ bool executeCall(
         }
         const auto* receiver = std::get_if<ObjectRef>(&arguments.front());
         if (receiver) {
+            if (!checkCrossHeapRefAccess(state, *receiver, false, "virtual call")) {
+                return false;
+            }
             if (const auto cached = tryCachedReceiver(*receiver)) {
                 return *cached;
             }
@@ -831,6 +870,9 @@ bool executeCall(
         }
         const auto* receiver = std::get_if<ObjectRef>(&arguments.front());
         if (receiver) {
+            if (!checkCrossHeapRefAccess(state, *receiver, false, "virtual call")) {
+                return false;
+            }
             if (const auto cached = tryCachedReceiver(*receiver)) {
                 return *cached;
             }
@@ -1643,6 +1685,9 @@ bool executeQuickInstruction(
     case detail::QuickOpcode::CheckNotNullFast: {
         const auto& val = registers[decoded.op0];
         if (const auto* ref = std::get_if<ObjectRef>(&val)) {
+            if (!checkCrossHeapRefAccess(state, *ref, false, "field access")) {
+                return false;
+            }
             if (state.heap && state.heap->isAlive(*ref)) {
                 registers[decoded.result] = val;
                 return true;
@@ -1659,6 +1704,9 @@ bool executeQuickInstruction(
         const auto& arrVal = registers[decoded.op0];
         const auto& idxVal = registers[decoded.op1];
         if (const auto* ref = std::get_if<ObjectRef>(&arrVal)) {
+            if (!checkCrossHeapRefAccess(state, *ref, false, "array element load")) {
+                return false;
+            }
             const auto idx = std::get<std::int64_t>(idxVal);
             if (idx >= 0 && state.heap) {
                 if (const auto* elem = state.heap->arrayGetFast(
@@ -1691,6 +1739,9 @@ bool executeQuickInstruction(
         const auto& idxVal = registers[decoded.op1];
         const auto& storeVal = registers[decoded.op2];
         if (const auto* ref = std::get_if<ObjectRef>(&arrVal)) {
+            if (!checkCrossHeapRefAccess(state, *ref, true, "array element store")) {
+                return false;
+            }
             const auto idx = std::get<std::int64_t>(idxVal);
             if (idx >= 0 && state.heap &&
                 state.heap->arraySetPrevalidated(
@@ -1938,6 +1989,73 @@ void resumeInterpreterCoroutineCallback(
     CoroutineFrame& frame,
     AsyncRuntimeContext& asyncContext);
 
+namespace {
+
+[[nodiscard]] Value makePendingAsyncReturnCarrier(
+    State& state,
+    const bytecode::Function& function,
+    AwaitableHandle completionHandle) {
+    if (function.returnType == semantic::PrimitiveType::Object &&
+        state.heap != nullptr && state.program != nullptr &&
+        function.returnTypeId != 0) {
+        if (const auto* ts = state.program->resolveType(function.returnTypeId)) {
+            std::vector<Value> fields;
+            std::vector<std::size_t> refFields;
+            fields.reserve(ts->fields.size());
+            for (std::size_t idx = 0; idx < ts->fields.size(); ++idx) {
+                const auto& f = ts->fields[idx];
+                Value fv{};
+                switch (f.type) {
+                case semantic::PrimitiveType::Bool: fv = Value(false); break;
+                case semantic::PrimitiveType::Byte:
+                case semantic::PrimitiveType::SByte:
+                case semantic::PrimitiveType::Short:
+                case semantic::PrimitiveType::UShort:
+                case semantic::PrimitiveType::Int:
+                case semantic::PrimitiveType::UInt: fv = Value(std::int64_t{0}); break;
+                case semantic::PrimitiveType::Long:
+                case semantic::PrimitiveType::ULong:
+                    fv = idx == 0
+                        ? Value(LongValue{static_cast<std::int64_t>(completionHandle.pack64())})
+                        : Value(LongValue{0});
+                    break;
+                case semantic::PrimitiveType::Char: fv = Value(CharValue{0}); break;
+                case semantic::PrimitiveType::Float:
+                case semantic::PrimitiveType::Double: fv = Value(0.0); break;
+                case semantic::PrimitiveType::String:
+                    fv = Value(NullString{});
+                    refFields.push_back(idx);
+                    break;
+                case semantic::PrimitiveType::Object:
+                    fv = Value(NullObject{});
+                    refFields.push_back(idx);
+                    break;
+                case semantic::PrimitiveType::Array:
+                    fv = Value(NullArray{});
+                    refFields.push_back(idx);
+                    break;
+                default:
+                    fv = Value{};
+                    break;
+                }
+                fields.push_back(std::move(fv));
+            }
+            RuntimeError allocErr;
+            if (const auto objRef = state.heap->allocateObject(
+                    function.returnTypeId,
+                    std::move(fields),
+                    std::move(refFields),
+                    &allocErr)) {
+                return Value(*objRef);
+            }
+        }
+        return Value(NullObject{});
+    }
+    return makeAwaitableStructValue(function.returnTypeId, completionHandle);
+}
+
+} // namespace
+
 bool suspendInterpreterCoroutine(
     State& state,
     const bytecode::Function& function,
@@ -1950,7 +2068,8 @@ bool suspendInterpreterCoroutine(
     std::size_t regCount,
     std::uint32_t resumeBlockId,
     AwaitableHandle awaitedHandle,
-    Value& outAwaitableStruct) {
+    Value& outAwaitableStruct,
+    bool runInlineOnComplete) {
     if (!state.asyncRuntime) {
         return fail(state, ErrorCode::InvalidProgram, "async suspension requires an AsyncRuntimeContext");
     }
@@ -2014,10 +2133,117 @@ bool suspendInterpreterCoroutine(
             awaitedHandle,
             &resumeInterpreterCoroutineCallback,
             state.resumeEnvRaw,
-            std::move(ownerCopy))) {
+            std::move(ownerCopy),
+            runInlineOnComplete)) {
         return fail(state, ErrorCode::InvalidProgram, "failed to suspend coroutine onto awaited handle");
     }
-    outAwaitableStruct = makeAwaitableStructValue(function.returnTypeId, completionHandle);
+    outAwaitableStruct = makePendingAsyncReturnCarrier(state, function, completionHandle);
+    return true;
+}
+
+bool suspendInterpreterWithAwaitScheduler(
+    State& state,
+    const bytecode::Function& function,
+    CoroutineFrameHandle& ioActiveCoroutine,
+    const Value* argsPtr,
+    std::size_t argCount,
+    const Value* localsPtr,
+    std::size_t localCount,
+    const Value* regsPtr,
+    std::size_t regCount,
+    std::uint32_t resumeBlockId,
+    const Value& awaitableVal,
+    Value& outReturnCarrier) {
+    if (!state.asyncRuntime || !state.awaitScheduler) {
+        return fail(state, ErrorCode::InvalidProgram, "custom await suspension requires AsyncRuntimeContext and IAwaitScheduler");
+    }
+    const bool hadActiveCoro = ioActiveCoroutine.valid();
+    AwaitableHandle bridgeHandle =
+        state.asyncRuntime->awaitables().allocatePending(ResumeQueue::Update);
+    if (!suspendInterpreterCoroutine(
+            state,
+            function,
+            ioActiveCoroutine,
+            argsPtr,
+            argCount,
+            localsPtr,
+            localCount,
+            regsPtr,
+            regCount,
+            resumeBlockId,
+            bridgeHandle,
+            outReturnCarrier,
+            /*runInlineOnComplete=*/true)) {
+        (void)state.asyncRuntime->awaitables().discard(bridgeHandle);
+        return false;
+    }
+
+    std::weak_ptr<AsyncRuntimeContext> weakAsync;
+    bool hasWeakAsync = false;
+    std::shared_ptr<const void> envOwner;
+    if (state.resumeEnvOwner && *state.resumeEnvOwner) {
+        envOwner = *state.resumeEnvOwner;
+    }
+    if (state.resumeEnvRaw) {
+        weakAsync = static_cast<const InterpreterResumeEnv*>(state.resumeEnvRaw)->asyncRuntimeWeak;
+        hasWeakAsync = !weakAsync.expired();
+    }
+
+    auto fired = std::make_shared<std::atomic<bool>>(false);
+    AsyncRuntimeContext* const rawAsyncCtx = state.asyncRuntime;
+    const CoroutineFrameHandle coroHandle = ioActiveCoroutine;
+    std::function<void()> resumeCallback =
+        [fired = std::move(fired),
+         weakAsync = std::move(weakAsync),
+         hasWeakAsync,
+         envOwner = std::move(envOwner),
+         rawAsyncCtx,
+         coroHandle,
+         bridgeHandle]() {
+            if (fired->exchange(true, std::memory_order_acq_rel)) {
+                return;
+            }
+            std::shared_ptr<AsyncRuntimeContext> lockedAsync;
+            AsyncRuntimeContext* ctx = nullptr;
+            if (hasWeakAsync) {
+                lockedAsync = weakAsync.lock();
+                ctx = lockedAsync.get();
+            } else {
+                ctx = rawAsyncCtx;
+            }
+            if (!ctx) {
+                return;
+            }
+            const auto* frame = ctx->coroutines().resolve(coroHandle);
+            if (!frame || frame->invalidated) {
+                (void)ctx->awaitables().discard(bridgeHandle);
+                return;
+            }
+            (void)ctx->awaitables().trySetResult(bridgeHandle);
+            (void)ctx->awaitables().discard(bridgeHandle);
+        };
+
+    RuntimeError schedErr;
+    if (!state.awaitScheduler->onSuspend(awaitableVal, std::move(resumeCallback), schedErr)) {
+        (void)state.asyncRuntime->awaitables().discard(bridgeHandle);
+        if (!hadActiveCoro && ioActiveCoroutine.valid()) {
+            AwaitableHandle allocatedCompletion{};
+            if (const auto* f = state.asyncRuntime->coroutines().resolve(ioActiveCoroutine)) {
+                allocatedCompletion = f->completionHandle;
+            }
+            state.asyncRuntime->coroutines().recycleFrame(ioActiveCoroutine);
+            ioActiveCoroutine = CoroutineFrameHandle{};
+            if (allocatedCompletion.valid() && !allocatedCompletion.isCompletedVoidSentinel()) {
+                (void)state.asyncRuntime->awaitables().discard(allocatedCompletion);
+            }
+        } else if (ioActiveCoroutine.valid()) {
+            if (auto* f = state.asyncRuntime->coroutines().resolve(ioActiveCoroutine)) {
+                f->suspended = false;
+            }
+        }
+        return fail(state, schedErr.code == ErrorCode::None ? ErrorCode::InvalidProgram : schedErr.code,
+            schedErr.message.empty() ? "custom await scheduler rejected suspension" : schedErr.message);
+    }
     return true;
 }
 
@@ -2028,6 +2254,23 @@ bool resumeInterpreterAwaitable(
     semantic::PrimitiveType expectedType,
     semantic::SymbolId expectedTypeId,
     Value& outResumedVal) {
+    if (state.awaitScheduler && state.awaitScheduler->handlesValue(awaitableVal)) {
+        RuntimeError schedErr;
+        Value payload{};
+        if (!state.awaitScheduler->tryGetResult(awaitableVal, hasResult, payload, schedErr)) {
+            return fail(
+                state,
+                schedErr.code == ErrorCode::None ? ErrorCode::ScriptException : schedErr.code,
+                schedErr.message.empty() ? "custom awaiter GetResult failed" : schedErr.message);
+        }
+        if (hasResult) {
+            if (!expectSignatureType(state, payload, expectedType, expectedTypeId, "await result")) {
+                return false;
+            }
+            outResumedVal = std::move(payload);
+        }
+        return true;
+    }
     AwaitableHandle awaitedHandle{};
     if (!state.asyncRuntime || !tryExtractAwaitableHandle(awaitableVal, awaitedHandle)) {
         return fail(state, ErrorCode::InvalidProgram, "await.resume local does not hold a valid Awaitable");
@@ -2064,10 +2307,7 @@ bool resolveInterpreterCoroutine(
     semantic::SymbolId returnStructTypeId,
     const Value* optionalPayload,
     Value& outWrappedStruct) {
-    if (!state.asyncRuntime) {
-        return fail(state, ErrorCode::InvalidProgram, "async.resolve requires an AsyncRuntimeContext");
-    }
-    if (activeCoroutine.valid()) {
+    if (activeCoroutine.valid() && state.asyncRuntime) {
         auto* frame = state.asyncRuntime->coroutines().resolve(activeCoroutine);
         if (!frame) {
             return fail(state, ErrorCode::InvalidProgram, "async.resolve coroutine frame is invalid");
@@ -2075,8 +2315,38 @@ bool resolveInterpreterCoroutine(
         frame->completed = true;
         const Value val = optionalPayload ? detachFrameSliceValue(*optionalPayload) : Value{};
         (void)state.asyncRuntime->awaitables().trySetResult(frame->completionHandle, val);
+        if (state.awaitScheduler) {
+            RuntimeError schedErr;
+            if (state.awaitScheduler->tryResolveAsyncReturn(
+                    returnStructTypeId,
+                    optionalPayload ? &val : nullptr,
+                    outWrappedStruct,
+                    schedErr)) {
+                return true;
+            }
+            if (schedErr.code != ErrorCode::None) {
+                return fail(state, schedErr.code, schedErr.message);
+            }
+        }
         outWrappedStruct = makeAwaitableStructValue(returnStructTypeId, frame->completionHandle);
         return true;
+    }
+    if (state.awaitScheduler) {
+        RuntimeError schedErr;
+        const Value detached = optionalPayload ? detachFrameSliceValue(*optionalPayload) : Value{};
+        if (state.awaitScheduler->tryResolveAsyncReturn(
+                returnStructTypeId,
+                optionalPayload ? &detached : nullptr,
+                outWrappedStruct,
+                schedErr)) {
+            return true;
+        }
+        if (schedErr.code != ErrorCode::None) {
+            return fail(state, schedErr.code, schedErr.message);
+        }
+    }
+    if (!state.asyncRuntime) {
+        return fail(state, ErrorCode::InvalidProgram, "async.resolve requires an AsyncRuntimeContext");
     }
     AwaitableHandle h{};
     if (!optionalPayload) {
@@ -2273,6 +2543,9 @@ bool executeInstruction(
         if (!nullValue) {
             if (instruction.elementType == semantic::PrimitiveType::Object) {
                 const auto* reference = std::get_if<ObjectRef>(value);
+                if (reference && !checkCrossHeapRefAccess(state, *reference, false, "runtime type check")) {
+                    return false;
+                }
                 const auto actual = reference && state.heap
                     ? state.heap->objectTypeId(*reference)
                     : std::optional<semantic::SymbolId>{};
@@ -2281,6 +2554,9 @@ bool executeInstruction(
             } else if (instruction.elementType ==
                        semantic::PrimitiveType::Array) {
                 const auto* reference = std::get_if<ObjectRef>(value);
+                if (reference && !checkCrossHeapRefAccess(state, *reference, false, "runtime type check")) {
+                    return false;
+                }
                 const auto actual = reference && state.heap
                     ? state.heap->arrayTypeId(*reference)
                     : std::optional<semantic::SymbolId>{};
@@ -2489,6 +2765,11 @@ bool executeInstruction(
             return fail(state, ErrorCode::NullReference,
                 "array element store attempted to dereference null");
         }
+        if (const auto* recvRef = std::get_if<ObjectRef>(receiver)) {
+            if (!checkCrossHeapRefAccess(state, *recvRef, true, "array element store")) {
+                return false;
+            }
+        }
         if (!expectType(state, *receiver, semantic::PrimitiveType::Array,
                 "array element store") ||
             !expectType(state, *indexValue, semantic::PrimitiveType::Int,
@@ -2595,8 +2876,15 @@ bool executeInstruction(
         const auto* value = operand(1);
         const auto* type = typeDescriptor(module, instruction.typeIndex);
         if (!receiver || !value || !type ||
-            instruction.index >= type->fields.size() ||
-            !expectObject(state, *receiver, *type, false, "field store") ||
+            instruction.index >= type->fields.size()) {
+            return false;
+        }
+        if (const auto* recvRef = std::get_if<ObjectRef>(receiver)) {
+            if (!checkCrossHeapRefAccess(state, *recvRef, true, "field store")) {
+                return false;
+            }
+        }
+        if (!expectObject(state, *receiver, *type, false, "field store") ||
             !expectSignatureType(
                 state,
                 *value,
@@ -2608,6 +2896,15 @@ bool executeInstruction(
             return false;
         }
         const auto recvRef = std::get<ObjectRef>(*receiver);
+        if (!recvRef.isStackSlotRef() &&
+            state.crossHeapPolicy != CrossHeapAccessPolicy::AllowReadWrite &&
+            state.heap && recvRef.valid() &&
+            recvRef.heapId != static_cast<std::uint32_t>(state.heap->heapId())) {
+            return fail(
+                state,
+                ErrorCode::CrossHeapAccessViolation,
+                "cross-heap field write rejected by active CrossHeapAccessPolicy");
+        }
         if (recvRef.isStackSlotRef()) {
             if (recvRef.stackRefSchemaId() == 0u) {
                 state.values[recvRef.slot] = detachFrameSliceValue(*value);
@@ -2803,6 +3100,9 @@ bool executeInstruction(
                 "delegate invocation attempted to dereference null");
         }
         const auto* delegateRef = std::get_if<ObjectRef>(delegateValue);
+        if (delegateRef && !checkCrossHeapRefAccess(state, *delegateRef, false, "delegate invocation")) {
+            return false;
+        }
         const auto actualType = delegateRef
             ? state.heap->objectTypeId(*delegateRef)
             : std::optional<semantic::SymbolId>{};
@@ -2912,6 +3212,9 @@ bool executeInstruction(
             const auto* receiver = delegateArguments.empty()
                 ? nullptr
                 : std::get_if<ObjectRef>(&delegateArguments.front());
+            if (receiver && !checkCrossHeapRefAccess(state, *receiver, false, "delegate invocation")) {
+                return false;
+            }
             const auto runtimeType = receiver
                 ? state.heap->objectTypeId(*receiver)
                 : std::optional<semantic::SymbolId>{};
@@ -2974,10 +3277,43 @@ bool executeInstruction(
         return true;
     case bytecode::Opcode::AwaitSuspend: {
         const auto* val = operand(0);
-        if (!val || instruction.index >= locals.size() || !state.asyncRuntime) {
+        if (!val || instruction.index >= locals.size()) {
             return fail(state, ErrorCode::InvalidProgram, "invalid await.suspend operand or local");
         }
         locals[instruction.index] = *val;
+        if (state.awaitScheduler && state.awaitScheduler->handlesValue(*val)) {
+            if (state.awaitScheduler->isCompleted(*val)) {
+                return true;
+            }
+            if (!state.currentBlockVmCoroutinePtr) {
+                return fail(state, ErrorCode::InvalidProgram, "missing coroutine context in block VM");
+            }
+            Value pendingRet{};
+            const Value* argsRaw = arguments.size() == 0 ? nullptr : &arguments.values->at(arguments.offset);
+            const Value* locsRaw = locals.size() == 0 ? nullptr : &locals.values->at(locals.offset);
+            const Value* regsRaw = registers.size() == 0 ? nullptr : &registers.values->at(registers.offset);
+            if (!suspendInterpreterWithAwaitScheduler(
+                    state,
+                    function,
+                    *state.currentBlockVmCoroutinePtr,
+                    argsRaw,
+                    arguments.size(),
+                    locsRaw,
+                    locals.size(),
+                    regsRaw,
+                    registers.size(),
+                    static_cast<std::uint32_t>(instruction.activeIntegerImmediate()),
+                    *val,
+                    pendingRet)) {
+                return false;
+            }
+            state.suspendedReturnValue = std::move(pendingRet);
+            state.coroutineSuspendedNow = true;
+            return true;
+        }
+        if (!state.asyncRuntime) {
+            return fail(state, ErrorCode::InvalidProgram, "invalid await.suspend operand or local");
+        }
         AwaitableHandle awaitedHandle{};
         if (!tryExtractAwaitableHandle(*val, awaitedHandle) ||
             !state.asyncRuntime->awaitables().isValid(awaitedHandle)) {
@@ -3034,14 +3370,20 @@ bool executeInstruction(
     }
     case bytecode::Opcode::AsyncResolve: {
         const auto* retTypeDesc = typeDescriptor(module, instruction.typeIndex);
-        if (!retTypeDesc || !state.currentBlockVmCoroutinePtr) {
+        if (!retTypeDesc) {
+            return fail(state, ErrorCode::InvalidProgram, "invalid async.resolve metadata");
+        }
+        if (!state.awaitScheduler && !state.currentBlockVmCoroutinePtr) {
             return fail(state, ErrorCode::InvalidProgram, "invalid async.resolve metadata");
         }
         const Value* payloadPtr = instruction.operands.empty() ? nullptr : operand(0);
         Value wrapped{};
+        const CoroutineFrameHandle activeCoro = state.currentBlockVmCoroutinePtr
+            ? *state.currentBlockVmCoroutinePtr
+            : CoroutineFrameHandle{};
         if (!resolveInterpreterCoroutine(
                 state,
-                *state.currentBlockVmCoroutinePtr,
+                activeCoro,
                 retTypeDesc->id,
                 payloadPtr,
                 wrapped)) {

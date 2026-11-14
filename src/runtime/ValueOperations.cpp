@@ -1495,4 +1495,105 @@ bool intrinsicValueLess(const Value& a, const Value& b, const ManagedHeap* heap)
 
 } // namespace detail
 
+
+void utf8ToUtf16(std::string_view utf8, std::u16string& outUtf16) {
+    outUtf16.clear();
+    outUtf16.reserve(utf8.size());
+    std::size_t i = 0;
+    while (i < utf8.size()) {
+        const auto b0 = static_cast<unsigned char>(utf8[i]);
+        std::uint32_t cp = 0xFFFDu;
+        if (b0 < 0x80u) {
+            cp = b0;
+            ++i;
+        } else if ((b0 & 0xE0u) == 0xC0u && i + 1 < utf8.size()) {
+            const auto b1 = static_cast<unsigned char>(utf8[i + 1]);
+            if ((b1 & 0xC0u) == 0x80u) {
+                cp = ((b0 & 0x1Fu) << 6) | (b1 & 0x3Fu);
+                if (cp < 0x80u) {
+                    cp = 0xFFFDu;
+                }
+                i += 2;
+            } else {
+                ++i;
+            }
+        } else if ((b0 & 0xF0u) == 0xE0u && i + 2 < utf8.size()) {
+            const auto b1 = static_cast<unsigned char>(utf8[i + 1]);
+            const auto b2 = static_cast<unsigned char>(utf8[i + 2]);
+            if ((b1 & 0xC0u) == 0x80u && (b2 & 0xC0u) == 0x80u) {
+                cp = ((b0 & 0x0Fu) << 12) | ((b1 & 0x3Fu) << 6) | (b2 & 0x3Fu);
+                if (cp < 0x800u || (cp >= 0xD800u && cp <= 0xDFFFu)) {
+                    cp = 0xFFFDu;
+                }
+                i += 3;
+            } else {
+                ++i;
+            }
+        } else if ((b0 & 0xF8u) == 0xF0u && i + 3 < utf8.size()) {
+            const auto b1 = static_cast<unsigned char>(utf8[i + 1]);
+            const auto b2 = static_cast<unsigned char>(utf8[i + 2]);
+            const auto b3 = static_cast<unsigned char>(utf8[i + 3]);
+            if ((b1 & 0xC0u) == 0x80u && (b2 & 0xC0u) == 0x80u && (b3 & 0xC0u) == 0x80u) {
+                cp = ((b0 & 0x07u) << 18) | ((b1 & 0x3Fu) << 12) |
+                     ((b2 & 0x3Fu) << 6) | (b3 & 0x3Fu);
+                if (cp < 0x10000u || cp > 0x10FFFFu) {
+                    cp = 0xFFFDu;
+                }
+                i += 4;
+            } else {
+                ++i;
+            }
+        } else {
+            ++i;
+        }
+        if (cp <= 0xFFFFu) {
+            if (cp >= 0xD800u && cp <= 0xDFFFu) {
+                cp = 0xFFFDu;
+            }
+            outUtf16.push_back(static_cast<char16_t>(cp));
+        } else if (cp <= 0x10FFFFu) {
+            cp -= 0x10000u;
+            outUtf16.push_back(static_cast<char16_t>(0xD800u + (cp >> 10)));
+            outUtf16.push_back(static_cast<char16_t>(0xDC00u + (cp & 0x3FFu)));
+        } else {
+            outUtf16.push_back(static_cast<char16_t>(0xFFFDu));
+        }
+    }
+}
+
+void utf16ToUtf8(std::u16string_view utf16, std::string& outUtf8) {
+    outUtf8.clear();
+    outUtf8.reserve(utf16.size() * 2);
+    std::size_t i = 0;
+    while (i < utf16.size()) {
+        std::uint32_t cp = static_cast<std::uint16_t>(utf16[i++]);
+        if (cp >= 0xD800u && cp <= 0xDBFFu && i < utf16.size()) {
+            const std::uint32_t low = static_cast<std::uint16_t>(utf16[i]);
+            if (low >= 0xDC00u && low <= 0xDFFFu) {
+                cp = 0x10000u + (((cp - 0xD800u) << 10) | (low - 0xDC00u));
+                ++i;
+            } else {
+                cp = 0xFFFDu;
+            }
+        } else if (cp >= 0xDC00u && cp <= 0xDFFFu) {
+            cp = 0xFFFDu;
+        }
+        if (cp < 0x80u) {
+            outUtf8.push_back(static_cast<char>(cp));
+        } else if (cp < 0x800u) {
+            outUtf8.push_back(static_cast<char>(0xC0u | (cp >> 6)));
+            outUtf8.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        } else if (cp < 0x10000u) {
+            outUtf8.push_back(static_cast<char>(0xE0u | (cp >> 12)));
+            outUtf8.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+            outUtf8.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        } else {
+            outUtf8.push_back(static_cast<char>(0xF0u | (cp >> 18)));
+            outUtf8.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
+            outUtf8.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+            outUtf8.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+        }
+    }
+}
+
 } // namespace realscript::runtime

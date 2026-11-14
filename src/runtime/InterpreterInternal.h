@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -133,6 +134,8 @@ struct State {
     std::optional<Value> pendingException;
     bool exceptionNotifiedDebugger = false;
     AsyncRuntimeContext* asyncRuntime = nullptr;
+    IAwaitScheduler* awaitScheduler = nullptr;
+    CrossHeapAccessPolicy crossHeapPolicy = CrossHeapAccessPolicy::AllowReadWrite;
     void* resumeEnvRaw = nullptr;
     const std::shared_ptr<const void>* resumeEnvOwner = nullptr;
     CoroutineFrameHandle resumingCoroutine{};
@@ -207,6 +210,7 @@ struct InterpreterResumeEnv {
     std::shared_ptr<const BindingRegistry> bindings;
     ExternalFunction externalResolver;
     ExecutionOptions options;
+    std::weak_ptr<AsyncRuntimeContext> asyncRuntimeWeak;
 };
 
 struct ThreadInvokeScratch {
@@ -897,7 +901,22 @@ bool suspendInterpreterCoroutine(
     std::size_t regCount,
     std::uint32_t resumeBlockId,
     AwaitableHandle awaitedHandle,
-    Value& outAwaitableStruct);
+    Value& outAwaitableStruct,
+    bool runInlineOnComplete = false);
+
+bool suspendInterpreterWithAwaitScheduler(
+    State& state,
+    const bytecode::Function& function,
+    CoroutineFrameHandle& ioActiveCoroutine,
+    const Value* argsPtr,
+    std::size_t argCount,
+    const Value* localsPtr,
+    std::size_t localCount,
+    const Value* regsPtr,
+    std::size_t regCount,
+    std::uint32_t resumeBlockId,
+    const Value& awaitableVal,
+    Value& outReturnCarrier);
 
 bool resumeInterpreterAwaitable(
     State& state,

@@ -45,6 +45,22 @@ std::uint64_t nextRegistryId() noexcept {
     return nextIdentity(next);
 }
 
+std::uint32_t compactNativeRegistryId(std::uint64_t registryId) noexcept {
+    return registryId == 0
+        ? 0u
+        : static_cast<std::uint32_t>(((registryId - 1u) % 65535u) + 1u);
+}
+
+std::mutex& nativeHandleRegistryDirMutex() noexcept {
+    static std::mutex dirMutex;
+    return dirMutex;
+}
+
+std::vector<NativeHandleRegistry*>& nativeHandleRegistries() noexcept {
+    static std::vector<NativeHandleRegistry*> registries;
+    return registries;
+}
+
 const char* objectKindName(ObjectKind kind) noexcept {
     switch (kind) {
     case ObjectKind::String: return "string";
@@ -3052,9 +3068,69 @@ struct ManagedHeap::Impl {
     std::uint32_t lastArrayLayoutId = 0;
 
     std::unordered_map<RootToken, Value> persistentRoots;
+    std::vector<const ShadowStack*> activeShadowStacks;
     std::unordered_map<semantic::SymbolId, Value> staticFields;
     std::unordered_map<std::string, NativeEcsColumnTable> nativeEcsTables;
     std::unordered_map<std::string, ObjectRef> internedStrings;
+    bool hasDirtyTrackingTypes = false;
+    std::unordered_map<semantic::SymbolId, std::vector<std::uint8_t>> typeDirtyBitMaps;
+    std::unordered_map<semantic::SymbolId, semantic::SymbolId> typeBaseIds;
+    std::unordered_map<std::uint32_t, std::uint64_t> observerDirtyMasks;
+    NativeWrapperSweepCallback nativeWrapperSweepCallback;
+
+    struct PendingWrapperSweep {
+        NativeHandle handle{};
+        std::uint64_t heapId = 0;
+        ObjectRef wrapper{};
+    };
+    std::vector<PendingWrapperSweep> pendingWrapperSweeps;
+
+    void flushPendingWrapperSweeps() {
+        std::vector<PendingWrapperSweep> pending;
+        NativeWrapperSweepCallback callback;
+        {
+            HeapSyncMutexGuard heapLock(syncState->mutex);
+            if (pendingWrapperSweeps.empty()) {
+                return;
+            }
+            pending.swap(pendingWrapperSweeps);
+            callback = nativeWrapperSweepCallback;
+        }
+        if (!callback) {
+            return;
+        }
+        for (const auto& entry : pending) {
+            if (!NativeHandleRegistry::shouldDispatchSweepNotification(
+                    entry.handle, entry.heapId, entry.wrapper)) {
+                continue;
+            }
+            callback(entry.handle, entry.heapId, entry.wrapper);
+        }
+    }
+
+    void markDirtyForFieldUnlocked(
+        ObjectRef reference,
+        semantic::SymbolId concreteTypeId,
+        std::size_t fieldIndex) noexcept {
+        if (!hasDirtyTrackingTypes || concreteTypeId == 0) {
+            return;
+        }
+        semantic::SymbolId cur = concreteTypeId;
+        for (int depth = 0; depth < 64 && cur != 0; ++depth) {
+            const auto mapIt = typeDirtyBitMaps.find(cur);
+            if (mapIt != typeDirtyBitMaps.end() && fieldIndex < mapIt->second.size()) {
+                const std::uint8_t bit = mapIt->second[fieldIndex];
+                if (bit < 64u) {
+                    observerDirtyMasks[reference.slot] |= (std::uint64_t{1} << bit);
+                }
+            }
+            const auto baseIt = typeBaseIds.find(cur);
+            if (baseIt == typeBaseIds.end() || baseIt->second == cur) {
+                break;
+            }
+            cur = baseIt->second;
+        }
+    }
     RootToken nextRootToken = 1;
     GcPhase phase = GcPhase::Idle;
     bool requested = false;
@@ -3531,6 +3607,34 @@ struct ManagedHeap::Impl {
                 internedStrings.erase(it);
             }
         }
+        if (hasDirtyTrackingTypes && !observerDirtyMasks.empty()) {
+            observerDirtyMasks.erase(slotIdx);
+        }
+        if (nativeWrapperSweepCallback && slot.kind() == ObjectKind::Record &&
+            slot.payload.s.data != nullptr) {
+            const ObjectRef sweptRef(
+                slotIdx,
+                slot.generation,
+                ObjectKind::Record,
+                heapId);
+            for (std::uint32_t fi = 0; fi < slot.payload.s.length; ++fi) {
+                const auto& fv = slot.payload.s.data[fi];
+                if (const auto* nh = std::get_if<NativeHandle>(&fv); nh && nh->valid()) {
+                    const bool duplicate = std::any_of(
+                        pendingWrapperSweeps.begin(),
+                        pendingWrapperSweeps.end(),
+                        [&](const PendingWrapperSweep& existing) {
+                            return existing.handle == *nh &&
+                                existing.heapId == heapId &&
+                                existing.wrapper == sweptRef;
+                        });
+                    if (!duplicate) {
+                        pendingWrapperSweeps.push_back(
+                            PendingWrapperSweep{*nh, heapId, sweptRef});
+                    }
+                }
+            }
+        }
         const auto bytes = slotSizeBytes(slotIdx, slot);
         releaseSlotPayload(slotIdx, slot);
         ++slot.generation;
@@ -3625,6 +3729,11 @@ struct ManagedHeap::Impl {
     void markRoots(const ShadowStack& shadowStack) {
         lastScannedShadowStackId = shadowStack.instanceId();
         shadowStack.visitTraceableRoots([&](const Value& value) { markValue(value); });
+        for (const ShadowStack* activeStack : activeShadowStacks) {
+            if (activeStack && activeStack != &shadowStack) {
+                activeStack->visitTraceableRoots([&](const Value& value) { markValue(value); });
+            }
+        }
         for (const auto& entry : persistentRoots) markValue(entry.second);
         for (const auto& entry : staticFields) markValue(entry.second);
         for (const auto& [typeName, table] : nativeEcsTables) {
@@ -3906,7 +4015,7 @@ struct ManagedHeap::Impl {
             startCollection(roots);
             startedThisCall = true;
         } else if (phase == GcPhase::Mark &&
-                   roots.frameCount() > 0 &&
+                   (roots.frameCount() > 0 || !activeShadowStacks.empty()) &&
                    lastScannedShadowStackId != roots.instanceId()) {
             markRoots(roots);
         }
@@ -5488,6 +5597,10 @@ bool ManagedHeap::fieldSet(
     }
     impl_->pinHeapValueIfNeededUnlocked(value);
     slot->payload.s.data[index] = std::move(value);
+    if (impl_->hasDirtyTrackingTypes) {
+        const auto tid = impl_->typeLayouts[slot->payload.s.layoutId].typeId;
+        impl_->markDirtyForFieldUnlocked(reference, tid, index);
+    }
     return true;
 }
 
@@ -5520,7 +5633,350 @@ bool ManagedHeap::fieldSetFast(
     }
     impl_->pinHeapValueIfNeededUnlocked(stored);
     slot->payload.s.data[index] = stored;
+    if (impl_->hasDirtyTrackingTypes) {
+        impl_->markDirtyForFieldUnlocked(reference, expectedTypeId, index);
+    }
     return true;
+}
+
+void ManagedHeap::registerTypeParent(
+    semantic::SymbolId typeId,
+    semantic::SymbolId baseTypeId) {
+    if (typeId == 0 || baseTypeId == 0 || typeId == baseTypeId) return;
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    impl_->typeBaseIds[typeId] = baseTypeId;
+}
+
+void ManagedHeap::registerTypeHierarchy(const ProgramImage& program) {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    for (const auto& [tid, ts] : program.types_) {
+        if (ts && tid != 0 && ts->baseTypeId != 0 && ts->baseTypeId != tid) {
+            impl_->typeBaseIds[tid] = ts->baseTypeId;
+        }
+    }
+}
+
+void ManagedHeap::notifyFieldMutated(
+    ObjectRef reference,
+    std::size_t fieldIndex) noexcept {
+    if (!hasDirtyTracking_) return;
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    if (!impl_->hasDirtyTrackingTypes) return;
+    auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Record ||
+        fieldIndex >= slot->payload.s.length) {
+        return;
+    }
+    const auto tid = impl_->typeLayouts[slot->payload.s.layoutId].typeId;
+    impl_->markDirtyForFieldUnlocked(reference, tid, fieldIndex);
+}
+
+void ManagedHeap::enableTypeDirtyTracking(
+    semantic::SymbolId typeId,
+    std::vector<std::uint8_t> fieldToBitMap) {
+    if (typeId == 0) return;
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    impl_->typeDirtyBitMaps[typeId] = std::move(fieldToBitMap);
+    impl_->hasDirtyTrackingTypes = !impl_->typeDirtyBitMaps.empty();
+    hasDirtyTracking_ = impl_->hasDirtyTrackingTypes;
+}
+
+bool ManagedHeap::markDirtyBit(ObjectRef reference, std::uint8_t bitIndex) noexcept {
+    if (bitIndex >= 64u) return false;
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    if (!impl_->getSlot(reference)) return false;
+    impl_->hasDirtyTrackingTypes = true;
+    hasDirtyTracking_ = true;
+    impl_->observerDirtyMasks[reference.slot] |= (std::uint64_t{1} << bitIndex);
+    return true;
+}
+
+std::uint64_t ManagedHeap::peekDirtyMask(ObjectRef reference) const noexcept {
+    HeapReadOrDisjointGuard heapLock(*impl_->syncState);
+    if (!impl_->hasDirtyTrackingTypes || !impl_->getSlot(reference)) return 0u;
+    const auto it = impl_->observerDirtyMasks.find(reference.slot);
+    return it != impl_->observerDirtyMasks.end() ? it->second : 0u;
+}
+
+std::uint64_t ManagedHeap::consumeDirtyMask(ObjectRef reference) noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    if (!impl_->hasDirtyTrackingTypes || !impl_->getSlot(reference)) return 0u;
+    const auto it = impl_->observerDirtyMasks.find(reference.slot);
+    if (it == impl_->observerDirtyMasks.end()) return 0u;
+    const std::uint64_t mask = it->second;
+    impl_->observerDirtyMasks.erase(it);
+    return mask;
+}
+
+namespace {
+
+struct CrossHeapStringCopy {
+    bool isNull = false;
+    std::string text;
+};
+
+struct SanitizedValueTree {
+    Value baseValue{};
+    bool isCopiedString = false;
+    std::size_t stringIndex = 0;
+    bool isRebuiltStruct = false;
+    semantic::SymbolId structTypeId = 0;
+    std::vector<SanitizedValueTree> fields;
+
+    [[nodiscard]] Value materialize(const std::vector<Value>& copiedStringValues) const {
+        if (isCopiedString) {
+            return copiedStringValues[stringIndex];
+        }
+        if (isRebuiltStruct) {
+            std::vector<Value> builtFields;
+            builtFields.reserve(fields.size());
+            for (const auto& child : fields) {
+                builtFields.push_back(child.materialize(copiedStringValues));
+            }
+            return Value{makeStructValueFromFields(structTypeId, std::move(builtFields))};
+        }
+        return baseValue;
+    }
+};
+
+template <typename HandleObjectRefFn>
+bool buildSanitizedValueTree(
+    const Value& val,
+    std::size_t depth,
+    HandleObjectRefFn&& handleObjectRef,
+    std::vector<CrossHeapStringCopy>& copiedStrings,
+    SanitizedValueTree& outNode,
+    RuntimeError* error) {
+    constexpr std::size_t kMaxCrossHeapStructDepth = 32;
+    if (const auto* ref = std::get_if<ObjectRef>(&val)) {
+        return handleObjectRef(*ref, copiedStrings, outNode, error);
+    }
+    if (const auto* sv = std::get_if<StringValue>(&val)) {
+        outNode.isCopiedString = true;
+        outNode.stringIndex = copiedStrings.size();
+        copiedStrings.push_back(CrossHeapStringCopy{false, sv->str()});
+        return true;
+    }
+    if (const auto* st = std::get_if<StructValue>(&val)) {
+        if (!st->valid() || st->isInline || !st->storage) {
+            outNode.baseValue = val;
+            return true;
+        }
+        if (depth >= kMaxCrossHeapStructDepth) {
+            setHeapError(
+                error,
+                ErrorCode::CrossHeapAccessViolation,
+                "nested struct depth exceeds cross-heap policy limit");
+            return false;
+        }
+        const std::size_t count = st->fieldCount();
+        outNode.isRebuiltStruct = true;
+        outNode.structTypeId = st->typeId;
+        outNode.fields.resize(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto fvOpt = structValueFieldAt(*st, i);
+            if (!fvOpt) {
+                setHeapError(
+                    error,
+                    ErrorCode::InvalidObjectReference,
+                    "struct field unavailable during cross-heap transfer");
+                return false;
+            }
+            if (!buildSanitizedValueTree(
+                    *fvOpt,
+                    depth + 1,
+                    handleObjectRef,
+                    copiedStrings,
+                    outNode.fields[i],
+                    error)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    outNode.baseValue = val;
+    return true;
+}
+
+} // namespace
+
+bool ManagedHeap::readFieldWithPolicy(
+    const ManagedHeap& targetHeap,
+    ObjectRef target,
+    std::size_t fieldIndex,
+    CrossHeapAccessPolicy policy,
+    Value& outValue,
+    RuntimeError* error) const {
+    const bool crossHeap = (&targetHeap != this) && (targetHeap.heapId() != heapId());
+    if (crossHeap && policy == CrossHeapAccessPolicy::Deny) {
+        setHeapError(
+            error,
+            ErrorCode::CrossHeapAccessViolation,
+            "cross-heap field read denied by active CrossHeapAccessPolicy");
+        return false;
+    }
+    const auto valOpt = targetHeap.fieldGet(target, fieldIndex);
+    if (!valOpt) {
+        setHeapError(
+            error,
+            ErrorCode::InvalidObjectReference,
+            "target object is dead or field index is out of range");
+        return false;
+    }
+    if (!crossHeap || policy != CrossHeapAccessPolicy::ReadOnlySanitizeStrings) {
+        outValue = *valOpt;
+        return true;
+    }
+
+    const auto targetHeapId = targetHeap.heapId();
+    std::vector<CrossHeapStringCopy> copiedStrings;
+    SanitizedValueTree root;
+    const auto handleReadRef = [&](
+        ObjectRef ref,
+        std::vector<CrossHeapStringCopy>& pending,
+        SanitizedValueTree& node,
+        RuntimeError* err) -> bool {
+        if (ref.kind != ObjectKind::String) {
+            setHeapError(
+                err,
+                ErrorCode::CrossHeapAccessViolation,
+                "cross-heap non-string ObjectRef rejected under ReadOnlySanitizeStrings");
+            return false;
+        }
+        if (ref.heapId != 0 && ref.heapId != targetHeapId) {
+            setHeapError(
+                err,
+                ErrorCode::CrossHeapAccessViolation,
+                "foreign heap string reference cannot cross heaps");
+            return false;
+        }
+        node.isCopiedString = true;
+        node.stringIndex = pending.size();
+        if (const auto sv = targetHeap.stringView(ref)) {
+            pending.push_back(CrossHeapStringCopy{false, std::string(*sv)});
+        } else {
+            pending.push_back(CrossHeapStringCopy{true, {}});
+        }
+        return true;
+    };
+    if (!buildSanitizedValueTree(*valOpt, 0, handleReadRef, copiedStrings, root, error)) {
+        return false;
+    }
+    if (copiedStrings.empty()) {
+        outValue = *valOpt;
+        return true;
+    }
+
+    std::vector<Value> allocatedStringValues(copiedStrings.size());
+    {
+        HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+        for (std::size_t i = 0; i < copiedStrings.size(); ++i) {
+            if (copiedStrings[i].isNull) {
+                allocatedStringValues[i] = Value{NullString{}};
+                continue;
+            }
+            const auto size = Impl::BaseObjectSizeBytes + copiedStrings[i].text.size();
+            auto ref = impl_->allocateStringSlot(std::move(copiedStrings[i].text), size, error);
+            if (!ref) {
+                return false;
+            }
+            allocatedStringValues[i] = Value{*ref};
+        }
+    }
+    outValue = root.materialize(allocatedStringValues);
+    return true;
+}
+
+bool ManagedHeap::writeFieldWithPolicy(
+    ManagedHeap& targetHeap,
+    ObjectRef target,
+    std::size_t fieldIndex,
+    Value newValue,
+    CrossHeapAccessPolicy policy,
+    RuntimeError* error) const {
+    const bool crossHeap = (&targetHeap != this) && (targetHeap.heapId() != heapId());
+    if (crossHeap && policy != CrossHeapAccessPolicy::AllowReadWrite) {
+        setHeapError(
+            error,
+            ErrorCode::CrossHeapAccessViolation,
+            "cross-heap field mutation rejected; dispatch a command envelope instead");
+        return false;
+    }
+    if (!targetHeap.fieldGet(target, fieldIndex)) {
+        setHeapError(
+            error,
+            ErrorCode::InvalidObjectReference,
+            "target object is dead or field index is out of range");
+        return false;
+    }
+
+    const auto targetHeapId = targetHeap.heapId();
+    const auto callerHeapId = heapId();
+    std::vector<CrossHeapStringCopy> copiedStrings;
+    SanitizedValueTree root;
+    const auto handleWriteRef = [&](
+        ObjectRef ref,
+        std::vector<CrossHeapStringCopy>& pending,
+        SanitizedValueTree& node,
+        RuntimeError* err) -> bool {
+        if (ref.kind != ObjectKind::String) {
+            if (ref.heapId != 0 && ref.heapId != targetHeapId) {
+                setHeapError(
+                    err,
+                    ErrorCode::CrossHeapAccessViolation,
+                    "foreign ObjectRef cannot be stored into targetHeap");
+                return false;
+            }
+            node.baseValue = Value{ref};
+            return true;
+        }
+        if (ref.heapId == targetHeapId) {
+            node.baseValue = Value{ref};
+            return true;
+        }
+        if (ref.heapId == callerHeapId && crossHeap) {
+            const auto sv = stringView(ref);
+            if (!sv) {
+                setHeapError(
+                    err,
+                    ErrorCode::InvalidObjectReference,
+                    "caller string reference is invalid");
+                return false;
+            }
+            node.isCopiedString = true;
+            node.stringIndex = pending.size();
+            pending.push_back(CrossHeapStringCopy{false, std::string(*sv)});
+            return true;
+        }
+        setHeapError(
+            err,
+            ErrorCode::CrossHeapAccessViolation,
+            "foreign string ObjectRef cannot be stored into targetHeap");
+        return false;
+    };
+    if (!buildSanitizedValueTree(newValue, 0, handleWriteRef, copiedStrings, root, error)) {
+        return false;
+    }
+    if (copiedStrings.empty()) {
+        return targetHeap.fieldSet(target, fieldIndex, std::move(newValue), error);
+    }
+
+    std::vector<Value> targetStringValues;
+    targetStringValues.reserve(copiedStrings.size());
+    for (auto& entry : copiedStrings) {
+        auto allocated = targetHeap.allocateString(std::move(entry.text), error);
+        if (!allocated) {
+            return false;
+        }
+        targetStringValues.push_back(Value{*allocated});
+    }
+    return targetHeap.fieldSet(
+        target, fieldIndex, root.materialize(targetStringValues), error);
+}
+
+void ManagedHeap::setNativeWrapperSweepCallback(NativeWrapperSweepCallback callback) {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    impl_->nativeWrapperSweepCallback = std::move(callback);
 }
 
 ManagedHeap::RootToken ManagedHeap::addPersistentRoot(ObjectRef reference) {
@@ -5932,6 +6388,7 @@ std::size_t ManagedHeap::step(
     if (shouldSweepPools) {
         (void)reclaimPoolValuesInternal(&shadowStack, /*waitIfBusy=*/false);
     }
+    impl_->flushPendingWrapperSweeps();
     return performed;
 }
 
@@ -5957,6 +6414,7 @@ IncrementalGcBudgetStats ManagedHeap::collectIncrementalWithBudget(
     if (shouldSweepPools) {
         (void)reclaimPoolValuesInternal(&roots, /*waitIfBusy=*/false);
     }
+    impl_->flushPendingWrapperSweeps();
     const auto endTime = std::chrono::steady_clock::now();
     stats.elapsed = detail::clampDurationToNanoseconds(endTime - startTime);
     stats.elapsedNanoseconds = static_cast<std::uint64_t>(
@@ -6011,6 +6469,25 @@ void ManagedHeap::finishWallClockCycleForDeterminism(const ShadowStack& shadowSt
     if (shouldSweepPools) {
         (void)reclaimPoolValuesInternal(&shadowStack, /*waitIfBusy=*/false);
     }
+    impl_->flushPendingWrapperSweeps();
+}
+
+void ManagedHeap::pushActiveShadowStack(const ShadowStack* stack) noexcept {
+    if (!impl_ || !stack) return;
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    impl_->activeShadowStacks.push_back(stack);
+}
+
+void ManagedHeap::popActiveShadowStack(const ShadowStack* stack) noexcept {
+    if (!impl_ || !stack) return;
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    auto& stacks = impl_->activeShadowStacks;
+    for (std::size_t i = stacks.size(); i > 0; --i) {
+        if (stacks[i - 1] == stack) {
+            stacks.erase(stacks.begin() + static_cast<std::ptrdiff_t>(i - 1));
+            break;
+        }
+    }
 }
 
 void ManagedHeap::collectFull(const ShadowStack& shadowStack) {
@@ -6030,6 +6507,7 @@ void ManagedHeap::collectFull(const ShadowStack& shadowStack) {
     if (shouldSweepPools) {
         (void)reclaimPoolValuesInternal(&shadowStack, /*waitIfBusy=*/false);
     }
+    impl_->flushPendingWrapperSweeps();
 }
 
 void ManagedHeap::collect(const RootSet& roots) {
@@ -6097,6 +6575,11 @@ std::size_t ManagedHeap::collectYoung(
     };
 
     shadowStack.visitTraceableRoots([&](const Value& val) { markYoungValue(markYoungValue, val); });
+    for (const ShadowStack* activeStack : impl_->activeShadowStacks) {
+        if (activeStack && activeStack != &shadowStack) {
+            activeStack->visitTraceableRoots([&](const Value& val) { markYoungValue(markYoungValue, val); });
+        }
+    }
     for (const auto& entry : impl_->persistentRoots) markYoungValue(markYoungValue, entry.second);
     for (const auto& entry : impl_->staticFields) markYoungValue(markYoungValue, entry.second);
     for (const auto& [typeName, table] : impl_->nativeEcsTables) {
@@ -6226,12 +6709,13 @@ std::size_t ManagedHeap::collectYoung(
             if (impl_->statistics.liveBytes < impl_->nextCollectionThreshold) {
                 impl_->requested = false;
             }
-            return processed;
+            stepResult = processed;
         }
     }
     if (handledIncremental && shouldSweepPools) {
         (void)reclaimPoolValuesInternal(&shadowStack, /*waitIfBusy=*/false);
     }
+    impl_->flushPendingWrapperSweeps();
     return stepResult;
 }
 
@@ -7239,13 +7723,25 @@ PersistentRoot::PersistentRoot(
     : heap_(heap), token_(token), value_(std::move(value)) {}
 
 NativeHandleRegistry::NativeHandleRegistry()
-    : registryId_(nextRegistryId()) {}
+    : registryId_(nextRegistryId()) {
+    std::lock_guard<std::mutex> dirLock(nativeHandleRegistryDirMutex());
+    nativeHandleRegistries().push_back(this);
+}
+
+NativeHandleRegistry::~NativeHandleRegistry() {
+    std::lock_guard<std::mutex> dirLock(nativeHandleRegistryDirMutex());
+    auto& registries = nativeHandleRegistries();
+    registries.erase(
+        std::remove(registries.begin(), registries.end(), this),
+        registries.end());
+}
 
 NativeHandle NativeHandleRegistry::create(
     semantic::SymbolId typeId,
     std::shared_ptr<void> resource,
     std::string debugNameValue) {
     if (typeId == 0 || !resource) return {};
+    std::lock_guard<std::mutex> lock(mutex_);
     const void* rawPtr = resource.get();
     std::uint32_t slotIndex = 0;
     if (!freeSlots_.empty()) {
@@ -7264,8 +7760,8 @@ NativeHandle NativeHandleRegistry::create(
     slot.rawPointer = rawPtr;
     slot.typeId = typeId;
     slot.debugName = std::move(debugNameValue);
-    slot.cachedWrapper = {};
-    slot.cachedHeapId = 0;
+    slot.cachedWrappers.clear();
+    slot.cachedWrapperHeapIds.clear();
     if (rawPtr) {
         activeSlotByPointer_[PointerTypeKey{rawPtr, typeId}] = slotIndex;
     }
@@ -7276,6 +7772,7 @@ std::optional<NativeHandle> NativeHandleRegistry::findHandle(
     semantic::SymbolId typeId,
     const void* rawPointer) const noexcept {
     if (typeId == 0 || !rawPointer) return std::nullopt;
+    std::lock_guard<std::mutex> lock(mutex_);
     const auto it = activeSlotByPointer_.find(PointerTypeKey{rawPointer, typeId});
     if (it == activeSlotByPointer_.end() || it->second >= slots_.size()) {
         return std::nullopt;
@@ -7290,30 +7787,79 @@ std::optional<NativeHandle> NativeHandleRegistry::findHandle(
 std::optional<ObjectRef> NativeHandleRegistry::cachedWrapper(
     NativeHandle handle,
     std::uint64_t heapId) const noexcept {
-    if (!isAlive(handle)) return std::nullopt;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!isAliveUnlocked(handle)) return std::nullopt;
     const auto& slot = slots_[handle.slot];
-    if (!slot.cachedWrapper.valid() || slot.cachedHeapId != heapId) {
-        return std::nullopt;
+    for (const auto& [hid, ref] : slot.cachedWrappers) {
+        if (hid == heapId && ref.valid()) {
+            return ref;
+        }
     }
-    return slot.cachedWrapper;
+    return std::nullopt;
 }
 
 bool NativeHandleRegistry::setCachedWrapper(
     NativeHandle handle,
     ObjectRef wrapper,
     std::uint64_t heapId) noexcept {
-    if (!isAlive(handle)) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!isAliveUnlocked(handle)) return false;
     auto& slot = slots_[handle.slot];
-    slot.cachedWrapper = wrapper;
-    slot.cachedHeapId = heapId;
+    if (std::find(
+            slot.cachedWrapperHeapIds.begin(),
+            slot.cachedWrapperHeapIds.end(),
+            heapId) == slot.cachedWrapperHeapIds.end()) {
+        slot.cachedWrapperHeapIds.push_back(heapId);
+    }
+    for (auto& [hid, ref] : slot.cachedWrappers) {
+        if (hid == heapId) {
+            ref = wrapper;
+            return true;
+        }
+    }
+    slot.cachedWrappers.emplace_back(heapId, wrapper);
     return true;
+}
+
+bool NativeHandleRegistry::removeCachedWrapper(
+    NativeHandle handle,
+    std::uint64_t heapId) noexcept {
+    return removeCachedWrapperImpl(handle, heapId, nullptr);
+}
+
+bool NativeHandleRegistry::removeCachedWrapper(
+    NativeHandle handle,
+    std::uint64_t heapId,
+    ObjectRef expectedWrapper) noexcept {
+    return removeCachedWrapperImpl(handle, heapId, &expectedWrapper);
+}
+
+bool NativeHandleRegistry::removeCachedWrapperImpl(
+    NativeHandle handle,
+    std::uint64_t heapId,
+    const ObjectRef* expectedWrapper) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!isAliveUnlocked(handle)) return false;
+    auto& wrappers = slots_[handle.slot].cachedWrappers;
+    const auto before = wrappers.size();
+    wrappers.erase(
+        std::remove_if(
+            wrappers.begin(),
+            wrappers.end(),
+            [&](const auto& entry) {
+                if (entry.first != heapId) return false;
+                return expectedWrapper == nullptr || entry.second == *expectedWrapper;
+            }),
+        wrappers.end());
+    return wrappers.size() != before;
 }
 
 std::shared_ptr<void> NativeHandleRegistry::resolve(
     NativeHandle handle,
     semantic::SymbolId expectedTypeId,
     RuntimeError* error) const {
-    if (!handle.valid() || handle.registryId != ((registryId_ == 0) ? 0u : (((registryId_ - 1u) % 65535u) + 1u)) ||
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!handle.valid() || handle.registryId != compactNativeRegistryId(registryId_) ||
         handle.slot >= slots_.size()) {
         setHeapError(error, ErrorCode::InvalidNativeHandle,
             "native handle is invalid");
@@ -7334,16 +7880,54 @@ std::shared_ptr<void> NativeHandleRegistry::resolve(
     return slot.resource;
 }
 
-bool NativeHandleRegistry::isAlive(NativeHandle handle) const noexcept {
-    return handle.valid() && handle.registryId == ((registryId_ == 0) ? 0u : (((registryId_ - 1u) % 65535u) + 1u)) &&
+bool NativeHandleRegistry::isAliveUnlocked(NativeHandle handle) const noexcept {
+    return handle.valid() && handle.registryId == compactNativeRegistryId(registryId_) &&
         handle.slot < slots_.size() &&
         slots_[handle.slot].resource &&
         slots_[handle.slot].generation == handle.generation &&
         slots_[handle.slot].typeId == handle.typeId;
 }
 
+bool NativeHandleRegistry::isAlive(NativeHandle handle) const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return isAliveUnlocked(handle);
+}
+
+bool NativeHandleRegistry::shouldDispatchSweepNotification(
+    NativeHandle handle,
+    std::uint64_t heapId,
+    ObjectRef sweptWrapper) noexcept {
+    if (!handle.valid()) return false;
+    std::lock_guard<std::mutex> dirLock(nativeHandleRegistryDirMutex());
+    for (NativeHandleRegistry* reg : nativeHandleRegistries()) {
+        if (!reg || compactNativeRegistryId(reg->registryId_) != handle.registryId) {
+            continue;
+        }
+        std::lock_guard<std::mutex> regLock(reg->mutex_);
+        if (!reg->isAliveUnlocked(handle)) {
+            continue;
+        }
+        const auto& slot = reg->slots_[handle.slot];
+        const bool heapUsedCache = std::find(
+            slot.cachedWrapperHeapIds.begin(),
+            slot.cachedWrapperHeapIds.end(),
+            heapId) != slot.cachedWrapperHeapIds.end();
+        if (!heapUsedCache) {
+            return true;
+        }
+        for (const auto& [hid, cachedRef] : slot.cachedWrappers) {
+            if (hid == heapId && cachedRef == sweptWrapper) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return false;
+}
+
 bool NativeHandleRegistry::release(NativeHandle handle) noexcept {
-    if (!isAlive(handle)) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!isAliveUnlocked(handle)) return false;
     auto& slot = slots_[handle.slot];
     if (slot.rawPointer) {
         const auto it = activeSlotByPointer_.find(
@@ -7356,8 +7940,8 @@ bool NativeHandleRegistry::release(NativeHandle handle) noexcept {
     slot.rawPointer = nullptr;
     slot.typeId = 0;
     slot.debugName.clear();
-    slot.cachedWrapper = {};
-    slot.cachedHeapId = 0;
+    slot.cachedWrappers.clear();
+    slot.cachedWrapperHeapIds.clear();
     ++slot.generation;
     if (slot.generation == 0 || slot.generation > 0xFFFFu) slot.generation = 1;
     freeSlots_.push_back(handle.slot);
@@ -7365,6 +7949,7 @@ bool NativeHandleRegistry::release(NativeHandle handle) noexcept {
 }
 
 void NativeHandleRegistry::clear() noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
     activeSlotByPointer_.clear();
     freeSlots_.clear();
     for (std::size_t index = 0; index < slots_.size(); ++index) {
@@ -7374,8 +7959,8 @@ void NativeHandleRegistry::clear() noexcept {
             slot.rawPointer = nullptr;
             slot.typeId = 0;
             slot.debugName.clear();
-            slot.cachedWrapper = {};
-            slot.cachedHeapId = 0;
+            slot.cachedWrappers.clear();
+            slot.cachedWrapperHeapIds.clear();
             ++slot.generation;
             if (slot.generation == 0 || slot.generation > 0xFFFFu) slot.generation = 1;
         }
@@ -7384,6 +7969,7 @@ void NativeHandleRegistry::clear() noexcept {
 }
 
 std::size_t NativeHandleRegistry::liveCount() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
     return static_cast<std::size_t>(std::count_if(
         slots_.begin(), slots_.end(),
         [](const Slot& slot) { return static_cast<bool>(slot.resource); }));
@@ -7394,19 +7980,22 @@ std::uint64_t NativeHandleRegistry::registryId() const noexcept {
 }
 
 std::string NativeHandleRegistry::debugName(NativeHandle handle) const {
-    return isAlive(handle) ? slots_[handle.slot].debugName : std::string{};
+    std::lock_guard<std::mutex> lock(mutex_);
+    return isAliveUnlocked(handle) ? slots_[handle.slot].debugName : std::string{};
 }
 
 void NativeHandleRegistry::registerCppType(
     std::type_index cppType,
     semantic::SymbolId typeId) {
     if (typeId != 0) {
+        std::lock_guard<std::mutex> lock(mutex_);
         cppTypeIds_[cppType] = typeId;
     }
 }
 
 semantic::SymbolId NativeHandleRegistry::findCppTypeId(
     std::type_index cppType) const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
     const auto it = cppTypeIds_.find(cppType);
     return it != cppTypeIds_.end() ? it->second : 0;
 }

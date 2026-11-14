@@ -45,7 +45,11 @@ void resumeInterpreterCoroutineCallback(
                 Value savedSuspendedRet = std::move(activeState->suspendedReturnValue);
                 RuntimeError savedError = std::move(activeState->error);
                 std::optional<Value> savedPendingExc = std::move(activeState->pendingException);
+                IAwaitScheduler* const savedAwaitScheduler = activeState->awaitScheduler;
 
+                if (auto* envPtr = static_cast<InterpreterResumeEnv*>(runnerContext)) {
+                    activeState->awaitScheduler = envPtr->options.awaitScheduler;
+                }
                 activeState->resumingCoroutine = frameHandle;
                 activeState->resumingFramePtr = &frame;
                 activeState->coroutineSuspendedNow = false;
@@ -60,6 +64,7 @@ void resumeInterpreterCoroutineCallback(
                     faultUnresolvedFrame(activeState->error);
                 }
 
+                activeState->awaitScheduler = savedAwaitScheduler;
                 activeState->resumingCoroutine = savedCoro;
                 activeState->resumingFramePtr = savedFramePtr;
                 activeState->coroutineSuspendedNow = savedSuspendedNow;
@@ -150,6 +155,8 @@ void resumeInterpreterCoroutineCallback(
     state.heap = env->heap.get();
     state.debugger = resumeOpts.debugger.get();
     state.asyncRuntime = &asyncContext;
+    state.awaitScheduler = resumeOpts.awaitScheduler;
+    state.crossHeapPolicy = resumeOpts.crossHeapPolicy;
     const std::shared_ptr<const void> keepAlive = frame.runnerOwner;
     state.resumeEnvRaw = env;
     state.resumeEnvOwner = &keepAlive;
@@ -165,6 +172,7 @@ void resumeInterpreterCoroutineCallback(
     } restoreBridge{asyncContext, prevBridge};
 
     FlatStackBankScope flatBankScope(state);
+    ManagedHeap::ActiveShadowStackScope activeHeapRoots(state.heap, &state.shadowStack);
     ShadowFrameScope roots(
         state.shadowStack, nullptr, nullptr, &state.values, &state.valueTop);
     if (state.traceEventsEnabled && state.heap && state.heap->isWallClockCycleActive()) {
@@ -189,6 +197,7 @@ Interpreter::Interpreter(std::vector<bytecode::Module> modules)
     auto linked = ProgramImage::link(std::move(modules), programError_);
     if (linked) {
         program_ = std::make_shared<ProgramImage>(std::move(*linked));
+        if (heap_) heap_->registerTypeHierarchy(*program_);
     }
 }
 
@@ -204,6 +213,8 @@ Interpreter::Interpreter(
     if (!program_) {
         programError_.code = ErrorCode::InvalidProgram;
         programError_.message = "interpreter has no linked program image";
+    } else if (heap_) {
+        heap_->registerTypeHierarchy(*program_);
     }
 }
 
@@ -214,6 +225,7 @@ void Interpreter::setExternalResolver(ExternalFunction resolver) {
 
 void Interpreter::setHeap(std::shared_ptr<ManagedHeap> heap) {
     heap_ = heap ? std::move(heap) : std::make_shared<ManagedHeap>();
+    if (program_ && heap_) heap_->registerTypeHierarchy(*program_);
     if (asyncRuntime_) asyncRuntime_->setHeap(heap_.get());
     resumeEnv_.reset();
 }
@@ -362,21 +374,28 @@ ExecutionResult Interpreter::invoke(
                 options.grantedCapabilities.end());
         }
     }
-    if (!resumeEnv_) {
+    if (!resumeEnv_ ||
+        static_cast<const InterpreterResumeEnv*>(resumeEnv_.get())->options.awaitScheduler !=
+            options.awaitScheduler) {
         auto env = std::make_shared<InterpreterResumeEnv>();
         env->program = program_;
         env->heap = heap_;
         env->bindings = bindings_;
         env->externalResolver = externalResolver_;
         env->options = options;
+        env->asyncRuntimeWeak = asyncRuntime_;
         resumeEnv_ = env;
     } else {
-        static_cast<InterpreterResumeEnv*>(resumeEnv_.get())->options = options;
+        auto* env = static_cast<InterpreterResumeEnv*>(resumeEnv_.get());
+        env->options = options;
+        env->asyncRuntimeWeak = asyncRuntime_;
     }
     state.determinism = DeterminismSession(std::move(options.determinism));
     state.heap = heap_.get();
     state.debugger = options.debugger.get();
     state.asyncRuntime = asyncRuntime_.get();
+    state.awaitScheduler = options.awaitScheduler;
+    state.crossHeapPolicy = options.crossHeapPolicy;
     if (state.asyncRuntime && state.heap && state.asyncRuntime->awaitables().heap() == nullptr) {
         state.asyncRuntime->setHeap(state.heap);
     }
@@ -414,6 +433,7 @@ ExecutionResult Interpreter::invoke(
     ExecutionResult execution;
     {
         FlatStackBankScope flatBankScope(state);
+        ManagedHeap::ActiveShadowStackScope activeHeapRoots(state.heap, &state.shadowStack);
         ShadowFrameScope roots(
             state.shadowStack, nullptr, nullptr, &state.values, &state.valueTop);
         if (state.traceEventsEnabled && state.heap && state.heap->isWallClockCycleActive()) {
@@ -510,6 +530,7 @@ const char* errorCodeName(ErrorCode code) noexcept {
     case ErrorCode::DuplicateSymbol: return "duplicate-symbol";
     case ErrorCode::InvalidObjectReference: return "invalid-object-reference";
     case ErrorCode::InvalidNativeHandle: return "invalid-native-handle";
+    case ErrorCode::CrossHeapAccessViolation: return "cross-heap-access-violation";
     case ErrorCode::NullReference: return "null-reference";
     case ErrorCode::IndexOutOfRange: return "index-out-of-range";
     case ErrorCode::OutOfMemory: return "out-of-memory";

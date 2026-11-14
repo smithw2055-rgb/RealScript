@@ -3,7 +3,6 @@
 #include "realscript/aot_cpp/AotRuntime.h"
 #include "realscript/aot_cpp/RuntimeAbi.h"
 #include "realscript/bytecode/Bytecode.h"
-#include "realscript/game/GameplayStateCodec.h"
 #include "realscript/runtime/FiberScheduler.h"
 #include "realscript/runtime/Runtime.h"
 
@@ -681,9 +680,6 @@ AbiContractManifest currentAbiContractManifest() noexcept {
         sizeof(runtime::CompactInstruction) == 8,
         "runtime::CompactInstruction must be 8 bytes");
     static_assert(
-        kRsgsStateEncodingVersion == game::kGameplayStateCodecVersion,
-        "RSGS state version constant must stay synchronized with GameplayStateCodec");
-    static_assert(
         kNativeModuleAbiMajor == aot::RuntimeAbiMajor &&
             kNativeModuleAbiMinor == aot::RuntimeAbiMinor,
         "NativeModuleAbi constants must stay synchronized with AotRuntime");
@@ -702,7 +698,7 @@ AbiContractManifest currentAbiContractManifest() noexcept {
         kBytecodeMaxSupportedMajor, kBytecodeMaxSupportedMinor};
     manifest.bytecodeTargetVersion = BytecodeVersionPoint{
         kBytecodeDefaultMajor, kBytecodeDefaultMinor};
-    manifest.rsgsStateVersion = game::kGameplayStateCodecVersion;
+    manifest.rsgsStateVersion = kRsgsStateEncodingVersion;
 
     manifest.runtimeValueSize = static_cast<std::uint32_t>(sizeof(runtime::Value));
     manifest.runtimeValueAlign = static_cast<std::uint32_t>(alignof(runtime::Value));

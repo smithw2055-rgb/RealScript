@@ -1570,6 +1570,9 @@ bool executeFunction(
                                             if (RS_FLAT_LIKELY(static_cast<std::uint8_t>(rhs.rawTag()) ==
                                                                calleeExec->trivialFieldTag0)) {
                                                 oce.view.fields[f0] = rhs;
+                                                if (RS_FLAT_UNLIKELY(state.heap->hasDirtyTracking())) {
+                                                    state.heap->notifyFieldMutated(oce.ref, f0);
+                                                }
                                                 trivialHandled = true;
                                             }
                                         }
@@ -1941,6 +1944,9 @@ bool executeFunction(
                                     RS_FLAT_SPAN_CHECK();
                                     localExecuted += spanCost;
                                     oce.view.fields[fIdx] = rhs;
+                                    if (RS_FLAT_UNLIKELY(state.heap->hasDirtyTracking())) {
+                                        state.heap->notifyFieldMutated(ref, fIdx);
+                                    }
                                     RS_FLAT_DISPATCH_NEXT();
                                 }
                             } else {
@@ -2048,6 +2054,9 @@ bool executeFunction(
                                         }
                                         localExecuted += spanCost;
                                         oce.view.fields[fIdx] = std::move(detached);
+                                        if (RS_FLAT_UNLIKELY(state.heap->hasDirtyTracking())) {
+                                            state.heap->notifyFieldMutated(ref, fIdx);
+                                        }
                                         RS_FLAT_DISPATCH_NEXT();
                                     }
                                     if (needsPin) pinValueInPools(rhs);
@@ -2058,6 +2067,9 @@ bool executeFunction(
                                     }
                                     localExecuted += spanCost;
                                     oce.view.fields[fIdx] = rhs;
+                                    if (RS_FLAT_UNLIKELY(state.heap->hasDirtyTracking())) {
+                                        state.heap->notifyFieldMutated(ref, fIdx);
+                                    }
                                     RS_FLAT_DISPATCH_NEXT();
                                 }
                             }
@@ -5035,6 +5047,9 @@ bool executeFunction(
                                 }
                                 localExecuted += spanCost;
                                 oce.view.fields[fIdx] = rhs;
+                                if (RS_FLAT_UNLIKELY(state.heap->hasDirtyTracking())) {
+                                    state.heap->notifyFieldMutated(ref, fIdx);
+                                }
                                 RS_FLAT_DISPATCH_NEXT();
                             }
                         }
@@ -5462,6 +5477,9 @@ bool executeFunction(
                                 if (RS_FLAT_LIKELY(static_cast<std::uint8_t>(rhs.rawTag()) ==
                                                    calleeExec->trivialFieldTag0)) {
                                     rOce.view.fields[f0] = rhs;
+                                    if (RS_FLAT_UNLIKELY(state.heap->hasDirtyTracking())) {
+                                        state.heap->notifyFieldMutated(leaf.receiverRef, f0);
+                                    }
                                     handled = true;
                                 }
                             }
@@ -5742,6 +5760,30 @@ bool executeFunction(
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 const Value awaitableVal = frameBase[ip->src0Slot];
                 frameBase[ip->storeSlot] = awaitableVal;
+                if (RS_FLAT_UNLIKELY(state.awaitScheduler && state.awaitScheduler->handlesValue(awaitableVal))) {
+                    if (state.awaitScheduler->isCompleted(awaitableVal)) {
+                        RS_FLAT_DISPATCH_NEXT();
+                    }
+                    state.executed = localExecuted;
+                    if (RS_FLAT_UNLIKELY(!suspendInterpreterWithAwaitScheduler(
+                            state,
+                            function,
+                            activeCoroutine,
+                            frameBase + execution->paramOffset,
+                            argCount,
+                            frameBase + execution->localOffset,
+                            function.localTypes.size(),
+                            frameBase + execution->registerOffset,
+                            function.registerTypes.size(),
+                            static_cast<std::uint32_t>(ip->integerImmediate),
+                            awaitableVal,
+                            result))) {
+                        goto L_FlatError;
+                    }
+                    state.valueTop = frameOffset;
+                    state.stack.pop_back();
+                    return true;
+                }
                 AwaitableHandle awaitedHandle{};
                 if (RS_FLAT_UNLIKELY(!state.asyncRuntime ||
                                      !tryExtractAwaitableHandle(awaitableVal, awaitedHandle) ||

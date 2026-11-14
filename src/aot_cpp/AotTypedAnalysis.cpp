@@ -381,6 +381,22 @@ std::vector<TypedSlotType> valueSlotTypes(const mir::Function& function) {
     return result;
 }
 
+namespace {
+
+[[nodiscard]] bool isBuiltinAsyncAwaitableType(
+    std::string_view typeName,
+    semantic::SymbolId typeId) noexcept {
+    static const semantic::SymbolId kVoidAwaitableId =
+        semantic::stableTypeId("RealScript.Async::Awaitable");
+    if (typeId == kVoidAwaitableId || typeName == "RealScript.Async::Awaitable") {
+        return true;
+    }
+    return typeName.rfind("Awaitable__", 0) == 0 ||
+        typeName.find("::Awaitable__") != std::string_view::npos;
+}
+
+} // namespace
+
 bool supportsTypedPrimitiveAot(
     const mir::Function& function,
     const std::unordered_set<semantic::SymbolId>& customStructs) {
@@ -391,8 +407,10 @@ bool supportsTypedPrimitiveAot(
         !function.blocks.front().instructions.empty() &&
         function.blocks.front().instructions.front().opcode == mir::Opcode::AsyncEnter;
     if (isAsyncFunction) {
+        const auto& enterInst = function.blocks.front().instructions.front();
         if (function.returnType != semantic::PrimitiveType::Struct ||
-            customStructs.find(function.returnTypeId) == customStructs.end()) {
+            customStructs.find(function.returnTypeId) == customStructs.end() ||
+            !isBuiltinAsyncAwaitableType(enterInst.symbolName, function.returnTypeId)) {
             return false;
         }
     }
@@ -611,7 +629,8 @@ bool supportsTypedPrimitiveAot(
                 if (opSlot.primitive != semantic::PrimitiveType::Struct ||
                     customStructs.find(opSlot.typeId) == customStructs.end() ||
                     function.localTypes[instruction.localIndex] != semantic::PrimitiveType::Struct ||
-                    locTid != opSlot.typeId) {
+                    locTid != opSlot.typeId ||
+                    !isBuiltinAsyncAwaitableType(instruction.symbolName, opSlot.typeId)) {
                     return false;
                 }
                 break;
@@ -625,7 +644,8 @@ bool supportsTypedPrimitiveAot(
                 const auto locTid = instruction.localIndex < function.localTypeIds.size()
                     ? function.localTypeIds[instruction.localIndex]
                     : 0;
-                if (customStructs.find(locTid) == customStructs.end()) {
+                if (customStructs.find(locTid) == customStructs.end() ||
+                    !isBuiltinAsyncAwaitableType(instruction.symbolName, locTid)) {
                     return false;
                 }
                 if (instruction.result >= 0 &&
@@ -640,6 +660,7 @@ bool supportsTypedPrimitiveAot(
                     instruction.result < 0 ||
                     instruction.resultType != semantic::PrimitiveType::Struct ||
                     customStructs.find(instruction.typeId) == customStructs.end() ||
+                    !isBuiltinAsyncAwaitableType(instruction.symbolName, instruction.typeId) ||
                     instruction.operands.size() > 1) {
                     return false;
                 }

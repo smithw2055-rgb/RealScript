@@ -2623,7 +2623,8 @@ bool CoroutineFramePool::suspendFrame(
     AwaitableHandle awaitedHandle,
     CoroutineResumeCallback resumeCallback,
     void* runnerContext,
-    std::shared_ptr<const void> runnerOwner) {
+    std::shared_ptr<const void> runnerOwner,
+    bool runInlineOnComplete) {
     if (!ownerContext_ || !resumeCallback) return false;
     if (!handle.valid() || handle.slot >= slots_.size()) return false;
     auto& slot = slots_[handle.slot];
@@ -2647,7 +2648,7 @@ bool CoroutineFramePool::suspendFrame(
     cont.context = this;
     cont.userTag = handle.pack64();
     cont.resumeQueue = slot.frame.resumeQueue;
-    cont.runInlineOnComplete = false;
+    cont.runInlineOnComplete = runInlineOnComplete;
     if (!ownerContext_->awaitables().onCompleted(awaitedHandle, cont)) {
         slot.frame.suspended = false;
         releasePinnedRoots(slot);
@@ -2668,7 +2669,8 @@ bool CoroutineFramePool::suspendScalarFrame(
     AwaitableHandle awaitedHandle,
     CoroutineResumeCallback resumeCallback,
     void* runnerContext,
-    std::shared_ptr<const void> runnerOwner) {
+    std::shared_ptr<const void> runnerOwner,
+    bool runInlineOnComplete) {
     if (!ownerContext_ || !resumeCallback) return false;
     if (!handle.valid() || handle.slot >= slots_.size()) return false;
     auto& slot = slots_[handle.slot];
@@ -2731,7 +2733,7 @@ bool CoroutineFramePool::suspendScalarFrame(
     cont.context = this;
     cont.userTag = handle.pack64();
     cont.resumeQueue = slot.frame.resumeQueue;
-    cont.runInlineOnComplete = false;
+    cont.runInlineOnComplete = runInlineOnComplete;
     if (!ownerContext_->awaitables().onCompleted(awaitedHandle, cont)) {
         slot.frame.suspended = false;
         releasePinnedRoots(slot);

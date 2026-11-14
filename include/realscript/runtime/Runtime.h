@@ -1837,7 +1837,51 @@ enum class ErrorCode {
     ReplayMismatch,
     ScriptException,
     CapabilityDenied,
+    CrossHeapAccessViolation,
 };
+
+enum class CrossHeapAccessPolicy : std::uint8_t {
+    AllowReadWrite = 0,
+    ReadOnlySanitizeStrings = 1,
+    Deny = 2,
+};
+
+struct RuntimeError;
+
+class IAwaitScheduler {
+public:
+    virtual ~IAwaitScheduler() = default;
+    [[nodiscard]] virtual bool handlesValue(const Value& awaited) const noexcept = 0;
+    [[nodiscard]] virtual bool isCompleted(const Value& awaited) const noexcept = 0;
+    virtual bool tryGetResult(
+        const Value& awaited,
+        bool hasResult,
+        Value& outResult,
+        RuntimeError& outError) = 0;
+    virtual bool onSuspend(
+        const Value& awaited,
+        std::function<void()> resumeCallback,
+        RuntimeError& outError) = 0;
+    virtual bool tryResolveAsyncReturn(
+        semantic::SymbolId returnTypeId,
+        const Value* payload,
+        Value& outWrapped,
+        RuntimeError& outError) {
+        (void)returnTypeId;
+        (void)payload;
+        (void)outWrapped;
+        (void)outError;
+        return false;
+    }
+};
+
+using NativeWrapperSweepCallback = std::function<void(
+    NativeHandle handle,
+    std::uint64_t heapId,
+    ObjectRef sweptWrapper)>;
+
+void utf8ToUtf16(std::string_view utf8, std::u16string& outUtf16);
+void utf16ToUtf8(std::u16string_view utf16, std::string& outUtf8);
 
 struct StackTraceLocation {
     semantic::SymbolId symbolId = 0;
@@ -2295,6 +2339,8 @@ struct LayoutMigrationStats {
     std::size_t oldGenBarriersMarked = 0;
 };
 
+class ProgramImage;
+
 class ManagedHeap {
 public:
     using RootToken = std::uint64_t;
@@ -2355,6 +2401,39 @@ public:
 
     [[nodiscard]] bool isAlive(ObjectRef reference) const noexcept;
     [[nodiscard]] std::optional<std::string_view> stringView(ObjectRef reference) const;
+
+    // Zero-default-overhead 64-bit Dirty-Bitmask Observer Side-Table & Cross-Heap Policy
+    [[nodiscard]] bool hasDirtyTracking() const noexcept {
+        return hasDirtyTracking_;
+    }
+    void registerTypeParent(
+        semantic::SymbolId typeId,
+        semantic::SymbolId baseTypeId);
+    void registerTypeHierarchy(const ProgramImage& program);
+    void notifyFieldMutated(
+        ObjectRef reference,
+        std::size_t fieldIndex) noexcept;
+    void enableTypeDirtyTracking(
+        semantic::SymbolId typeId,
+        std::vector<std::uint8_t> fieldToBitMap);
+    bool markDirtyBit(ObjectRef reference, std::uint8_t bitIndex) noexcept;
+    [[nodiscard]] std::uint64_t peekDirtyMask(ObjectRef reference) const noexcept;
+    [[nodiscard]] std::uint64_t consumeDirtyMask(ObjectRef reference) noexcept;
+    bool readFieldWithPolicy(
+        const ManagedHeap& targetHeap,
+        ObjectRef target,
+        std::size_t fieldIndex,
+        CrossHeapAccessPolicy policy,
+        Value& outValue,
+        RuntimeError* error = nullptr) const;
+    bool writeFieldWithPolicy(
+        ManagedHeap& targetHeap,
+        ObjectRef target,
+        std::size_t fieldIndex,
+        Value newValue,
+        CrossHeapAccessPolicy policy,
+        RuntimeError* error = nullptr) const;
+    void setNativeWrapperSweepCallback(NativeWrapperSweepCallback callback);
     [[nodiscard]] static std::optional<std::string> tryCopyStringGlobal(ObjectRef reference);
     [[nodiscard]] std::optional<std::size_t> arrayLength(ObjectRef reference) const;
     [[nodiscard]] std::optional<semantic::SymbolId> arrayTypeId(
@@ -2641,10 +2720,29 @@ public:
         ParallelLockFreeScope& operator=(const ParallelLockFreeScope&) = delete;
     };
 
+    class ActiveShadowStackScope {
+    public:
+        ActiveShadowStackScope(ManagedHeap* heap, const ShadowStack* stack) noexcept
+            : heap_(heap), stack_(stack) {
+            if (heap_ && stack_) heap_->pushActiveShadowStack(stack_);
+        }
+        ~ActiveShadowStackScope() noexcept {
+            if (heap_ && stack_) heap_->popActiveShadowStack(stack_);
+        }
+        ActiveShadowStackScope(const ActiveShadowStackScope&) = delete;
+        ActiveShadowStackScope& operator=(const ActiveShadowStackScope&) = delete;
+    private:
+        ManagedHeap* heap_ = nullptr;
+        const ShadowStack* stack_ = nullptr;
+    };
+
 private:
     friend class PersistentRoot;
+    void pushActiveShadowStack(const ShadowStack* stack) noexcept;
+    void popActiveShadowStack(const ShadowStack* stack) noexcept;
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    bool hasDirtyTracking_ = false;
 };
 
 #if defined(_MSC_VER)
@@ -2682,6 +2780,7 @@ private:
 class NativeHandleRegistry {
 public:
     NativeHandleRegistry();
+    ~NativeHandleRegistry();
     NativeHandleRegistry(const NativeHandleRegistry&) = delete;
     NativeHandleRegistry& operator=(const NativeHandleRegistry&) = delete;
     NativeHandleRegistry(NativeHandleRegistry&&) = delete;
@@ -2701,6 +2800,13 @@ public:
         NativeHandle handle,
         ObjectRef wrapper,
         std::uint64_t heapId) noexcept;
+    bool removeCachedWrapper(
+        NativeHandle handle,
+        std::uint64_t heapId) noexcept;
+    bool removeCachedWrapper(
+        NativeHandle handle,
+        std::uint64_t heapId,
+        ObjectRef expectedWrapper) noexcept;
     [[nodiscard]] std::shared_ptr<void> resolve(
         NativeHandle handle,
         semantic::SymbolId expectedTypeId = 0,
@@ -2715,14 +2821,26 @@ public:
     [[nodiscard]] semantic::SymbolId findCppTypeId(std::type_index cppType) const noexcept;
 
 private:
+    friend class ManagedHeap;
+
+    [[nodiscard]] bool isAliveUnlocked(NativeHandle handle) const noexcept;
+    bool removeCachedWrapperImpl(
+        NativeHandle handle,
+        std::uint64_t heapId,
+        const ObjectRef* expectedWrapper) noexcept;
+    [[nodiscard]] static bool shouldDispatchSweepNotification(
+        NativeHandle handle,
+        std::uint64_t heapId,
+        ObjectRef sweptWrapper) noexcept;
+
     struct Slot {
         std::shared_ptr<void> resource;
         const void* rawPointer = nullptr;
         semantic::SymbolId typeId = 0;
         std::uint32_t generation = 1;
         std::string debugName;
-        ObjectRef cachedWrapper{};
-        std::uint64_t cachedHeapId = 0;
+        std::vector<std::pair<std::uint64_t, ObjectRef>> cachedWrappers;
+        std::vector<std::uint64_t> cachedWrapperHeapIds;
     };
     struct PointerTypeKey {
         const void* rawPointer = nullptr;
@@ -2738,6 +2856,7 @@ private:
             return h1 ^ (h2 + 0x9e3779b9u + (h1 << 6u) + (h1 >> 2u));
         }
     };
+    mutable std::mutex mutex_;
     std::uint64_t registryId_ = 0;
     std::vector<Slot> slots_;
     std::vector<std::uint32_t> freeSlots_;
@@ -3036,6 +3155,8 @@ struct ExecutionOptions {
     bool enforceCapabilities = false;
     std::unordered_set<std::string> grantedCapabilities;
     bool trustedRelease = false;
+    IAwaitScheduler* awaitScheduler = nullptr;
+    CrossHeapAccessPolicy crossHeapPolicy = CrossHeapAccessPolicy::AllowReadWrite;
 };
 
 #if defined(_MSC_VER)
@@ -3202,6 +3323,7 @@ public:
         const std::string& qualifiedName) const;
 
 private:
+    friend class ManagedHeap;
     friend const detail::ExecutionMirror& detail::executionMirror(
         const ProgramImage& program) noexcept;
 

@@ -681,7 +681,8 @@ public:
         AwaitableHandle awaitedHandle,
         CoroutineResumeCallback resumeCallback,
         void* runnerContext,
-        std::shared_ptr<const void> runnerOwner = {});
+        std::shared_ptr<const void> runnerOwner = {},
+        bool runInlineOnComplete = false);
 
     bool suspendScalarFrame(
         CoroutineFrameHandle handle,
@@ -693,7 +694,8 @@ public:
         AwaitableHandle awaitedHandle,
         CoroutineResumeCallback resumeCallback,
         void* runnerContext,
-        std::shared_ptr<const void> runnerOwner = {});
+        std::shared_ptr<const void> runnerOwner = {},
+        bool runInlineOnComplete = false);
 
     template <typename Visitor>
     void forEachActiveFrame(Visitor&& visitor) {
