@@ -134,6 +134,10 @@ text::TextSpan TypeBinaryExpressionSyntax::span() const noexcept {
         designationToken ? designationToken->span : type.span());
 }
 
+text::TextSpan TaggedStringExpressionSyntax::span() const noexcept {
+    return combine(tagToken.span, stringToken.span);
+}
+
 text::TextSpan TypeOfExpressionSyntax::span() const noexcept {
     return combine(typeofKeyword.span, closeParenToken.span);
 }
@@ -613,6 +617,13 @@ std::unique_ptr<ExpressionSyntax> cloneExpressionSyntax(const ExpressionSyntax& 
         out->literalToken = static_cast<const LiteralExpressionSyntax&>(value).literalToken;
         return out;
     }
+    case SyntaxKind::TaggedStringExpression: {
+        const auto& src = static_cast<const TaggedStringExpressionSyntax&>(value);
+        auto out = std::make_unique<TaggedStringExpressionSyntax>();
+        out->tagToken = src.tagToken;
+        out->stringToken = src.stringToken;
+        return out;
+    }
     case SyntaxKind::NameExpression: {
         const auto& src = static_cast<const NameExpressionSyntax&>(value);
         auto out = std::make_unique<NameExpressionSyntax>();
@@ -1065,6 +1076,7 @@ FieldDeclarationSyntax cloneFieldDeclarationSyntax(const FieldDeclarationSyntax&
     out.equalsToken = value.equalsToken;
     if (value.initializer) out.initializer = cloneExpressionSyntax(*value.initializer);
     out.semicolonToken = value.semicolonToken;
+    out.originSourceName = value.originSourceName;
     return out;
 }
 
@@ -1089,6 +1101,7 @@ ConstructorDeclarationSyntax cloneConstructorDeclarationSyntax(
     out.baseArgumentCommaTokens = value.baseArgumentCommaTokens;
     out.initializerCloseParenToken = value.initializerCloseParenToken;
     out.body = cloneBlockStatementSyntax(value.body);
+    out.originSourceName = value.originSourceName;
     return out;
 }
 
@@ -1107,6 +1120,7 @@ PropertyDeclarationSyntax clonePropertyDeclarationSyntax(
     out.equalsToken = value.equalsToken;
     if (value.initializer) out.initializer = cloneExpressionSyntax(*value.initializer);
     out.semicolonToken = value.semicolonToken;
+    out.originSourceName = value.originSourceName;
     return out;
 }
 
@@ -1129,6 +1143,7 @@ SequenceDeclarationSyntax cloneSequenceDeclarationSyntax(
     out.commaTokens = value.commaTokens;
     out.closeParenToken = value.closeParenToken;
     out.body = cloneBlockStatementSyntax(value.body);
+    out.originSourceName = value.originSourceName;
     return out;
 }
 
@@ -1155,6 +1170,7 @@ FunctionDeclarationSyntax cloneFunctionDeclarationSyntax(
     out.semicolonToken = value.semicolonToken;
     out.body = cloneBlockStatementSyntax(value.body);
     out.hygienicModules = value.hygienicModules;
+    out.originSourceName = value.originSourceName;
     return out;
 }
 

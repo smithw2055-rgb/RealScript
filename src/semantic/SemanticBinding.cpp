@@ -37,6 +37,8 @@ void collectLambdaCaptureNames(
         }
     };
     switch (expression.kind()) {
+    case syntax::SyntaxKind::TaggedStringExpression:
+        return;
     case syntax::SyntaxKind::NameExpression:
         record(static_cast<const syntax::NameExpressionSyntax&>(
             expression).identifierToken.text);
@@ -135,10 +137,15 @@ void collectLambdaCaptureNames(
             *value.expression, insideLambda, parameterScopes, names);
         return;
     }
-    case syntax::SyntaxKind::NewObjectExpression:
-        visit(static_cast<const syntax::NewObjectExpressionSyntax&>(
-            expression).arguments);
+    case syntax::SyntaxKind::NewObjectExpression: {
+        const auto& obj = static_cast<const
+            syntax::NewObjectExpressionSyntax&>(expression);
+        visit(obj.arguments);
+        for (const auto& init : obj.initializers) {
+            visit(init.expressions);
+        }
         return;
+    }
     case syntax::SyntaxKind::NewArrayExpression: {
         const auto& arr = static_cast<const
             syntax::NewArrayExpressionSyntax&>(expression);
@@ -341,6 +348,7 @@ SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
         input.visibleTypes[canonicalTypeName(input.types[typeIndex])] = input.types[typeIndex];
         ++typeIndex;
     }
+    (void)propagateStackOnlyTypes(input.types, input.visibleTypes);
     bool constProgressed = true;
     while (constProgressed) {
         constProgressed = false;
@@ -619,6 +627,12 @@ SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
     };
     addMembers(syntaxTree.classes);
     addMembers(syntaxTree.structs);
+    (void)propagateStackOnlyTypes(input.types, input.visibleTypes);
+    for (const auto& type : input.types) {
+        if (type.kind == TypeKind::Class || type.kind == TypeKind::Struct) {
+            (void)validateStackOnlyFields(type, input.visibleTypes, diagnostics_);
+        }
+    }
 
     return bindModule(input);
 }
@@ -717,6 +731,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
     checkedArithmetic_ = true;
     result.symbol.sourceName = currentSourceName_;
     currentFunctionIsAsync_ = input.symbol.asyncFunction;
+    currentFunctionIsSequence_ = (input.sequence != nullptr);
     currentReturnType_ = input.symbol.returnType;
     currentReturnTypeName_ = input.symbol.returnTypeName;
     currentReturnModifier_ = input.symbol.returnModifier;
@@ -732,14 +747,22 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
         } else {
             const auto foundAsyncType = visibleTypes_.find(input.symbol.returnTypeName);
             if (foundAsyncType != visibleTypes_.end()) {
+                bool matchedFromResult = false;
                 for (const auto& m : foundAsyncType->second.methods) {
                     if (m.staticMethod && m.name == "FromResult" && m.parameters.size() == 1) {
                         currentReturnType_ = m.parameters[0].type;
                         currentReturnTypeName_ = m.parameters[0].typeName;
                         currentStorageReturnType_ = storageTypeOf(m.parameters[0]);
                         currentStorageReturnTypeName_ = storageTypeNameOf(m.parameters[0]);
+                        matchedFromResult = true;
                         break;
                     }
+                }
+                if (!matchedFromResult && foundAsyncType->second.awaitableProtocol) {
+                    currentReturnType_ = PrimitiveType::Void;
+                    currentReturnTypeName_.clear();
+                    currentStorageReturnType_ = PrimitiveType::Void;
+                    currentStorageReturnTypeName_.clear();
                 }
             }
         }
@@ -4459,6 +4482,17 @@ std::unique_ptr<BoundStatement> Binder::bindForeachStatement(
     result->iterationVariable.name = syntaxTree.identifierToken.text;
     result->iterationVariable.type = bindType(syntaxTree.type, false, &declaredTypeName);
     result->iterationVariable.typeName = declaredTypeName;
+    if ((currentFunctionIsAsync_ || currentFunctionIsSequence_) &&
+        isStackOnlyType(
+            result->iterationVariable.type,
+            result->iterationVariable.typeName,
+            visibleTypes_)) {
+        diagnostics_.report(
+            "RS2696",
+            "async or sequence function cannot declare stack-only local variable '" +
+                result->iterationVariable.name + "'",
+            syntaxTree.identifierToken.span);
+    }
     result->iterationVariable.index = nextVariableIndex_++;
     result->iterationVariable.declarationSpan = syntaxTree.identifierToken.span;
     result->iterationVariable.id = stableTypeId(std::to_string(currentFunctionId_) +
@@ -5268,6 +5302,14 @@ std::unique_ptr<BoundStatement> Binder::bindVariableDeclaration(
         std::string declaredTypeName;
         const auto declaredType = bindType(
             syntaxTree.type, false, &declaredTypeName);
+        if ((currentFunctionIsAsync_ || currentFunctionIsSequence_) &&
+            isStackOnlyType(declaredType, declaredTypeName, visibleTypes_)) {
+            diagnostics_.report(
+                "RS2696",
+                "async or sequence function cannot declare stack-only local variable '" +
+                    syntaxTree.identifierToken.text + "'",
+                syntaxTree.identifierToken.span);
+        }
         if (!syntaxTree.equalsToken ||
             !syntaxTree.initializerRefKeyword ||
             !syntaxTree.initializer) {
@@ -5281,6 +5323,16 @@ std::unique_ptr<BoundStatement> Binder::bindVariableDeclaration(
                 syntax::SyntaxKind::CallExpression ||
             syntaxTree.initializer->kind() ==
                 syntax::SyntaxKind::MemberCallExpression) {
+            if (isStackOnlyType(declaredType, declaredTypeName, visibleTypes_)) {
+                diagnostics_.report(
+                    "RS2697",
+                    "stack-only struct '" +
+                        stackOnlyTypeDisplayName(
+                            declaredType, declaredTypeName, visibleTypes_) +
+                        "' cannot be bound by 'ref' call return",
+                    syntaxTree.identifierToken.span);
+                return result;
+            }
             auto initializer = bindExpression(*syntaxTree.initializer);
             const auto expectedStorage = referenceWrapperTypeName(
                 currentModuleName_, declaredType, declaredTypeName);
@@ -5434,6 +5486,17 @@ std::unique_ptr<BoundStatement> Binder::bindVariableDeclaration(
     result->variable.id = stableTypeId(std::to_string(currentFunctionId_) +
         "::local:" + std::to_string(result->variable.index) + ":" +
         result->variable.name);
+    if ((currentFunctionIsAsync_ || currentFunctionIsSequence_) &&
+        isStackOnlyType(
+            result->variable.type,
+            result->variable.typeName,
+            visibleTypes_)) {
+        diagnostics_.report(
+            "RS2696",
+            "async or sequence function cannot declare stack-only local variable '" +
+                result->variable.name + "'",
+            syntaxTree.identifierToken.span);
+    }
 
     if (result->variable.isConst && !syntaxTree.initializer) {
         diagnostics_.report(
@@ -5508,6 +5571,9 @@ std::unique_ptr<BoundExpression> Binder::bindExpression(
     case syntax::SyntaxKind::LiteralExpression:
         return bindLiteralExpression(
             static_cast<const syntax::LiteralExpressionSyntax&>(syntaxTree));
+    case syntax::SyntaxKind::TaggedStringExpression:
+        return bindTaggedStringExpression(
+            static_cast<const syntax::TaggedStringExpressionSyntax&>(syntaxTree));
     case syntax::SyntaxKind::NameExpression:
         return bindNameExpression(
             static_cast<const syntax::NameExpressionSyntax&>(syntaxTree));
@@ -5632,6 +5698,15 @@ PrimitiveType Binder::bindType(
             diagnostics_.report(
                 "RS2201",
                 "invalid array element type",
+                syntaxTree.span());
+            return PrimitiveType::Error;
+        }
+        if (isStackOnlyType(baseType, baseTypeName, visibleTypes_)) {
+            diagnostics_.report(
+                "RS2695",
+                "stack-only struct '" +
+                    stackOnlyTypeDisplayName(baseType, baseTypeName, visibleTypes_) +
+                    "' cannot be an array element type",
                 syntaxTree.span());
             return PrimitiveType::Error;
         }

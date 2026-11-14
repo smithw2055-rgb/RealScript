@@ -1212,17 +1212,24 @@ bool verifyModule(
                         diagnostics.report("RS3020", "invalid numeric comparison types", instruction.sourceSpan);
                     }
                 } else if (instruction.opcode == Opcode::AsyncEnter) {
+                    const bool validAsyncCarrier =
+                        function.returnType == semantic::PrimitiveType::Struct ||
+                        function.returnType == semantic::PrimitiveType::Object;
                     if (types.find(instruction.typeId) == types.end() ||
-                        function.returnType != semantic::PrimitiveType::Struct ||
+                        !validAsyncCarrier ||
                         function.returnTypeId != instruction.typeId) {
                         diagnostics.report(
                             "RS3075", "invalid MIR async.enter contract", instruction.sourceSpan);
                     }
                 } else if (instruction.opcode == Opcode::AwaitSuspend &&
                            operandCountIsValid) {
+                    const auto opType = valueType(instruction.operands.front());
+                    const bool validAwaitCarrier =
+                        opType == semantic::PrimitiveType::Struct ||
+                        opType == semantic::PrimitiveType::Object;
                     if (instruction.localIndex >= function.localTypes.size() ||
-                        function.localTypes[instruction.localIndex] != semantic::PrimitiveType::Struct ||
-                        valueType(instruction.operands.front()) != semantic::PrimitiveType::Struct ||
+                        !validAwaitCarrier ||
+                        function.localTypes[instruction.localIndex] != opType ||
                         types.find(instruction.typeId) == types.end() ||
                         instruction.integerImmediate < 0 ||
                         blocks.find(static_cast<BlockId>(instruction.integerImmediate)) == blocks.end()) {
@@ -1230,15 +1237,21 @@ bool verifyModule(
                             "RS3076", "invalid MIR await.suspend contract", instruction.sourceSpan);
                     }
                 } else if (instruction.opcode == Opcode::AwaitResume) {
-                    if (instruction.localIndex >= function.localTypes.size() ||
-                        function.localTypes[instruction.localIndex] != semantic::PrimitiveType::Struct ||
+                    const bool validLocalCarrier =
+                        instruction.localIndex < function.localTypes.size() &&
+                        (function.localTypes[instruction.localIndex] == semantic::PrimitiveType::Struct ||
+                         function.localTypes[instruction.localIndex] == semantic::PrimitiveType::Object);
+                    if (!validLocalCarrier ||
                         types.find(instruction.typeId) == types.end()) {
                         diagnostics.report(
                             "RS3077", "invalid MIR await.resume contract", instruction.sourceSpan);
                     }
                 } else if (instruction.opcode == Opcode::AsyncResolve) {
+                    const bool validResolveCarrier =
+                        instruction.resultType == semantic::PrimitiveType::Struct ||
+                        instruction.resultType == semantic::PrimitiveType::Object;
                     if (instruction.operands.size() > 1 ||
-                        instruction.resultType != semantic::PrimitiveType::Struct ||
+                        !validResolveCarrier ||
                         instruction.resultTypeId != instruction.typeId ||
                         types.find(instruction.typeId) == types.end()) {
                         diagnostics.report(

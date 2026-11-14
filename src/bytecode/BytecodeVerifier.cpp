@@ -616,8 +616,22 @@ bool verifyModule(
             const auto key = (static_cast<std::uint64_t>(point.blockId) << 33) |
                 (static_cast<std::uint64_t>(point.instructionIndex) << 1) |
                 (point.terminator ? 1ull : 0ull);
+            bool rangeValid = false;
+            if (point.mappedPath.empty()) {
+                rangeValid = validSourceRange(point.range, sourceFiles);
+            } else {
+                const auto srcIt = sourceFiles.find(point.range.fileId);
+                if (srcIt != sourceFiles.end() &&
+                    (point.range.start.line < point.range.end.line ||
+                     (point.range.start.line == point.range.end.line &&
+                      point.range.start.column <= point.range.end.column))) {
+                    const auto phys = debug::makeSourceRange(*srcIt->second, point.range.span);
+                    rangeValid = phys.start.column == point.range.start.column &&
+                        phys.end.column == point.range.end.column;
+                }
+            }
             if (!validPosition ||
-                !validSourceRange(point.range, sourceFiles) ||
+                !rangeValid ||
                 !sequenceKeys.insert(key).second) {
                 diagnostics.report(
                     "RS5162",
@@ -1673,8 +1687,10 @@ bool verifyModule(
                     break;
                 case Opcode::AsyncEnter:
                     if (instruction.typeIndex >= module.types.size() ||
-                        module.types[instruction.typeIndex].kind != semantic::TypeKind::Struct ||
-                        function.returnType != semantic::PrimitiveType::Struct ||
+                        (module.types[instruction.typeIndex].kind != semantic::TypeKind::Struct &&
+                         module.types[instruction.typeIndex].kind != semantic::TypeKind::Class) ||
+                        (function.returnType != semantic::PrimitiveType::Struct &&
+                         function.returnType != semantic::PrimitiveType::Object) ||
                         function.returnTypeId != module.types[instruction.typeIndex].id) {
                         diagnostics.report("RS5190", "invalid bytecode async.enter", {});
                     }
@@ -1682,8 +1698,9 @@ bool verifyModule(
                 case Opcode::AwaitSuspend:
                     if (instruction.operands.size() != 1 ||
                         instruction.index >= function.localTypes.size() ||
-                        function.localTypes[instruction.index] != semantic::PrimitiveType::Struct ||
-                        registerType(instruction.operands.front()) != semantic::PrimitiveType::Struct ||
+                        (function.localTypes[instruction.index] != semantic::PrimitiveType::Struct &&
+                         function.localTypes[instruction.index] != semantic::PrimitiveType::Object) ||
+                        registerType(instruction.operands.front()) != function.localTypes[instruction.index] ||
                         instruction.typeIndex >= module.types.size() ||
                         instruction.integerImmediate < 0 ||
                         blocks.find(static_cast<BlockId>(instruction.integerImmediate)) == blocks.end()) {
@@ -1692,7 +1709,8 @@ bool verifyModule(
                     break;
                 case Opcode::AwaitResume:
                     if (instruction.index >= function.localTypes.size() ||
-                        function.localTypes[instruction.index] != semantic::PrimitiveType::Struct ||
+                        (function.localTypes[instruction.index] != semantic::PrimitiveType::Struct &&
+                         function.localTypes[instruction.index] != semantic::PrimitiveType::Object) ||
                         instruction.typeIndex >= module.types.size()) {
                         diagnostics.report("RS5192", "invalid bytecode await.resume", {});
                     }
@@ -1700,8 +1718,10 @@ bool verifyModule(
                 case Opcode::AsyncResolve:
                     if (instruction.operands.size() > 1 ||
                         instruction.typeIndex >= module.types.size() ||
-                        module.types[instruction.typeIndex].kind != semantic::TypeKind::Struct ||
-                        resultType != semantic::PrimitiveType::Struct ||
+                        (module.types[instruction.typeIndex].kind != semantic::TypeKind::Struct &&
+                         module.types[instruction.typeIndex].kind != semantic::TypeKind::Class) ||
+                        (resultType != semantic::PrimitiveType::Struct &&
+                         resultType != semantic::PrimitiveType::Object) ||
                         registerTypeId(instruction.result) != module.types[instruction.typeIndex].id) {
                         diagnostics.report("RS5193", "invalid bytecode async.resolve", {});
                     }

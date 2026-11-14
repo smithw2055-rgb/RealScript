@@ -30,6 +30,11 @@ public:
         std::string sourceName = {});
 
     void append(const DiagnosticBag& other);
+    void truncate(std::size_t count) noexcept {
+        if (count < diagnostics_.size()) {
+            diagnostics_.resize(count);
+        }
+    }
     [[nodiscard]] bool hasErrors() const noexcept;
     [[nodiscard]] bool empty() const noexcept { return diagnostics_.empty(); }
     [[nodiscard]] const std::vector<Diagnostic>& items() const noexcept { return diagnostics_; }

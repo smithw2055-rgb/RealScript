@@ -1,11 +1,13 @@
 #include "realscript/compiler/ModuleBuildCache.h"
 
+#include "CompilationInternal.h"
 #include "realscript/Version.h"
 #include "realscript/semantic/Semantic.h"
 #include "realscript/syntax/Syntax.h"
 #include "realscript/text/Text.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -40,7 +42,7 @@ namespace realscript::compiler {
 namespace {
 
 constexpr std::uint32_t kCacheFormatVersion = 3u;
-constexpr std::uint32_t kMirOverlayVersion = 1u;
+constexpr std::uint32_t kMirOverlayVersion = 2u;
 constexpr std::uint32_t kStandaloneMirVersion = 1u;
 constexpr std::uint32_t kOptArtifactVersion = 1u;
 constexpr std::uint32_t kGraphMetaVersion = 1u;
@@ -151,11 +153,20 @@ void mixOptimizationOptions(
     mixU64(h, static_cast<std::uint64_t>(opt.maxInlineInstructions));
 }
 
+constexpr std::array<const char*, 6> kBuiltinModuleNames = {
+    "RealScript.Math",
+    "RealScript.Fiber",
+    "RealScript.Async",
+    "RealScript.Resource",
+    "RealScript.Weak",
+    "RealScript.Memory",
+};
+
 bool isBuiltinModuleName(const std::string& name) noexcept {
-    return name == "RealScript.Math" ||
-        name == "RealScript.Fiber" ||
-        name == "RealScript.Async" ||
-        name == "RealScript.Resource";
+    for (const char* cand : kBuiltinModuleNames) {
+        if (name == cand) return true;
+    }
+    return false;
 }
 
 bool scanInterpolatedStringHoles(
@@ -553,6 +564,26 @@ std::vector<std::uint8_t> encodeMirFunctionsOverlay(const mir::Module& module) {
     w.raw("RSMR", 4);
     w.u32(kMirOverlayVersion);
     w.str(module.name);
+
+    std::vector<const debug::SourceFileInfo*> filesWithDirectives;
+    for (const auto& sf : module.sourceFiles) {
+        if (!sf.lineDirectives.empty()) {
+            filesWithDirectives.push_back(&sf);
+        }
+    }
+    w.u32(static_cast<std::uint32_t>(filesWithDirectives.size()));
+    for (const auto* sf : filesWithDirectives) {
+        w.u32(sf->id);
+        w.u32(static_cast<std::uint32_t>(sf->lineDirectives.size()));
+        for (const auto& ld : sf->lineDirectives) {
+            w.u64(static_cast<std::uint64_t>(ld.physicalStartLine));
+            w.u64(static_cast<std::uint64_t>(ld.mappedStartLine));
+            w.str(ld.mappedPath);
+            w.u8(ld.hidden ? 1u : 0u);
+            w.u8(ld.isDefault ? 1u : 0u);
+        }
+    }
+
     w.u32(static_cast<std::uint32_t>(module.functions.size()));
     for (const auto& fn : module.functions) {
         w.u64(fn.symbolId);
@@ -641,6 +672,8 @@ std::vector<std::uint8_t> encodeMirFunctionsOverlay(const mir::Module& module) {
             w.u32(sp.blockId);
             w.u32(sp.instructionIndex);
             w.u8(sp.terminator ? 1u : 0u);
+            w.u8(sp.hidden ? 1u : 0u);
+            w.str(sp.mappedPath);
             w.range(sp.range);
         }
         w.u32(static_cast<std::uint32_t>(fn.debugInfo.locals.size()));
@@ -672,6 +705,36 @@ bool decodeMirFunctionsOverlay(
     outMir.languageMetadata = bcModule.languageMetadata;
     outMir.sourceFiles = bcModule.sourceFiles;
     outMir.types = bcModule.types;
+
+    const auto sfDirCount = r.u32();
+    if (!r.valid() || sfDirCount > r.remaining() / 30u + 1u) return false;
+    std::unordered_map<debug::SourceFileId, std::vector<text::LineDirectiveSpan>> lineDirectivesByFileId;
+    for (std::uint32_t sfi = 0; sfi < sfDirCount; ++sfi) {
+        const auto sfId = r.u32();
+        const auto ldCount = r.u32();
+        if (!r.valid() || ldCount > r.remaining() / 22u + 1u) return false;
+        std::vector<text::LineDirectiveSpan> dirs;
+        dirs.reserve(ldCount);
+        for (std::uint32_t ldi = 0; ldi < ldCount; ++ldi) {
+            text::LineDirectiveSpan ld;
+            ld.physicalStartLine = static_cast<std::size_t>(r.u64());
+            ld.mappedStartLine = static_cast<std::size_t>(r.u64());
+            ld.mappedPath = r.str();
+            const auto hiddenFlag = r.u8();
+            const auto defaultFlag = r.u8();
+            if (hiddenFlag > 1u || defaultFlag > 1u) return false;
+            ld.hidden = (hiddenFlag != 0u);
+            ld.isDefault = (defaultFlag != 0u);
+            dirs.push_back(std::move(ld));
+        }
+        lineDirectivesByFileId[sfId] = std::move(dirs);
+    }
+    for (auto& sf : outMir.sourceFiles) {
+        if (const auto it = lineDirectivesByFileId.find(sf.id);
+            it != lineDirectivesByFileId.end()) {
+            sf.lineDirectives = std::move(it->second);
+        }
+    }
 
     const auto fnCount = r.u32();
     if (!r.valid() || fnCount > r.remaining() / 24u + 1u) return false;
@@ -823,17 +886,20 @@ bool decodeMirFunctionsOverlay(
         fn.debugInfo.declaration = r.range();
         fn.debugInfo.body = r.range();
         const auto spCount = r.u32();
-        if (!r.valid() || spCount > r.remaining() / 40u + 1u) return false;
+        if (!r.valid() || spCount > r.remaining() / 50u + 1u) return false;
         fn.debugInfo.sequencePoints.reserve(spCount);
         for (std::uint32_t si = 0; si < spCount; ++si) {
             debug::SequencePoint sp;
             sp.blockId = r.u32();
             sp.instructionIndex = r.u32();
             const auto termFlag = r.u8();
-            if (termFlag > 1u) return false;
+            const auto hiddenFlag = r.u8();
+            if (termFlag > 1u || hiddenFlag > 1u) return false;
             sp.terminator = (termFlag != 0u);
+            sp.hidden = (hiddenFlag != 0u);
+            sp.mappedPath = r.str();
             sp.range = r.range();
-            fn.debugInfo.sequencePoints.push_back(sp);
+            fn.debugInfo.sequencePoints.push_back(std::move(sp));
         }
         const auto locCount = r.u32();
         if (!r.valid() || locCount > r.remaining() / 60u + 1u) return false;
@@ -1262,11 +1328,25 @@ void collectReferencedTypeNames(
     }
 }
 
+const text::SourceText& resolveAttrSource(
+    const syntax::AttributeListSyntax& list,
+    const text::SourceText& fallback,
+    const std::unordered_map<std::string, const ParsedSourceUnit*>* unitByPath) {
+    if (unitByPath && !list.originSourceName.empty()) {
+        if (const auto it = unitByPath->find(list.originSourceName); it != unitByPath->end()) {
+            return *it->second->sourceText;
+        }
+    }
+    return fallback;
+}
+
 std::string formatAttributesCanonical(
     const std::vector<syntax::AttributeListSyntax>& lists,
-    const text::SourceText& source) {
+    const text::SourceText& source,
+    const std::unordered_map<std::string, const ParsedSourceUnit*>* unitByPath = nullptr) {
     std::vector<std::string> items;
     for (const auto& list : lists) {
+        const auto& attrSrc = resolveAttrSource(list, source, unitByPath);
         for (const auto& attr : list.attributes) {
             std::ostringstream s;
             s << attr.nameToken.text << '(';
@@ -1275,7 +1355,7 @@ std::string formatAttributesCanonical(
                 if (arg.nameToken) s << arg.nameToken->text << '=';
                 else s << '$' << pos++ << '=';
                 const auto sp = arg.valueSpan();
-                if (!sp.empty()) s << source.view(sp);
+                if (!sp.empty()) s << attrSrc.view(sp);
                 s << ';';
             }
             s << ')';
@@ -1291,10 +1371,12 @@ std::string formatAttributesCanonical(
 std::string renderAttributesForStub(
     const std::vector<syntax::AttributeListSyntax>& lists,
     const text::SourceText& source,
-    std::string_view indent) {
+    std::string_view indent,
+    const std::unordered_map<std::string, const ParsedSourceUnit*>* unitByPath = nullptr) {
     std::ostringstream out;
     for (const auto& list : lists) {
         if (list.attributes.empty()) continue;
+        const auto& attrSrc = resolveAttrSource(list, source, unitByPath);
         out << indent << '[';
         for (std::size_t i = 0; i < list.attributes.size(); ++i) {
             if (i != 0) out << ", ";
@@ -1307,7 +1389,7 @@ std::string renderAttributesForStub(
                     const auto& arg = attr.arguments[j];
                     if (arg.nameToken) out << arg.nameToken->text << " = ";
                     const auto sp = arg.valueSpan();
-                    if (!sp.empty()) out << source.view(sp);
+                    if (!sp.empty()) out << attrSrc.view(sp);
                 }
                 out << ')';
             }
@@ -2138,6 +2220,38 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
         }
         info.implementationFingerprint = implFp;
 
+        std::unordered_map<std::string, const ParsedSourceUnit*> unitByPath;
+        std::vector<detail::PartialUnitEntry> partialUnits;
+        unitByPath.reserve(group.units.size());
+        partialUnits.reserve(group.units.size());
+        for (auto& u : group.units) {
+            unitByPath[u.rawSource.path] = &u;
+            partialUnits.push_back(detail::PartialUnitEntry{u.ast.get(), u.rawSource.path});
+        }
+        const auto unitForOrigin = [&](
+            const std::string& origin,
+            const ParsedSourceUnit& fallback) -> const ParsedSourceUnit& {
+            if (!origin.empty()) {
+                if (const auto it = unitByPath.find(origin); it != unitByPath.end()) {
+                    return *it->second;
+                }
+            }
+            return fallback;
+        };
+
+        std::unordered_map<std::string, detail::MergedPartialTypeOriginInfo> multiPartRecords;
+        {
+            diagnostics::DiagnosticBag partialDiags;
+            bool partialInvalid = false;
+            detail::mergePartialRecordDeclarations(
+                partialUnits, partialDiags, partialInvalid, &multiPartRecords);
+            (void)partialInvalid;
+            for (const auto& d : partialDiags.items()) {
+                result.diagnostics.report(
+                    d.code, d.message, d.span, d.severity, d.sourceName);
+            }
+        }
+
         // 2. Build module-visible type table (imported public types + own type shells)
         semantic::TypeSymbolMap visibleTypes = builtinTypes;
         for (const auto& imp : group.imports) {
@@ -2484,10 +2598,24 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
 
             if (!decl.typeParameters.empty()) {
                 moduleHasPublicGenerics = true;
-                publicSurfaceItems.push_back(
-                    std::string(isStruct ? "generic-struct:" : "generic-class:") +
-                    normalizedSpanTokens(u.tokens, decl.span()));
-                stubBody << u.sourceText->view(decl.span()) << "\n\n";
+                const std::string recKey =
+                    std::string(isStruct ? "struct:" : "class:") +
+                    decl.identifierToken.text + "#" + std::to_string(decl.typeParameters.size());
+                if (const auto mpIt = multiPartRecords.find(recKey);
+                    mpIt != multiPartRecords.end() && !mpIt->second.parts.empty()) {
+                    for (const auto& gp : mpIt->second.parts) {
+                        const auto& gpUnit = unitForOrigin(gp.sourceName, u);
+                        publicSurfaceItems.push_back(
+                            std::string(isStruct ? "generic-struct:" : "generic-class:") +
+                            normalizedSpanTokens(gpUnit.tokens, gp.span));
+                        stubBody << gpUnit.sourceText->view(gp.span) << "\n\n";
+                    }
+                } else {
+                    publicSurfaceItems.push_back(
+                        std::string(isStruct ? "generic-struct:" : "generic-class:") +
+                        normalizedSpanTokens(u.tokens, decl.span()));
+                    stubBody << u.sourceText->view(decl.span()) << "\n\n";
+                }
                 return;
             }
 
@@ -2495,13 +2623,13 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
             std::ostringstream sig;
             sig << (isStruct ? "struct:" : "class:")
                 << accessibilityLabel(acc) << ':'
-                << formatAttributesCanonical(decl.attributes, *u.sourceText) << ':'
+                << formatAttributesCanonical(decl.attributes, *u.sourceText, &unitByPath) << ':'
                 << (ts.abstractType ? "abstract:" : "")
                 << (ts.sealedType ? "sealed:" : "")
                 << (ts.staticType ? "static:" : "")
                 << semantic::canonicalTypeName(ts);
 
-            stubBody << renderAttributesForStub(decl.attributes, *u.sourceText, "");
+            stubBody << renderAttributesForStub(decl.attributes, *u.sourceText, "", &unitByPath);
             stubBody << accessibilityLabel(acc) << ' ';
             if (ts.staticType) stubBody << "static ";
             else {
@@ -2557,7 +2685,8 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
                 sig << ';';
 
                 // Emit field in .d.rscript stub to preserve exact slot layout
-                stubBody << renderAttributesForStub(fSyn.attributes, *u.sourceText, "    ");
+                const auto& fUnit = unitForOrigin(fSyn.originSourceName, u);
+                stubBody << renderAttributesForStub(fSyn.attributes, *fUnit.sourceText, "    ", &unitByPath);
                 stubBody << "    " << accessibilityLabel(fSym.accessibility) << ' ';
                 if (fSym.constField) stubBody << "const ";
                 else {
@@ -2576,12 +2705,13 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
 
             // Events (all events add synthetic $event_*_delegate field to class layout)
             for (const auto& ev : decl.events) {
+                const auto& evUnit = unitForOrigin(ev.originSourceName, u);
                 const auto evAcc = semantic::accessibilityFromModifiers(ev.modifiers);
                 collectReferencedTypeNames(ev.delegateType, neededLayoutPrivateTypes);
                 sig << "event:" << static_cast<int>(evAcc) << ':'
                     << canonicalizeTypeSyntax(ev.delegateType, visibleTypes) << ':'
                     << ev.identifierToken.text << ';';
-                stubBody << renderAttributesForStub(ev.attributes, *u.sourceText, "    ");
+                stubBody << renderAttributesForStub(ev.attributes, *evUnit.sourceText, "    ", &unitByPath);
                 stubBody << "    " << accessibilityLabel(evAcc) << " event "
                          << renderTypeSyntaxForStub(ev.delegateType) << ' '
                          << ev.identifierToken.text << ";\n";
@@ -2628,6 +2758,7 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
                     ctor.modifiers, syntax::SyntaxKind::StaticKeyword);
                 if (isStaticCtor) continue;
                 emittedAnyInstanceCtor = true;
+                const auto& ctorUnit = unitForOrigin(ctor.originSourceName, u);
                 const auto cAcc = semantic::accessibilityFromModifiers(ctor.modifiers);
                 const bool isExportedCtor =
                     cAcc == semantic::Accessibility::Public ||
@@ -2638,15 +2769,15 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
                     for (std::size_t pi = 0; pi < ctor.parameters.size(); ++pi) {
                         if (pi != 0) stubBody << ", ";
                         stubBody << renderParameterForStub(
-                            ctor.parameters[pi], *u.sourceText, &ts, visibleTypes);
+                            ctor.parameters[pi], *ctorUnit.sourceText, &ts, visibleTypes);
                     }
                     stubBody << ")" << baseInitClause << " {}\n";
                     sig << "has-nonpublic-ctor;";
                     continue;
                 }
                 sig << "ctor:" << accessibilityLabel(cAcc) << ':'
-                    << formatAttributesCanonical(ctor.attributes, *u.sourceText) << '(';
-                stubBody << renderAttributesForStub(ctor.attributes, *u.sourceText, "    ");
+                    << formatAttributesCanonical(ctor.attributes, *ctorUnit.sourceText, &unitByPath) << '(';
+                stubBody << renderAttributesForStub(ctor.attributes, *ctorUnit.sourceText, "    ", &unitByPath);
                 stubBody << "    " << accessibilityLabel(cAcc) << ' ' << ts.name << '(';
                 for (std::size_t pi = 0; pi < ctor.parameters.size(); ++pi) {
                     if (pi != 0) {
@@ -2654,9 +2785,9 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
                         stubBody << ", ";
                     }
                     sig << formatParameterSignature(
-                        ctor.parameters[pi], *u.sourceText, &ts, visibleTypes);
+                        ctor.parameters[pi], *ctorUnit.sourceText, &ts, visibleTypes);
                     stubBody << renderParameterForStub(
-                        ctor.parameters[pi], *u.sourceText, &ts, visibleTypes);
+                        ctor.parameters[pi], *ctorUnit.sourceText, &ts, visibleTypes);
                 }
                 sig << ");";
                 stubBody << ")" << baseInitClause << " {}\n";
@@ -2680,10 +2811,11 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
                     (isExposedBase && mIsVtableSlot && mAcc != semantic::Accessibility::Private);
                 if (!isExportedMethod) continue;
 
+                const auto& mUnit = unitForOrigin(m.originSourceName, u);
                 if (!m.typeParameters.empty()) {
                     moduleHasPublicGenerics = true;
-                    sig << "generic-method:" << normalizedSpanTokens(u.tokens, m.span()) << ';';
-                    stubBody << "    " << u.sourceText->view(m.span()) << '\n';
+                    sig << "generic-method:" << normalizedSpanTokens(mUnit.tokens, m.span()) << ';';
+                    stubBody << "    " << mUnit.sourceText->view(m.span()) << '\n';
                     continue;
                 }
 
@@ -2698,7 +2830,7 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
 
                 if (opInfo.isOperator) {
                     sig << "operator:" << accessibilityLabel(mAcc) << ':'
-                        << formatAttributesCanonical(m.attributes, *u.sourceText) << ':'
+                        << formatAttributesCanonical(m.attributes, *mUnit.sourceText, &unitByPath) << ':'
                         << (isStatic ? "static:" : "")
                         << (hasRefRet ? "ref:" : "");
                     if (opInfo.isConversion) {
@@ -2709,7 +2841,7 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
                             << " operator " << opInfo.operatorToken << '(';
                     }
 
-                    stubBody << renderAttributesForStub(m.attributes, *u.sourceText, "    ");
+                    stubBody << renderAttributesForStub(m.attributes, *mUnit.sourceText, "    ", &unitByPath);
                     stubBody << "    " << accessibilityLabel(mAcc) << ' ';
                     if (isStatic) stubBody << "static ";
                     if (opInfo.isConversion) {
@@ -2726,9 +2858,9 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
                             stubBody << ", ";
                         }
                         sig << formatParameterSignature(
-                            m.parameters[pi], *u.sourceText, &ts, visibleTypes);
+                            m.parameters[pi], *mUnit.sourceText, &ts, visibleTypes);
                         stubBody << renderParameterForStub(
-                            m.parameters[pi], *u.sourceText, &ts, visibleTypes);
+                            m.parameters[pi], *mUnit.sourceText, &ts, visibleTypes);
                     }
                     sig << ");";
                     stubBody << ") "
@@ -2738,7 +2870,7 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
                 }
 
                 sig << "method:" << accessibilityLabel(mAcc) << ':'
-                    << formatAttributesCanonical(m.attributes, *u.sourceText) << ':'
+                    << formatAttributesCanonical(m.attributes, *mUnit.sourceText, &unitByPath) << ':'
                     << (isStatic ? "static:" : "")
                     << (isVirtual ? "virtual:" : "")
                     << (isOverride ? "override:" : "")
@@ -2749,7 +2881,7 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
                     << canonicalizeTypeSyntax(m.returnType, visibleTypes) << ' '
                     << m.identifierToken.text << '(';
 
-                stubBody << renderAttributesForStub(m.attributes, *u.sourceText, "    ");
+                stubBody << renderAttributesForStub(m.attributes, *mUnit.sourceText, "    ", &unitByPath);
                 stubBody << "    " << accessibilityLabel(mAcc) << ' ';
                 if (isStatic) stubBody << "static ";
                 if (isVirtual) stubBody << "virtual ";
@@ -2767,9 +2899,9 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
                         stubBody << ", ";
                     }
                     sig << formatParameterSignature(
-                        m.parameters[pi], *u.sourceText, &ts, visibleTypes);
+                        m.parameters[pi], *mUnit.sourceText, &ts, visibleTypes);
                     stubBody << renderParameterForStub(
-                        m.parameters[pi], *u.sourceText, &ts, visibleTypes);
+                        m.parameters[pi], *mUnit.sourceText, &ts, visibleTypes);
                 }
                 sig << ");";
                 if (isAbstract || m.semicolonToken.has_value()) {
@@ -2783,6 +2915,7 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
 
             // Properties
             for (const auto& prop : decl.properties) {
+                const auto& propUnit = unitForOrigin(prop.originSourceName, u);
                 const auto pAcc = semantic::accessibilityFromModifiers(prop.modifiers);
                 const bool getterAuto = prop.getter && prop.getter->semicolonToken.has_value();
                 const bool setterAuto = prop.setter && prop.setter->semicolonToken.has_value();
@@ -2809,7 +2942,7 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
                     }
                     sig << ';';
 
-                    stubBody << renderAttributesForStub(prop.attributes, *u.sourceText, "    ");
+                    stubBody << renderAttributesForStub(prop.attributes, *propUnit.sourceText, "    ", &unitByPath);
                     stubBody << "    " << accessibilityLabel(pAcc) << ' ';
                     if (prop.staticKeyword) stubBody << "static ";
                     stubBody << renderTypeSyntaxForStub(prop.type) << ' '
@@ -2841,14 +2974,14 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
                     stubBody << '\n';
                 } else if (isExportedProp) {
                     sig << "prop:" << accessibilityLabel(pAcc) << ':'
-                        << formatAttributesCanonical(prop.attributes, *u.sourceText) << ':'
+                        << formatAttributesCanonical(prop.attributes, *propUnit.sourceText, &unitByPath) << ':'
                         << (prop.staticKeyword ? "S:" : "I:")
                         << canonicalizeTypeSyntax(prop.type, visibleTypes) << ':'
                         << prop.identifierToken.text
                         << (prop.getter ? ":g" : ":-")
                         << (prop.setter ? ":s" : ":-") << ';';
 
-                    stubBody << renderAttributesForStub(prop.attributes, *u.sourceText, "    ");
+                    stubBody << renderAttributesForStub(prop.attributes, *propUnit.sourceText, "    ", &unitByPath);
                     stubBody << "    " << accessibilityLabel(pAcc) << ' ';
                     if (prop.staticKeyword) stubBody << "static ";
                     stubBody << renderTypeSyntaxForStub(prop.type) << ' '
@@ -2867,8 +3000,9 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
 
             // Sequences (affect class layout via synthetic state/local fields)
             for (const auto& seq : decl.sequences) {
-                sig << "sequence:" << normalizedSpanTokens(u.tokens, seq.span()) << ';';
-                stubBody << "    " << u.sourceText->view(seq.span()) << '\n';
+                const auto& seqUnit = unitForOrigin(seq.originSourceName, u);
+                sig << "sequence:" << normalizedSpanTokens(seqUnit.tokens, seq.span()) << ';';
+                stubBody << "    " << seqUnit.sourceText->view(seq.span()) << '\n';
             }
 
             sig << '}';
@@ -2958,16 +3092,29 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
                 for (const auto& cl : u.ast->classes) {
                     if (semantic::accessibilityFromModifiers(cl.modifiers) !=
                         semantic::Accessibility::Public) {
-                        publicSurfaceItems.push_back(
-                            "generic-dep-internal-class:" + normalizedSpanTokens(u.tokens, cl.span()));
+                        const std::string recKey =
+                            "class:" + cl.identifierToken.text + "#" + std::to_string(cl.typeParameters.size());
+                        if (const auto mpIt = multiPartRecords.find(recKey);
+                            mpIt != multiPartRecords.end() && !mpIt->second.parts.empty()) {
+                            for (const auto& gp : mpIt->second.parts) {
+                                const auto& gpUnit = unitForOrigin(gp.sourceName, u);
+                                publicSurfaceItems.push_back(
+                                    "generic-dep-internal-class:" +
+                                    normalizedSpanTokens(gpUnit.tokens, gp.span));
+                            }
+                        } else {
+                            publicSurfaceItems.push_back(
+                                "generic-dep-internal-class:" + normalizedSpanTokens(u.tokens, cl.span()));
+                        }
                     } else {
                         for (const auto& m : cl.methods) {
                             const auto mAcc = semantic::accessibilityFromModifiers(m.modifiers);
                             if (mAcc != semantic::Accessibility::Public &&
                                 mAcc != semantic::Accessibility::Protected) {
+                                const auto& mUnit = unitForOrigin(m.originSourceName, u);
                                 publicSurfaceItems.push_back(
                                     "generic-dep-priv-method:" + cl.identifierToken.text + ":" +
-                                    normalizedSpanTokens(u.tokens, m.span()));
+                                    normalizedSpanTokens(mUnit.tokens, m.span()));
                             }
                         }
                     }
@@ -2975,15 +3122,28 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
                 for (const auto& st : u.ast->structs) {
                     if (semantic::accessibilityFromModifiers(st.modifiers) !=
                         semantic::Accessibility::Public) {
-                        publicSurfaceItems.push_back(
-                            "generic-dep-internal-struct:" + normalizedSpanTokens(u.tokens, st.span()));
+                        const std::string recKey =
+                            "struct:" + st.identifierToken.text + "#" + std::to_string(st.typeParameters.size());
+                        if (const auto mpIt = multiPartRecords.find(recKey);
+                            mpIt != multiPartRecords.end() && !mpIt->second.parts.empty()) {
+                            for (const auto& gp : mpIt->second.parts) {
+                                const auto& gpUnit = unitForOrigin(gp.sourceName, u);
+                                publicSurfaceItems.push_back(
+                                    "generic-dep-internal-struct:" +
+                                    normalizedSpanTokens(gpUnit.tokens, gp.span));
+                            }
+                        } else {
+                            publicSurfaceItems.push_back(
+                                "generic-dep-internal-struct:" + normalizedSpanTokens(u.tokens, st.span()));
+                        }
                     } else {
                         for (const auto& m : st.methods) {
                             if (semantic::accessibilityFromModifiers(m.modifiers) !=
                                 semantic::Accessibility::Public) {
+                                const auto& mUnit = unitForOrigin(m.originSourceName, u);
                                 publicSurfaceItems.push_back(
                                     "generic-dep-priv-method:" + st.identifierToken.text + ":" +
-                                    normalizedSpanTokens(u.tokens, m.span()));
+                                    normalizedSpanTokens(mUnit.tokens, m.span()));
                             }
                         }
                     }
@@ -3250,15 +3410,9 @@ CachedBuildResult ModuleBuildCache::build(
         }
     };
     const auto canonicalizeNeededBuiltins = [&]() {
-        static constexpr const char* kCanonicalOrder[] = {
-            "RealScript.Math",
-            "RealScript.Fiber",
-            "RealScript.Async",
-            "RealScript.Resource",
-        };
         std::vector<std::string> ordered;
         ordered.reserve(neededBuiltins.size());
-        for (const char* bCand : kCanonicalOrder) {
+        for (const char* bCand : kBuiltinModuleNames) {
             if (std::find(neededBuiltins.begin(), neededBuiltins.end(), bCand) !=
                 neededBuiltins.end()) {
                 ordered.emplace_back(bCand);
@@ -3276,6 +3430,8 @@ CachedBuildResult ModuleBuildCache::build(
         bool wantFiber = false;
         bool wantAsync = false;
         bool wantResource = false;
+        bool wantWeak = false;
+        bool wantMemory = false;
         for (const auto& modName : graph.topologicalOrder) {
             const auto& info = graph.modules.at(modName);
             for (const auto& imp : info.imports) {
@@ -3283,6 +3439,8 @@ CachedBuildResult ModuleBuildCache::build(
                 if (imp == "RealScript.Fiber") wantFiber = true;
                 if (imp == "RealScript.Async") wantAsync = true;
                 if (imp == "RealScript.Resource") wantResource = true;
+                if (imp == "RealScript.Weak") wantWeak = true;
+                if (imp == "RealScript.Memory") wantMemory = true;
             }
             for (const auto& sf : info.sources) {
                 if (!wantAsync && sourceMentionsAsyncPrimitives(sf.content)) {
@@ -3297,6 +3455,8 @@ CachedBuildResult ModuleBuildCache::build(
         if (wantFiber) ensureBuiltinListed("RealScript.Fiber");
         if (wantAsync) ensureBuiltinListed("RealScript.Async");
         if (wantResource) ensureBuiltinListed("RealScript.Resource");
+        if (wantWeak) ensureBuiltinListed("RealScript.Weak");
+        if (wantMemory) ensureBuiltinListed("RealScript.Memory");
     }
 
     // Compute transitive dependency sets over user modules
@@ -3433,12 +3593,7 @@ CachedBuildResult ModuleBuildCache::build(
         meta.rsmirChecksum = checksum64(rsmirBytes);
         meta.unoptSize = unoptBytes.size();
         meta.unoptChecksum = checksum64(unoptBytes);
-        for (const char* bCand : {
-                 "RealScript.Math",
-                 "RealScript.Fiber",
-                 "RealScript.Async",
-                 "RealScript.Resource",
-             }) {
+        for (const char* bCand : kBuiltinModuleNames) {
             if (mirModuleReferencesBuiltin(unoptMirMod, bCand) ||
                 mirModuleReferencesBuiltin(optMirMod, bCand)) {
                 meta.usedBuiltins.emplace_back(bCand);
@@ -3838,7 +3993,7 @@ CachedBuildResult ModuleBuildCache::build(
     // Check if any module's unoptMir transitively references built-in modules not yet listed
     for (const auto& modName : graph.topologicalOrder) {
         const auto& unopt = workMap.at(modName).unoptMir;
-        for (const char* bCand : {"RealScript.Math", "RealScript.Fiber", "RealScript.Async", "RealScript.Resource"}) {
+        for (const char* bCand : kBuiltinModuleNames) {
             if (mirModuleReferencesBuiltin(unopt, bCand)) {
                 ensureBuiltinListed(bCand);
                 loadOrBuildBaseBuiltin(bCand);

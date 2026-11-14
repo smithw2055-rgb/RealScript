@@ -1,6 +1,7 @@
 #include "realscript/text/Text.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace realscript::text {
 
@@ -30,8 +31,55 @@ LinePosition SourceText::linePosition(std::size_t offset) const noexcept {
     return {line, offset - lineStarts_[line]};
 }
 
+MappedLineLocation SourceText::mappedLocation(std::size_t offset) const {
+    const auto phys = linePosition(offset);
+    if (lineDirectives_.empty()) {
+        return {name_, phys, false};
+    }
+    const auto it = std::upper_bound(
+        lineDirectives_.begin(),
+        lineDirectives_.end(),
+        phys.line,
+        [](std::size_t targetLine, const LineDirectiveSpan& entry) {
+            return targetLine < entry.physicalStartLine;
+        });
+    if (it == lineDirectives_.begin()) {
+        return {name_, phys, false};
+    }
+    const auto& active = *(it - 1);
+    if (active.isDefault) {
+        return {name_, phys, false};
+    }
+    if (active.hidden) {
+        return {active.mappedPath.empty() ? name_ : active.mappedPath, phys, true};
+    }
+    const std::size_t delta = phys.line >= active.physicalStartLine
+        ? (phys.line - active.physicalStartLine)
+        : 0u;
+    return {
+        active.mappedPath.empty() ? name_ : active.mappedPath,
+        {active.mappedStartLine + delta, phys.column},
+        false,
+    };
+}
+
+bool SourceText::isHiddenOffset(std::size_t offset) const noexcept {
+    if (lineDirectives_.empty()) return false;
+    const auto phys = linePosition(offset);
+    const auto it = std::upper_bound(
+        lineDirectives_.begin(),
+        lineDirectives_.end(),
+        phys.line,
+        [](std::size_t targetLine, const LineDirectiveSpan& entry) {
+            return targetLine < entry.physicalStartLine;
+        });
+    if (it == lineDirectives_.begin()) return false;
+    return (it - 1)->hidden;
+}
+
 void SourceText::buildLineMap() {
     lineStarts_.clear();
+    lineDirectives_.clear();
     lineStarts_.push_back(0);
 
     for (std::size_t i = 0; i < content_.size(); ++i) {
@@ -42,6 +90,180 @@ void SourceText::buildLineMap() {
             lineStarts_.push_back(i + 1);
         } else if (content_[i] == '\n') {
             lineStarts_.push_back(i + 1);
+        }
+    }
+
+    std::string activePath = name_;
+    bool inBlockComment = false;
+    bool inVerbatimString = false;
+
+    const auto isHorizWs = [](char ch) noexcept {
+        return ch == ' ' || ch == '\t';
+    };
+    const auto isDirectiveTerminator = [](char ch) noexcept {
+        return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
+    };
+
+    for (std::size_t lineIdx = 0; lineIdx < lineStarts_.size(); ++lineIdx) {
+        std::size_t pos = lineStarts_[lineIdx];
+        const std::size_t end = (lineIdx + 1 < lineStarts_.size())
+            ? lineStarts_[lineIdx + 1]
+            : content_.size();
+        if (lineIdx == 0 && pos + 3 <= end &&
+            static_cast<unsigned char>(content_[pos]) == 0xEFu &&
+            static_cast<unsigned char>(content_[pos + 1]) == 0xBBu &&
+            static_cast<unsigned char>(content_[pos + 2]) == 0xBFu) {
+            pos += 3;
+        }
+
+        if (!inBlockComment && !inVerbatimString) {
+            std::size_t dirPos = pos;
+            while (dirPos < end && isHorizWs(content_[dirPos])) {
+                ++dirPos;
+            }
+            if (dirPos < end && content_[dirPos] == '#') {
+                ++dirPos;
+                while (dirPos < end && isHorizWs(content_[dirPos])) {
+                    ++dirPos;
+                }
+                if (end - dirPos >= 4 &&
+                    std::string_view(content_).substr(dirPos, 4) == "line") {
+                    dirPos += 4;
+                    if (dirPos == end || isDirectiveTerminator(content_[dirPos])) {
+                        while (dirPos < end && isHorizWs(content_[dirPos])) {
+                            ++dirPos;
+                        }
+                        const std::size_t nextPhysLine = lineIdx + 1;
+                        if (end - dirPos >= 6 &&
+                            std::string_view(content_).substr(dirPos, 6) == "hidden" &&
+                            (dirPos + 6 == end || isDirectiveTerminator(content_[dirPos + 6]))) {
+                            lineDirectives_.push_back({nextPhysLine, 0, activePath, true, false});
+                            continue;
+                        }
+                        if (end - dirPos >= 7 &&
+                            std::string_view(content_).substr(dirPos, 7) == "default" &&
+                            (dirPos + 7 == end || isDirectiveTerminator(content_[dirPos + 7]))) {
+                            activePath = name_;
+                            lineDirectives_.push_back({nextPhysLine, nextPhysLine, name_, false, true});
+                            continue;
+                        }
+                        if (dirPos < end && content_[dirPos] >= '0' && content_[dirPos] <= '9') {
+                            constexpr std::size_t kMaxLine =
+                                (std::numeric_limits<std::size_t>::max)();
+                            bool overflow = false;
+                            std::size_t mappedOneBased = 0;
+                            while (dirPos < end && content_[dirPos] >= '0' && content_[dirPos] <= '9') {
+                                const auto digit =
+                                    static_cast<std::size_t>(content_[dirPos] - '0');
+                                if (mappedOneBased > (kMaxLine - digit) / 10u) {
+                                    overflow = true;
+                                    break;
+                                }
+                                mappedOneBased = mappedOneBased * 10u + digit;
+                                ++dirPos;
+                            }
+                            if (!overflow &&
+                                (dirPos == end || isDirectiveTerminator(content_[dirPos]))) {
+                                while (dirPos < end && isHorizWs(content_[dirPos])) {
+                                    ++dirPos;
+                                }
+                                if (dirPos < end && content_[dirPos] == '"') {
+                                    ++dirPos;
+                                    std::string parsedPath;
+                                    while (dirPos < end && content_[dirPos] != '"' &&
+                                           content_[dirPos] != '\r' && content_[dirPos] != '\n') {
+                                        parsedPath.push_back(content_[dirPos]);
+                                        ++dirPos;
+                                    }
+                                    if (!parsedPath.empty()) {
+                                        activePath = std::move(parsedPath);
+                                    }
+                                }
+                                const std::size_t zeroBased =
+                                    mappedOneBased > 0 ? (mappedOneBased - 1) : 0u;
+                                lineDirectives_.push_back(
+                                    {nextPhysLine, zeroBased, activePath, false, false});
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+
+        while (pos < end) {
+            if (inBlockComment) {
+                if (pos + 1 < end && content_[pos] == '*' && content_[pos + 1] == '/') {
+                    inBlockComment = false;
+                    pos += 2;
+                } else {
+                    ++pos;
+                }
+                continue;
+            }
+            if (inVerbatimString) {
+                if (content_[pos] == '"') {
+                    if (pos + 1 < end && content_[pos + 1] == '"') {
+                        pos += 2;
+                    } else {
+                        inVerbatimString = false;
+                        ++pos;
+                    }
+                } else {
+                    ++pos;
+                }
+                continue;
+            }
+
+            if (pos + 1 < end && content_[pos] == '/' && content_[pos + 1] == '/') {
+                break;
+            }
+            if (pos + 1 < end && content_[pos] == '/' && content_[pos + 1] == '*') {
+                inBlockComment = true;
+                pos += 2;
+                continue;
+            }
+            if (pos + 1 < end && content_[pos] == '@' && content_[pos + 1] == '"') {
+                inVerbatimString = true;
+                pos += 2;
+                continue;
+            }
+            if (pos + 2 < end &&
+                ((content_[pos] == '$' && content_[pos + 1] == '@' && content_[pos + 2] == '"') ||
+                 (content_[pos] == '@' && content_[pos + 1] == '$' && content_[pos + 2] == '"'))) {
+                inVerbatimString = true;
+                pos += 3;
+                continue;
+            }
+            if (content_[pos] == '"') {
+                ++pos;
+                while (pos < end) {
+                    if (content_[pos] == '\\' && pos + 1 < end) {
+                        pos += 2;
+                    } else if (content_[pos] == '"') {
+                        ++pos;
+                        break;
+                    } else {
+                        ++pos;
+                    }
+                }
+                continue;
+            }
+            if (content_[pos] == '\'') {
+                ++pos;
+                while (pos < end) {
+                    if (content_[pos] == '\\' && pos + 1 < end) {
+                        pos += 2;
+                    } else if (content_[pos] == '\'') {
+                        ++pos;
+                        break;
+                    } else {
+                        ++pos;
+                    }
+                }
+                continue;
+            }
+            ++pos;
         }
     }
 }

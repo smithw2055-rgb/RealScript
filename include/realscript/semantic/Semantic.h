@@ -284,6 +284,10 @@ struct TypeSymbol {
     bool abstractType = false;
     bool sealedType = false;
     bool staticType = false;
+    bool partialType = false;
+    bool stackOnly = false;
+    bool hasValueLifecycle = false;
+    bool awaitableProtocol = false;
     bool deterministic = false;
     SymbolId baseTypeId = 0;
     std::string baseTypeName;
@@ -345,6 +349,25 @@ using FunctionOverloadMap =
     const std::string& moduleName,
     PrimitiveType sourceType,
     const std::string& sourceTypeName = {});
+[[nodiscard]] bool isStackOnlyType(
+    PrimitiveType type,
+    const std::string& typeName,
+    const TypeSymbolMap& visibleTypes) noexcept;
+[[nodiscard]] bool isStackOnlyArrayType(
+    PrimitiveType type,
+    const std::string& typeName,
+    const TypeSymbolMap& visibleTypes) noexcept;
+[[nodiscard]] std::string stackOnlyTypeDisplayName(
+    PrimitiveType type,
+    const std::string& typeName,
+    const TypeSymbolMap& visibleTypes);
+bool propagateStackOnlyTypes(
+    std::vector<TypeSymbol>& types,
+    TypeSymbolMap& visibleTypes);
+[[nodiscard]] bool validateStackOnlyFields(
+    const TypeSymbol& type,
+    const TypeSymbolMap& visibleTypes,
+    diagnostics::DiagnosticBag& diagnostics);
 [[nodiscard]] TypeSymbol declareTypeShell(
     const std::string& moduleName,
     const syntax::ClassDeclarationSyntax& syntax);
@@ -1331,6 +1354,14 @@ private:
         text::TextSpan span);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindTypeOfExpression(
         const syntax::TypeOfExpressionSyntax& syntax);
+    [[nodiscard]] std::unique_ptr<BoundExpression> bindTaggedStringExpression(
+        const syntax::TaggedStringExpressionSyntax& syntax);
+    [[nodiscard]] bool probeOverloadLambdaBody(const FunctionBindingInput& lb);
+    [[nodiscard]] std::unique_ptr<BoundExpression> bindArgumentWithOverloadCandidates(
+        const syntax::ExpressionSyntax& argSyntax,
+        std::size_t argIndex,
+        const std::vector<const FunctionSymbol*>& candidates,
+        const std::string& context);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindSwitchExpression(
         const syntax::SwitchExpressionSyntax& syntax);
     [[nodiscard]] std::unique_ptr<BoundExpression> bindConditionalExpression(
@@ -1428,6 +1459,34 @@ private:
     [[nodiscard]] std::unique_ptr<BoundErrorExpression> makeError(
         text::TextSpan span) const;
 
+    struct SpeculativeState {
+        std::size_t diagCount = 0;
+        std::size_t occurrencesCount = 0;
+        std::size_t nextLambdaOrdinal = 0;
+        std::size_t pendingFunctionBindingsCount = 0;
+        std::size_t pendingTypesCount = 0;
+        std::size_t allVariablesCount = 0;
+        std::size_t nextVariableIndex = 0;
+        std::vector<std::unordered_map<std::string, VariableSymbol>> scopes;
+        std::vector<std::unordered_map<std::string, VariableSymbol>> referenceAliasScopes;
+        std::vector<text::TextSpan> scopeSpans;
+        std::unordered_set<std::string> capturedVariableNames;
+        std::unordered_map<std::string, FieldSymbol> sequenceLocalFields;
+        PrimitiveType currentReturnType = PrimitiveType::Error;
+        std::string currentReturnTypeName;
+        ParameterModifier currentReturnModifier = ParameterModifier::None;
+        PrimitiveType currentStorageReturnType = PrimitiveType::Error;
+        std::string currentStorageReturnTypeName;
+        std::size_t loopDepth = 0;
+        std::size_t breakableDepth = 0;
+        bool bindingFinally = false;
+        std::size_t finallyBreakableDepth = 0;
+        std::size_t finallyLoopDepth = 0;
+    };
+    [[nodiscard]] SpeculativeState snapshotSpeculativeState() const;
+    void restoreSpeculativeState(const SpeculativeState& state);
+    [[nodiscard]] bool hasErrorDiagnosticsSince(std::size_t startIndex) const noexcept;
+
     struct ScopedDiagnosticProxy {
         Binder& owner;
         void report(
@@ -1466,6 +1525,7 @@ private:
     std::optional<VariableSymbol> currentExceptionVariable_;
     bool bindingFinally_ = false;
     bool currentFunctionIsAsync_ = false;
+    bool currentFunctionIsSequence_ = false;
     std::size_t finallyBreakableDepth_ = 0;
     std::size_t finallyLoopDepth_ = 0;
     FunctionOverloadMap visibleFunctions_;

@@ -904,8 +904,41 @@ std::optional<semantic::FieldSymbol> makeSequenceLocalField(
         typeName = semantic::canonicalTypeName(found->second);
     }
     if (declaration.type.isArray()) {
+        if (semantic::isStackOnlyType(type, typeName, visibleTypes)) {
+            diagnostics.report(
+                "RS2695",
+                "stack-only struct '" +
+                    semantic::stackOnlyTypeDisplayName(type, typeName, visibleTypes) +
+                    "' cannot be an array element type",
+                declaration.type.span(),
+                diagnostics::DiagnosticSeverity::Error,
+                sourceName);
+            return std::nullopt;
+        }
         typeName = semantic::arrayTypeName(type, typeName);
         type = semantic::PrimitiveType::Array;
+    }
+    if (semantic::isStackOnlyType(type, typeName, visibleTypes)) {
+        diagnostics.report(
+            "RS2696",
+            "sequence '" + sequence.identifierToken.text +
+                "' cannot declare stack-only local variable '" +
+                declaration.identifierToken.text + "'",
+            declaration.identifierToken.span,
+            diagnostics::DiagnosticSeverity::Error,
+            sourceName);
+        return std::nullopt;
+    }
+    if (semantic::isStackOnlyArrayType(type, typeName, visibleTypes)) {
+        diagnostics.report(
+            "RS2695",
+            "stack-only struct '" +
+                semantic::stackOnlyTypeDisplayName(type, typeName, visibleTypes) +
+                "' cannot be an array element type",
+            declaration.type.span(),
+            diagnostics::DiagnosticSeverity::Error,
+            sourceName);
+        return std::nullopt;
     }
     semantic::FieldSymbol field;
     field.name = "$sequence_local_" + sequence.identifierToken.text + "_" +
@@ -1248,13 +1281,18 @@ void synthesizeDeclarationsSequencesAndMembers(
                     }
                     for (const auto& methodSyntax : typeSyntax.methods) {
                         if (!methodSyntax.typeParameters.empty()) continue;
+                        const auto& methodSrc = methodSyntax.originSourceName.empty()
+                            ? unit->source->name()
+                            : methodSyntax.originSourceName;
                         if (fieldNames.find(methodSyntax.identifierToken.text) !=
                             fieldNames.end()) {
                             result.diagnostics.report(
                                 "RS2464",
                                 "method '" + methodSyntax.identifierToken.text +
                                     "' conflicts with a field of the same name",
-                                methodSyntax.identifierToken.span);
+                                methodSyntax.identifierToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                methodSrc);
                             module.invalid = true;
                         }
                         methodNames.insert(methodSyntax.identifierToken.text);
@@ -1263,7 +1301,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                         binding.symbol = semantic::declareFunctionSymbol(
                             moduleName, methodSyntax, module.visibleTypes,
                             methodDeclBag, &owner);
-                        appendStampedDiagnostics(result.diagnostics, methodDeclBag, unit->source->name());
+                        appendStampedDiagnostics(result.diagnostics, methodDeclBag, methodSrc);
                         if (methodDeclBag.hasErrors()) module.invalid = true;
                         if (owner.staticType && !binding.symbol.staticMethod) {
                             result.diagnostics.report(
@@ -1273,7 +1311,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                     "' in static class '" + owner.name + "'",
                                 methodSyntax.identifierToken.span,
                                 diagnostics::DiagnosticSeverity::Error,
-                                unit->source->name());
+                                methodSrc);
                             module.invalid = true;
                         }
                         const auto plannedVirtualSlot =
@@ -1283,8 +1321,8 @@ void synthesizeDeclarationsSequencesAndMembers(
                             binding.symbol.virtualSlot =
                                 plannedVirtualSlot->second;
                         }
-                        binding.sourceName = unit->source->name();
-                        binding.symbol.sourceName = binding.sourceName;
+                        binding.sourceName = methodSrc;
+                        binding.symbol.sourceName = methodSrc;
                         binding.body = methodSyntax.semicolonToken
                             ? nullptr
                             : &methodSyntax.body;
@@ -1302,7 +1340,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                         const auto inheritedIndex =
                             prepareVirtualMethod(
                                 owner, binding.symbol, methodSyntax,
-                                module, result, unit->source->name());
+                                module, result, methodSrc);
                         if (inheritedIndex) {
                             owner.methods[*inheritedIndex] = binding.symbol;
                         } else {
@@ -1316,6 +1354,9 @@ void synthesizeDeclarationsSequencesAndMembers(
                             sequence.identifierToken.text);
                     }
                     for (const auto& sequenceSyntax : typeSyntax.sequences) {
+                        const auto& seqSrc = sequenceSyntax.originSourceName.empty()
+                            ? unit->source->name()
+                            : sequenceSyntax.originSourceName;
                         if (owner.staticType) {
                             result.diagnostics.report(
                                 "RS2489",
@@ -1324,7 +1365,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                     "' in static class '" + owner.name + "'",
                                 sequenceSyntax.identifierToken.span,
                                 diagnostics::DiagnosticSeverity::Error,
-                                unit->source->name());
+                                seqSrc);
                             module.invalid = true;
                             return;
                         }
@@ -1334,7 +1375,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                 "sequence methods require a class owner",
                                 sequenceSyntax.identifierToken.span,
                                 diagnostics::DiagnosticSeverity::Error,
-                                unit->source->name());
+                                seqSrc);
                             module.invalid = true;
                             return;
                         }
@@ -1348,7 +1389,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                     "' conflicts with another member",
                                 sequenceSyntax.identifierToken.span,
                                 diagnostics::DiagnosticSeverity::Error,
-                                unit->source->name());
+                                seqSrc);
                             module.invalid = true;
                             continue;
                         }
@@ -1356,7 +1397,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                         const auto yields = sequenceYields(
                             sequenceSyntax,
                             result.diagnostics,
-                            unit->source->name());
+                            seqSrc);
                         const auto singleYieldLoop =
                             isSingleYieldLoopSequence(sequenceSyntax);
                         const auto singleYieldBranch =
@@ -1384,7 +1425,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                 "a sequence cannot compose itself on the same owner",
                                 sequenceSyntax.identifierToken.span,
                                 diagnostics::DiagnosticSeverity::Error,
-                                unit->source->name());
+                                seqSrc);
                             module.invalid = true;
                         }
                         // Phase 22 uses one explicit program-counter callback
@@ -1404,12 +1445,42 @@ void synthesizeDeclarationsSequencesAndMembers(
                         std::vector<InterfaceTypeRef> sequenceParameterTypes;
                         sequenceParameterTypes.reserve(
                             sequenceSyntax.parameters.size());
-                        for (const auto& parameter : sequenceSyntax.parameters) {
+                        for (std::size_t pIdx = 0; pIdx < sequenceSyntax.parameters.size(); ++pIdx) {
+                            const auto& parameter = sequenceSyntax.parameters[pIdx];
                             sequenceParameterTypes.push_back(resolveInterfaceType(
                                 parameter.type, module.visibleTypes,
-                                result.diagnostics, unit->source->name(), false));
+                                result.diagnostics, seqSrc, false));
                             if (sequenceParameterTypes.back().type ==
                                 semantic::PrimitiveType::Error) {
+                                module.invalid = true;
+                            } else if (pIdx > 0 && semantic::isStackOnlyType(
+                                    sequenceParameterTypes.back().type,
+                                    sequenceParameterTypes.back().typeName,
+                                    module.visibleTypes)) {
+                                result.diagnostics.report(
+                                    "RS2696",
+                                    "sequence '" + sequenceSyntax.identifierToken.text +
+                                        "' cannot declare stack-only parameter '" +
+                                        parameter.identifierToken.text + "'",
+                                    parameter.identifierToken.span,
+                                    diagnostics::DiagnosticSeverity::Error,
+                                    seqSrc);
+                                module.invalid = true;
+                            } else if (pIdx > 0 && semantic::isStackOnlyArrayType(
+                                    sequenceParameterTypes.back().type,
+                                    sequenceParameterTypes.back().typeName,
+                                    module.visibleTypes)) {
+                                result.diagnostics.report(
+                                    "RS2695",
+                                    "stack-only struct '" +
+                                        semantic::stackOnlyTypeDisplayName(
+                                            sequenceParameterTypes.back().type,
+                                            sequenceParameterTypes.back().typeName,
+                                            module.visibleTypes) +
+                                        "' cannot be an array element type",
+                                    parameter.type.span(),
+                                    diagnostics::DiagnosticSeverity::Error,
+                                    seqSrc);
                                 module.invalid = true;
                             }
                         }
@@ -1420,7 +1491,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                 *sequenceSyntax.resultType,
                                 module.visibleTypes,
                                 result.diagnostics,
-                                unit->source->name(),
+                                seqSrc,
                                 false);
                             if (sequenceResultType.type ==
                                 semantic::PrimitiveType::Error) {
@@ -1433,7 +1504,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                     "not all result-sequence code paths return a value",
                                     sequenceSyntax.body.span(),
                                     diagnostics::DiagnosticSeverity::Error,
-                                    unit->source->name());
+                                    seqSrc);
                                 module.invalid = true;
                             }
                         }
@@ -1444,7 +1515,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                         targetField.type = semantic::PrimitiveType::Long;
                         targetField.index = owner.fields.size();
                         targetField.synthetic = true;
-                        targetField.sourceName = unit->source->name();
+                        targetField.sourceName = seqSrc;
                         targetField.declarationSpan =
                             sequenceSyntax.identifierToken.span;
                         targetField.id = semantic::stableTypeId(
@@ -1459,7 +1530,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                         timerField.type = semantic::PrimitiveType::Long;
                         timerField.index = owner.fields.size();
                         timerField.synthetic = true;
-                        timerField.sourceName = unit->source->name();
+                        timerField.sourceName = seqSrc;
                         timerField.declarationSpan =
                             sequenceSyntax.identifierToken.span;
                         timerField.id = semantic::stableTypeId(
@@ -1474,7 +1545,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                         stateField.type = semantic::PrimitiveType::Int;
                         stateField.index = owner.fields.size();
                         stateField.synthetic = true;
-                        stateField.sourceName = unit->source->name();
+                        stateField.sourceName = seqSrc;
                         stateField.declarationSpan =
                             sequenceSyntax.identifierToken.span;
                         stateField.id = semantic::stableTypeId(
@@ -1489,7 +1560,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                         completedField.type = semantic::PrimitiveType::Bool;
                         completedField.index = owner.fields.size();
                         completedField.synthetic = true;
-                        completedField.sourceName = unit->source->name();
+                        completedField.sourceName = seqSrc;
                         completedField.declarationSpan =
                             sequenceSyntax.identifierToken.span;
                         completedField.id = semantic::stableTypeId(
@@ -1508,7 +1579,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                 sequenceResultType.typeName;
                             resultField.index = owner.fields.size();
                             resultField.synthetic = true;
-                            resultField.sourceName = unit->source->name();
+                            resultField.sourceName = seqSrc;
                             resultField.declarationSpan =
                                 sequenceSyntax.resultType->span();
                             resultField.id = semantic::stableTypeId(
@@ -1537,7 +1608,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                 sequenceParameterTypes[parameterIndex].typeName;
                             field.index = owner.fields.size();
                             field.synthetic = true;
-                            field.sourceName = unit->source->name();
+                            field.sourceName = seqSrc;
                             field.declarationSpan = parameter.identifierToken.span;
                             field.id = semantic::stableTypeId(
                                 semantic::canonicalTypeName(owner) +
@@ -1568,7 +1639,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                     "sequence local names must be unique across suspension scopes",
                                     declaration->identifierToken.span,
                                     diagnostics::DiagnosticSeverity::Error,
-                                    unit->source->name());
+                                    seqSrc);
                                 module.invalid = true;
                                 continue;
                             }
@@ -1580,7 +1651,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                 modules,
                                 sequenceParameterFields,
                                 sequenceLocalFields,
-                                unit->source->name(),
+                                seqSrc,
                                 result.diagnostics);
                             if (!field) {
                                 module.invalid = true;
@@ -1643,7 +1714,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                     syntax::NewArrayExpressionSyntax&>(expression);
                                 auto element = resolveInterfaceType(
                                     creation.elementType, module.visibleTypes,
-                                    result.diagnostics, unit->source->name(), false);
+                                    result.diagnostics, seqSrc, false);
                                 if (element.type == semantic::PrimitiveType::Error) {
                                     return std::nullopt;
                                 }
@@ -1656,7 +1727,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                 return resolveInterfaceType(static_cast<const
                                     syntax::NewObjectExpressionSyntax&>(expression).type,
                                     module.visibleTypes, result.diagnostics,
-                                    unit->source->name(), false);
+                                    seqSrc, false);
                             case syntax::SyntaxKind::MemberAccessExpression: {
                                 const auto& access = static_cast<const
                                     syntax::MemberAccessExpressionSyntax&>(expression);
@@ -1690,7 +1761,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                             field.typeName = type.typeName;
                             field.index = owner.fields.size();
                             field.synthetic = true;
-                            field.sourceName = unit->source->name();
+                            field.sourceName = seqSrc;
                             field.declarationSpan = span;
                             field.id = semantic::stableTypeId(
                                 semantic::canonicalTypeName(owner) +
@@ -1717,7 +1788,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                     "suspending foreach collection must have a statically identifiable array or object type",
                                     loop.collection->span(),
                                     diagnostics::DiagnosticSeverity::Error,
-                                    unit->source->name());
+                                    seqSrc);
                                 module.invalid = true;
                                 continue;
                             }
@@ -1847,9 +1918,46 @@ void synthesizeDeclarationsSequencesAndMembers(
                             }
                             auto iterationType = resolveInterfaceType(
                                 loop.type, module.visibleTypes,
-                                result.diagnostics, unit->source->name(), false);
+                                result.diagnostics, seqSrc, false);
                             if (iterationType.type ==
                                 semantic::PrimitiveType::Error) {
+                                module.invalid = true;
+                                continue;
+                            }
+                            if (semantic::isStackOnlyType(
+                                    iterationType.type,
+                                    iterationType.typeName,
+                                    module.visibleTypes) ||
+                                semantic::isStackOnlyType(
+                                    collectionType->type,
+                                    collectionType->typeName,
+                                    module.visibleTypes)) {
+                                result.diagnostics.report(
+                                    "RS2696",
+                                    "sequence '" + sequenceSyntax.identifierToken.text +
+                                        "' cannot capture stack-only foreach variable '" +
+                                        loop.identifierToken.text + "'",
+                                    loop.identifierToken.span,
+                                    diagnostics::DiagnosticSeverity::Error,
+                                    seqSrc);
+                                module.invalid = true;
+                                continue;
+                            }
+                            if (semantic::isStackOnlyArrayType(
+                                    iterationType.type,
+                                    iterationType.typeName,
+                                    module.visibleTypes)) {
+                                result.diagnostics.report(
+                                    "RS2695",
+                                    "stack-only struct '" +
+                                        semantic::stackOnlyTypeDisplayName(
+                                            iterationType.type,
+                                            iterationType.typeName,
+                                            module.visibleTypes) +
+                                        "' cannot be an array element type",
+                                    loop.type.span(),
+                                    diagnostics::DiagnosticSeverity::Error,
+                                    seqSrc);
                                 module.invalid = true;
                                 continue;
                             }
@@ -1860,7 +1968,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                     "sequence local names must be unique across suspension scopes",
                                     loop.identifierToken.span,
                                     diagnostics::DiagnosticSeverity::Error,
-                                    unit->source->name());
+                                    seqSrc);
                                 module.invalid = true;
                                 continue;
                             }
@@ -1903,7 +2011,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                     sequenceSyntax.identifierToken.text + "_" +
                                     std::to_string(callback + 1),
                                 false,
-                                unit->source->name()));
+                                seqSrc));
                         }
 
                         auto entry = makeSequenceFunction(
@@ -1912,7 +2020,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                             sequenceSyntax,
                             sequenceSyntax.identifierToken.text,
                             true,
-                            unit->source->name(),
+                            seqSrc,
                             sequenceParameterTypes);
                         bool seqDeterministic = module.deterministic || owner.deterministic;
                         for (const auto& list : sequenceSyntax.attributes) {
@@ -1928,7 +2036,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                         }
                         semantic::FunctionBindingInput entryBinding;
                         entryBinding.symbol = entry;
-                        entryBinding.sourceName = unit->source->name();
+                        entryBinding.sourceName = seqSrc;
                         entryBinding.parameterNames.push_back("this");
                         entryBinding.parameterSpans.push_back(
                             typeSyntax.identifierToken.span);
@@ -1965,7 +2073,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                              ++callback) {
                             semantic::FunctionBindingInput binding;
                             binding.symbol = callbacks[callback];
-                            binding.sourceName = unit->source->name();
+                            binding.sourceName = seqSrc;
                             binding.parameterNames.push_back("this");
                             binding.parameterSpans.push_back(
                                 typeSyntax.identifierToken.span);
@@ -2007,7 +2115,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                         "' conflicts with another member",
                                     sequenceSyntax.identifierToken.span,
                                     diagnostics::DiagnosticSeverity::Error,
-                                    unit->source->name());
+                                    seqSrc);
                                 module.invalid = true;
                                 return;
                             }
@@ -2018,7 +2126,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                 sequenceSyntax,
                                 std::move(getterName),
                                 false,
-                                unit->source->name());
+                                seqSrc);
                             getter.returnType = field.type;
                             getter.returnTypeName = field.typeName;
                             getter.synthetic = true;
@@ -2031,8 +2139,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                             }
                             semantic::FunctionBindingInput getterBinding;
                             getterBinding.symbol = getter;
-                            getterBinding.sourceName =
-                                unit->source->name();
+                            getterBinding.sourceName = seqSrc;
                             getterBinding.parameterNames.push_back("this");
                             getterBinding.parameterSpans.push_back(
                                 typeSyntax.identifierToken.span);
@@ -2061,7 +2168,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                 moduleName,
                                 owner,
                                 sequenceSyntax,
-                                unit->source->name());
+                                seqSrc);
                         if (methodNames.find(cancellation.name) !=
                             methodNames.end()) {
                             result.diagnostics.report(
@@ -2070,13 +2177,13 @@ void synthesizeDeclarationsSequencesAndMembers(
                                     cancellation.name + "' conflicts with another member",
                                 sequenceSyntax.identifierToken.span,
                                 diagnostics::DiagnosticSeverity::Error,
-                                unit->source->name());
+                                seqSrc);
                             module.invalid = true;
                         } else {
                             methodNames.insert(cancellation.name);
                             semantic::FunctionBindingInput cancellationBinding;
                             cancellationBinding.symbol = cancellation;
-                            cancellationBinding.sourceName = unit->source->name();
+                            cancellationBinding.sourceName = seqSrc;
                             cancellationBinding.parameterNames.push_back("this");
                             cancellationBinding.parameterSpans.push_back(
                                 typeSyntax.identifierToken.span);
@@ -2106,7 +2213,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                 ? std::string(semantic::primitiveTypeName(
                                       sequenceResultType.type))
                                 : sequenceResultType.typeName;
-                        record.sourceName = unit->source->name();
+                        record.sourceName = seqSrc;
                         record.offset =
                             sequenceSyntax.identifierToken.span.start;
                         for (const auto& callback : callbacks) {
@@ -2115,6 +2222,9 @@ void synthesizeDeclarationsSequencesAndMembers(
                         result.nativeSequences.push_back(std::move(record));
                     }
                     for (const auto& constructorSyntax : typeSyntax.constructors) {
+                        const auto& ctorSrc = constructorSyntax.originSourceName.empty()
+                            ? unit->source->name()
+                            : constructorSyntax.originSourceName;
                         const bool isStaticCtor = semantic::hasModifier(
                             constructorSyntax.modifiers, syntax::SyntaxKind::StaticKeyword);
                         if (owner.staticType && !isStaticCtor) {
@@ -2124,15 +2234,18 @@ void synthesizeDeclarationsSequencesAndMembers(
                                     "' cannot declare instance constructors",
                                 constructorSyntax.identifierToken.span,
                                 diagnostics::DiagnosticSeverity::Error,
-                                unit->source->name());
+                                ctorSrc);
                             module.invalid = true;
                         }
                         semantic::FunctionBindingInput binding;
+                        diagnostics::DiagnosticBag ctorDeclBag;
                         binding.symbol = semantic::declareConstructorSymbol(
                             moduleName, constructorSyntax, owner,
-                            module.visibleTypes, result.diagnostics);
-                        binding.sourceName = unit->source->name();
-                        binding.symbol.sourceName = binding.sourceName;
+                            module.visibleTypes, ctorDeclBag);
+                        appendStampedDiagnostics(result.diagnostics, ctorDeclBag, ctorSrc);
+                        if (ctorDeclBag.hasErrors()) module.invalid = true;
+                        binding.sourceName = ctorSrc;
+                        binding.symbol.sourceName = ctorSrc;
                         binding.body = &constructorSyntax.body;
                         binding.constructorSyntax = &constructorSyntax;
                         if (!binding.symbol.staticMethod) {
@@ -2148,7 +2261,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                         "' cannot declare more than one static constructor",
                                     constructorSyntax.identifierToken.span,
                                     diagnostics::DiagnosticSeverity::Error,
-                                    unit->source->name());
+                                    ctorSrc);
                                 module.invalid = true;
                             }
                             owner.staticConstructor = binding.symbol;
@@ -2156,6 +2269,9 @@ void synthesizeDeclarationsSequencesAndMembers(
                         addBinding(module, std::move(binding), constructorSyntax.identifierToken.span);
                     }
                     for (const auto& propertySyntax : typeSyntax.properties) {
+                        const auto& propSrc = propertySyntax.originSourceName.empty()
+                            ? unit->source->name()
+                            : propertySyntax.originSourceName;
                         if (!propertyNames.insert(
                                 propertySyntax.identifierToken.text).second ||
                             fieldNames.find(propertySyntax.identifierToken.text) !=
@@ -2166,12 +2282,17 @@ void synthesizeDeclarationsSequencesAndMembers(
                                 "RS2464",
                                 "property '" + propertySyntax.identifierToken.text +
                                     "' conflicts with another member",
-                                propertySyntax.identifierToken.span);
+                                propertySyntax.identifierToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                propSrc);
                             module.invalid = true;
                         }
+                        diagnostics::DiagnosticBag propDeclBag;
                         auto property = semantic::declarePropertySymbol(
                             moduleName, propertySyntax, owner,
-                            module.visibleTypes, result.diagnostics);
+                            module.visibleTypes, propDeclBag);
+                        appendStampedDiagnostics(result.diagnostics, propDeclBag, propSrc);
+                        if (propDeclBag.hasErrors()) module.invalid = true;
                         if (owner.staticType && !property.staticProperty) {
                             result.diagnostics.report(
                                 "RS2489",
@@ -2180,12 +2301,12 @@ void synthesizeDeclarationsSequencesAndMembers(
                                     owner.name + "'",
                                 propertySyntax.identifierToken.span,
                                 diagnostics::DiagnosticSeverity::Error,
-                                unit->source->name());
+                                propSrc);
                             module.invalid = true;
                         }
-                        property.sourceName = unit->source->name();
-                        if (property.getter) property.getter->sourceName = unit->source->name();
-                        if (property.setter) property.setter->sourceName = unit->source->name();
+                        property.sourceName = propSrc;
+                        if (property.getter) property.getter->sourceName = propSrc;
+                        if (property.setter) property.setter->sourceName = propSrc;
                         const bool getterAuto = propertySyntax.getter &&
                             propertySyntax.getter->semicolonToken.has_value();
                         const bool setterAuto = propertySyntax.setter &&
@@ -2201,7 +2322,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                 "property accessors cannot mix auto and explicit bodies",
                                 propertySyntax.identifierToken.span,
                                 diagnostics::DiagnosticSeverity::Error,
-                                unit->source->name());
+                                propSrc);
                             module.invalid = true;
                         }
                         if (autoProperty && !property.getter) {
@@ -2210,7 +2331,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                 "auto-implemented properties must declare a get accessor",
                                 propertySyntax.identifierToken.span,
                                 diagnostics::DiagnosticSeverity::Error,
-                                unit->source->name());
+                                propSrc);
                             module.invalid = true;
                         }
                         if (!autoProperty && propertySyntax.initializer) {
@@ -2221,7 +2342,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                     ? propertySyntax.equalsToken->span
                                     : propertySyntax.identifierToken.span,
                                 diagnostics::DiagnosticSeverity::Error,
-                                unit->source->name());
+                                propSrc);
                             module.invalid = true;
                         }
                         if (autoProperty) {
@@ -2237,7 +2358,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                             backing.staticField = property.staticProperty;
                             backing.readonlyField = !property.setter.has_value();
                             backing.initializerSyntax = propertySyntax.initializer.get();
-                            backing.sourceName = unit->source->name();
+                            backing.sourceName = propSrc;
                             backing.declarationSpan = propertySyntax.identifierToken.span;
                             backing.id = semantic::stableTypeId(
                                 semantic::canonicalTypeName(owner) +
@@ -2259,7 +2380,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                         diag.message,
                                         diag.span,
                                         diag.severity,
-                                        unit->source->name());
+                                        propSrc);
                                     if (diag.severity == diagnostics::DiagnosticSeverity::Error) {
                                         module.invalid = true;
                                     }
@@ -2269,7 +2390,8 @@ void synthesizeDeclarationsSequencesAndMembers(
                         if (property.getter) {
                             semantic::FunctionBindingInput binding;
                             binding.symbol = *property.getter;
-                            binding.sourceName = unit->source->name();
+                            binding.sourceName = propSrc;
+                            binding.symbol.sourceName = propSrc;
                             binding.body = propertySyntax.getter->body.get();
                             if (!binding.symbol.staticMethod) {
                                 binding.parameterNames.push_back("this");
@@ -2285,7 +2407,8 @@ void synthesizeDeclarationsSequencesAndMembers(
                         if (property.setter) {
                             semantic::FunctionBindingInput binding;
                             binding.symbol = *property.setter;
-                            binding.sourceName = unit->source->name();
+                            binding.sourceName = propSrc;
+                            binding.symbol.sourceName = propSrc;
                             binding.body = propertySyntax.setter->body.get();
                             if (!binding.symbol.staticMethod) {
                                 binding.parameterNames.push_back("this");
@@ -2423,6 +2546,9 @@ void synthesizeDeclarationsSequencesAndMembers(
                             std::unordered_map<std::string, std::size_t>
                                 eventIndices;
                             for (const auto& eventSyntax : typeSyntax.events) {
+                                const auto& eventSrc = eventSyntax.originSourceName.empty()
+                                    ? unit->source->name()
+                                    : eventSyntax.originSourceName;
                                 if (fieldNames.find(
                                         eventSyntax.identifierToken.text) !=
                                         fieldNames.end() ||
@@ -2442,7 +2568,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                             "' conflicts with another member",
                                         eventSyntax.identifierToken.span,
                                         diagnostics::DiagnosticSeverity::Error,
-                                        unit->source->name());
+                                        eventSrc);
                                     module.invalid = true;
                                     continue;
                                 }
@@ -2458,7 +2584,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                             "'",
                                         eventSyntax.delegateType.span(),
                                         diagnostics::DiagnosticSeverity::Error,
-                                        unit->source->name());
+                                        eventSrc);
                                     module.invalid = true;
                                     continue;
                                 }
@@ -2469,7 +2595,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                         "event delegate must return void",
                                         eventSyntax.delegateType.span(),
                                         diagnostics::DiagnosticSeverity::Error,
-                                        unit->source->name());
+                                        eventSrc);
                                     module.invalid = true;
                                 }
                                 semantic::EventSymbol event;
@@ -2483,7 +2609,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                 event.delegateName = canonicalDelegateName(
                                     delegate->second.moduleName,
                                     delegate->second.name);
-                                event.sourceName = unit->source->name();
+                                event.sourceName = eventSrc;
                                 event.declarationSpan =
                                     eventSyntax.identifierToken.span;
                                 event.id = semantic::stableTypeId(
@@ -2520,7 +2646,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                 storage.typeName = event.delegateName;
                                 storage.index = owner.fields.size();
                                 storage.synthetic = true;
-                                storage.sourceName = unit->source->name();
+                                storage.sourceName = eventSrc;
                                 storage.declarationSpan =
                                     eventSyntax.identifierToken.span;
                                 storage.id = semantic::stableTypeId(

@@ -921,6 +921,38 @@ std::unique_ptr<BoundExpression> Binder::bindTypeBinaryExpression(
     return result;
 }
 
+std::unique_ptr<BoundExpression> Binder::bindTaggedStringExpression(
+    const syntax::TaggedStringExpressionSyntax& syntaxTree) {
+    const std::string handlerName = "__TagLiteral_" + syntaxTree.tagToken.text;
+    syntax::CallExpressionSyntax syntheticCall;
+    syntheticCall.identifierToken = syntaxTree.tagToken;
+    syntheticCall.identifierToken.text = handlerName;
+    syntheticCall.openParenToken = syntax::SyntaxToken{
+        syntax::SyntaxKind::OpenParenToken, syntaxTree.stringToken.span, "(", {}, true};
+    auto argLit = std::make_unique<syntax::LiteralExpressionSyntax>();
+    argLit->literalToken = syntaxTree.stringToken;
+    syntheticCall.arguments.push_back(std::move(argLit));
+    syntheticCall.argumentNames.push_back(std::nullopt);
+    syntheticCall.argumentModifiers.push_back(std::nullopt);
+    syntheticCall.closeParenToken = syntax::SyntaxToken{
+        syntax::SyntaxKind::CloseParenToken, syntaxTree.stringToken.span, ")", {}, true};
+
+    const bool hasGlobal = visibleFunctions_.find(handlerName) != visibleFunctions_.end();
+    const bool hasMember = currentOwnerType_ &&
+        (!findMethods(*currentOwnerType_, handlerName, true).empty() ||
+         (!currentStaticMethod_ && !findMethods(*currentOwnerType_, handlerName, false).empty()));
+    if (!hasGlobal && !hasMember) {
+        diagnostics_.report(
+            "RS2690",
+            "unhandled tagged string literal '" + syntaxTree.tagToken.text +
+                "@\"...\"'; import a module providing '" + handlerName +
+                "(string)' or mount a compiler macro plugin",
+            syntaxTree.span());
+        return makeError(syntaxTree.span());
+    }
+    return bindCallExpression(syntheticCall);
+}
+
 std::unique_ptr<BoundExpression> Binder::bindTypeOfExpression(
     const syntax::TypeOfExpressionSyntax& syntaxTree) {
     std::string typeName;

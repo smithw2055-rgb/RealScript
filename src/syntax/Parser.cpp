@@ -2572,6 +2572,14 @@ std::unique_ptr<ExpressionSyntax> Parser::parsePrimaryExpression() {
         return root ? std::move(root) : makeStringLiteral("", token.span);
     }
     case SyntaxKind::IdentifierToken: {
+        if (peek(1).kind == SyntaxKind::StringLiteralToken &&
+            current().span.end() == peek(1).span.start &&
+            peek(1).text.rfind("@\"", 0) == 0) {
+            auto result = std::make_unique<TaggedStringExpressionSyntax>();
+            result->tagToken = nextToken();
+            result->stringToken = nextToken();
+            return result;
+        }
         const auto qualLen = moduleQualifiedIdentLength(0);
         const std::size_t nextOff = qualLen > 0 ? qualLen : 1;
         if (peek(nextOff).kind == SyntaxKind::OpenParenToken ||

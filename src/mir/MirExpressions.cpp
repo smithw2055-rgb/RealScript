@@ -482,7 +482,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             semantic::BoundAwaitExpression&>(expression);
         const auto operandVal = lowerExpression(*awaitExpr.operand);
         const auto awaitLocalIndex = currentFunction_->localTypes.size();
-        currentFunction_->localTypes.push_back(semantic::PrimitiveType::Struct);
+        currentFunction_->localTypes.push_back(awaitExpr.operand->type);
         currentFunction_->localTypeIds.push_back(awaitExpr.operandTypeId);
 
         const auto resumeBlock = createBlock();
@@ -3517,7 +3517,7 @@ void Lowerer::emitReturn(
     if (currentAsyncFunction_) {
         Instruction resolveInst;
         resolveInst.result = nextValueId_++;
-        resolveInst.resultType = semantic::PrimitiveType::Struct;
+        resolveInst.resultType = currentFunction_->returnType;
         resolveInst.resultTypeId = currentFunction_->returnTypeId;
         resolveInst.opcode = Opcode::AsyncResolve;
         if (value.has_value()) {

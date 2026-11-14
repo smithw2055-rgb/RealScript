@@ -2083,6 +2083,7 @@ public class Resource : IDisposable {
     }
 }
 
+[ValueLifecycle]
 public struct ResourceHandle : IDisposable {
     public long __leaseId;
     public long __resourceId;
@@ -2763,6 +2764,158 @@ bool sourceMentionsResourcePrimitives(std::string_view text) {
         }
     }
     return false;
+}
+
+const std::string& builtinWeakModuleSource() {
+    static const std::string kSource = R"RS(
+module RealScript.Weak;
+
+public struct WeakRef<T> where T : class {
+    private long __slot;
+    private long __generation;
+    private long __heapId;
+
+    public WeakRef(long slot, long generation, long heapId) {
+        __slot = slot;
+        __generation = generation;
+        __heapId = heapId;
+    }
+
+    public static WeakRef<T> Empty() {
+        return new WeakRef<T>(0L, 0L, 0L);
+    }
+
+    public bool HasHandle() {
+        return __generation != 0L;
+    }
+}
+)RS";
+    return kSource;
+}
+
+const std::string& builtinMemoryModuleSource() {
+    static const std::string kSource = R"RS(
+module RealScript.Memory;
+
+[StackOnly]
+public struct Span<T> {
+    private T[] __array;
+    private int __offset;
+    private int __length;
+
+    public Span(T[] array, int offset, int length) {
+        if (array == null) {
+            if (offset != 0 || length != 0) {
+                int[] empty = new int[0];
+                int unused = empty[0];
+            }
+        } else {
+            if (offset < 0 || length < 0 || offset > array.Length || length > array.Length - offset) {
+                int[] empty = new int[0];
+                int unused = empty[0];
+            }
+        }
+        __array = array;
+        __offset = offset;
+        __length = length;
+    }
+
+    public static Span<T> FromArray(T[] array) {
+        if (array == null) {
+            return new Span<T>(null, 0, 0);
+        }
+        return new Span<T>(array, 0, array.Length);
+    }
+
+    public int Length {
+        get { return __length; }
+    }
+
+    public bool IsEmpty {
+        get { return __length <= 0; }
+    }
+
+    public T Get(int index) {
+        if (index < 0 || index >= __length) {
+            int[] empty = new int[0];
+            int unused = empty[0];
+        }
+        return __array[__offset + index];
+    }
+
+    public void Set(int index, T value) {
+        if (index < 0 || index >= __length) {
+            int[] empty = new int[0];
+            int unused = empty[0];
+        }
+        __array[__offset + index] = value;
+    }
+
+    public Span<T> Slice(int start, int length) {
+        if (start < 0 || length < 0 || start > __length || length > __length - start) {
+            int[] empty = new int[0];
+            int unused = empty[0];
+        }
+        return new Span<T>(__array, __offset + start, length);
+    }
+}
+
+[StackOnly]
+public struct ReadOnlySpan<T> {
+    private T[] __array;
+    private int __offset;
+    private int __length;
+
+    public ReadOnlySpan(T[] array, int offset, int length) {
+        if (array == null) {
+            if (offset != 0 || length != 0) {
+                int[] empty = new int[0];
+                int unused = empty[0];
+            }
+        } else {
+            if (offset < 0 || length < 0 || offset > array.Length || length > array.Length - offset) {
+                int[] empty = new int[0];
+                int unused = empty[0];
+            }
+        }
+        __array = array;
+        __offset = offset;
+        __length = length;
+    }
+
+    public static ReadOnlySpan<T> FromArray(T[] array) {
+        if (array == null) {
+            return new ReadOnlySpan<T>(null, 0, 0);
+        }
+        return new ReadOnlySpan<T>(array, 0, array.Length);
+    }
+
+    public int Length {
+        get { return __length; }
+    }
+
+    public bool IsEmpty {
+        get { return __length <= 0; }
+    }
+
+    public T Get(int index) {
+        if (index < 0 || index >= __length) {
+            int[] empty = new int[0];
+            int unused = empty[0];
+        }
+        return __array[__offset + index];
+    }
+
+    public ReadOnlySpan<T> Slice(int start, int length) {
+        if (start < 0 || length < 0 || start > __length || length > __length - start) {
+            int[] empty = new int[0];
+            int unused = empty[0];
+        }
+        return new ReadOnlySpan<T>(__array, __offset + start, length);
+    }
+}
+)RS";
+    return kSource;
 }
 
 } // namespace realscript::compiler::detail
