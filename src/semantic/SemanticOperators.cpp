@@ -172,7 +172,8 @@ std::unique_ptr<BoundExpression> Binder::bindUnaryExpression(
         if (operand->type == PrimitiveType::Error) {
             return makeError(syntaxTree.span());
         }
-        if (operand->type == PrimitiveType::Struct && !operand->typeName.empty()) {
+        if ((operand->type == PrimitiveType::Struct || operand->type == PrimitiveType::Object) &&
+            !operand->typeName.empty()) {
             const auto foundType = visibleTypes_.find(operand->typeName);
             if (operand->typeName == "RealScript.Async::Awaitable" ||
                 operand->typeName == "Awaitable" ||
@@ -206,6 +207,70 @@ std::unique_ptr<BoundExpression> Binder::bindUnaryExpression(
                         res->operand = std::move(operand);
                         return res;
                     }
+                }
+            }
+            // Duck-typed Awaiter protocol: any struct/class exposing GetAwaiter() or
+            // direct IsCompleted (bool property/method) + GetResult() method (or [Awaitable]).
+            if (foundType != visibleTypes_.end()) {
+                const TypeSymbol* awaiterType = &foundType->second;
+                for (const auto& m : foundType->second.methods) {
+                    if (!m.staticMethod && m.name == "GetAwaiter" &&
+                        visibleParameterOffset(m) == m.parameters.size() &&
+                        !m.returnTypeName.empty()) {
+                        const auto awIt = visibleTypes_.find(m.returnTypeName);
+                        if (awIt != visibleTypes_.end()) {
+                            operand = bindSelectedCall(
+                                m,
+                                {},
+                                {},
+                                {},
+                                {},
+                                std::move(operand),
+                                syntaxTree.operand->span(),
+                                "GetAwaiter");
+                            awaiterType = &awIt->second;
+                        }
+                        break;
+                    }
+                }
+                bool hasIsCompleted = awaiterType->awaitableProtocol;
+                for (const auto& p : awaiterType->properties) {
+                    if (!p.staticProperty && p.name == "IsCompleted" && p.type == PrimitiveType::Bool) {
+                        hasIsCompleted = true;
+                        break;
+                    }
+                }
+                if (!hasIsCompleted) {
+                    for (const auto& m : awaiterType->methods) {
+                        if (!m.staticMethod && m.name == "IsCompleted" &&
+                            visibleParameterOffset(m) == m.parameters.size() &&
+                            m.returnType == PrimitiveType::Bool) {
+                            hasIsCompleted = true;
+                            break;
+                        }
+                    }
+                }
+                const FunctionSymbol* getResultMethod = nullptr;
+                for (const auto& m : awaiterType->methods) {
+                    if (!m.staticMethod && m.name == "GetResult" &&
+                        visibleParameterOffset(m) == m.parameters.size()) {
+                        getResultMethod = &m;
+                        break;
+                    }
+                }
+                if (hasIsCompleted && getResultMethod) {
+                    auto res = std::make_unique<BoundAwaitExpression>();
+                    res->span = syntaxTree.span();
+                    res->type = getResultMethod->returnType;
+                    res->typeName = getResultMethod->returnTypeName;
+                    res->operandTypeId = awaiterType->id;
+                    res->resultTypeId =
+                        (isExactType(res->type) || res->type == PrimitiveType::Handle) &&
+                        !res->typeName.empty()
+                            ? stableTypeId(res->typeName)
+                            : 0;
+                    res->operand = std::move(operand);
+                    return res;
                 }
             }
         }
@@ -817,6 +882,17 @@ std::unique_ptr<BoundExpression> Binder::bindCastExpression(
             "cannot explicitly convert '" +
                 std::string(primitiveTypeName(expression->type)) +
                 "' to '" + primitiveTypeName(target) + "'",
+            syntaxTree.span());
+        return makeError(syntaxTree.span());
+    }
+    if (target == PrimitiveType::Object &&
+        isStackOnlyType(expression->type, expression->typeName, visibleTypes_)) {
+        diagnostics_.report(
+            "RS2694",
+            "stack-only struct '" +
+                stackOnlyTypeDisplayName(expression->type, expression->typeName, visibleTypes_) +
+                "' cannot be boxed to reference type '" +
+                (targetTypeName.empty() ? std::string("object") : targetTypeName) + "'",
             syntaxTree.span());
         return makeError(syntaxTree.span());
     }

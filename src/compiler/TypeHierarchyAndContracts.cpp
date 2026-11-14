@@ -810,6 +810,7 @@ debug::SourceFileInfo makeSourceFileInfo(
             info.lineStarts.push_back(static_cast<std::uint32_t>(index + 1));
         }
     }
+    info.lineDirectives = source.lineDirectives();
     return info;
 }
 
@@ -1215,7 +1216,11 @@ void discoverTypesContractsAndLayouts(
                 } else {
                     appendStampedDiagnostics(result.diagnostics, localBag, unit->source->name());
                     type->sourceName = unit->source->name();
-                    for (auto& field : type->fields) field.sourceName = unit->source->name();
+                    for (auto& field : type->fields) {
+                        if (field.sourceName.empty()) {
+                            field.sourceName = unit->source->name();
+                        }
+                    }
                 }
             }
             for (const auto& node : unit->syntaxTree->structs) {
@@ -1229,7 +1234,11 @@ void discoverTypesContractsAndLayouts(
                 } else {
                     appendStampedDiagnostics(result.diagnostics, localBag, unit->source->name());
                     type->sourceName = unit->source->name();
-                    for (auto& field : type->fields) field.sourceName = unit->source->name();
+                    for (auto& field : type->fields) {
+                        if (field.sourceName.empty()) {
+                            field.sourceName = unit->source->name();
+                        }
+                    }
                 }
             }
         }
@@ -1279,6 +1288,167 @@ void discoverTypesContractsAndLayouts(
                 }
             }
             refreshVisibleTypes(modules, module);
+        }
+    }
+
+    // Propagate [StackOnly] transitively across structs before method/sequence synthesis.
+    {
+        bool stackOnlyChanged = true;
+        while (stackOnlyChanged) {
+            stackOnlyChanged = false;
+            for (auto& [moduleName, module] : modules) {
+                (void)moduleName;
+                if (module.frontendCached) continue;
+                if (semantic::propagateStackOnlyTypes(module.types, module.visibleTypes)) {
+                    stackOnlyChanged = true;
+                }
+            }
+            if (stackOnlyChanged) {
+                for (auto& [moduleName, module] : modules) {
+                    (void)moduleName;
+                    if (module.frontendCached) continue;
+                    refreshVisibleTypes(modules, module);
+                }
+            }
+        }
+        for (auto& [moduleName, module] : modules) {
+            (void)moduleName;
+            if (module.frontendCached) continue;
+            for (const auto& input : module.delegateInputs) {
+                if (!input.syntax) continue;
+                const auto delIt = module.delegates.find(input.syntax->identifierToken.text);
+                if (delIt == module.delegates.end()) continue;
+                const auto& contract = delIt->second;
+                if (semantic::isStackOnlyArrayType(
+                        contract.returnType.type,
+                        contract.returnType.typeName,
+                        module.visibleTypes)) {
+                    result.diagnostics.report(
+                        "RS2695",
+                        "stack-only struct '" +
+                            semantic::stackOnlyTypeDisplayName(
+                                contract.returnType.type,
+                                contract.returnType.typeName,
+                                module.visibleTypes) +
+                            "' cannot be an array element type",
+                        input.syntax->returnType.span(),
+                        diagnostics::DiagnosticSeverity::Error,
+                        input.sourceName);
+                    module.invalid = true;
+                }
+                for (std::size_t idx = 0;
+                     idx < contract.parameters.size() &&
+                     idx < input.syntax->parameters.size();
+                     ++idx) {
+                    const auto& pt = contract.parameters[idx];
+                    const auto pm = idx < contract.parameterModifiers.size()
+                        ? contract.parameterModifiers[idx]
+                        : semantic::ParameterModifier::None;
+                    const auto& paramSyn = input.syntax->parameters[idx];
+                    if (semantic::isStackOnlyArrayType(
+                            pt.type, pt.typeName, module.visibleTypes)) {
+                        result.diagnostics.report(
+                            "RS2695",
+                            "stack-only struct '" +
+                                semantic::stackOnlyTypeDisplayName(
+                                    pt.type, pt.typeName, module.visibleTypes) +
+                                "' cannot be an array element type",
+                            paramSyn.type.span(),
+                            diagnostics::DiagnosticSeverity::Error,
+                            input.sourceName);
+                        module.invalid = true;
+                    }
+                    if ((pm == semantic::ParameterModifier::Ref ||
+                         pm == semantic::ParameterModifier::Out) &&
+                        semantic::isStackOnlyType(
+                            pt.type, pt.typeName, module.visibleTypes)) {
+                        result.diagnostics.report(
+                            "RS2697",
+                            "stack-only struct '" +
+                                semantic::stackOnlyTypeDisplayName(
+                                    pt.type, pt.typeName, module.visibleTypes) +
+                                "' cannot be passed by 'ref' or 'out'",
+                            paramSyn.identifierToken.span,
+                            diagnostics::DiagnosticSeverity::Error,
+                            input.sourceName);
+                        module.invalid = true;
+                    }
+                }
+            }
+            for (const auto& input : module.interfaceInputs) {
+                if (!input.syntax) continue;
+                const auto* owner = findOwnType(module, input.syntax->identifierToken.text);
+                if (!owner || !owner->interfaceType) continue;
+                const auto alreadyReported = [&](const char* code, text::TextSpan span) {
+                    for (const auto& diag : result.diagnostics.items()) {
+                        if (diag.code == code && diag.span.start == span.start &&
+                            diag.span.length == span.length &&
+                            diag.sourceName == input.sourceName) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                for (std::size_t mIdx = 0;
+                     mIdx < input.syntax->methods.size() &&
+                     mIdx < owner->methods.size();
+                     ++mIdx) {
+                    const auto& mSyn = input.syntax->methods[mIdx];
+                    const auto& mSym = owner->methods[mIdx];
+                    if (semantic::isStackOnlyArrayType(
+                            mSym.returnType, mSym.returnTypeName, module.visibleTypes) &&
+                        !alreadyReported("RS2695", mSyn.returnType.span())) {
+                        result.diagnostics.report(
+                            "RS2695",
+                            "stack-only struct '" +
+                                semantic::stackOnlyTypeDisplayName(
+                                    mSym.returnType, mSym.returnTypeName, module.visibleTypes) +
+                                "' cannot be an array element type",
+                            mSyn.returnType.span(),
+                            diagnostics::DiagnosticSeverity::Error,
+                            input.sourceName);
+                        module.invalid = true;
+                    }
+                    const std::size_t offset = mSym.method && !mSym.staticMethod ? 1u : 0u;
+                    for (std::size_t pIdx = 0;
+                         pIdx < mSyn.parameters.size() &&
+                         (pIdx + offset) < mSym.parameters.size();
+                         ++pIdx) {
+                        const auto& paramSym = mSym.parameters[pIdx + offset];
+                        const auto& paramSyn = mSyn.parameters[pIdx];
+                        if (semantic::isStackOnlyArrayType(
+                                paramSym.type, paramSym.typeName, module.visibleTypes) &&
+                            !alreadyReported("RS2695", paramSyn.type.span())) {
+                            result.diagnostics.report(
+                                "RS2695",
+                                "stack-only struct '" +
+                                    semantic::stackOnlyTypeDisplayName(
+                                        paramSym.type, paramSym.typeName, module.visibleTypes) +
+                                    "' cannot be an array element type",
+                                paramSyn.type.span(),
+                                diagnostics::DiagnosticSeverity::Error,
+                                input.sourceName);
+                            module.invalid = true;
+                        }
+                        if ((paramSym.modifier == semantic::ParameterModifier::Ref ||
+                             paramSym.modifier == semantic::ParameterModifier::Out) &&
+                            semantic::isStackOnlyType(
+                                paramSym.type, paramSym.typeName, module.visibleTypes) &&
+                            !alreadyReported("RS2697", paramSyn.identifierToken.span)) {
+                            result.diagnostics.report(
+                                "RS2697",
+                                "stack-only struct '" +
+                                    semantic::stackOnlyTypeDisplayName(
+                                        paramSym.type, paramSym.typeName, module.visibleTypes) +
+                                    "' cannot be passed by 'ref' or 'out'",
+                                paramSyn.identifierToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                input.sourceName);
+                            module.invalid = true;
+                        }
+                    }
+                }
+            }
         }
     }
 }

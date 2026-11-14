@@ -95,6 +95,7 @@ enum class SyntaxKind {
     VirtualKeyword,
     OverrideKeyword,
     SealedKeyword,
+    PartialKeyword,
     BaseKeyword,
     GetKeyword,
     SetKeyword,
@@ -171,6 +172,7 @@ enum class SyntaxKind {
     VariableDeclarationStatement,
     ExpressionStatement,
     LiteralExpression,
+    TaggedStringExpression,
     NameExpression,
     LambdaExpression,
     UnaryExpression,
@@ -234,6 +236,7 @@ private:
     [[nodiscard]] SyntaxToken lexNumber();
     [[nodiscard]] SyntaxToken lexIdentifierOrKeyword();
     [[nodiscard]] SyntaxToken lexString();
+    [[nodiscard]] SyntaxToken lexVerbatimString();
     [[nodiscard]] SyntaxToken lexCharacter();
     [[nodiscard]] SyntaxToken lexInterpolatedString();
     [[nodiscard]] char current() const noexcept;
@@ -284,6 +287,7 @@ struct AttributeListSyntax final : SyntaxNode {
     std::vector<AttributeSyntax> attributes;
     std::vector<SyntaxToken> commaTokens;
     SyntaxToken closeBracketToken;
+    std::string originSourceName;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override {
         return SyntaxKind::AttributeList;
@@ -405,6 +409,16 @@ struct LiteralExpressionSyntax final : ExpressionSyntax {
 
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::LiteralExpression; }
     [[nodiscard]] text::TextSpan span() const noexcept override { return literalToken.span; }
+};
+
+struct TaggedStringExpressionSyntax final : ExpressionSyntax {
+    SyntaxToken tagToken;
+    SyntaxToken stringToken;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override {
+        return SyntaxKind::TaggedStringExpression;
+    }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
 };
 
 struct NameExpressionSyntax final : ExpressionSyntax {
@@ -964,6 +978,7 @@ struct FieldDeclarationSyntax final : SyntaxNode {
     std::optional<SyntaxToken> equalsToken;
     std::unique_ptr<ExpressionSyntax> initializer;
     SyntaxToken semicolonToken;
+    std::string originSourceName;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::FieldDeclaration; }
     [[nodiscard]] text::TextSpan span() const noexcept override;
@@ -979,6 +994,7 @@ struct EventDeclarationSyntax final : SyntaxNode {
     TypeSyntax delegateType;
     SyntaxToken identifierToken;
     SyntaxToken semicolonToken;
+    std::string originSourceName;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override {
         return SyntaxKind::EventDeclaration;
@@ -1001,6 +1017,7 @@ struct ConstructorDeclarationSyntax final : SyntaxNode {
     std::vector<SyntaxToken> baseArgumentCommaTokens;
     std::optional<SyntaxToken> initializerCloseParenToken;
     BlockStatementSyntax body;
+    std::string originSourceName;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::ConstructorDeclaration; }
     [[nodiscard]] text::TextSpan span() const noexcept override;
@@ -1028,6 +1045,7 @@ struct PropertyDeclarationSyntax final : SyntaxNode {
     std::optional<SyntaxToken> equalsToken;
     std::unique_ptr<ExpressionSyntax> initializer;
     std::optional<SyntaxToken> semicolonToken;
+    std::string originSourceName;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::PropertyDeclaration; }
     [[nodiscard]] text::TextSpan span() const noexcept override;
@@ -1184,6 +1202,7 @@ struct FunctionDeclarationSyntax final : SyntaxNode {
     std::optional<SyntaxToken> semicolonToken;
     BlockStatementSyntax body;
     std::vector<std::string> hygienicModules;
+    std::string originSourceName;
 
     [[nodiscard]] bool hasBody() const noexcept { return !semicolonToken.has_value(); }
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::FunctionDeclaration; }
@@ -1226,6 +1245,7 @@ struct SequenceDeclarationSyntax final : SyntaxNode {
     std::vector<SyntaxToken> commaTokens;
     SyntaxToken closeParenToken;
     BlockStatementSyntax body;
+    std::string originSourceName;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override {
         return SyntaxKind::SequenceDeclaration;

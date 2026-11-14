@@ -478,7 +478,9 @@ bool tryApplyEvaluatedConstantToField(
             "RS2408",
             "cannot convert constant field initializer for '" + field.name + "' to '" +
                 displayType(field.type, field.typeName) + "'",
-            field.initializerSyntax ? field.initializerSyntax->span() : field.declarationSpan);
+            field.initializerSyntax ? field.initializerSyntax->span() : field.declarationSpan,
+            diagnostics::DiagnosticSeverity::Error,
+            field.sourceName);
     }
     return false;
 }
@@ -499,7 +501,9 @@ bool populateFields(
                 "RS2401",
                 "field '" + fieldSyntax.identifierToken.text +
                     "' is already declared in type '" + type.name + "'",
-                fieldSyntax.identifierToken.span);
+                fieldSyntax.identifierToken.span,
+                diagnostics::DiagnosticSeverity::Error,
+                fieldSyntax.originSourceName);
             valid = false;
         }
         const auto resolved = resolveType(fieldSyntax.type, visibleTypes, false);
@@ -507,7 +511,9 @@ bool populateFields(
             diagnostics.report(
                 "RS2402",
                 "unknown field type '" + fieldSyntax.type.name.text + "'",
-                fieldSyntax.type.span());
+                fieldSyntax.type.span(),
+                diagnostics::DiagnosticSeverity::Error,
+                fieldSyntax.originSourceName);
             valid = false;
         }
         FieldSymbol field;
@@ -530,7 +536,9 @@ bool populateFields(
             diagnostics.report(
                 "RS2483",
                 "field '" + field.name + "' cannot be both const and readonly",
-                fieldSyntax.identifierToken.span);
+                fieldSyntax.identifierToken.span,
+                diagnostics::DiagnosticSeverity::Error,
+                fieldSyntax.originSourceName);
             valid = false;
         }
         if (field.constField) {
@@ -541,7 +549,9 @@ bool populateFields(
                 "RS2489",
                 "cannot declare instance field '" + field.name +
                     "' in static class '" + type.name + "'",
-                fieldSyntax.identifierToken.span);
+                fieldSyntax.identifierToken.span,
+                diagnostics::DiagnosticSeverity::Error,
+                fieldSyntax.originSourceName);
             valid = false;
         }
         field.initializerSyntax = fieldSyntax.initializer.get();
@@ -549,10 +559,13 @@ bool populateFields(
             diagnostics.report(
                 "RS2407",
                 "const field '" + field.name + "' requires an initializer",
-                fieldSyntax.identifierToken.span);
+                fieldSyntax.identifierToken.span,
+                diagnostics::DiagnosticSeverity::Error,
+                fieldSyntax.originSourceName);
             valid = false;
         }
         field.declarationSpan = fieldSyntax.identifierToken.span;
+        field.sourceName = fieldSyntax.originSourceName;
         field.id = fnv1a(canonicalTypeName(type) + "::field:" + field.name);
         type.fields.push_back(std::move(field));
     }
@@ -626,6 +639,13 @@ void appendSyntaxParameters(
                 "RS2201",
                 "invalid parameter type '" +
                     parameterSyntax.type.name.text + "'",
+                parameterSyntax.type.span());
+        } else if (isStackOnlyArrayType(parameterType.type, parameterType.name, visibleTypes)) {
+            diagnostics.report(
+                "RS2695",
+                "stack-only struct '" +
+                    stackOnlyTypeDisplayName(parameterType.type, parameterType.name, visibleTypes) +
+                    "' cannot be an array element type",
                 parameterSyntax.type.span());
         }
         VariableSymbol parameter;
@@ -773,6 +793,15 @@ void appendSyntaxParameters(
         }
         if (parameter.modifier == ParameterModifier::Ref ||
             parameter.modifier == ParameterModifier::Out) {
+            if (isStackOnlyType(parameter.type, parameter.typeName, visibleTypes)) {
+                diagnostics.report(
+                    "RS2697",
+                    "stack-only struct '" +
+                        stackOnlyTypeDisplayName(
+                            parameter.type, parameter.typeName, visibleTypes) +
+                        "' cannot be passed by 'ref' or 'out'",
+                    parameterSyntax.identifierToken.span);
+            }
             parameter.storageType = PrimitiveType::Object;
             parameter.storageTypeName = referenceWrapperTypeName(
                 result.moduleName,
@@ -861,224 +890,154 @@ bool isAssignable(
     return false;
 }
 
-const char* primitiveTypeName(PrimitiveType type) noexcept {
-    switch (type) {
-    case PrimitiveType::Error: return "<error>";
-    case PrimitiveType::Void: return "void";
-    case PrimitiveType::Bool: return "bool";
-    case PrimitiveType::Byte: return "byte";
-    case PrimitiveType::SByte: return "sbyte";
-    case PrimitiveType::Short: return "short";
-    case PrimitiveType::UShort: return "ushort";
-    case PrimitiveType::Int: return "int";
-    case PrimitiveType::UInt: return "uint";
-    case PrimitiveType::Long: return "long";
-    case PrimitiveType::ULong: return "ulong";
-    case PrimitiveType::Float: return "float";
-    case PrimitiveType::Double: return "double";
-    case PrimitiveType::Char: return "char";
-    case PrimitiveType::String: return "string";
-    case PrimitiveType::Object: return "object";
-    case PrimitiveType::Struct: return "struct";
-    case PrimitiveType::Enum: return "enum";
-    case PrimitiveType::Array: return "array";
-    case PrimitiveType::Handle: return "handle";
-    case PrimitiveType::Null: return "null";
+namespace {
+
+bool isStackOnlyTypeImpl(
+    PrimitiveType type,
+    const std::string& typeName,
+    const TypeSymbolMap& visibleTypes,
+    std::unordered_set<SymbolId>& visited) {
+    if (type != PrimitiveType::Struct || typeName.empty()) {
+        return false;
     }
-    return "<unknown>";
-}
-
-PrimitiveType resolvePrimitiveType(const std::string& name) noexcept {
-    if (name == "void") return PrimitiveType::Void;
-    if (name == "bool") return PrimitiveType::Bool;
-    if (name == "byte") return PrimitiveType::Byte;
-    if (name == "sbyte") return PrimitiveType::SByte;
-    if (name == "short") return PrimitiveType::Short;
-    if (name == "ushort") return PrimitiveType::UShort;
-    if (name == "int") return PrimitiveType::Int;
-    if (name == "uint") return PrimitiveType::UInt;
-    if (name == "long") return PrimitiveType::Long;
-    if (name == "ulong") return PrimitiveType::ULong;
-    if (name == "float") return PrimitiveType::Float;
-    if (name == "double") return PrimitiveType::Double;
-    if (name == "char") return PrimitiveType::Char;
-    if (name == "string") return PrimitiveType::String;
-    if (name == "handle") return PrimitiveType::Handle;
-    return PrimitiveType::Error;
-}
-
-bool isNumericType(PrimitiveType type) noexcept {
-    return isIntegralType(type) || isFloatingPointType(type);
-}
-
-bool isIntegralType(PrimitiveType type) noexcept {
-    return type == PrimitiveType::Byte ||
-        type == PrimitiveType::SByte ||
-        type == PrimitiveType::Short ||
-        type == PrimitiveType::UShort ||
-        type == PrimitiveType::Int ||
-        type == PrimitiveType::UInt ||
-        type == PrimitiveType::Long ||
-        type == PrimitiveType::ULong ||
-        type == PrimitiveType::Char;
-}
-
-bool isUnsignedIntegralType(PrimitiveType type) noexcept {
-    return type == PrimitiveType::Byte ||
-        type == PrimitiveType::UShort ||
-        type == PrimitiveType::UInt ||
-        type == PrimitiveType::ULong ||
-        type == PrimitiveType::Char;
-}
-
-bool isFloatingPointType(PrimitiveType type) noexcept {
-    return type == PrimitiveType::Float || type == PrimitiveType::Double;
-}
-
-bool isReferenceType(PrimitiveType type) noexcept {
-    return type == PrimitiveType::String ||
-        type == PrimitiveType::Object ||
-        type == PrimitiveType::Array;
-}
-
-bool isExactType(PrimitiveType type) noexcept {
-    return type == PrimitiveType::Object ||
-        type == PrimitiveType::Struct ||
-        type == PrimitiveType::Enum ||
-        type == PrimitiveType::Array;
-}
-
-std::string arrayTypeName(
-    PrimitiveType elementType,
-    const std::string& elementTypeName) {
-    const auto base = isExactType(elementType)
-        ? elementTypeName
-        : std::string(primitiveTypeName(elementType));
-    return base.empty() ? std::string{} : base + "[]";
-}
-
-bool decodeArrayTypeName(
-    const std::string& name,
-    PrimitiveType& elementType,
-    std::string& elementTypeName) {
-    if (name.size() < 3 || name.substr(name.size() - 2) != "[]") return false;
-    const auto base = name.substr(0, name.size() - 2);
-    const auto primitive = resolvePrimitiveType(base);
-    if (primitive != PrimitiveType::Error && primitive != PrimitiveType::Void) {
-        elementType = primitive;
-        elementTypeName.clear();
+    const auto found = visibleTypes.find(typeName);
+    if (found == visibleTypes.end()) {
+        return false;
+    }
+    if (found->second.stackOnly) {
         return true;
     }
-    // Exact non-primitive arrays are resolved through descriptors by TypeId.
-    elementType = PrimitiveType::Object;
-    elementTypeName = base;
-    return !base.empty();
-}
-
-ConversionKind classifyConversion(PrimitiveType from, PrimitiveType to) noexcept {
-    if (from == PrimitiveType::Error || to == PrimitiveType::Error) return ConversionKind::Identity;
-    if (from == to) return ConversionKind::Identity;
-    if (from == PrimitiveType::Null && to == PrimitiveType::String) return ConversionKind::NullToString;
-    if (from == PrimitiveType::Null && to == PrimitiveType::Object) return ConversionKind::NullToObject;
-    if (from == PrimitiveType::Null && to == PrimitiveType::Array) return ConversionKind::NullToArray;
-    if (from == PrimitiveType::Int && to == PrimitiveType::Long) return ConversionKind::IntToLong;
-    if (from == PrimitiveType::Int && to == PrimitiveType::Double) return ConversionKind::IntToDouble;
-    if (from == PrimitiveType::Long && to == PrimitiveType::Double) return ConversionKind::LongToDouble;
-    const auto implicitNumeric = [](PrimitiveType source, PrimitiveType target) {
-        switch (source) {
-        case PrimitiveType::SByte:
-            return target == PrimitiveType::Short ||
-                target == PrimitiveType::Int || target == PrimitiveType::Long ||
-                target == PrimitiveType::Float || target == PrimitiveType::Double;
-        case PrimitiveType::Byte:
-            return target == PrimitiveType::Short || target == PrimitiveType::UShort ||
-                target == PrimitiveType::Int || target == PrimitiveType::UInt ||
-                target == PrimitiveType::Long || target == PrimitiveType::ULong ||
-                target == PrimitiveType::Float || target == PrimitiveType::Double;
-        case PrimitiveType::Short:
-            return target == PrimitiveType::Int || target == PrimitiveType::Long ||
-                target == PrimitiveType::Float || target == PrimitiveType::Double;
-        case PrimitiveType::UShort:
-        case PrimitiveType::Char:
-            return target == PrimitiveType::Int || target == PrimitiveType::UInt ||
-                target == PrimitiveType::Long || target == PrimitiveType::ULong ||
-                target == PrimitiveType::Float || target == PrimitiveType::Double;
-        case PrimitiveType::Int:
-            return target == PrimitiveType::Long || target == PrimitiveType::Float ||
-                target == PrimitiveType::Double;
-        case PrimitiveType::UInt:
-            return target == PrimitiveType::Long || target == PrimitiveType::ULong ||
-                target == PrimitiveType::Float || target == PrimitiveType::Double;
-        case PrimitiveType::Long:
-        case PrimitiveType::ULong:
-            return target == PrimitiveType::Float || target == PrimitiveType::Double;
-        case PrimitiveType::Float:
-            return target == PrimitiveType::Double;
-        default:
-            return false;
+    const SymbolId visitId = found->second.id != 0
+        ? found->second.id
+        : stableTypeId(found->second);
+    if (!visited.insert(visitId).second) {
+        return false;
+    }
+    for (const auto& field : found->second.fields) {
+        if (field.staticField || field.constField) continue;
+        if (isStackOnlyTypeImpl(field.type, field.typeName, visibleTypes, visited)) {
+            return true;
         }
-    };
-    if (implicitNumeric(from, to)) return ConversionKind::Numeric;
-    return ConversionKind::None;
-}
-
-int conversionRank(PrimitiveType from, PrimitiveType to) noexcept {
-    switch (classifyConversion(from, to)) {
-    case ConversionKind::Identity: return 0;
-    case ConversionKind::NullToString:
-    case ConversionKind::NullToObject:
-    case ConversionKind::NullToArray:
-    case ConversionKind::IntToLong:
-        return 1;
-    case ConversionKind::IntToDouble:
-    case ConversionKind::LongToDouble:
-        return 2;
-    case ConversionKind::Numeric:
-        return 3;
-    case ConversionKind::None: return -1;
     }
-    return -1;
+    return false;
 }
 
-std::string canonicalTypeName(const TypeSymbol& type) {
-    return type.moduleName.empty() ? type.name : type.moduleName + "::" + type.name;
+} // namespace
+
+bool isStackOnlyType(
+    PrimitiveType type,
+    const std::string& typeName,
+    const TypeSymbolMap& visibleTypes) noexcept {
+    std::unordered_set<SymbolId> visited;
+    return isStackOnlyTypeImpl(type, typeName, visibleTypes, visited);
 }
 
-SymbolId stableTypeId(const TypeSymbol& type) { return stableTypeId(canonicalTypeName(type)); }
-SymbolId stableTypeId(const std::string& canonicalName) {
-    return canonicalName.empty() ? 0 : fnv1a(canonicalName);
-}
-
-std::string referenceWrapperTypeName(
-    const std::string& moduleName,
-    PrimitiveType sourceType,
-    const std::string& sourceTypeName) {
-    std::string key = isExactType(sourceType) &&
-            !sourceTypeName.empty()
-        ? sourceTypeName
-        : primitiveTypeName(sourceType);
-    for (auto& character : key) {
-        const auto alphaNumeric =
-            (character >= 'a' && character <= 'z') ||
-            (character >= 'A' && character <= 'Z') ||
-            (character >= '0' && character <= '9') ||
-            character == '_';
-        if (!alphaNumeric) character = '_';
+bool isStackOnlyArrayType(
+    PrimitiveType type,
+    const std::string& typeName,
+    const TypeSymbolMap& visibleTypes) noexcept {
+    if (type != PrimitiveType::Array || typeName.empty()) {
+        return false;
     }
-    std::string moduleKey = moduleName.empty() ? "Global" : moduleName;
-    for (auto& character : moduleKey) {
-        const auto alphaNumeric =
-            (character >= 'a' && character <= 'z') ||
-            (character >= 'A' && character <= 'Z') ||
-            (character >= '0' && character <= '9') ||
-            character == '_';
-        if (!alphaNumeric) character = '_';
+    PrimitiveType elemType = PrimitiveType::Error;
+    std::string elemTypeName;
+    if (!decodeArrayTypeName(typeName, elemType, elemTypeName)) {
+        return false;
     }
-    const auto simpleName =
-        "__RsRef__" + moduleKey + "__" + key;
-    return moduleName.empty()
-        ? simpleName
-        : moduleName + "::" + simpleName;
+    return isStackOnlyType(elemType, elemTypeName, visibleTypes);
+}
+
+std::string stackOnlyTypeDisplayName(
+    PrimitiveType type,
+    const std::string& typeName,
+    const TypeSymbolMap& visibleTypes) {
+    std::string lookupName = typeName;
+    if (type == PrimitiveType::Array) {
+        PrimitiveType elemType = PrimitiveType::Error;
+        std::string elemTypeName;
+        if (decodeArrayTypeName(typeName, elemType, elemTypeName)) {
+            lookupName = std::move(elemTypeName);
+        }
+    }
+    const auto found = visibleTypes.find(lookupName);
+    if (found != visibleTypes.end() && !found->second.name.empty()) {
+        return found->second.name;
+    }
+    return !lookupName.empty() ? lookupName : std::string(primitiveTypeName(type));
+}
+
+bool propagateStackOnlyTypes(
+    std::vector<TypeSymbol>& types,
+    TypeSymbolMap& visibleTypes) {
+    bool anyChanged = false;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (auto& type : types) {
+            if (type.kind != TypeKind::Struct || type.stackOnly) {
+                continue;
+            }
+            bool containsStackOnly = false;
+            for (const auto& field : type.fields) {
+                if (field.staticField || field.constField) continue;
+                if (isStackOnlyType(field.type, field.typeName, visibleTypes)) {
+                    containsStackOnly = true;
+                    break;
+                }
+            }
+            if (containsStackOnly) {
+                type.stackOnly = true;
+                visibleTypes[type.name] = type;
+                visibleTypes[canonicalTypeName(type)] = type;
+                changed = true;
+                anyChanged = true;
+            }
+        }
+    }
+    return anyChanged;
+}
+
+bool validateStackOnlyFields(
+    const TypeSymbol& type,
+    const TypeSymbolMap& visibleTypes,
+    diagnostics::DiagnosticBag& diagnostics) {
+    bool valid = true;
+    for (const auto& field : type.fields) {
+        if (field.declaringTypeId != type.id) {
+            continue;
+        }
+        if (field.name.rfind("$sequence_", 0) == 0) {
+            continue;
+        }
+        const auto& sourceName = field.sourceName.empty()
+            ? type.sourceName
+            : field.sourceName;
+        if (isStackOnlyArrayType(field.type, field.typeName, visibleTypes)) {
+            diagnostics.report(
+                "RS2695",
+                "stack-only struct '" +
+                    stackOnlyTypeDisplayName(field.type, field.typeName, visibleTypes) +
+                    "' cannot be an array element type",
+                field.declarationSpan,
+                diagnostics::DiagnosticSeverity::Error,
+                sourceName);
+            valid = false;
+            continue;
+        }
+        if (isStackOnlyType(field.type, field.typeName, visibleTypes) &&
+            (type.kind == TypeKind::Class || field.staticField)) {
+            diagnostics.report(
+                "RS2692",
+                "stack-only struct '" +
+                    stackOnlyTypeDisplayName(field.type, field.typeName, visibleTypes) +
+                    "' cannot be declared as a class instance or static field",
+                field.declarationSpan,
+                diagnostics::DiagnosticSeverity::Error,
+                sourceName);
+            valid = false;
+        }
+    }
+    return valid;
 }
 
 TypeSymbol declareTypeShell(
@@ -1093,6 +1052,10 @@ TypeSymbol declareTypeShell(
         syntaxTree.modifiers, syntax::SyntaxKind::AbstractKeyword);
     result.sealedType = result.staticType || hasModifier(
         syntaxTree.modifiers, syntax::SyntaxKind::SealedKeyword);
+    result.partialType = hasModifier(
+        syntaxTree.modifiers, syntax::SyntaxKind::PartialKeyword);
+    result.awaitableProtocol = hasAttributeName(
+        syntaxTree.attributes, "Awaitable");
     result.deterministic = hasAttributeName(
         syntaxTree.attributes, "Deterministic");
     result.moduleName = moduleName;
@@ -1109,6 +1072,15 @@ TypeSymbol declareTypeShell(
     result.kind = TypeKind::Struct;
     result.accessibility = accessibilityFromModifiers(syntaxTree.modifiers);
     result.sealedType = true;
+    result.partialType = hasModifier(
+        syntaxTree.modifiers, syntax::SyntaxKind::PartialKeyword);
+    result.stackOnly = hasAttributeName(
+        syntaxTree.attributes, "StackOnly");
+    result.hasValueLifecycle =
+        hasAttributeName(syntaxTree.attributes, "ValueLifecycle") ||
+        hasAttributeName(syntaxTree.attributes, "RefCounted");
+    result.awaitableProtocol = hasAttributeName(
+        syntaxTree.attributes, "Awaitable");
     result.deterministic = hasAttributeName(
         syntaxTree.attributes, "Deterministic");
     result.moduleName = moduleName;
@@ -1182,7 +1154,9 @@ bool validateConstantFields(
             diagnostics.report(
                 "RS2407",
                 "const field '" + field.name + "' requires a compile-time constant initializer",
-                field.initializerSyntax->span());
+                field.initializerSyntax->span(),
+                diagnostics::DiagnosticSeverity::Error,
+                field.sourceName);
             valid = false;
         }
     }
@@ -1329,12 +1303,29 @@ FunctionSymbol declareFunctionSymbol(
     result.returnTypeName = returnType.name;
     if (syntaxTree.refReturnKeyword) {
         result.returnModifier = ParameterModifier::Ref;
+        if (isStackOnlyType(result.returnType, result.returnTypeName, visibleTypes)) {
+            diagnostics.report(
+                "RS2697",
+                "stack-only struct '" +
+                    stackOnlyTypeDisplayName(
+                        result.returnType, result.returnTypeName, visibleTypes) +
+                    "' cannot be returned by 'ref'",
+                syntaxTree.refReturnKeyword->span);
+        }
         result.storageReturnType = PrimitiveType::Object;
         result.storageReturnTypeName = referenceWrapperTypeName(
             moduleName, result.returnType, result.returnTypeName);
     }
     if (result.returnType == PrimitiveType::Error) {
         diagnostics.report("RS2200", "unknown return type '" + syntaxTree.returnType.name.text + "'", syntaxTree.returnType.span());
+    } else if (isStackOnlyArrayType(result.returnType, result.returnTypeName, visibleTypes)) {
+        diagnostics.report(
+            "RS2695",
+            "stack-only struct '" +
+                stackOnlyTypeDisplayName(
+                    result.returnType, result.returnTypeName, visibleTypes) +
+                "' cannot be an array element type",
+            syntaxTree.returnType.span());
     }
     appendSyntaxParameters(result, syntaxTree.parameters, visibleTypes, diagnostics, owner);
     if (result.asyncFunction) {
@@ -1360,6 +1351,14 @@ FunctionSymbol declareFunctionSymbol(
                         param.name + "'",
                     param.declarationSpan);
             }
+            if (!param.name.empty() && param.name != "this" &&
+                isStackOnlyType(param.type, param.typeName, visibleTypes)) {
+                diagnostics.report(
+                    "RS2696",
+                    "async function '" + result.name + "' cannot declare stack-only parameter '" +
+                        param.name + "'",
+                    param.declarationSpan);
+            }
         }
         bool validAsyncRet = false;
         if (result.returnType == PrimitiveType::Struct) {
@@ -1370,7 +1369,8 @@ FunctionSymbol declareFunctionSymbol(
                 const auto foundRet = visibleTypes.find(result.returnTypeName);
                 if (foundRet != visibleTypes.end() &&
                     (foundRet->second.name.rfind("Awaitable__", 0) == 0 ||
-                     foundRet->second.name == "Awaitable")) {
+                     foundRet->second.name == "Awaitable" ||
+                     foundRet->second.awaitableProtocol)) {
                     validAsyncRet = true;
                 }
             }
@@ -1423,6 +1423,14 @@ FunctionSymbol declareFunctionSymbol(
         diagnostics.report(
             "RS2200",
             "unknown return type '" + syntaxTree.returnType.name.text + "'",
+            syntaxTree.returnType.span());
+    } else if (isStackOnlyArrayType(result.returnType, result.returnTypeName, visibleTypes)) {
+        diagnostics.report(
+            "RS2695",
+            "stack-only struct '" +
+                stackOnlyTypeDisplayName(
+                    result.returnType, result.returnTypeName, visibleTypes) +
+                "' cannot be an array element type",
             syntaxTree.returnType.span());
     }
     appendSyntaxParameters(
@@ -1532,6 +1540,13 @@ PropertySymbol declarePropertySymbol(
     result.typeName = resolved.name;
     if (resolved.type == PrimitiveType::Error) {
         diagnostics.report("RS2460", "unknown property type '" + syntaxTree.type.name.text + "'", syntaxTree.type.span());
+    } else if (isStackOnlyArrayType(result.type, result.typeName, visibleTypes)) {
+        diagnostics.report(
+            "RS2695",
+            "stack-only struct '" +
+                stackOnlyTypeDisplayName(result.type, result.typeName, visibleTypes) +
+                "' cannot be an array element type",
+            syntaxTree.type.span());
     }
     if (syntaxTree.getter) {
         FunctionSymbol getter;

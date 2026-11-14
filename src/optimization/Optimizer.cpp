@@ -828,6 +828,7 @@ void refreshDebugInfo(
             true,
             block.terminator.sourceSpan);
     }
+    debug::finalizeFunctionDebugInfo(function.debugInfo, files);
 }
 
 bool isLicmSafeOpcode(mir::Opcode opcode) noexcept {

@@ -64,9 +64,21 @@ bool containsBreakForCurrentTarget(
     }
 }
 
+thread_local const std::vector<semantic::TypeSymbol>* tlsActiveModelTypes = nullptr;
+
+struct ActiveModelTypesScope {
+    const std::vector<semantic::TypeSymbol>* prev;
+    explicit ActiveModelTypesScope(const std::vector<semantic::TypeSymbol>* cur) noexcept
+        : prev(tlsActiveModelTypes) {
+        tlsActiveModelTypes = cur;
+    }
+    ~ActiveModelTypesScope() noexcept { tlsActiveModelTypes = prev; }
+};
+
 } // namespace
 
 Module Lowerer::lower(const semantic::SemanticModel& model) {
+    ActiveModelTypesScope typesScope(&model.types);
     Module result; result.name = model.moduleName; result.types = model.types;
     for (const auto& function : model.functions) result.functions.push_back(lowerFunction(function));
     return result;
@@ -203,8 +215,22 @@ Function Lowerer::lowerFunction(const semantic::BoundFunction& function) {
         emitStoreLocal(parameter.index, value, {});
     }
     lowerStatement(*function.body);
-    const bool isVoidAsync = currentAsyncFunction_ &&
+    bool isVoidAsync = currentAsyncFunction_ &&
         result.returnTypeId == semantic::stableTypeId("RealScript.Async::Awaitable");
+    if (currentAsyncFunction_ && !isVoidAsync && tlsActiveModelTypes) {
+        for (const auto& t : *tlsActiveModelTypes) {
+            if (t.id == result.returnTypeId && t.awaitableProtocol) {
+                for (const auto& m : t.methods) {
+                    if (!m.staticMethod && m.name == "GetResult" &&
+                        m.returnType == semantic::PrimitiveType::Void) {
+                        isVoidAsync = true;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+    }
     if (hasCurrentBlock() && !currentBlockTerminated() &&
         (function.symbol.returnType == semantic::PrimitiveType::Void || isVoidAsync))
         emitReturn(std::nullopt, function.body->span);

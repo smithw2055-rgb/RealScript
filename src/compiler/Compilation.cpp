@@ -25,24 +25,702 @@ std::uint64_t stableFingerprint(const std::string& value) noexcept {
 }
 
 
+struct CompilerSession::Impl {
+    mutable std::mutex parsedUnitCacheMutex;
+    std::unordered_map<std::uint64_t, ParsedUnit> parsedUnitCache;
+    mutable std::mutex moduleFrontendCacheMutex;
+    std::unordered_map<std::string, CachedModuleFrontend> moduleFrontendCache;
+};
+
+CompilerSession::CompilerSession() : impl_(std::make_unique<Impl>()) {}
+CompilerSession::~CompilerSession() = default;
+
+void CompilerSession::clearCaches() {
+    {
+        std::lock_guard<std::mutex> lock(impl_->parsedUnitCacheMutex);
+        impl_->parsedUnitCache.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl_->moduleFrontendCacheMutex);
+        impl_->moduleFrontendCache.clear();
+    }
+}
+
+std::size_t CompilerSession::parsedUnitCacheSize() const noexcept {
+    std::lock_guard<std::mutex> lock(impl_->parsedUnitCacheMutex);
+    return impl_->parsedUnitCache.size();
+}
+
+std::size_t CompilerSession::moduleFrontendCacheSize() const noexcept {
+    std::lock_guard<std::mutex> lock(impl_->moduleFrontendCacheMutex);
+    return impl_->moduleFrontendCache.size();
+}
+
+void ModulePackRegistry::registerPack(ModulePack pack) {
+    for (auto& existing : packs_) {
+        if (existing.moduleName == pack.moduleName) {
+            existing = std::move(pack);
+            return;
+        }
+    }
+    packs_.push_back(std::move(pack));
+}
+
+bool ModulePackRegistry::unregisterPack(std::string_view moduleName) {
+    const auto before = packs_.size();
+    packs_.erase(
+        std::remove_if(
+            packs_.begin(),
+            packs_.end(),
+            [&](const ModulePack& p) { return p.moduleName == moduleName; }),
+        packs_.end());
+    return packs_.size() != before;
+}
+
+const ModulePack* ModulePackRegistry::findPack(std::string_view moduleName) const noexcept {
+    for (const auto& p : packs_) {
+        if (p.moduleName == moduleName) return &p;
+    }
+    return nullptr;
+}
+
+std::uint64_t ModulePackRegistry::fingerprint() const noexcept {
+    std::uint64_t fp = 14695981039346656037ull;
+    for (const auto& p : packs_) {
+        fp = combineFingerprint(fp, stableFingerprint(p.moduleName));
+    }
+    return fp;
+}
+
+const ModulePackRegistry& ModulePackRegistry::builtinDefaults() {
+    static const ModulePackRegistry kDefaults = []() {
+        ModulePackRegistry reg;
+        reg.registerPack({
+            "RealScript.Math",
+            "$builtin/RealScript.Math.rscript",
+            &builtinDeterministicMathModuleSource,
+            nullptr,
+            false});
+        reg.registerPack({
+            "RealScript.Fiber",
+            "$builtin/RealScript.Fiber.rscript",
+            &builtinFiberModuleSource,
+            nullptr,
+            false});
+        reg.registerPack({
+            "RealScript.Async",
+            "$builtin/RealScript.Async.rscript",
+            &builtinAsyncModuleSource,
+            &sourceMentionsAsyncPrimitives,
+            true});
+        reg.registerPack({
+            "RealScript.Resource",
+            "$builtin/RealScript.Resource.rscript",
+            &builtinResourceModuleSource,
+            &sourceMentionsResourcePrimitives,
+            true});
+        reg.registerPack({
+            "RealScript.Weak",
+            "$builtin/RealScript.Weak.rscript",
+            &builtinWeakModuleSource,
+            nullptr,
+            false});
+        reg.registerPack({
+            "RealScript.Memory",
+            "$builtin/RealScript.Memory.rscript",
+            &builtinMemoryModuleSource,
+            nullptr,
+            false});
+        return reg;
+    }();
+    return kDefaults;
+}
+
+namespace {
+
+std::string formatTypeSyntaxKey(const syntax::TypeSyntax& type) {
+    std::string out = type.name.text;
+    if (!type.typeArguments.empty() || type.isGeneric()) {
+        out.push_back('<');
+        for (std::size_t i = 0; i < type.typeArguments.size(); ++i) {
+            if (i > 0) out.push_back(',');
+            out += formatTypeSyntaxKey(type.typeArguments[i]);
+        }
+        out.push_back('>');
+    }
+    if (type.isNullable()) out.push_back('?');
+    if (type.isArray()) out += "[]";
+    return out;
+}
+
+std::string partialMethodSignatureKey(const syntax::FunctionDeclarationSyntax& fn) {
+    std::ostringstream oss;
+    const bool isStat =
+        fn.staticKeyword.has_value() ||
+        semantic::hasModifier(fn.modifiers, syntax::SyntaxKind::StaticKeyword);
+    oss << (isStat ? "static:" : "inst:") << fn.identifierToken.text << "`"
+        << fn.typeParameters.size() << "/" << fn.parameters.size() << ":";
+    for (const auto& p : fn.parameters) {
+        if (p.modifierToken) oss << p.modifierToken->text << "&";
+        oss << formatTypeSyntaxKey(p.type) << ",";
+    }
+    return oss.str();
+}
+
+std::string normalizedPartialMethodAccess(const syntax::FunctionDeclarationSyntax& fn) {
+    if (semantic::hasModifier(fn.modifiers, syntax::SyntaxKind::PublicKeyword)) return "public";
+    if (semantic::hasModifier(fn.modifiers, syntax::SyntaxKind::ProtectedKeyword)) return "protected";
+    if (semantic::hasModifier(fn.modifiers, syntax::SyntaxKind::InternalKeyword)) return "internal";
+    return "private";
+}
+
+bool partialMethodModifiersMatch(
+    const syntax::FunctionDeclarationSyntax& lhs,
+    const syntax::FunctionDeclarationSyntax& rhs) {
+    if (normalizedPartialMethodAccess(lhs) != normalizedPartialMethodAccess(rhs)) {
+        return false;
+    }
+    static constexpr syntax::SyntaxKind kCheckedModifiers[] = {
+        syntax::SyntaxKind::StaticKeyword,
+        syntax::SyntaxKind::AsyncKeyword,
+        syntax::SyntaxKind::AbstractKeyword,
+        syntax::SyntaxKind::VirtualKeyword,
+        syntax::SyntaxKind::OverrideKeyword,
+        syntax::SyntaxKind::SealedKeyword,
+    };
+    for (const auto kind : kCheckedModifiers) {
+        if (semantic::hasModifier(lhs.modifiers, kind) !=
+            semantic::hasModifier(rhs.modifiers, kind)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+struct ConstraintClauseItem {
+    std::string key;
+    std::vector<syntax::SyntaxToken> tokens;
+};
+
+std::vector<ConstraintClauseItem> splitConstraintClauseItems(
+    const std::vector<syntax::SyntaxToken>& tokens) {
+    std::vector<ConstraintClauseItem> items;
+    std::vector<syntax::SyntaxToken> currentTokens;
+    std::string currentKey;
+    int angleDepth = 0;
+    auto flush = [&]() {
+        if (!currentTokens.empty()) {
+            items.push_back(ConstraintClauseItem{std::move(currentKey), std::move(currentTokens)});
+            currentKey.clear();
+            currentTokens.clear();
+        }
+    };
+    for (const auto& token : tokens) {
+        if (token.kind == syntax::SyntaxKind::LessToken) ++angleDepth;
+        if (token.kind == syntax::SyntaxKind::GreaterToken && angleDepth > 0) --angleDepth;
+        if (token.kind == syntax::SyntaxKind::CommaToken && angleDepth == 0) {
+            flush();
+        } else {
+            currentKey += token.text;
+            currentTokens.push_back(token);
+        }
+    }
+    flush();
+    return items;
+}
+
+void reconcilePartialMethods(
+    std::vector<syntax::FunctionDeclarationSyntax>& methods,
+    const std::string& fallbackSourceName,
+    diagnostics::DiagnosticBag& diagnostics,
+    bool& moduleInvalid) {
+    auto sourceOf = [&](const syntax::FunctionDeclarationSyntax& fn) -> const std::string& {
+        return fn.originSourceName.empty() ? fallbackSourceName : fn.originSourceName;
+    };
+
+    std::unordered_map<std::string, std::size_t> declIndexByKey;
+    std::unordered_map<std::string, std::size_t> implIndexByKey;
+    std::unordered_set<std::size_t> skipIndices;
+    for (std::size_t idx = 0; idx < methods.size(); ++idx) {
+        const auto& m = methods[idx];
+        if (!semantic::hasModifier(m.modifiers, syntax::SyntaxKind::PartialKeyword)) continue;
+        const auto key = partialMethodSignatureKey(m);
+        if (m.semicolonToken.has_value()) {
+            if (!declIndexByKey.emplace(key, idx).second) {
+                diagnostics.report(
+                    "RS4023",
+                    "duplicate defining declaration of partial method '" +
+                        m.identifierToken.text + "'",
+                    m.identifierToken.span,
+                    diagnostics::DiagnosticSeverity::Error,
+                    sourceOf(m));
+                moduleInvalid = true;
+                skipIndices.insert(idx);
+            }
+        } else {
+            if (!implIndexByKey.emplace(key, idx).second) {
+                diagnostics.report(
+                    "RS4024",
+                    "duplicate implementation declaration of partial method '" +
+                        m.identifierToken.text + "'",
+                    m.identifierToken.span,
+                    diagnostics::DiagnosticSeverity::Error,
+                    sourceOf(m));
+                moduleInvalid = true;
+                skipIndices.insert(idx);
+            }
+        }
+    }
+
+    for (const auto& [key, dIdx] : declIndexByKey) {
+        const auto implIt = implIndexByKey.find(key);
+        if (implIt != implIndexByKey.end()) {
+            auto& implM = methods[implIt->second];
+            const auto& declM = methods[dIdx];
+            if (formatTypeSyntaxKey(declM.returnType) != formatTypeSyntaxKey(implM.returnType) ||
+                declM.refReturnKeyword.has_value() != implM.refReturnKeyword.has_value()) {
+                diagnostics.report(
+                    "RS4022",
+                    "partial method '" + declM.identifierToken.text +
+                        "' declarations have mismatched return types",
+                    implM.identifierToken.span,
+                    diagnostics::DiagnosticSeverity::Error,
+                    sourceOf(implM));
+                moduleInvalid = true;
+            }
+            if (!partialMethodModifiersMatch(declM, implM)) {
+                diagnostics.report(
+                    "RS4022",
+                    "partial method '" + declM.identifierToken.text +
+                        "' declarations have mismatched modifiers",
+                    implM.identifierToken.span,
+                    diagnostics::DiagnosticSeverity::Error,
+                    sourceOf(implM));
+                moduleInvalid = true;
+            }
+            const std::string& declSrc = sourceOf(declM);
+            for (auto a : declM.attributes) {
+                if (a.originSourceName.empty()) a.originSourceName = declSrc;
+                implM.attributes.push_back(std::move(a));
+            }
+            skipIndices.insert(dIdx);
+        } else {
+            // Unimplemented partial method: allowed if void and has no 'out' parameters -> synthesize empty body!
+            auto& declM = methods[dIdx];
+            bool hasOut = false;
+            for (const auto& p : declM.parameters) {
+                if (p.modifierToken && p.modifierToken->kind == syntax::SyntaxKind::OutKeyword) {
+                    hasOut = true;
+                    break;
+                }
+            }
+            if (declM.returnType.name.kind == syntax::SyntaxKind::VoidKeyword &&
+                !declM.refReturnKeyword.has_value() && !hasOut) {
+                declM.semicolonToken.reset();
+                declM.body.openBraceToken = syntax::SyntaxToken{
+                    syntax::SyntaxKind::OpenBraceToken, declM.closeParenToken.span, "{", {}, true};
+                declM.body.closeBraceToken = syntax::SyntaxToken{
+                    syntax::SyntaxKind::CloseBraceToken, declM.closeParenToken.span, "}", {}, true};
+            } else {
+                diagnostics.report(
+                    "RS4020",
+                    "partial method '" + declM.identifierToken.text +
+                        "' must have an implementation part because it returns a value or has 'out' parameters",
+                    declM.identifierToken.span,
+                    diagnostics::DiagnosticSeverity::Error,
+                    sourceOf(declM));
+                moduleInvalid = true;
+            }
+        }
+    }
+
+    if (!skipIndices.empty()) {
+        std::vector<syntax::FunctionDeclarationSyntax> reconciled;
+        reconciled.reserve(methods.size() - skipIndices.size());
+        for (std::size_t idx = 0; idx < methods.size(); ++idx) {
+            if (skipIndices.find(idx) == skipIndices.end()) {
+                reconciled.push_back(std::move(methods[idx]));
+            }
+        }
+        methods = std::move(reconciled);
+    }
+}
+
+template <typename DeclSyntax>
+void mergePartialDeclGroup(
+    std::vector<DeclSyntax*> parts,
+    diagnostics::DiagnosticBag& diagnostics,
+    const std::vector<std::string>& partSourceNames,
+    bool& moduleInvalid) {
+    if (parts.size() <= 1) return;
+    bool allPartial = true;
+    bool anyPartial = false;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        if (semantic::hasModifier(parts[i]->modifiers, syntax::SyntaxKind::PartialKeyword)) {
+            anyPartial = true;
+        } else {
+            allPartial = false;
+        }
+    }
+    if (!allPartial) {
+        if (anyPartial) {
+            for (std::size_t i = 0; i < parts.size(); ++i) {
+                if (!semantic::hasModifier(parts[i]->modifiers, syntax::SyntaxKind::PartialKeyword)) {
+                    diagnostics.report(
+                        "RS4004",
+                        "missing 'partial' modifier on declaration of type '" +
+                            parts[i]->identifierToken.text +
+                            "' (all declarations must specify 'partial')",
+                        parts[i]->identifierToken.span,
+                        diagnostics::DiagnosticSeverity::Error,
+                        partSourceNames[i]);
+                }
+            }
+        } else {
+            for (std::size_t i = 1; i < parts.size(); ++i) {
+                diagnostics.report(
+                    "RS4004",
+                    "duplicate type '" + parts[i]->identifierToken.text +
+                        "' (add 'partial' modifier to all declarations to merge partial parts)",
+                    parts[i]->identifierToken.span,
+                    diagnostics::DiagnosticSeverity::Error,
+                    partSourceNames[i]);
+            }
+        }
+        moduleInvalid = true;
+        return;
+    }
+
+    auto stampAttrList = [](std::vector<syntax::AttributeListSyntax>& lists, const std::string& src) {
+        for (auto& list : lists) {
+            if (list.originSourceName.empty()) list.originSourceName = src;
+        }
+    };
+    auto stampMembers = [&](DeclSyntax& decl, const std::string& src) {
+        stampAttrList(decl.attributes, src);
+        for (auto& f : decl.fields) {
+            if (f.originSourceName.empty()) f.originSourceName = src;
+            stampAttrList(f.attributes, src);
+        }
+        for (auto& p : decl.properties) {
+            if (p.originSourceName.empty()) p.originSourceName = src;
+            stampAttrList(p.attributes, src);
+        }
+        for (auto& e : decl.events) {
+            if (e.originSourceName.empty()) e.originSourceName = src;
+            stampAttrList(e.attributes, src);
+        }
+        for (auto& c : decl.constructors) {
+            if (c.originSourceName.empty()) c.originSourceName = src;
+            stampAttrList(c.attributes, src);
+        }
+        for (auto& s : decl.sequences) {
+            if (s.originSourceName.empty()) s.originSourceName = src;
+            stampAttrList(s.attributes, src);
+        }
+        for (auto& m : decl.methods) {
+            if (m.originSourceName.empty()) m.originSourceName = src;
+            stampAttrList(m.attributes, src);
+        }
+    };
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        stampMembers(*parts[i], partSourceNames[i]);
+    }
+
+    DeclSyntax& primary = *parts[0];
+    for (std::size_t i = 1; i < parts.size(); ++i) {
+        DeclSyntax& extra = *parts[i];
+        for (std::size_t tp = 0; tp < primary.typeParameters.size() && tp < extra.typeParameters.size(); ++tp) {
+            if (primary.typeParameters[tp].text != extra.typeParameters[tp].text) {
+                diagnostics.report(
+                    "RS4021",
+                    "partial declarations of '" + primary.identifierToken.text +
+                        "' must use the same generic type parameter names (expected '" +
+                        primary.typeParameters[tp].text + "', got '" +
+                        extra.typeParameters[tp].text + "')",
+                    extra.typeParameters[tp].span,
+                    diagnostics::DiagnosticSeverity::Error,
+                    partSourceNames[i]);
+                moduleInvalid = true;
+            }
+        }
+        for (auto& attrList : extra.attributes) {
+            primary.attributes.push_back(std::move(attrList));
+        }
+        for (const auto& mod : extra.modifiers) {
+            if (!semantic::hasModifier(primary.modifiers, mod.kind)) {
+                primary.modifiers.push_back(mod);
+            }
+        }
+        for (const auto& iface : extra.interfaces) {
+            bool exists = false;
+            for (const auto& exIface : primary.interfaces) {
+                if (formatTypeSyntaxKey(exIface) == formatTypeSyntaxKey(iface)) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) {
+                primary.interfaces.push_back(iface);
+            }
+        }
+        for (const auto& clause : extra.constraints) {
+            syntax::GenericConstraintClauseSyntax* existingClause = nullptr;
+            for (auto& candidate : primary.constraints) {
+                if (candidate.typeParameter.text == clause.typeParameter.text) {
+                    existingClause = &candidate;
+                    break;
+                }
+            }
+            if (!existingClause) {
+                primary.constraints.push_back(clause);
+                continue;
+            }
+            const auto existingItems = splitConstraintClauseItems(existingClause->constraints);
+            const auto incomingItems = splitConstraintClauseItems(clause.constraints);
+            auto containsKey = [](const std::vector<ConstraintClauseItem>& items, const std::string& key) {
+                for (const auto& item : items) {
+                    if (item.key == key) return true;
+                }
+                return false;
+            };
+            const bool existingHasClass = containsKey(existingItems, "class");
+            const bool existingHasStruct = containsKey(existingItems, "struct");
+            const bool incomingHasClass = containsKey(incomingItems, "class");
+            const bool incomingHasStruct = containsKey(incomingItems, "struct");
+            if ((existingHasClass && incomingHasStruct) || (existingHasStruct && incomingHasClass)) {
+                diagnostics.report(
+                    "RS4022",
+                    "conflicting generic primary constraints for type parameter '" +
+                        clause.typeParameter.text + "' across partial declarations of '" +
+                        primary.identifierToken.text + "'",
+                    clause.typeParameter.span,
+                    diagnostics::DiagnosticSeverity::Error,
+                    partSourceNames[i]);
+                moduleInvalid = true;
+                continue;
+            }
+            for (const auto& item : incomingItems) {
+                if (containsKey(existingItems, item.key)) continue;
+                if (!existingClause->constraints.empty()) {
+                    existingClause->constraints.push_back(syntax::SyntaxToken{
+                        syntax::SyntaxKind::CommaToken, clause.colonToken.span, ",", {}, true});
+                }
+                for (const auto& token : item.tokens) {
+                    existingClause->constraints.push_back(token);
+                }
+            }
+        }
+        for (auto& f : extra.fields) primary.fields.push_back(std::move(f));
+        for (auto& p : extra.properties) primary.properties.push_back(std::move(p));
+        for (auto& e : extra.events) primary.events.push_back(std::move(e));
+        for (auto& c : extra.constructors) primary.constructors.push_back(std::move(c));
+        for (auto& s : extra.sequences) primary.sequences.push_back(std::move(s));
+        for (auto& m : extra.methods) primary.methods.push_back(std::move(m));
+    }
+
+    reconcilePartialMethods(primary.methods, partSourceNames[0], diagnostics, moduleInvalid);
+}
+
+template <typename DeclSyntax>
+void mergeRecordGroupsForUnits(
+    const std::vector<detail::PartialUnitEntry>& units,
+    std::vector<DeclSyntax> syntax::CompilationUnitSyntax::* vecMember,
+    std::string_view kindPrefix,
+    diagnostics::DiagnosticBag& diagnostics,
+    bool& moduleInvalid,
+    std::unordered_map<std::string, detail::MergedPartialTypeOriginInfo>* outMultiPartRecords) {
+    struct RecordGroup {
+        std::vector<DeclSyntax*> parts;
+        std::vector<std::pair<syntax::CompilationUnitSyntax*, std::size_t>> locations;
+        std::vector<std::string> sourceNames;
+    };
+
+    std::map<std::string, RecordGroup> groups;
+    std::vector<std::string> order;
+    for (const auto& u : units) {
+        if (!u.syntaxTree) continue;
+        auto& vec = u.syntaxTree->*vecMember;
+        for (std::size_t idx = 0; idx < vec.size(); ++idx) {
+            auto& decl = vec[idx];
+            const std::string key =
+                decl.identifierToken.text + "#" + std::to_string(decl.typeParameters.size());
+            if (groups.find(key) == groups.end()) order.push_back(key);
+            auto& g = groups[key];
+            g.parts.push_back(&decl);
+            g.locations.emplace_back(u.syntaxTree, idx);
+            g.sourceNames.push_back(u.sourceName);
+        }
+    }
+
+    std::unordered_map<syntax::CompilationUnitSyntax*, std::unordered_set<std::size_t>> eraseIndices;
+    for (const auto& key : order) {
+        auto& g = groups[key];
+        if (g.parts.size() > 1) {
+            if (outMultiPartRecords) {
+                auto& info = (*outMultiPartRecords)[std::string(kindPrefix) + key];
+                for (std::size_t i = 0; i < g.parts.size(); ++i) {
+                    info.parts.push_back(detail::MergedGenericPartialPart{
+                        g.sourceNames[i], g.parts[i]->span()});
+                }
+            }
+            mergePartialDeclGroup(g.parts, diagnostics, g.sourceNames, moduleInvalid);
+            for (std::size_t i = 1; i < g.locations.size(); ++i) {
+                eraseIndices[g.locations[i].first].insert(g.locations[i].second);
+            }
+        } else if (g.parts.size() == 1) {
+            reconcilePartialMethods(
+                g.parts[0]->methods, g.sourceNames[0], diagnostics, moduleInvalid);
+        }
+    }
+
+    for (auto& [treePtr, indices] : eraseIndices) {
+        auto& vec = treePtr->*vecMember;
+        std::vector<DeclSyntax> kept;
+        kept.reserve(vec.size());
+        for (std::size_t i = 0; i < vec.size(); ++i) {
+            if (indices.find(i) == indices.end()) kept.push_back(std::move(vec[i]));
+        }
+        vec = std::move(kept);
+    }
+}
+
+} // namespace
+
+namespace detail {
+
+void mergePartialRecordDeclarations(
+    const std::vector<PartialUnitEntry>& units,
+    diagnostics::DiagnosticBag& diagnostics,
+    bool& moduleInvalid,
+    std::unordered_map<std::string, MergedPartialTypeOriginInfo>* outMultiPartRecords) {
+    mergeRecordGroupsForUnits(
+        units,
+        &syntax::CompilationUnitSyntax::classes,
+        "class:",
+        diagnostics,
+        moduleInvalid,
+        outMultiPartRecords);
+    mergeRecordGroupsForUnits(
+        units,
+        &syntax::CompilationUnitSyntax::structs,
+        "struct:",
+        diagnostics,
+        moduleInvalid,
+        outMultiPartRecords);
+}
+
+} // namespace detail
+
+namespace {
+
+void mergePartialTypesInModule(ModuleWork& module, BuildResult& result) {
+    // Clone shared syntaxTree before mutating so parsedUnitCache stays immutable!
+    bool needsTreeMutation = false;
+    std::unordered_map<std::string, std::size_t> classCounts;
+    std::unordered_map<std::string, std::size_t> structCounts;
+    for (const auto* u : module.units) {
+        for (const auto& c : u->syntaxTree->classes) {
+            ++classCounts[c.identifierToken.text + "#" + std::to_string(c.typeParameters.size())];
+            for (const auto& m : c.methods) {
+                if (semantic::hasModifier(m.modifiers, syntax::SyntaxKind::PartialKeyword)) {
+                    needsTreeMutation = true;
+                }
+            }
+        }
+        for (const auto& s : u->syntaxTree->structs) {
+            ++structCounts[s.identifierToken.text + "#" + std::to_string(s.typeParameters.size())];
+            for (const auto& m : s.methods) {
+                if (semantic::hasModifier(m.modifiers, syntax::SyntaxKind::PartialKeyword)) {
+                    needsTreeMutation = true;
+                }
+            }
+        }
+    }
+    for (const auto& [k, cnt] : classCounts) if (cnt > 1) needsTreeMutation = true;
+    for (const auto& [k, cnt] : structCounts) if (cnt > 1) needsTreeMutation = true;
+    if (!needsTreeMutation) return;
+
+    std::vector<detail::PartialUnitEntry> partialUnits;
+    partialUnits.reserve(module.units.size());
+    for (auto* u : module.units) {
+        auto cloned = std::make_shared<syntax::CompilationUnitSyntax>();
+        if (u->syntaxTree->moduleDeclaration) {
+            cloned->moduleDeclaration = std::make_unique<syntax::ModuleDeclarationSyntax>(*u->syntaxTree->moduleDeclaration);
+        }
+        cloned->imports = u->syntaxTree->imports;
+        for (const auto& c : u->syntaxTree->classes) {
+            cloned->classes.push_back(syntax::cloneClassDeclarationSyntax(c));
+        }
+        for (const auto& s : u->syntaxTree->structs) {
+            cloned->structs.push_back(syntax::cloneStructDeclarationSyntax(s));
+        }
+        cloned->enums = u->syntaxTree->enums;
+        for (const auto& iface : u->syntaxTree->interfaces) {
+            cloned->interfaces.push_back(syntax::cloneInterfaceDeclarationSyntax(iface));
+        }
+        for (const auto& del : u->syntaxTree->delegates) {
+            cloned->delegates.push_back(syntax::cloneDelegateDeclarationSyntax(del));
+        }
+        for (const auto& fn : u->syntaxTree->functions) {
+            cloned->functions.push_back(syntax::cloneFunctionDeclarationSyntax(fn));
+        }
+        cloned->endOfFileToken = u->syntaxTree->endOfFileToken;
+        u->syntaxTree = std::move(cloned);
+        partialUnits.push_back(detail::PartialUnitEntry{u->syntaxTree.get(), u->source->name()});
+    }
+
+    detail::mergePartialRecordDeclarations(
+        partialUnits, result.diagnostics, module.invalid);
+}
+
+} // namespace
+
 BuildResult Compilation::build(const BuildSnapshot* previous) const {
     BuildResult result;
     std::vector<std::unique_ptr<ParsedUnit>> units;
     std::map<std::string, ModuleWork> modules;
 
-    static std::mutex sParsedUnitCacheMutex;
-    static std::unordered_map<std::uint64_t, ParsedUnit> sParsedUnitCache;
-    static std::mutex sModuleFrontendCacheMutex;
-    static std::unordered_map<std::string, CachedModuleFrontend> sModuleFrontendCache;
+    static auto sDefaultSession = std::make_shared<CompilerSession>();
+    CompilerSession& activeSession = options_.session ? *options_.session : *sDefaultSession;
+    auto& sessionImpl = activeSession.impl();
+
+    // Compute active ModulePack + MacroPlugin configuration fingerprint for cache isolation
+    std::vector<ModulePack> effectivePacks;
+    if (options_.packRegistry) {
+        for (const auto& p : options_.packRegistry->packs()) {
+            if (options_.disabledPacks.find(p.moduleName) == options_.disabledPacks.end()) {
+                effectivePacks.push_back(p);
+            }
+        }
+    } else if (options_.allowDefaultBuiltinPacks) {
+        for (const auto& p : ModulePackRegistry::builtinDefaults().packs()) {
+            if (options_.disabledPacks.find(p.moduleName) == options_.disabledPacks.end()) {
+                effectivePacks.push_back(p);
+            }
+        }
+    }
+    for (const auto& extra : options_.extraPacks) {
+        if (options_.disabledPacks.find(extra.moduleName) == options_.disabledPacks.end()) {
+            effectivePacks.push_back(extra);
+        }
+    }
+    std::uint64_t configFp = 14695981039346656037ull;
+    for (const auto& p : effectivePacks) {
+        configFp = combineFingerprint(configFp, stableFingerprint(p.moduleName));
+    }
+    for (const auto& mp : options_.macroPlugins) {
+        if (mp) configFp = combineFingerprint(configFp, stableFingerprint("macro:" + mp->name()));
+    }
 
     const auto addSourceUnit = [&](const SourceFile& sourceFile) {
         const auto fp = stableFingerprint(sourceFile.path + "\n" + sourceFile.content);
         auto unit = std::make_unique<ParsedUnit>();
         bool cacheHit = false;
         {
-            std::lock_guard<std::mutex> lock(sParsedUnitCacheMutex);
-            const auto found = sParsedUnitCache.find(fp);
-            if (found != sParsedUnitCache.end() &&
+            std::lock_guard<std::mutex> lock(sessionImpl.parsedUnitCacheMutex);
+            const auto found = sessionImpl.parsedUnitCache.find(fp);
+            if (found != sessionImpl.parsedUnitCache.end() &&
                 found->second.source &&
                 found->second.source->name() == sourceFile.path) {
                 *unit = found->second;
@@ -75,9 +753,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             }
             unit->hasGenericSyntax = (sourceFile.content.find('<') != std::string::npos);
             {
-                std::lock_guard<std::mutex> lock(sParsedUnitCacheMutex);
-                if (sParsedUnitCache.size() > 8192) sParsedUnitCache.clear();
-                sParsedUnitCache[fp] = *unit;
+                std::lock_guard<std::mutex> lock(sessionImpl.parsedUnitCacheMutex);
+                if (sessionImpl.parsedUnitCache.size() > 8192) sessionImpl.parsedUnitCache.clear();
+                sessionImpl.parsedUnitCache[fp] = *unit;
             }
         }
         for (const auto& diagnostic : unit->parseDiagnostics) {
@@ -98,87 +776,71 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         addSourceUnit(sourceFile);
     }
 
-    bool importsBuiltinMath = false;
-    bool importsBuiltinFiber = false;
-    for (const auto& [name, module] : modules) {
-        (void)name;
-        if (module.imports.find("RealScript.Math") != module.imports.end()) {
-            importsBuiltinMath = true;
+    // Execute registered ICompilerMacroPlugin source generators prior to pack mounting & semantic binding
+    if (!options_.macroPlugins.empty()) {
+        std::vector<MacroAstUnitView> views;
+        views.reserve(units.size());
+        for (const auto& u : units) {
+            if (!u || !u->source || !u->syntaxTree) continue;
+            views.push_back(MacroAstUnitView{
+                u->source->name(),
+                u->moduleName,
+                u->imports,
+                u->source.get(),
+                u->syntaxTree.get()});
         }
-        if (module.imports.find("RealScript.Fiber") != module.imports.end()) {
-            importsBuiltinFiber = true;
+        MacroExpansionContext ctx{views};
+        std::vector<SourceFile> generatedFiles;
+        for (const auto& plugin : options_.macroPlugins) {
+            if (!plugin) continue;
+            plugin->expand(ctx, generatedFiles, result.diagnostics);
         }
-    }
-    if (importsBuiltinMath && modules.find("RealScript.Math") == modules.end()) {
-        addSourceUnit(SourceFile{
-            "$builtin/RealScript.Math.rscript",
-            builtinDeterministicMathModuleSource()});
-    }
-    if (importsBuiltinFiber && modules.find("RealScript.Fiber") == modules.end()) {
-        addSourceUnit(SourceFile{
-            "$builtin/RealScript.Fiber.rscript",
-            builtinFiberModuleSource()});
+        for (const auto& genFile : generatedFiles) {
+            addSourceUnit(genFile);
+        }
     }
 
-    bool needsBuiltinAsync = false;
-    std::vector<std::string> modulesUsingAsync;
-    for (const auto& [name, module] : modules) {
-        if (name == "RealScript.Async") continue;
-        bool moduleUsesAsync =
-            module.imports.find("RealScript.Async") != module.imports.end();
-        if (!moduleUsesAsync) {
-            for (const auto* u : module.units) {
-                if (u && u->source && sourceMentionsAsyncPrimitives(u->source->content())) {
-                    moduleUsesAsync = true;
-                    break;
+    // Mount needed ModulePacks via unified ModulePack descriptors (zero hardcoded module branches)
+    std::unordered_set<std::string> packNamesSet;
+    for (const auto& p : effectivePacks) packNamesSet.insert(p.moduleName);
+    for (const auto& pack : effectivePacks) {
+        if (!pack.sourceProvider) continue;
+        bool needed = false;
+        std::vector<std::string> implicitConsumers;
+        for (const auto& [name, module] : modules) {
+            if (name == pack.moduleName) continue;
+            if (module.imports.find(pack.moduleName) != module.imports.end()) {
+                needed = true;
+                continue;
+            }
+            if (pack.implicitUsagePredicate && packNamesSet.find(name) == packNamesSet.end()) {
+                for (const auto* u : module.units) {
+                    if (u && u->source && pack.implicitUsagePredicate(u->source->content())) {
+                        needed = true;
+                        if (pack.autoInjectImportOnImplicitUsage) {
+                            implicitConsumers.push_back(name);
+                        }
+                        break;
+                    }
                 }
             }
         }
-        if (moduleUsesAsync) {
-            needsBuiltinAsync = true;
-            modulesUsingAsync.push_back(name);
+        if (needed && modules.find(pack.moduleName) == modules.end()) {
+            addSourceUnit(SourceFile{
+                pack.virtualSourcePath.empty()
+                    ? ("$builtin/" + pack.moduleName + ".rscript")
+                    : pack.virtualSourcePath,
+                pack.sourceProvider()});
         }
-    }
-    if (needsBuiltinAsync && modules.find("RealScript.Async") == modules.end()) {
-        addSourceUnit(SourceFile{
-            "$builtin/RealScript.Async.rscript",
-            builtinAsyncModuleSource()});
-    }
-    for (const auto& modName : modulesUsingAsync) {
-        modules[modName].imports.insert("RealScript.Async");
+        for (const auto& consumer : implicitConsumers) {
+            modules[consumer].imports.insert(pack.moduleName);
+        }
     }
 
-    bool needsBuiltinResource = false;
-    std::vector<std::string> modulesUsingResource;
-    for (const auto& [name, module] : modules) {
-        if (name == "RealScript.Resource" ||
-            name == "RealScript.Math" ||
-            name == "RealScript.Fiber" ||
-            name == "RealScript.Async") {
-            continue;
-        }
-        bool moduleUsesResource =
-            module.imports.find("RealScript.Resource") != module.imports.end();
-        if (!moduleUsesResource) {
-            for (const auto* u : module.units) {
-                if (u && u->source && sourceMentionsResourcePrimitives(u->source->content())) {
-                    moduleUsesResource = true;
-                    break;
-                }
-            }
-        }
-        if (moduleUsesResource) {
-            needsBuiltinResource = true;
-            modulesUsingResource.push_back(name);
-        }
-    }
-    if (needsBuiltinResource && modules.find("RealScript.Resource") == modules.end()) {
-        addSourceUnit(SourceFile{
-            "$builtin/RealScript.Resource.rscript",
-            builtinResourceModuleSource()});
-    }
-    for (const auto& modName : modulesUsingResource) {
-        modules[modName].imports.insert("RealScript.Resource");
+    // Merge partial class / partial struct declarations & reconcile partial methods
+    for (auto& [modName, mod] : modules) {
+        (void)modName;
+        mergePartialTypesInModule(mod, result);
     }
 
     specializeNativeGenerics(units, modules, result);
@@ -263,7 +925,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             (void)computeTransitiveFp(moduleName);
         }
         if (previous) {
-            std::lock_guard<std::mutex> lock(sModuleFrontendCacheMutex);
+            std::lock_guard<std::mutex> lock(sessionImpl.moduleFrontendCacheMutex);
             for (auto& [moduleName, module] : modules) {
                 if (moduleName == "$global" || module.invalid || module.transitiveSourceFingerprint == 0) continue;
                 const auto prevIt = previous->modules.find(moduleName);
@@ -272,9 +934,10 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                     continue;
                 }
                 const std::string cacheKey =
-                    moduleName + "#" + std::to_string(module.transitiveSourceFingerprint);
-                const auto fcIt = sModuleFrontendCache.find(cacheKey);
-                if (fcIt == sModuleFrontendCache.end() ||
+                    moduleName + "#" + std::to_string(module.transitiveSourceFingerprint) +
+                    "#" + std::to_string(configFp);
+                const auto fcIt = sessionImpl.moduleFrontendCache.find(cacheKey);
+                if (fcIt == sessionImpl.moduleFrontendCache.end() ||
                     fcIt->second.transitiveSourceFingerprint != module.transitiveSourceFingerprint ||
                     fcIt->second.sourceFingerprint != module.sourceFingerprint ||
                     fcIt->second.publicFingerprint != prevIt->second.publicFingerprint ||
@@ -315,8 +978,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             for (auto& [moduleName, module] : modules) {
                 if (module.frontendCached && module.neededByDirtyModule) {
                     const std::string cacheKey =
-                        moduleName + "#" + std::to_string(module.transitiveSourceFingerprint);
-                    const auto& fc = sModuleFrontendCache.at(cacheKey);
+                        moduleName + "#" + std::to_string(module.transitiveSourceFingerprint) +
+                        "#" + std::to_string(configFp);
+                    const auto& fc = sessionImpl.moduleFrontendCache.at(cacheKey);
                     module.types = fc.types;
                     module.interfaces = fc.interfaces;
                     module.delegates = fc.delegates;
@@ -334,8 +998,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         modules, result, globalObsoleteSymbols);
 
     if (result.nativeGenericInstantiations.empty()) {
-        std::lock_guard<std::mutex> lock(sModuleFrontendCacheMutex);
-        if (sModuleFrontendCache.size() > 4096) sModuleFrontendCache.clear();
+        std::lock_guard<std::mutex> lock(sessionImpl.moduleFrontendCacheMutex);
+        if (sessionImpl.moduleFrontendCache.size() > 4096) sessionImpl.moduleFrontendCache.clear();
         for (const auto& [moduleName, module] : modules) {
             if (moduleName == "$global" || module.frontendCached || module.invalid || module.transitiveSourceFingerprint == 0) {
                 continue;
@@ -371,8 +1035,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 }
             }
             const std::string cacheKey =
-                moduleName + "#" + std::to_string(module.transitiveSourceFingerprint);
-            sModuleFrontendCache[cacheKey] = std::move(fc);
+                moduleName + "#" + std::to_string(module.transitiveSourceFingerprint) +
+                "#" + std::to_string(configFp);
+            sessionImpl.moduleFrontendCache[cacheKey] = std::move(fc);
         }
     }
 

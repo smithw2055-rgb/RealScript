@@ -30,6 +30,7 @@ bool hasSequenceResultMetadata(const Version& version) noexcept {
 
 constexpr std::uint32_t kInlineMetadataTrailerMagic = 0x52534944u; // "RSID"
 constexpr std::uint32_t kFunctionAccessMetadataTrailerMagic = 0x52534641u; // "RSFA"
+constexpr std::uint32_t kLineMapDebugTrailerMagic = 0x52534C4Du; // "RSLM"
 
 bool hasInlineDependencyMetadata(const Module& mod) noexcept {
     return mod.version.major == 0 && mod.version.minor >= 7 &&
@@ -707,6 +708,9 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
     for (const auto& function : module.functions) {
         strings.add(function.name);
         for (const auto& local : function.debugInfo.locals) strings.add(local.name);
+        for (const auto& point : function.debugInfo.sequencePoints) {
+            if (!point.mappedPath.empty()) strings.add(point.mappedPath);
+        }
         for (const auto& block : function.blocks) {
             for (const auto& instruction : block.instructions) {
                 if (instruction.opcode == Opcode::ConstantString) {
@@ -996,6 +1000,32 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
             debugSection.u8(local.parameter ? 1 : 0);
             writeRange(debugSection, local.declaration);
             writeRange(debugSection, local.scope);
+        }
+    }
+    const bool hasLineMapMetadata = std::any_of(
+        module.functions.begin(),
+        module.functions.end(),
+        [](const Function& fn) {
+            return std::any_of(
+                fn.debugInfo.sequencePoints.begin(),
+                fn.debugInfo.sequencePoints.end(),
+                [](const debug::SequencePoint& sp) {
+                    return sp.hidden || !sp.mappedPath.empty();
+                });
+        });
+    if (hasLineMapMetadata) {
+        debugSection.u32(kLineMapDebugTrailerMagic);
+        for (const auto& function : module.functions) {
+            debugSection.u64(function.symbolId);
+            const auto& pts = function.debugInfo.sequencePoints;
+            debugSection.u32(static_cast<std::uint32_t>(pts.size()));
+            for (const auto& point : pts) {
+                debugSection.u8(point.hidden ? 1u : 0u);
+                debugSection.u32(
+                    point.mappedPath.empty()
+                        ? InvalidIndex
+                        : strings.indexOf(point.mappedPath));
+            }
         }
     }
 
@@ -2151,6 +2181,35 @@ bool decodeModule(
                 if (source.id == info.sourceFileId) {
                     info.sourceName = source.path;
                     break;
+                }
+            }
+        }
+        if (reader.valid() && reader.remaining() >= 4 &&
+            reader.peekU32() == kLineMapDebugTrailerMagic) {
+            (void)reader.u32();
+            for (std::uint32_t index = 0; index < functionCount; ++index) {
+                const auto symbolId = reader.u64();
+                const auto found = functionsById.find(symbolId);
+                if (found == functionsById.end()) {
+                    diagnostics.report("RS5007", "line-map debug trailer references an unknown function", {});
+                    return false;
+                }
+                auto& pts = found->second->debugInfo.sequencePoints;
+                const auto ptCount = reader.u32();
+                if (!reader.valid() || ptCount != pts.size()) {
+                    diagnostics.report("RS5003", "line-map debug trailer count mismatch", {});
+                    return false;
+                }
+                for (std::uint32_t p = 0; p < ptCount; ++p) {
+                    pts[p].hidden = reader.u8() != 0;
+                    const auto pathIdx = reader.u32();
+                    if (pathIdx != InvalidIndex) {
+                        if (!validStringIndex(pathIdx, strings, diagnostics,
+                                "invalid sequence-point mapped path index")) {
+                            return false;
+                        }
+                        pts[p].mappedPath = strings[pathIdx];
+                    }
                 }
             }
         }

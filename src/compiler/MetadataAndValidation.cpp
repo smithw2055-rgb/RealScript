@@ -536,10 +536,24 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
 
         for (auto& [modName, mod] : modules) {
             (void)modName;
+            std::unordered_map<std::string, const text::SourceText*> unitSourcesByName;
+            for (const auto* u : mod.units) {
+                if (u && u->source) unitSourcesByName[u->source->name()] = u->source.get();
+            }
             for (const auto* unit : mod.units) {
                 if (!unit || !unit->syntaxTree) continue;
                 const auto& srcName = unit->source->name();
                 const bool validateThisMod = !mod.frontendCached;
+                const auto memberSrcName = [&](const auto& member) -> const std::string& {
+                    return member.originSourceName.empty() ? srcName : member.originSourceName;
+                };
+                const auto memberSourceText = [&](const auto& member) -> const text::SourceText& {
+                    if (!member.originSourceName.empty()) {
+                        const auto it = unitSourcesByName.find(member.originSourceName);
+                        if (it != unitSourcesByName.end() && it->second) return *it->second;
+                    }
+                    return *unit->source;
+                };
 
                 if (validateThisMod && unit->syntaxTree->moduleDeclaration) {
                     validateAttrLists(
@@ -559,15 +573,16 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
                             }
                         }
                         for (const auto& fSyn : decl.fields) {
+                            const auto& memberSrc = memberSrcName(fSyn);
                             if (validateThisMod) {
-                                validateAttrLists(mod, srcName, fSyn.attributes, AttrTarget_Field);
+                                validateAttrLists(mod, memberSrc, fSyn.attributes, AttrTarget_Field);
                             }
                             if (owner) {
                                 for (const auto& fSym : owner->fields) {
                                     if (fSym.declaringTypeId == owner->id &&
                                         fSym.name == fSyn.identifierToken.text) {
                                         if (const auto obs = extractObsolete(
-                                                fSyn.attributes, *unit->source, mod.visibleTypes)) {
+                                                fSyn.attributes, memberSourceText(fSyn), mod.visibleTypes)) {
                                             globalObsoleteSymbols[fSym.id] = *obs;
                                         }
                                     }
@@ -575,15 +590,16 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
                             }
                         }
                         for (const auto& pSyn : decl.properties) {
+                            const auto& memberSrc = memberSrcName(pSyn);
                             if (validateThisMod) {
-                                validateAttrLists(mod, srcName, pSyn.attributes, AttrTarget_Property);
+                                validateAttrLists(mod, memberSrc, pSyn.attributes, AttrTarget_Property);
                             }
                             if (owner) {
                                 for (const auto& pSym : owner->properties) {
                                     if (pSym.declaringTypeId == owner->id &&
                                         pSym.name == pSyn.identifierToken.text) {
                                         if (const auto obs = extractObsolete(
-                                                pSyn.attributes, *unit->source, mod.visibleTypes)) {
+                                                pSyn.attributes, memberSourceText(pSyn), mod.visibleTypes)) {
                                             globalObsoleteSymbols[pSym.id] = *obs;
                                             if (pSym.getter) globalObsoleteSymbols[pSym.getter->id] = *obs;
                                             if (pSym.setter) globalObsoleteSymbols[pSym.setter->id] = *obs;
@@ -594,19 +610,20 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
                         }
                         for (const auto& evSyn : decl.events) {
                             if (validateThisMod) {
-                                validateAttrLists(mod, srcName, evSyn.attributes, AttrTarget_Event);
+                                validateAttrLists(mod, memberSrcName(evSyn), evSyn.attributes, AttrTarget_Event);
                             }
                         }
                         for (const auto& cSyn : decl.constructors) {
+                            const auto& memberSrc = memberSrcName(cSyn);
                             if (validateThisMod) {
-                                validateAttrLists(mod, srcName, cSyn.attributes, AttrTarget_Ctor);
+                                validateAttrLists(mod, memberSrc, cSyn.attributes, AttrTarget_Ctor);
                                 for (const auto& param : cSyn.parameters) {
-                                    validateAttrLists(mod, srcName, param.attributes, AttrTarget_Parameter);
+                                    validateAttrLists(mod, memberSrc, param.attributes, AttrTarget_Parameter);
                                 }
                             }
                             if (owner) {
                                 if (const auto obs = extractObsolete(
-                                        cSyn.attributes, *unit->source, mod.visibleTypes)) {
+                                        cSyn.attributes, memberSourceText(cSyn), mod.visibleTypes)) {
                                     diagnostics::DiagnosticBag ignored;
                                     const auto cSym = semantic::declareConstructorSymbol(
                                         mod.name, cSyn, *owner, mod.visibleTypes, ignored);
@@ -616,15 +633,16 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
                         }
                         for (const auto& mSyn : decl.methods) {
                             if (!mSyn.typeParameters.empty()) continue;
+                            const auto& memberSrc = memberSrcName(mSyn);
                             if (validateThisMod) {
-                                validateAttrLists(mod, srcName, mSyn.attributes, AttrTarget_Method);
+                                validateAttrLists(mod, memberSrc, mSyn.attributes, AttrTarget_Method);
                                 for (const auto& param : mSyn.parameters) {
-                                    validateAttrLists(mod, srcName, param.attributes, AttrTarget_Parameter);
+                                    validateAttrLists(mod, memberSrc, param.attributes, AttrTarget_Parameter);
                                 }
                             }
                             if (owner) {
                                 if (const auto obs = extractObsolete(
-                                        mSyn.attributes, *unit->source, mod.visibleTypes)) {
+                                        mSyn.attributes, memberSourceText(mSyn), mod.visibleTypes)) {
                                     diagnostics::DiagnosticBag ignored;
                                     const auto mSym = semantic::declareFunctionSymbol(
                                         mod.name, mSyn, mod.visibleTypes, ignored, owner);
@@ -634,9 +652,10 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
                         }
                         for (const auto& sSyn : decl.sequences) {
                             if (validateThisMod) {
-                                validateAttrLists(mod, srcName, sSyn.attributes, AttrTarget_Method);
+                                const auto& memberSrc = memberSrcName(sSyn);
+                                validateAttrLists(mod, memberSrc, sSyn.attributes, AttrTarget_Method);
                                 for (const auto& param : sSyn.parameters) {
-                                    validateAttrLists(mod, srcName, param.attributes, AttrTarget_Parameter);
+                                    validateAttrLists(mod, memberSrc, param.attributes, AttrTarget_Parameter);
                                 }
                             }
                         }
@@ -777,9 +796,23 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
             for (auto& [modName, mod] : modules) {
                 (void)modName;
                 if (mod.frontendCached) continue;
+                std::unordered_map<std::string, const text::SourceText*> unitSourcesByName;
+                for (const auto* u : mod.units) {
+                    if (u && u->source) unitSourcesByName[u->source->name()] = u->source.get();
+                }
                 for (const auto* unit : mod.units) {
                     if (!unit || !unit->syntaxTree || unit->isGenericSpecialization) continue;
                     const auto& srcName = unit->source->name();
+                    const auto memberSrcName = [&](const auto& member) -> const std::string& {
+                        return member.originSourceName.empty() ? srcName : member.originSourceName;
+                    };
+                    const auto memberSourceText = [&](const auto& member) -> const text::SourceText& {
+                        if (!member.originSourceName.empty()) {
+                            const auto it = unitSourcesByName.find(member.originSourceName);
+                            if (it != unitSourcesByName.end() && it->second) return *it->second;
+                        }
+                        return *unit->source;
+                    };
                     const auto checkRecordDeclSigs = [&](const auto& decls) {
                         for (const auto& decl : decls) {
                             if (!decl.typeParameters.empty()) continue;
@@ -792,28 +825,30 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
                             }
                             for (const auto& fSyn : decl.fields) {
                                 const bool fObs = ownerObs ||
-                                    extractObsolete(fSyn.attributes, *unit->source, mod.visibleTypes).has_value();
-                                checkSignatureTypeObs(mod, srcName, fSyn.type, ownerId, fObs);
+                                    extractObsolete(fSyn.attributes, memberSourceText(fSyn), mod.visibleTypes).has_value();
+                                checkSignatureTypeObs(mod, memberSrcName(fSyn), fSyn.type, ownerId, fObs);
                             }
                             for (const auto& pSyn : decl.properties) {
                                 const bool pObs = ownerObs ||
-                                    extractObsolete(pSyn.attributes, *unit->source, mod.visibleTypes).has_value();
-                                checkSignatureTypeObs(mod, srcName, pSyn.type, ownerId, pObs);
+                                    extractObsolete(pSyn.attributes, memberSourceText(pSyn), mod.visibleTypes).has_value();
+                                checkSignatureTypeObs(mod, memberSrcName(pSyn), pSyn.type, ownerId, pObs);
                             }
                             for (const auto& cSyn : decl.constructors) {
+                                const auto& memberSrc = memberSrcName(cSyn);
                                 const bool cObs = ownerObs ||
-                                    extractObsolete(cSyn.attributes, *unit->source, mod.visibleTypes).has_value();
+                                    extractObsolete(cSyn.attributes, memberSourceText(cSyn), mod.visibleTypes).has_value();
                                 for (const auto& param : cSyn.parameters) {
-                                    checkSignatureTypeObs(mod, srcName, param.type, ownerId, cObs);
+                                    checkSignatureTypeObs(mod, memberSrc, param.type, ownerId, cObs);
                                 }
                             }
                             for (const auto& mSyn : decl.methods) {
                                 if (!mSyn.typeParameters.empty()) continue;
+                                const auto& memberSrc = memberSrcName(mSyn);
                                 const bool mObs = ownerObs ||
-                                    extractObsolete(mSyn.attributes, *unit->source, mod.visibleTypes).has_value();
-                                checkSignatureTypeObs(mod, srcName, mSyn.returnType, ownerId, mObs);
+                                    extractObsolete(mSyn.attributes, memberSourceText(mSyn), mod.visibleTypes).has_value();
+                                checkSignatureTypeObs(mod, memberSrc, mSyn.returnType, ownerId, mObs);
                                 for (const auto& param : mSyn.parameters) {
-                                    checkSignatureTypeObs(mod, srcName, param.type, ownerId, mObs);
+                                    checkSignatureTypeObs(mod, memberSrc, param.type, ownerId, mObs);
                                 }
                             }
                         }
@@ -895,6 +930,42 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
         for (const auto& [name, owner] : structs) {
             (void)owner;
             if (colors[name] == 0) visit(name);
+        }
+    }
+
+    // Re-propagate transitive [StackOnly] across all modules and validate field storage.
+    {
+        bool stackOnlyChanged = true;
+        while (stackOnlyChanged) {
+            stackOnlyChanged = false;
+            for (auto& [moduleName, module] : modules) {
+                (void)moduleName;
+                if (module.frontendCached) continue;
+                if (semantic::propagateStackOnlyTypes(module.types, module.visibleTypes)) {
+                    stackOnlyChanged = true;
+                }
+            }
+            if (stackOnlyChanged) {
+                for (auto& [moduleName, module] : modules) {
+                    (void)moduleName;
+                    if (module.frontendCached) continue;
+                    refreshVisibleTypes(modules, module);
+                }
+            }
+        }
+        for (auto& [moduleName, module] : modules) {
+            (void)moduleName;
+            if (module.frontendCached) continue;
+            for (const auto& type : module.types) {
+                if (type.kind != semantic::TypeKind::Class &&
+                    type.kind != semantic::TypeKind::Struct) {
+                    continue;
+                }
+                if (!semantic::validateStackOnlyFields(
+                        type, module.visibleTypes, result.diagnostics)) {
+                    module.invalid = true;
+                }
+            }
         }
     }
 

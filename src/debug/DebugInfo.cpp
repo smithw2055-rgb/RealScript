@@ -55,7 +55,36 @@ void finalizeFunctionDebugInfo(
     };
     resolve(info.declaration);
     resolve(info.body);
-    for (auto& point : info.sequencePoints) resolve(point.range);
+    for (auto& point : info.sequencePoints) {
+        resolve(point.range);
+        if (!source->lineDirectives.empty()) {
+            const auto physLine = point.range.start.line;
+            const auto it = std::upper_bound(
+                source->lineDirectives.begin(),
+                source->lineDirectives.end(),
+                physLine,
+                [](std::size_t targetLine, const text::LineDirectiveSpan& entry) {
+                    return targetLine < entry.physicalStartLine;
+                });
+            if (it != source->lineDirectives.begin()) {
+                const auto& active = *(it - 1);
+                if (active.hidden) {
+                    point.hidden = true;
+                    point.mappedPath = active.mappedPath;
+                } else if (!active.isDefault) {
+                    const std::size_t delta = physLine >= active.physicalStartLine
+                        ? (physLine - active.physicalStartLine)
+                        : 0u;
+                    const std::size_t endDelta = point.range.end.line >= physLine
+                        ? (point.range.end.line - physLine)
+                        : 0u;
+                    point.range.start.line = active.mappedStartLine + delta;
+                    point.range.end.line = point.range.start.line + endDelta;
+                    point.mappedPath = active.mappedPath.empty() ? source->path : active.mappedPath;
+                }
+            }
+        }
+    }
     for (auto& local : info.locals) {
         resolve(local.declaration);
         resolve(local.scope);

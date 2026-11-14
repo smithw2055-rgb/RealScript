@@ -86,6 +86,7 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(VirtualKeyword);
         RS_KIND(OverrideKeyword);
         RS_KIND(SealedKeyword);
+        RS_KIND(PartialKeyword);
         RS_KIND(BaseKeyword);
         RS_KIND(GetKeyword);
         RS_KIND(SetKeyword);
@@ -160,6 +161,7 @@ const char* syntaxKindName(SyntaxKind kind) noexcept {
         RS_KIND(VariableDeclarationStatement);
         RS_KIND(ExpressionStatement);
         RS_KIND(LiteralExpression);
+        RS_KIND(TaggedStringExpression);
         RS_KIND(NameExpression);
         RS_KIND(LambdaExpression);
         RS_KIND(UnaryExpression);
@@ -239,6 +241,7 @@ SyntaxKind keywordKind(const std::string& textValue) noexcept {
         {"virtual", SyntaxKind::VirtualKeyword},
         {"override", SyntaxKind::OverrideKeyword},
         {"sealed", SyntaxKind::SealedKeyword},
+        {"partial", SyntaxKind::PartialKeyword},
         {"base", SyntaxKind::BaseKeyword},
         {"get", SyntaxKind::GetKeyword},
         {"set", SyntaxKind::SetKeyword},
@@ -326,6 +329,7 @@ bool isDeclarationModifier(SyntaxKind kind) noexcept {
     case SyntaxKind::VirtualKeyword:
     case SyntaxKind::OverrideKeyword:
     case SyntaxKind::SealedKeyword:
+    case SyntaxKind::PartialKeyword:
     case SyntaxKind::AsyncKeyword:
         return true;
     default:

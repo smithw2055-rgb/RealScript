@@ -36,10 +36,16 @@ bool DiagnosticBag::hasErrors() const noexcept {
 std::string formatDiagnostic(
     const Diagnostic& diagnostic,
     const text::SourceText& source) {
-    const auto position = source.linePosition(diagnostic.span.start);
-    const auto& sourceName = diagnostic.sourceName.empty()
-        ? source.name()
-        : diagnostic.sourceName;
+    const bool canRemap = !source.lineDirectives().empty() &&
+        (diagnostic.sourceName.empty() || diagnostic.sourceName == source.name());
+    const auto mapped = canRemap
+        ? source.mappedLocation(diagnostic.span.start)
+        : text::MappedLineLocation{
+              diagnostic.sourceName.empty() ? source.name() : diagnostic.sourceName,
+              source.linePosition(diagnostic.span.start),
+              false};
+    const auto position = mapped.position;
+    const auto& sourceName = mapped.path;
 
     std::ostringstream out;
     out << sourceName << ':' << (position.line + 1) << ':' << (position.column + 1)

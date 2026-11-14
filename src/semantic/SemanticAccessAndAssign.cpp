@@ -64,16 +64,19 @@ bool Binder::isManagedResourceHandleType(
     PrimitiveType type,
     const std::string& typeName) const noexcept {
     if (type != PrimitiveType::Struct || typeName.empty()) return false;
+    const auto found = visibleTypes_.find(typeName);
+    if (found == visibleTypes_.end() || found->second.kind != TypeKind::Struct) {
+        return false;
+    }
     const auto sep = typeName.rfind("::");
     const std::string_view shortName = sep == std::string::npos
         ? std::string_view(typeName)
         : std::string_view(typeName).substr(sep + 2);
-    if (shortName != "ResourceHandle" &&
-        shortName.rfind("ResourceHandle__", 0) != 0) {
-        return false;
-    }
-    const auto found = visibleTypes_.find(typeName);
-    if (found == visibleTypes_.end() || found->second.kind != TypeKind::Struct) {
+    const bool lifecycleMarked =
+        found->second.hasValueLifecycle ||
+        shortName == "ResourceHandle" ||
+        shortName.rfind("ResourceHandle__", 0) == 0;
+    if (!lifecycleMarked) {
         return false;
     }
     for (const auto& m : found->second.methods) {

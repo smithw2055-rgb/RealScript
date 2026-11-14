@@ -16,6 +16,7 @@ struct SourceFileInfo {
     std::string path;
     std::uint64_t contentHash = 0;
     std::vector<std::uint32_t> lineStarts;
+    std::vector<text::LineDirectiveSpan> lineDirectives;
 };
 
 struct SourceRange {
@@ -34,6 +35,8 @@ struct SequencePoint {
     std::uint32_t blockId = 0;
     std::uint32_t instructionIndex = 0;
     bool terminator = false;
+    bool hidden = false;
+    std::string mappedPath;
     SourceRange range;
 };
 

@@ -27,6 +27,20 @@ struct LinePosition {
     std::size_t column = 0;
 };
 
+struct LineDirectiveSpan {
+    std::size_t physicalStartLine = 0;
+    std::size_t mappedStartLine = 0;
+    std::string mappedPath;
+    bool hidden = false;
+    bool isDefault = false;
+};
+
+struct MappedLineLocation {
+    std::string path;
+    LinePosition position;
+    bool hidden = false;
+};
+
 class SourceText {
 public:
     explicit SourceText(std::string content, std::string name = "<memory>");
@@ -38,6 +52,11 @@ public:
     [[nodiscard]] char at(std::size_t offset) const noexcept;
     [[nodiscard]] std::string_view view(TextSpan span) const noexcept;
     [[nodiscard]] LinePosition linePosition(std::size_t offset) const noexcept;
+    [[nodiscard]] MappedLineLocation mappedLocation(std::size_t offset) const;
+    [[nodiscard]] bool isHiddenOffset(std::size_t offset) const noexcept;
+    [[nodiscard]] const std::vector<LineDirectiveSpan>& lineDirectives() const noexcept {
+        return lineDirectives_;
+    }
     [[nodiscard]] std::size_t lineCount() const noexcept { return lineStarts_.size(); }
 
 private:
@@ -46,6 +65,7 @@ private:
     std::string content_;
     std::string name_;
     std::vector<std::size_t> lineStarts_;
+    std::vector<LineDirectiveSpan> lineDirectives_;
 };
 
 [[nodiscard]] std::size_t utf8ColumnToUtf16Column(

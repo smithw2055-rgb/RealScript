@@ -647,109 +647,194 @@ bool delegateMethodMatches(
     return true;
 }
 
-void collectLambdaNames(
+namespace {
+
+bool isShadowedLambdaParameter(
+    const std::vector<std::unordered_set<std::string>>& scopes,
+    const std::string& name) noexcept {
+    for (const auto& scope : scopes) {
+        if (scope.find(name) != scope.end()) return true;
+    }
+    return false;
+}
+
+void collectLambdaNamesImpl(
     const syntax::ExpressionSyntax& expression,
+    std::vector<std::unordered_set<std::string>>& lambdaParamScopes,
     std::vector<syntax::SyntaxToken>& names) {
     const auto visit = [&](const auto& values) {
         for (const auto& value : values) {
-            collectLambdaNames(*value, names);
+            if (value) collectLambdaNamesImpl(*value, lambdaParamScopes, names);
         }
     };
     switch (expression.kind()) {
-    case syntax::SyntaxKind::NameExpression:
-        names.push_back(static_cast<const
-            syntax::NameExpressionSyntax&>(expression).identifierToken);
+    case syntax::SyntaxKind::NameExpression: {
+        const auto& tok = static_cast<const
+            syntax::NameExpressionSyntax&>(expression).identifierToken;
+        if (!isShadowedLambdaParameter(lambdaParamScopes, tok.text)) {
+            names.push_back(tok);
+        }
         return;
+    }
     case syntax::SyntaxKind::UnaryExpression:
-        collectLambdaNames(*static_cast<const
-            syntax::UnaryExpressionSyntax&>(expression).operand, names);
+        collectLambdaNamesImpl(*static_cast<const
+            syntax::UnaryExpressionSyntax&>(expression).operand,
+            lambdaParamScopes, names);
         return;
     case syntax::SyntaxKind::BinaryExpression: {
         const auto& value = static_cast<const
             syntax::BinaryExpressionSyntax&>(expression);
-        collectLambdaNames(*value.left, names);
-        collectLambdaNames(*value.right, names);
+        collectLambdaNamesImpl(*value.left, lambdaParamScopes, names);
+        collectLambdaNamesImpl(*value.right, lambdaParamScopes, names);
         return;
     }
     case syntax::SyntaxKind::AssignmentExpression: {
         const auto& value = static_cast<const
             syntax::AssignmentExpressionSyntax&>(expression);
-        names.push_back(value.identifierToken);
-        collectLambdaNames(*value.expression, names);
+        if (!isShadowedLambdaParameter(
+                lambdaParamScopes, value.identifierToken.text)) {
+            names.push_back(value.identifierToken);
+        }
+        collectLambdaNamesImpl(*value.expression, lambdaParamScopes, names);
         return;
     }
     case syntax::SyntaxKind::ParenthesizedExpression:
-        collectLambdaNames(*static_cast<const
+        collectLambdaNamesImpl(*static_cast<const
             syntax::ParenthesizedExpressionSyntax&>(expression).expression,
-            names);
+            lambdaParamScopes, names);
         return;
     case syntax::SyntaxKind::CastExpression:
-        collectLambdaNames(*static_cast<const
-            syntax::CastExpressionSyntax&>(expression).expression, names);
+        collectLambdaNamesImpl(*static_cast<const
+            syntax::CastExpressionSyntax&>(expression).expression,
+            lambdaParamScopes, names);
         return;
     case syntax::SyntaxKind::CallExpression: {
         const auto& value = static_cast<const
             syntax::CallExpressionSyntax&>(expression);
-        names.push_back(value.identifierToken);
+        if (!isShadowedLambdaParameter(
+                lambdaParamScopes, value.identifierToken.text)) {
+            names.push_back(value.identifierToken);
+        }
         visit(value.arguments);
         return;
     }
     case syntax::SyntaxKind::MemberCallExpression: {
         const auto& value = static_cast<const
             syntax::MemberCallExpressionSyntax&>(expression);
-        collectLambdaNames(*value.receiver, names);
+        collectLambdaNamesImpl(*value.receiver, lambdaParamScopes, names);
         visit(value.arguments);
         return;
     }
     case syntax::SyntaxKind::MemberAccessExpression:
-        collectLambdaNames(*static_cast<const
+        collectLambdaNamesImpl(*static_cast<const
             syntax::MemberAccessExpressionSyntax&>(expression).receiver,
-            names);
+            lambdaParamScopes, names);
         return;
     case syntax::SyntaxKind::ElementAccessExpression: {
         const auto& value = static_cast<const
             syntax::ElementAccessExpressionSyntax&>(expression);
-        collectLambdaNames(*value.receiver, names);
-        collectLambdaNames(*value.index, names);
+        collectLambdaNamesImpl(*value.receiver, lambdaParamScopes, names);
+        collectLambdaNamesImpl(*value.index, lambdaParamScopes, names);
         return;
     }
     case syntax::SyntaxKind::ElementAssignmentExpression: {
         const auto& value = static_cast<const
             syntax::ElementAssignmentExpressionSyntax&>(expression);
-        collectLambdaNames(*value.receiver, names);
-        collectLambdaNames(*value.index, names);
-        collectLambdaNames(*value.expression, names);
+        collectLambdaNamesImpl(*value.receiver, lambdaParamScopes, names);
+        collectLambdaNamesImpl(*value.index, lambdaParamScopes, names);
+        collectLambdaNamesImpl(*value.expression, lambdaParamScopes, names);
         return;
     }
     case syntax::SyntaxKind::MemberAssignmentExpression: {
         const auto& value = static_cast<const
             syntax::MemberAssignmentExpressionSyntax&>(expression);
-        collectLambdaNames(*value.receiver, names);
-        collectLambdaNames(*value.expression, names);
+        collectLambdaNamesImpl(*value.receiver, lambdaParamScopes, names);
+        collectLambdaNamesImpl(*value.expression, lambdaParamScopes, names);
         return;
     }
-    case syntax::SyntaxKind::NewObjectExpression:
-        visit(static_cast<const
-            syntax::NewObjectExpressionSyntax&>(expression).arguments);
+    case syntax::SyntaxKind::NewObjectExpression: {
+        const auto& obj = static_cast<const
+            syntax::NewObjectExpressionSyntax&>(expression);
+        visit(obj.arguments);
+        for (const auto& init : obj.initializers) {
+            visit(init.expressions);
+        }
         return;
+    }
     case syntax::SyntaxKind::NewArrayExpression: {
         const auto& arr = static_cast<const
             syntax::NewArrayExpressionSyntax&>(expression);
-        if (arr.length) collectLambdaNames(*arr.length, names);
+        if (arr.length) {
+            collectLambdaNamesImpl(*arr.length, lambdaParamScopes, names);
+        }
         visit(arr.initialValues);
+        return;
+    }
+    case syntax::SyntaxKind::TypeBinaryExpression:
+        collectLambdaNamesImpl(*static_cast<const
+            syntax::TypeBinaryExpressionSyntax&>(expression).expression,
+            lambdaParamScopes, names);
+        return;
+    case syntax::SyntaxKind::ConditionalExpression: {
+        const auto& cond = static_cast<const
+            syntax::ConditionalExpressionSyntax&>(expression);
+        collectLambdaNamesImpl(*cond.condition, lambdaParamScopes, names);
+        collectLambdaNamesImpl(*cond.whenTrue, lambdaParamScopes, names);
+        collectLambdaNamesImpl(*cond.whenFalse, lambdaParamScopes, names);
+        return;
+    }
+    case syntax::SyntaxKind::SwitchExpression: {
+        const auto& sw = static_cast<const
+            syntax::SwitchExpressionSyntax&>(expression);
+        collectLambdaNamesImpl(*sw.expression, lambdaParamScopes, names);
+        for (const auto& arm : sw.arms) {
+            if (arm.label) {
+                collectLambdaNamesImpl(*arm.label, lambdaParamScopes, names);
+            }
+            if (arm.guard) {
+                collectLambdaNamesImpl(*arm.guard, lambdaParamScopes, names);
+            }
+            if (arm.value) {
+                collectLambdaNamesImpl(*arm.value, lambdaParamScopes, names);
+            }
+        }
+        return;
+    }
+    case syntax::SyntaxKind::LambdaExpression: {
+        const auto& nested = static_cast<const
+            syntax::LambdaExpressionSyntax&>(expression);
+        std::unordered_set<std::string> params;
+        for (const auto& tok : nested.parameterTokens) {
+            params.insert(tok.text);
+        }
+        lambdaParamScopes.push_back(std::move(params));
+        if (nested.body) {
+            collectLambdaNamesImpl(*nested.body, lambdaParamScopes, names);
+        }
+        lambdaParamScopes.pop_back();
         return;
     }
     case syntax::SyntaxKind::ThisExpression:
         names.push_back(static_cast<const
             syntax::ThisExpressionSyntax&>(expression).thisKeyword);
         return;
-    case syntax::SyntaxKind::LambdaExpression:
+    case syntax::SyntaxKind::TaggedStringExpression:
+    case syntax::SyntaxKind::TypeOfExpression:
     case syntax::SyntaxKind::LiteralExpression:
     case syntax::SyntaxKind::BaseExpression:
         return;
     default:
         return;
     }
+}
+
+} // namespace
+
+void collectLambdaNames(
+    const syntax::ExpressionSyntax& expression,
+    std::vector<syntax::SyntaxToken>& names) {
+    std::vector<std::unordered_set<std::string>> scopes;
+    collectLambdaNamesImpl(expression, scopes, names);
 }
 
 bool isReadonlyFieldWritable(
@@ -923,6 +1008,18 @@ std::unique_ptr<BoundExpression> Binder::convertExpression(
     std::string targetTypeName) {
     if (!expression) return makeError(span);
     if (expression->type == PrimitiveType::Error || target == PrimitiveType::Error) return expression;
+
+    if (target == PrimitiveType::Object &&
+        isStackOnlyType(expression->type, expression->typeName, visibleTypes_)) {
+        diagnostics_.report(
+            "RS2694",
+            "stack-only struct '" +
+                stackOnlyTypeDisplayName(expression->type, expression->typeName, visibleTypes_) +
+                "' cannot be boxed to reference type '" +
+                (targetTypeName.empty() ? std::string("object") : targetTypeName) + "'",
+            span);
+        return makeError(span);
+    }
 
     const auto nullable = target == PrimitiveType::Struct
         ? visibleTypes_.find(targetTypeName)

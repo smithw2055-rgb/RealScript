@@ -1,4 +1,5 @@
 #include "SemanticInternal.h"
+#include "FlowAnalysis.h"
 
 #include <algorithm>
 #include <cmath>
@@ -67,6 +68,13 @@ std::unique_ptr<BoundExpression> Binder::bindDelegateCreation(
             }
             const auto* variable = lookupVariable(name.text);
             if (variable && capturedIds.insert(variable->id).second) {
+                if (isStackOnlyType(variable->type, variable->typeName, visibleTypes_)) {
+                    diagnostics_.report(
+                        "RS2693",
+                        "stack-only variable '" + variable->name +
+                            "' cannot be captured by a lambda or closure",
+                        name.span);
+                }
                 captured.push_back(*variable);
                 continue;
             }
@@ -75,6 +83,12 @@ std::unique_ptr<BoundExpression> Binder::bindDelegateCreation(
                  findProperty(*currentOwnerType_, name.text))) {
                 const auto* self = lookupVariable("this");
                 if (self && capturedIds.insert(self->id).second) {
+                    if (isStackOnlyType(self->type, self->typeName, visibleTypes_)) {
+                        diagnostics_.report(
+                            "RS2693",
+                            "stack-only variable 'this' cannot be captured by a lambda or closure",
+                            name.span);
+                    }
                     captured.push_back(*self);
                 }
             }
@@ -228,8 +242,16 @@ std::unique_ptr<BoundExpression> Binder::bindDelegateCreation(
             }
             if (!candidates.empty()) {
                 const auto* self = lookupVariable("this");
-                if (self) receiver = variableExpression(
-                    *self, syntaxTree.span());
+                if (self) {
+                    if (isStackOnlyType(self->type, self->typeName, visibleTypes_)) {
+                        diagnostics_.report(
+                            "RS2693",
+                            "stack-only variable 'this' cannot be captured by a lambda or closure",
+                            syntaxTree.span());
+                    }
+                    receiver = variableExpression(
+                        *self, syntaxTree.span());
+                }
             }
         }
     } else if (syntaxTree.kind() ==
@@ -1296,41 +1318,14 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
             }
         }
     }
-    const FunctionSymbol* targetCandidate =
-        targetCandidates.size() == 1
-            ? targetCandidates.front()
-            : nullptr;
-    const auto targetOffset = targetCandidate
-        ? visibleParameterOffset(*targetCandidate)
-        : 0u;
-    if (targetCandidate &&
-        targetCandidate->parameters.size() !=
-            syntaxTree.arguments.size() + targetOffset) {
-        targetCandidate = nullptr;
-    }
     std::vector<std::unique_ptr<BoundExpression>> arguments;
     for (std::size_t index = 0;
          index < syntaxTree.arguments.size(); ++index) {
-        if (targetCandidate) {
-            const auto& parameter =
-                targetCandidate->parameters[index + targetOffset];
-            const auto targetType =
-                visibleTypes_.find(parameter.typeName);
-            const bool delegateTarget =
-                parameter.type == PrimitiveType::Object &&
-                targetType != visibleTypes_.end() &&
-                targetType->second.delegateType;
-            arguments.push_back(delegateTarget
-                ? bindTargetExpression(
-                    *syntaxTree.arguments[index],
-                    parameter.type,
-                    parameter.typeName,
-                    "argument")
-                : bindExpression(*syntaxTree.arguments[index]));
-        } else {
-            arguments.push_back(bindExpression(
-                *syntaxTree.arguments[index]));
-        }
+        arguments.push_back(bindArgumentWithOverloadCandidates(
+            *syntaxTree.arguments[index],
+            index,
+            targetCandidates,
+            "argument"));
     }
 
     if (currentOwnerType_ && !currentStaticMethod_) {
@@ -1599,6 +1594,7 @@ std::unique_ptr<BoundExpression> Binder::tryBindExtensionMethodCall(
 
 std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
     const syntax::MemberCallExpressionSyntax& syntaxTree) {
+    const std::size_t preCallDiagCount = rootDiagnostics_.items().size();
     std::vector<std::unique_ptr<BoundExpression>> arguments;
     for (const auto& argument : syntaxTree.arguments) {
         arguments.push_back(bindExpression(*argument));
@@ -1870,6 +1866,55 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
                     method->moduleName);
             }),
         methods.end());
+    // Re-bind any unresolved lambda or method-group argument against candidate delegate targets
+    if (!methods.empty()) {
+        std::vector<bool> rebindMask(syntaxTree.arguments.size(), false);
+        bool needsCandidateRebind = false;
+        for (std::size_t i = 0; i < syntaxTree.arguments.size(); ++i) {
+            const auto k = syntaxTree.arguments[i]->kind();
+            if (k == syntax::SyntaxKind::LambdaExpression ||
+                ((k == syntax::SyntaxKind::NameExpression ||
+                  k == syntax::SyntaxKind::MemberAccessExpression ||
+                  k == syntax::SyntaxKind::ParenthesizedExpression) &&
+                 arguments[i]->type == PrimitiveType::Error)) {
+                rebindMask[i] = true;
+                needsCandidateRebind = true;
+            }
+        }
+        if (needsCandidateRebind) {
+            // Erase ONLY premature RS8803/unresolved diagnostics emitted during this call's
+            // initial pass for the rebound arguments in currentSourceName_.
+            std::vector<diagnostics::Diagnostic> kept;
+            const auto& existingDiags = rootDiagnostics_.items();
+            kept.reserve(existingDiags.size());
+            for (std::size_t di = 0; di < existingDiags.size(); ++di) {
+                const auto& d = existingDiags[di];
+                bool erase = false;
+                if (di >= preCallDiagCount && d.sourceName == currentSourceName_) {
+                    for (std::size_t i = 0; i < syntaxTree.arguments.size(); ++i) {
+                        if (!rebindMask[i]) continue;
+                        const auto argSpan = syntaxTree.arguments[i]->span();
+                        if (d.span.start >= argSpan.start &&
+                            d.span.end() <= argSpan.end()) {
+                            erase = true;
+                            break;
+                        }
+                    }
+                }
+                if (!erase) kept.push_back(d);
+            }
+            rootDiagnostics_.truncate(0);
+            for (const auto& d : kept) {
+                rootDiagnostics_.report(d.code, d.message, d.span, d.severity, d.sourceName);
+            }
+            for (std::size_t i = 0; i < syntaxTree.arguments.size(); ++i) {
+                if (rebindMask[i]) {
+                    arguments[i] = bindArgumentWithOverloadCandidates(
+                        *syntaxTree.arguments[i], i, methods, "method argument");
+                }
+            }
+        }
+    }
     bool ambiguous = false;
     const auto plan = selectFlexibleCall(
         methods, arguments, &syntaxTree.argumentNames,
@@ -1981,14 +2026,17 @@ std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
             syntaxTree.type.span());
         return makeError(syntaxTree.span());
     }
-    std::vector<std::unique_ptr<BoundExpression>> arguments;
-    for (const auto& argument : syntaxTree.arguments) arguments.push_back(bindExpression(*argument));
     std::vector<const FunctionSymbol*> constructors;
     for (const auto& ctor : found->second.constructors) {
         if (isMemberAccessible(
                 ctor.accessibility, ctor.declaringTypeId, ctor.moduleName)) {
             constructors.push_back(&ctor);
         }
+    }
+    std::vector<std::unique_ptr<BoundExpression>> arguments;
+    for (std::size_t index = 0; index < syntaxTree.arguments.size(); ++index) {
+        arguments.push_back(bindArgumentWithOverloadCandidates(
+            *syntaxTree.arguments[index], index, constructors, "constructor argument"));
     }
     bool ambiguous = false;
     const FunctionSymbol* best = nullptr;
@@ -2233,12 +2281,271 @@ std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
     return result;
 }
 
+Binder::SpeculativeState Binder::snapshotSpeculativeState() const {
+    SpeculativeState state;
+    state.diagCount = rootDiagnostics_.items().size();
+    state.occurrencesCount = occurrences_.size();
+    state.nextLambdaOrdinal = nextLambdaOrdinal_;
+    state.pendingFunctionBindingsCount = pendingFunctionBindings_.size();
+    state.pendingTypesCount = pendingTypes_.size();
+    state.allVariablesCount = allVariables_.size();
+    state.nextVariableIndex = nextVariableIndex_;
+    state.scopes = scopes_;
+    state.referenceAliasScopes = referenceAliasScopes_;
+    state.scopeSpans = scopeSpans_;
+    state.capturedVariableNames = capturedVariableNames_;
+    state.sequenceLocalFields = sequenceLocalFields_;
+    state.currentReturnType = currentReturnType_;
+    state.currentReturnTypeName = currentReturnTypeName_;
+    state.currentReturnModifier = currentReturnModifier_;
+    state.currentStorageReturnType = currentStorageReturnType_;
+    state.currentStorageReturnTypeName = currentStorageReturnTypeName_;
+    state.loopDepth = loopDepth_;
+    state.breakableDepth = breakableDepth_;
+    state.bindingFinally = bindingFinally_;
+    state.finallyBreakableDepth = finallyBreakableDepth_;
+    state.finallyLoopDepth = finallyLoopDepth_;
+    return state;
+}
+
+void Binder::restoreSpeculativeState(const SpeculativeState& state) {
+    rootDiagnostics_.truncate(state.diagCount);
+    if (state.occurrencesCount < occurrences_.size()) {
+        occurrences_.resize(state.occurrencesCount);
+    }
+    nextLambdaOrdinal_ = state.nextLambdaOrdinal;
+    while (pendingTypes_.size() > state.pendingTypesCount) {
+        visibleTypes_.erase(pendingTypes_.back().name);
+        visibleTypes_.erase(canonicalTypeName(pendingTypes_.back()));
+        pendingTypes_.pop_back();
+    }
+    if (state.pendingFunctionBindingsCount < pendingFunctionBindings_.size()) {
+        pendingFunctionBindings_.resize(state.pendingFunctionBindingsCount);
+    }
+    if (state.allVariablesCount < allVariables_.size()) {
+        allVariables_.resize(state.allVariablesCount);
+    }
+    nextVariableIndex_ = state.nextVariableIndex;
+    scopes_ = state.scopes;
+    referenceAliasScopes_ = state.referenceAliasScopes;
+    scopeSpans_ = state.scopeSpans;
+    capturedVariableNames_ = state.capturedVariableNames;
+    sequenceLocalFields_ = state.sequenceLocalFields;
+    currentReturnType_ = state.currentReturnType;
+    currentReturnTypeName_ = state.currentReturnTypeName;
+    currentReturnModifier_ = state.currentReturnModifier;
+    currentStorageReturnType_ = state.currentStorageReturnType;
+    currentStorageReturnTypeName_ = state.currentStorageReturnTypeName;
+    loopDepth_ = state.loopDepth;
+    breakableDepth_ = state.breakableDepth;
+    bindingFinally_ = state.bindingFinally;
+    finallyBreakableDepth_ = state.finallyBreakableDepth;
+    finallyLoopDepth_ = state.finallyLoopDepth;
+}
+
+bool Binder::hasErrorDiagnosticsSince(std::size_t startIndex) const noexcept {
+    const auto& items = rootDiagnostics_.items();
+    for (std::size_t i = startIndex; i < items.size(); ++i) {
+        if (items[i].severity == diagnostics::DiagnosticSeverity::Error) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Binder::probeOverloadLambdaBody(const FunctionBindingInput& lb) {
+    if (!lb.eventLambda || !lb.eventLambda->body) {
+        return true;
+    }
+    const auto saved = snapshotSpeculativeState();
+
+    currentReturnType_ = lb.symbol.returnType;
+    currentReturnTypeName_ = lb.symbol.returnTypeName;
+    currentReturnModifier_ = lb.symbol.returnModifier;
+    currentStorageReturnType_ = storageReturnTypeOf(lb.symbol);
+    currentStorageReturnTypeName_ = storageReturnTypeNameOf(lb.symbol);
+    loopDepth_ = 0;
+    breakableDepth_ = 0;
+    bindingFinally_ = false;
+    finallyBreakableDepth_ = 0;
+    finallyLoopDepth_ = 0;
+
+    pushScope(lb.eventLambda->span());
+    for (std::size_t pi = 1u; pi < lb.symbol.parameters.size(); ++pi) {
+        scopes_.back()[lb.symbol.parameters[pi].name] = lb.symbol.parameters[pi];
+    }
+    std::unique_ptr<BoundExpression> boundBody;
+    if (lb.symbol.returnType == PrimitiveType::Void) {
+        boundBody = bindExpression(*lb.eventLambda->body);
+    } else {
+        boundBody = bindTargetExpression(
+            *lb.eventLambda->body,
+            lb.symbol.returnType,
+            lb.symbol.returnTypeName,
+            "lambda return value");
+    }
+    popScope();
+
+    const bool ok = !hasErrorDiagnosticsSince(saved.diagCount) &&
+        boundBody && boundBody->type != PrimitiveType::Error;
+    restoreSpeculativeState(saved);
+    return ok;
+}
+
+std::unique_ptr<BoundExpression> Binder::bindArgumentWithOverloadCandidates(
+    const syntax::ExpressionSyntax& argSyntax,
+    std::size_t argIndex,
+    const std::vector<const FunctionSymbol*>& candidates,
+    const std::string& context) {
+    std::vector<std::pair<PrimitiveType, std::string>> delegateTargets;
+    std::size_t nonDelegateCandidates = 0;
+    for (const auto* cand : candidates) {
+        if (!cand) continue;
+        const auto off = visibleParameterOffset(*cand);
+        if (argIndex + off >= cand->parameters.size()) continue;
+        const auto& param = cand->parameters[argIndex + off];
+        const auto tIt = visibleTypes_.find(param.typeName);
+        if (param.type == PrimitiveType::Object &&
+            tIt != visibleTypes_.end() &&
+            tIt->second.delegateType) {
+            bool dup = false;
+            for (const auto& existing : delegateTargets) {
+                if (existing.second == param.typeName) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                delegateTargets.emplace_back(param.type, param.typeName);
+            }
+        } else {
+            ++nonDelegateCandidates;
+        }
+    }
+    if (delegateTargets.size() == 1u && nonDelegateCandidates == 0u) {
+        return bindTargetExpression(
+            argSyntax, delegateTargets[0].first, delegateTargets[0].second, context);
+    }
+    if (!delegateTargets.empty() &&
+        (argSyntax.kind() == syntax::SyntaxKind::LambdaExpression ||
+         argSyntax.kind() == syntax::SyntaxKind::NameExpression ||
+         argSyntax.kind() == syntax::SyntaxKind::MemberAccessExpression ||
+         argSyntax.kind() == syntax::SyntaxKind::ParenthesizedExpression)) {
+        struct CandidateSuccess {
+            std::size_t targetIndex = 0;
+            bool isLambda = false;
+            bool isVoidReturn = false;
+            bool bodyIsNonVoid = false;
+            int bodyConversionRank = -1;
+        };
+        std::vector<CandidateSuccess> successes;
+        const auto baseline = snapshotSpeculativeState();
+        for (std::size_t dtIdx = 0; dtIdx < delegateTargets.size(); ++dtIdx) {
+            const auto& dt = delegateTargets[dtIdx];
+            auto attempt = bindTargetExpression(argSyntax, dt.first, dt.second, context);
+            bool ok = !hasErrorDiagnosticsSince(baseline.diagCount) &&
+                attempt && attempt->type != PrimitiveType::Error;
+            CandidateSuccess match;
+            match.targetIndex = dtIdx;
+            if (ok && pendingFunctionBindings_.size() > baseline.pendingFunctionBindingsCount) {
+                const auto lb = pendingFunctionBindings_.back();
+                match.isLambda = true;
+                match.isVoidReturn = (lb.symbol.returnType == PrimitiveType::Void);
+                ok = probeOverloadLambdaBody(lb);
+                if (ok && lb.eventLambda && lb.eventLambda->body) {
+                    const auto innerSaved = snapshotSpeculativeState();
+                    pushScope(lb.eventLambda->span());
+                    for (std::size_t pi = 1u; pi < lb.symbol.parameters.size(); ++pi) {
+                        scopes_.back()[lb.symbol.parameters[pi].name] = lb.symbol.parameters[pi];
+                    }
+                    auto bodyExpr = bindExpression(*lb.eventLambda->body);
+                    const bool bodyOk = !hasErrorDiagnosticsSince(innerSaved.diagCount) &&
+                        bodyExpr && bodyExpr->type != PrimitiveType::Error;
+                    if (bodyOk && bodyExpr->type != PrimitiveType::Void) {
+                        match.bodyIsNonVoid = true;
+                        if (!match.isVoidReturn) {
+                            if (bodyExpr->type == lb.symbol.returnType &&
+                                (!isExactType(lb.symbol.returnType) ||
+                                 lb.symbol.returnTypeName.empty() ||
+                                 bodyExpr->typeName.empty() ||
+                                 bodyExpr->typeName == lb.symbol.returnTypeName)) {
+                                match.bodyConversionRank = 0;
+                            } else {
+                                const int r = conversionRank(bodyExpr->type, lb.symbol.returnType);
+                                match.bodyConversionRank = (r >= 0) ? (r + 1) : 100;
+                            }
+                        }
+                    }
+                    restoreSpeculativeState(innerSaved);
+                }
+            }
+            restoreSpeculativeState(baseline);
+            if (ok) {
+                successes.push_back(match);
+            }
+        }
+
+        if (!successes.empty()) {
+            bool anyNonVoidSuccess = false;
+            for (const auto& s : successes) {
+                if (!s.isVoidReturn) {
+                    anyNonVoidSuccess = true;
+                    break;
+                }
+            }
+            if (anyNonVoidSuccess) {
+                std::vector<CandidateSuccess> nonVoidPreferred;
+                for (const auto& s : successes) {
+                    if (!(s.isLambda && s.isVoidReturn && s.bodyIsNonVoid)) {
+                        nonVoidPreferred.push_back(s);
+                    }
+                }
+                if (!nonVoidPreferred.empty()) {
+                    successes = std::move(nonVoidPreferred);
+                }
+            }
+            if (successes.size() > 1u) {
+                std::vector<CandidateSuccess> exactReturnMatches;
+                for (const auto& s : successes) {
+                    if (s.isLambda && !s.isVoidReturn && s.bodyConversionRank == 0) {
+                        exactReturnMatches.push_back(s);
+                    }
+                }
+                if (!exactReturnMatches.empty() &&
+                    exactReturnMatches.size() < successes.size()) {
+                    successes = std::move(exactReturnMatches);
+                }
+            }
+            if (successes.size() == 1u) {
+                const auto& winner = delegateTargets[successes[0].targetIndex];
+                return bindTargetExpression(argSyntax, winner.first, winner.second, context);
+            }
+            diagnostics_.report(
+                "RS2473",
+                "overload resolution for " + context +
+                    " is ambiguous between multiple matching delegate targets",
+                argSyntax.span());
+            return makeError(argSyntax.span());
+        }
+    }
+    return bindExpression(argSyntax);
+}
+
 std::unique_ptr<BoundExpression> Binder::bindNewArrayExpression(
     const syntax::NewArrayExpressionSyntax& syntaxTree) {
     std::string elementTypeName;
     const auto elementType = bindType(syntaxTree.elementType, false, &elementTypeName);
     if (elementType == PrimitiveType::Error || elementType == PrimitiveType::Void || elementType == PrimitiveType::Array) {
         diagnostics_.report("RS2420", "array element type is not supported", syntaxTree.elementType.span());
+        return makeError(syntaxTree.span());
+    }
+    if (isStackOnlyType(elementType, elementTypeName, visibleTypes_)) {
+        diagnostics_.report(
+            "RS2695",
+            "stack-only struct '" +
+                stackOnlyTypeDisplayName(elementType, elementTypeName, visibleTypes_) +
+                "' cannot be an array element type",
+            syntaxTree.elementType.span());
         return makeError(syntaxTree.span());
     }
     if (syntaxTree.explicitLength && !syntaxTree.initialValues.empty()) {

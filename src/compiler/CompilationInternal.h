@@ -246,6 +246,29 @@ void validateConcreteClassType(
 [[nodiscard]] const std::string& builtinFiberModuleSource();
 [[nodiscard]] const std::string& builtinResourceModuleSource();
 [[nodiscard]] bool sourceMentionsResourcePrimitives(std::string_view text);
+[[nodiscard]] const std::string& builtinWeakModuleSource();
+[[nodiscard]] const std::string& builtinMemoryModuleSource();
+
+// Partial record merging & partial method reconciliation (defined in Compilation.cpp)
+struct PartialUnitEntry {
+    syntax::CompilationUnitSyntax* syntaxTree = nullptr;
+    std::string sourceName;
+};
+
+struct MergedGenericPartialPart {
+    std::string sourceName;
+    text::TextSpan span;
+};
+
+struct MergedPartialTypeOriginInfo {
+    std::vector<MergedGenericPartialPart> parts;
+};
+
+void mergePartialRecordDeclarations(
+    const std::vector<PartialUnitEntry>& units,
+    diagnostics::DiagnosticBag& diagnostics,
+    bool& moduleInvalid,
+    std::unordered_map<std::string, MergedPartialTypeOriginInfo>* outMultiPartRecords = nullptr);
 
 // Pipeline stage passes
 void specializeNativeGenerics(

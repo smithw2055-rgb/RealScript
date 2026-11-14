@@ -773,6 +773,8 @@ inline void substituteExpression(
         }
         return;
     }
+    case syntax::SyntaxKind::TaggedStringExpression:
+        return;
     case syntax::SyntaxKind::TypeOfExpression: {
         auto& expr = static_cast<syntax::TypeOfExpressionSyntax&>(expression);
         substituteType(expr.type, subs, hasGenericSyntax);
@@ -3473,6 +3475,8 @@ private:
             }
             return;
         }
+        case syntax::SyntaxKind::TaggedStringExpression:
+            return;
         case syntax::SyntaxKind::TypeOfExpression: {
             auto& value = static_cast<syntax::TypeOfExpressionSyntax&>(expression);
             rewriteType(value.type, moduleName, sourceName, queue);
