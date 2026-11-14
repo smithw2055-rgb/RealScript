@@ -10,6 +10,10 @@ option(REALSCRIPT_BUILD_BENCHMARKS "Build RealScript performance benchmarks" OFF
 option(REALSCRIPT_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS "Run external C++ toolchain JIT integration tests" ON)
 option(REALSCRIPT_INSTALL_SDK "Generate installable RealScript SDK targets" ON)
+option(REALSCRIPT_ENABLE_DEBUG_SERVICES "Build L1 Debug & DAP application layer" ON)
+option(REALSCRIPT_ENABLE_TOOLING "Build L1 Formatter, Linter, Fuzzer & LSP application layer" ON)
+option(REALSCRIPT_ENABLE_EXTENSIBILITY "Build L1 Reflection & Sandboxed ModHost application layer" ON)
+option(REALSCRIPT_ENABLE_GAME_SDK "Build L1 Game Engine SDK & Scene Runtime application layer" ON)
 
 function(realscript_enable_cxx_warnings target)
     if(MSVC)
@@ -47,7 +51,7 @@ if(MSVC)
     )
 endif()
 
-# P3 Stage 1: Physical layered OBJECT targets with zero circular link dependencies.
+# Physical layered OBJECT targets (each .cpp compiled once, zero circular deps).
 function(realscript_add_layer_library target)
     add_library(${target} OBJECT ${ARGN})
     set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -59,14 +63,59 @@ function(realscript_add_layer_library target)
     realscript_enable_cxx_warnings(${target})
 endfunction()
 
-# Layer 1: Foundation (text, diagnostics & protocol JSON primitives)
+# Physical STATIC slice archives (each .cpp belongs to at most one STATIC archive).
+function(realscript_add_slice_library target export_name)
+    add_library(${target} STATIC ${ARGN})
+    set_target_properties(${target} PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        LINKER_LANGUAGE CXX
+        EXPORT_NAME ${export_name}
+    )
+    target_include_directories(${target}
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    )
+    target_compile_features(${target} PUBLIC cxx_std_17)
+    add_library(RealScript::${export_name} ALIAS ${target})
+endfunction()
+
+# ============================================================================
+# Tier 0: L0 Microkernel Physical STATIC Slices (always built)
+# ============================================================================
+
+# 1. Foundation (text, GUID, diagnostics, JSON primitives, pure semantic type metadata)
 realscript_add_layer_library(realscript_layer_foundation
     src/text/Text.cpp
+    src/text/AssetGuid.cpp
     src/diagnostics/Diagnostic.cpp
     src/tooling/Json.cpp
+    src/semantic/TypeMetadata.cpp
 )
+realscript_add_slice_library(realscript_slice_foundation_core Foundation
+    $<TARGET_OBJECTS:realscript_layer_foundation>
+)
+if(MSVC)
+    target_sources(realscript_slice_foundation_core INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/tools/debuggers/RealScript.natvis>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_DATADIR}/RealScript/debuggers/RealScript.natvis>
+    )
+endif()
 
-# Layer 2: Compiler Core (syntax, semantic, mir, optimization, bytecode, compiler)
+# 2. Bytecode Format & Debug Metadata (shared contract between Compiler and Runtime)
+realscript_add_layer_library(realscript_layer_bytecode_format
+    src/bytecode/BytecodeFacts.cpp
+    src/bytecode/BytecodeVerifier.cpp
+    src/bytecode/BytecodeDisassembler.cpp
+    src/bytecode/BytecodeCodec.cpp
+    src/debug/DebugInfo.cpp
+)
+realscript_add_slice_library(realscript_slice_bytecode_core Bytecode
+    $<TARGET_OBJECTS:realscript_layer_bytecode_format>
+)
+target_link_libraries(realscript_slice_bytecode_core PUBLIC realscript_slice_foundation_core)
+
+# 3. Compiler Core (syntax, semantic symbols/binder, MIR, optimizer, bytecode lowerer, compiler)
 realscript_add_layer_library(realscript_layer_compiler_core
     src/syntax/SyntaxFacts.cpp
     src/syntax/Lexer.cpp
@@ -86,23 +135,23 @@ realscript_add_layer_library(realscript_layer_compiler_core
     src/mir/MirVerifier.cpp
     src/mir/MirPrinter.cpp
     src/optimization/Optimizer.cpp
-    src/bytecode/BytecodeFacts.cpp
     src/bytecode/BytecodeLowerer.cpp
-    src/bytecode/BytecodeVerifier.cpp
-    src/bytecode/BytecodeDisassembler.cpp
-    src/bytecode/BytecodeCodec.cpp
     src/compiler/BuiltinModules.cpp
     src/compiler/NativeGenerics.cpp
     src/compiler/TypeHierarchyAndContracts.cpp
     src/compiler/SequenceAndEventSynthesis.cpp
     src/compiler/MetadataAndValidation.cpp
-    src/debug/DebugInfo.cpp
     src/compiler/Compilation.cpp
     src/compiler/ModuleBuildCache.cpp
 )
+realscript_add_slice_library(realscript_slice_compiler_core Compiler
+    $<TARGET_OBJECTS:realscript_layer_compiler_core>
+)
+target_link_libraries(realscript_slice_compiler_core PUBLIC realscript_slice_bytecode_core)
 
-# Layer 3: Runtime Core (modularized runtime services, VM, GC, fibers, async & ABI governance)
+# 4. Runtime Core (HostAbi, ABI governance, VM, GC, fibers, async)
 realscript_add_layer_library(realscript_layer_runtime_core
+    src/runtime/HostAbi.cpp
     src/runtime/AbiGovernance.cpp
     src/runtime/ValueOperations.cpp
     src/runtime/BindingRegistry.cpp
@@ -117,8 +166,15 @@ realscript_add_layer_library(realscript_layer_runtime_core
     src/runtime/FiberScheduler.cpp
     src/runtime/AsyncRuntime.cpp
 )
+realscript_add_slice_library(realscript_slice_runtime_core Runtime
+    $<TARGET_OBJECTS:realscript_layer_runtime_core>
+)
+target_link_libraries(realscript_slice_runtime_core PUBLIC realscript_slice_bytecode_core)
+if(CMAKE_DL_LIBS)
+    target_link_libraries(realscript_slice_runtime_core PUBLIC ${CMAKE_DL_LIBS})
+endif()
 
-# Layer 4: Native Backends & Hot Reload (aot_cpp, jit, hot_reload)
+# 5. Native Backends & Hot Reload (aot_cpp, jit, hot_reload)
 realscript_add_layer_library(realscript_layer_native_backends
     src/aot_cpp/AotRuntime.cpp
     src/aot_cpp/AotRangeAnalysis.cpp
@@ -133,120 +189,222 @@ realscript_add_layer_library(realscript_layer_native_backends
     src/jit/StencilJit.cpp
     src/hot_reload/HotReload.cpp
 )
-
-# Layer 5: Debug Services (debugger & DAP server)
-realscript_add_layer_library(realscript_layer_debug
-    src/debug/Debugger.cpp
-    src/debug/DapServer.cpp
-)
-
-# Layer 6: Game SDK & Scene Productization
-realscript_add_layer_library(realscript_layer_game
-    src/game/RsBindParser.cpp
-    src/game/GameApi.cpp
-    src/game/ScriptObjectRuntime.cpp
-    src/game/ScriptInvokeRuntime.cpp
-    src/game/ScriptValueRuntime.cpp
-    src/game/SceneLifecycleRuntime.cpp
-    src/game/SceneEventRuntime.cpp
-    src/game/GameProductization.cpp
-    src/game/GameplayPrimitives.cpp
-    src/game/GameplayMetadata.cpp
-    src/game/GameplayScripting.cpp
-    src/game/GameplayStateCodec.cpp
-)
-
-# Layer 7: Tooling & Language Server (Formatter, Governance, scene-aware LanguageService & LSP)
-realscript_add_layer_library(realscript_layer_tooling
-    src/tooling/Formatter.cpp
-    src/tooling/GovernanceLinter.cpp
-    src/tooling/GovernanceFuzzer.cpp
-    src/tooling/LanguageService.cpp
-    src/tooling/LspServer.cpp
-)
-
-# Layer 8: Reflection & Sandboxed Mod Host
-realscript_add_layer_library(realscript_layer_extensibility
-    src/reflection/Reflection.cpp
-    src/plugin/ModHost.cpp
-)
-
-add_library(realscript_frontend STATIC
-    $<TARGET_OBJECTS:realscript_layer_foundation>
-    $<TARGET_OBJECTS:realscript_layer_compiler_core>
-    $<TARGET_OBJECTS:realscript_layer_runtime_core>
+realscript_add_slice_library(realscript_slice_native_backends NativeBackends
     $<TARGET_OBJECTS:realscript_layer_native_backends>
-    $<TARGET_OBJECTS:realscript_layer_debug>
-    $<TARGET_OBJECTS:realscript_layer_game>
-    $<TARGET_OBJECTS:realscript_layer_tooling>
-    $<TARGET_OBJECTS:realscript_layer_extensibility>
 )
-set_target_properties(realscript_frontend PROPERTIES
-    POSITION_INDEPENDENT_CODE ON
-    LINKER_LANGUAGE CXX
-    EXPORT_NAME Frontend
+target_link_libraries(realscript_slice_native_backends PUBLIC
+    realscript_slice_runtime_core
+    realscript_slice_compiler_core
 )
-add_library(RealScript::Frontend ALIAS realscript_frontend)
 
-target_include_directories(realscript_frontend
-    PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+# 6. L0 INTERFACE Composition & Internal JIT Support Archive
+add_library(realscript_aot_support INTERFACE)
+target_link_libraries(realscript_aot_support INTERFACE realscript_slice_native_backends)
+set_target_properties(realscript_aot_support PROPERTIES EXPORT_NAME AotSupport)
+add_library(RealScript::AotSupport ALIAS realscript_aot_support)
+
+add_library(realscript_kernel INTERFACE)
+target_link_libraries(realscript_kernel INTERFACE
+    realscript_slice_native_backends
+    realscript_slice_compiler_core
+    realscript_slice_runtime_core
 )
-target_compile_features(realscript_frontend PUBLIC cxx_std_17)
-if(MSVC)
-    target_sources(realscript_frontend INTERFACE
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/tools/debuggers/RealScript.natvis>
-        $<INSTALL_INTERFACE:${CMAKE_INSTALL_DATADIR}/RealScript/debuggers/RealScript.natvis>)
+set_target_properties(realscript_kernel PROPERTIES EXPORT_NAME Kernel)
+add_library(RealScript::Kernel ALIAS realscript_kernel)
+
+if(REALSCRIPT_BUILD_TESTS OR REALSCRIPT_BUILD_BENCHMARKS)
+    add_library(realscript_jit_support_archive STATIC EXCLUDE_FROM_ALL
+        $<TARGET_OBJECTS:realscript_layer_foundation>
+        $<TARGET_OBJECTS:realscript_layer_bytecode_format>
+        $<TARGET_OBJECTS:realscript_layer_runtime_core>
+        $<TARGET_OBJECTS:realscript_layer_native_backends>
+    )
+    set_target_properties(realscript_jit_support_archive PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        LINKER_LANGUAGE CXX
+    )
+    target_include_directories(realscript_jit_support_archive
+        PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    )
+    target_compile_features(realscript_jit_support_archive PUBLIC cxx_std_17)
+    if(CMAKE_DL_LIBS)
+        target_link_libraries(realscript_jit_support_archive PUBLIC ${CMAKE_DL_LIBS})
+    endif()
 endif()
-if(CMAKE_DL_LIBS)
-    target_link_libraries(realscript_frontend PUBLIC ${CMAKE_DL_LIBS})
+
+# ============================================================================
+# Tier 1: L1 Application Physical STATIC Libraries (optional)
+# ============================================================================
+
+if(REALSCRIPT_ENABLE_DEBUG_SERVICES)
+    realscript_add_layer_library(realscript_layer_debug
+        src/debug/Debugger.cpp
+        src/debug/DapServer.cpp
+    )
+    realscript_add_slice_library(realscript_app_debug Debug
+        $<TARGET_OBJECTS:realscript_layer_debug>
+    )
+    target_link_libraries(realscript_app_debug PUBLIC
+        realscript_slice_runtime_core
+        realscript_slice_compiler_core
+    )
+
+    add_executable(rsdebug tools/rsdebug/main.cpp)
+    target_link_libraries(rsdebug PRIVATE RealScript::Debug)
+    target_compile_features(rsdebug PRIVATE cxx_std_17)
+    realscript_enable_cxx_warnings(rsdebug)
 endif()
 
-function(realscript_add_component target export_name)
-    add_library(${target} INTERFACE)
-    target_link_libraries(${target} INTERFACE realscript_frontend)
-    set_target_properties(${target} PROPERTIES EXPORT_NAME ${export_name})
-    add_library(RealScript::${export_name} ALIAS ${target})
-endfunction()
+if(REALSCRIPT_ENABLE_TOOLING)
+    realscript_add_layer_library(realscript_layer_tooling
+        src/tooling/Formatter.cpp
+        src/tooling/GovernanceLinter.cpp
+        src/tooling/GovernanceFuzzer.cpp
+        src/tooling/LanguageService.cpp
+        src/tooling/LspServer.cpp
+    )
+    realscript_add_slice_library(realscript_app_tooling Tooling
+        $<TARGET_OBJECTS:realscript_layer_tooling>
+    )
+    target_link_libraries(realscript_app_tooling PUBLIC
+        realscript_slice_compiler_core
+        realscript_slice_runtime_core
+        realscript_slice_native_backends
+    )
 
-realscript_add_component(realscript_runtime Runtime)
-realscript_add_component(realscript_compiler Compiler)
-realscript_add_component(realscript_game_runtime GameRuntime)
-realscript_add_component(realscript_game_compiler GameCompiler)
-realscript_add_component(realscript_game_sdk GameSdk)
-realscript_add_component(realscript_aot_support AotSupport)
-realscript_add_component(realscript_debug Debug)
-realscript_add_component(realscript_tooling Tooling)
-realscript_add_component(realscript_full Full)
+    add_executable(rslsp tools/rslsp/main.cpp)
+    target_link_libraries(rslsp PRIVATE RealScript::Tooling)
+    target_compile_features(rslsp PRIVATE cxx_std_17)
+    realscript_enable_cxx_warnings(rslsp)
+endif()
+
+if(REALSCRIPT_ENABLE_EXTENSIBILITY)
+    realscript_add_layer_library(realscript_layer_extensibility
+        src/reflection/Reflection.cpp
+        src/plugin/ModHost.cpp
+    )
+    realscript_add_slice_library(realscript_app_extensibility Extensibility
+        $<TARGET_OBJECTS:realscript_layer_extensibility>
+    )
+    target_link_libraries(realscript_app_extensibility PUBLIC
+        realscript_slice_runtime_core
+        realscript_slice_compiler_core
+    )
+endif()
+
+if(REALSCRIPT_ENABLE_GAME_SDK)
+    realscript_add_layer_library(realscript_layer_game
+        src/game/RsBindParser.cpp
+        src/game/GameApi.cpp
+        src/game/ScriptObjectRuntime.cpp
+        src/game/ScriptInvokeRuntime.cpp
+        src/game/ScriptValueRuntime.cpp
+        src/game/SceneLifecycleRuntime.cpp
+        src/game/SceneEventRuntime.cpp
+        src/game/GameProductization.cpp
+        src/game/GameplayPrimitives.cpp
+        src/game/GameplayMetadata.cpp
+        src/game/GameplayScripting.cpp
+        src/game/GameplayStateCodec.cpp
+    )
+    realscript_add_slice_library(realscript_app_game_sdk GameSdk
+        $<TARGET_OBJECTS:realscript_layer_game>
+    )
+    target_link_libraries(realscript_app_game_sdk PUBLIC
+        realscript_slice_runtime_core
+        realscript_slice_compiler_core
+        realscript_slice_native_backends
+    )
+    if(REALSCRIPT_ENABLE_DEBUG_SERVICES)
+        target_link_libraries(realscript_app_game_sdk PUBLIC realscript_app_debug)
+        target_compile_definitions(realscript_layer_game PRIVATE REALSCRIPT_HAS_DEBUG_SERVICES=1)
+        target_compile_definitions(realscript_app_game_sdk PUBLIC REALSCRIPT_HAS_DEBUG_SERVICES=1)
+    else()
+        target_compile_definitions(realscript_layer_game PRIVATE REALSCRIPT_HAS_DEBUG_SERVICES=0)
+        target_compile_definitions(realscript_app_game_sdk PUBLIC REALSCRIPT_HAS_DEBUG_SERVICES=0)
+    endif()
+
+    add_library(realscript_game_runtime INTERFACE)
+    target_link_libraries(realscript_game_runtime INTERFACE realscript_app_game_sdk)
+    set_target_properties(realscript_game_runtime PROPERTIES EXPORT_NAME GameRuntime)
+    add_library(RealScript::GameRuntime ALIAS realscript_game_runtime)
+
+    add_library(realscript_game_compiler INTERFACE)
+    target_link_libraries(realscript_game_compiler INTERFACE realscript_app_game_sdk)
+    set_target_properties(realscript_game_compiler PROPERTIES EXPORT_NAME GameCompiler)
+    add_library(RealScript::GameCompiler ALIAS realscript_game_compiler)
+
+    add_executable(rsbind tools/rsbind/main.cpp)
+    target_link_libraries(rsbind PRIVATE RealScript::GameSdk)
+    target_compile_features(rsbind PRIVATE cxx_std_17)
+    realscript_enable_cxx_warnings(rsbind)
+endif()
+
+# ============================================================================
+# Always-Built L0 CLIs & Umbrella INTERFACE Targets
+# ============================================================================
 
 add_executable(rsc tools/rsc/main.cpp)
 target_link_libraries(rsc PRIVATE RealScript::Compiler RealScript::Runtime)
 target_compile_features(rsc PRIVATE cxx_std_17)
-
-add_executable(rsdebug tools/rsdebug/main.cpp)
-target_link_libraries(rsdebug PRIVATE RealScript::Debug)
-target_compile_features(rsdebug PRIVATE cxx_std_17)
-
-add_executable(rslsp tools/rslsp/main.cpp)
-target_link_libraries(rslsp PRIVATE RealScript::Tooling)
-target_compile_features(rslsp PRIVATE cxx_std_17)
+if(REALSCRIPT_ENABLE_TOOLING)
+    target_link_libraries(rsc PRIVATE RealScript::Tooling)
+    target_compile_definitions(rsc PRIVATE REALSCRIPT_HAS_TOOLING=1)
+else()
+    target_compile_definitions(rsc PRIVATE REALSCRIPT_HAS_TOOLING=0)
+endif()
+realscript_enable_cxx_warnings(rsc)
 
 add_executable(rsaot tools/rsaot/main.cpp)
 target_link_libraries(rsaot PRIVATE RealScript::Compiler RealScript::AotSupport)
 target_compile_features(rsaot PRIVATE cxx_std_17)
+realscript_enable_cxx_warnings(rsaot)
 
 add_executable(rsbench tools/rsbench/main.cpp)
 target_link_libraries(rsbench PRIVATE RealScript::Compiler RealScript::Runtime)
 target_compile_features(rsbench PRIVATE cxx_std_17)
+realscript_enable_cxx_warnings(rsbench)
 
-add_executable(rsbind tools/rsbind/main.cpp)
-target_link_libraries(rsbind PRIVATE RealScript::GameSdk)
-target_compile_features(rsbind PRIVATE cxx_std_17)
+add_library(realscript_frontend INTERFACE)
+target_link_libraries(realscript_frontend INTERFACE realscript_kernel)
+set_target_properties(realscript_frontend PROPERTIES EXPORT_NAME Frontend)
+add_library(RealScript::Frontend ALIAS realscript_frontend)
 
-foreach(realscript_tool IN ITEMS rsc rsdebug rslsp rsaot rsbench rsbind)
-    realscript_enable_cxx_warnings(${realscript_tool})
+add_library(realscript_full INTERFACE)
+target_link_libraries(realscript_full INTERFACE realscript_kernel)
+set_target_properties(realscript_full PROPERTIES EXPORT_NAME Full)
+add_library(RealScript::Full ALIAS realscript_full)
+
+foreach(_rs_opt IN ITEMS DEBUG_SERVICES TOOLING EXTENSIBILITY GAME_SDK)
+    if(REALSCRIPT_ENABLE_${_rs_opt})
+        set(REALSCRIPT_HAS_${_rs_opt}_CMAKE ON)
+        set(_rs_has_def 1)
+    else()
+        set(REALSCRIPT_HAS_${_rs_opt}_CMAKE OFF)
+        set(_rs_has_def 0)
+    endif()
+    target_compile_definitions(realscript_frontend INTERFACE
+        REALSCRIPT_HAS_${_rs_opt}=${_rs_has_def})
+    target_compile_definitions(realscript_full INTERFACE
+        REALSCRIPT_HAS_${_rs_opt}=${_rs_has_def})
 endforeach()
+
+if(REALSCRIPT_ENABLE_DEBUG_SERVICES)
+    target_link_libraries(realscript_frontend INTERFACE realscript_app_debug)
+    target_link_libraries(realscript_full INTERFACE realscript_app_debug)
+endif()
+if(REALSCRIPT_ENABLE_TOOLING)
+    target_link_libraries(realscript_frontend INTERFACE realscript_app_tooling)
+    target_link_libraries(realscript_full INTERFACE realscript_app_tooling)
+endif()
+if(REALSCRIPT_ENABLE_EXTENSIBILITY)
+    target_link_libraries(realscript_frontend INTERFACE realscript_app_extensibility)
+    target_link_libraries(realscript_full INTERFACE realscript_app_extensibility)
+endif()
+if(REALSCRIPT_ENABLE_GAME_SDK)
+    target_link_libraries(realscript_frontend INTERFACE realscript_app_game_sdk)
+    target_link_libraries(realscript_full INTERFACE realscript_app_game_sdk)
+endif()
 
 include(cmake/RealScriptAot.cmake)
 
@@ -265,13 +423,14 @@ if(REALSCRIPT_BUILD_BENCHMARKS)
         rsbench_aot benchmarks/aot_integer_driver.cpp)
     target_link_libraries(
         rsbench_aot
-        PRIVATE realscript_bench_integer_generated RealScript::Full)
+        PRIVATE realscript_bench_integer_generated RealScript::Kernel)
     target_compile_features(rsbench_aot PRIVATE cxx_std_17)
     realscript_enable_cxx_warnings(rsbench_aot)
 
     add_executable(
         rsbench_jit benchmarks/jit_integer_driver.cpp)
-    target_link_libraries(rsbench_jit PRIVATE RealScript::Full)
+    target_link_libraries(rsbench_jit PRIVATE RealScript::Kernel)
+    add_dependencies(rsbench_jit realscript_jit_support_archive)
     target_compile_features(rsbench_jit PRIVATE cxx_std_17)
     target_compile_definitions(
         rsbench_jit
@@ -279,16 +438,18 @@ if(REALSCRIPT_BUILD_BENCHMARKS)
             REALSCRIPT_BENCH_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
             REALSCRIPT_BENCH_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
             REALSCRIPT_BENCH_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
-            REALSCRIPT_BENCH_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_frontend>"
+            REALSCRIPT_BENCH_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_jit_support_archive>"
             REALSCRIPT_BENCH_JIT_CACHE_BASE="${CMAKE_CURRENT_BINARY_DIR}/jit-benchmark-cache"
     )
     realscript_enable_cxx_warnings(rsbench_jit)
 
-    add_executable(
-        rsbench_product benchmarks/product_macro_driver.cpp)
-    target_link_libraries(rsbench_product PRIVATE RealScript::Full)
-    target_compile_features(rsbench_product PRIVATE cxx_std_17)
-    realscript_enable_cxx_warnings(rsbench_product)
+    if(REALSCRIPT_ENABLE_GAME_SDK)
+        add_executable(
+            rsbench_product benchmarks/product_macro_driver.cpp)
+        target_link_libraries(rsbench_product PRIVATE RealScript::Full)
+        target_compile_features(rsbench_product PRIVATE cxx_std_17)
+        realscript_enable_cxx_warnings(rsbench_product)
+    endif()
 endif()
 
 if(REALSCRIPT_BUILD_TESTS)
@@ -380,13 +541,14 @@ if(REALSCRIPT_BUILD_TESTS)
             realscript_phase6_jit_tests
             realscript.phase6.jit
             tests/phase6_jit_tests.cpp)
+        add_dependencies(realscript_phase6_jit_tests realscript_jit_support_archive)
         target_compile_definitions(
             realscript_phase6_jit_tests
             PRIVATE
                 REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
                 REALSCRIPT_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
                 REALSCRIPT_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
-                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_frontend>"
+                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_jit_support_archive>"
                 REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/jit-cache"
         )
     endif()
@@ -549,12 +711,15 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript.p3.stage3-language-extensibility
         tests/p3_stage3_language_extensibility_tests.cpp)
     if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
+        add_dependencies(
+            realscript_p3_stage3_language_extensibility_tests
+            realscript_jit_support_archive)
         target_compile_definitions(
             realscript_p3_stage3_language_extensibility_tests
             PRIVATE
                 REALSCRIPT_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
                 REALSCRIPT_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
-                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_frontend>"
+                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_jit_support_archive>"
                 REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/p3-stage3-jit-cache")
     endif()
     realscript_add_cpp_test(
@@ -566,12 +731,13 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript.p2.stage4-stencil-jit
         tests/p2_stage4_stencil_jit_tests.cpp)
     if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
+        add_dependencies(realscript_p2_stage4_stencil_jit_tests realscript_jit_support_archive)
         target_compile_definitions(
             realscript_p2_stage4_stencil_jit_tests
             PRIVATE
                 REALSCRIPT_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
                 REALSCRIPT_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
-                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_frontend>"
+                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_jit_support_archive>"
                 REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/p2-stage4-jit-cache")
     endif()
     if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
@@ -579,13 +745,16 @@ if(REALSCRIPT_BUILD_TESTS)
             realscript_sprint2_generics_using_resource_tests
             realscript.sprint2.generics-using-resource
             tests/sprint2_generics_using_resource_tests.cpp)
+        add_dependencies(
+            realscript_sprint2_generics_using_resource_tests
+            realscript_jit_support_archive)
         target_compile_definitions(
             realscript_sprint2_generics_using_resource_tests
             PRIVATE
                 REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
                 REALSCRIPT_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
                 REALSCRIPT_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
-                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_frontend>"
+                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_jit_support_archive>"
                 REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/sprint2-jit-cache")
     endif()
     realscript_add_cpp_test(
@@ -597,12 +766,15 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript.phase2.stackref-lvalue-jit-aot
         tests/phase2_stackref_lvalue_jit_aot_tests.cpp)
     if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
+        add_dependencies(
+            realscript_phase2_stackref_lvalue_jit_aot_tests
+            realscript_jit_support_archive)
         target_compile_definitions(
             realscript_phase2_stackref_lvalue_jit_aot_tests
             PRIVATE
                 REALSCRIPT_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
                 REALSCRIPT_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
-                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_frontend>"
+                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_jit_support_archive>"
                 REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/phase2-stackref-jit-cache")
         set_target_properties(realscript_phase2_stackref_lvalue_jit_aot_tests PROPERTIES ENABLE_EXPORTS ON)
     endif()
@@ -611,12 +783,15 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript.phase3.jit-aot-large-flatstruct-fastpath
         tests/phase3_jit_aot_large_flatstruct_fastpath_tests.cpp)
     if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
+        add_dependencies(
+            realscript_phase3_jit_aot_large_flatstruct_fastpath_tests
+            realscript_jit_support_archive)
         target_compile_definitions(
             realscript_phase3_jit_aot_large_flatstruct_fastpath_tests
             PRIVATE
                 REALSCRIPT_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
                 REALSCRIPT_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
-                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_frontend>"
+                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_jit_support_archive>"
                 REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/phase3-flatstruct-jit-cache")
         set_target_properties(realscript_phase3_jit_aot_large_flatstruct_fastpath_tests PROPERTIES ENABLE_EXPORTS ON)
     endif()
@@ -892,12 +1067,15 @@ if(REALSCRIPT_BUILD_TESTS)
         NAME realscript.phase28.net-async-and-trusted-aot
         COMMAND realscript_phase28_net_async_and_trusted_aot_tests)
     if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
+        add_dependencies(
+            realscript_phase19_runtime_polymorphism_tests
+            realscript_jit_support_archive)
         target_compile_definitions(
             realscript_phase19_runtime_polymorphism_tests
             PRIVATE
                 REALSCRIPT_PHASE19_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
                 REALSCRIPT_PHASE19_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
-                REALSCRIPT_PHASE19_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_frontend>"
+                REALSCRIPT_PHASE19_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_jit_support_archive>"
                 REALSCRIPT_PHASE19_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/phase19-jit-cache"
         )
     endif()
@@ -964,13 +1142,16 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript_p2_audit_architecture_regression_tests
         realscript.p2.audit_architecture_regression
         tests/p2_audit_architecture_regression_tests.cpp)
+    add_dependencies(
+        realscript_p2_audit_architecture_regression_tests
+        realscript_jit_support_archive)
     target_compile_definitions(
         realscript_p2_audit_architecture_regression_tests
         PRIVATE
             REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
             REALSCRIPT_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
             REALSCRIPT_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
-            REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_frontend>"
+            REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_jit_support_archive>"
             REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/p2-jit-cache"
     )
 
@@ -984,26 +1165,49 @@ if(REALSCRIPT_BUILD_TESTS)
 endif()
 
 if(REALSCRIPT_INSTALL_SDK)
-    install(
-        TARGETS
-            realscript_frontend
-            realscript_runtime
-            realscript_compiler
+    set(realscript_install_export_targets
+        realscript_slice_foundation_core
+        realscript_slice_bytecode_core
+        realscript_slice_compiler_core
+        realscript_slice_runtime_core
+        realscript_slice_native_backends
+        realscript_aot_support
+        realscript_kernel
+        realscript_frontend
+        realscript_full
+        rsaot
+    )
+    set(realscript_install_cli_targets rsc rsbench)
+
+    if(REALSCRIPT_ENABLE_DEBUG_SERVICES)
+        list(APPEND realscript_install_export_targets realscript_app_debug)
+        list(APPEND realscript_install_cli_targets rsdebug)
+    endif()
+    if(REALSCRIPT_ENABLE_TOOLING)
+        list(APPEND realscript_install_export_targets realscript_app_tooling)
+        list(APPEND realscript_install_cli_targets rslsp)
+    endif()
+    if(REALSCRIPT_ENABLE_EXTENSIBILITY)
+        list(APPEND realscript_install_export_targets realscript_app_extensibility)
+    endif()
+    if(REALSCRIPT_ENABLE_GAME_SDK)
+        list(APPEND realscript_install_export_targets
+            realscript_app_game_sdk
             realscript_game_runtime
             realscript_game_compiler
-            realscript_game_sdk
-            realscript_aot_support
-            realscript_debug
-            realscript_tooling
-            realscript_full
-            rsaot
+        )
+        list(APPEND realscript_install_cli_targets rsbind)
+    endif()
+
+    install(
+        TARGETS ${realscript_install_export_targets}
         EXPORT RealScriptTargets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
     install(
-        TARGETS rsc rsdebug rslsp rsbench rsbind
+        TARGETS ${realscript_install_cli_targets}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
     install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
