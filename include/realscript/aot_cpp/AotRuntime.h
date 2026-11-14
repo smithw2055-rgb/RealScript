@@ -1772,6 +1772,10 @@ public:
     [[nodiscard]] runtime::AsyncRuntimeContext* rawAsyncRuntime() const noexcept {
         return asyncRuntime_.get();
     }
+    void setAwaitScheduler(runtime::IAwaitScheduler* awaitScheduler) noexcept;
+    [[nodiscard]] runtime::IAwaitScheduler* awaitScheduler() const noexcept {
+        return options_.awaitScheduler;
+    }
     [[nodiscard]] bool tryEnterResumingCoroutine(
         semantic::SymbolId functionSymbolId,
         std::vector<runtime::Value>& argumentValues,
@@ -2157,6 +2161,33 @@ private:
         runtime::TraceEventKind kind,
         runtime::DeterminismOperationId operationId = 0,
         std::string_view operation = {});
+    void ensureResumeEnv();
+    [[nodiscard]] bool prepareCoroutineFrame(
+        semantic::SymbolId functionSymbolId,
+        semantic::SymbolId returnStructTypeId,
+        runtime::AwaitableHandle awaitedHandle,
+        runtime::CoroutineFrameHandle& ioActiveCoroutine,
+        runtime::AwaitableHandle& outCompletionHandle);
+    [[nodiscard]] runtime::Value makePendingAsyncReturnCarrier(
+        semantic::SymbolId returnStructTypeId,
+        runtime::AwaitableHandle completionHandle) const;
+    [[nodiscard]] bool suspendValueCoroutineFrame(
+        semantic::SymbolId functionSymbolId,
+        semantic::SymbolId returnStructTypeId,
+        runtime::AwaitableHandle awaitedHandle,
+        std::uint32_t resumeBlockId,
+        const std::vector<runtime::Value>& argumentValues,
+        const std::vector<runtime::Value>& locals,
+        const std::vector<runtime::Value>& registers,
+        runtime::CoroutineFrameHandle& ioActiveCoroutine,
+        runtime::Value& outResult,
+        bool runInlineOnComplete);
+    static void resumeCoroutineThunk(
+        void* runnerContext,
+        runtime::CoroutineFrameHandle frameHandle,
+        runtime::CoroutineFrame& frame,
+        runtime::AsyncRuntimeContext& asyncContext,
+        const char* faultFallback);
 
     const ProgramDescriptor* program_ = nullptr;
     std::shared_ptr<runtime::ManagedHeap> heap_;

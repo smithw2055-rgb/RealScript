@@ -716,6 +716,180 @@ bool restoreGameplayHostState(
     return decoded && host.restore(*decoded);
 }
 
+namespace {
+
+std::map<std::string, std::string> resolveSchemaMigrationWithUnorderedState(
+    const std::vector<FieldSchemaDescriptor>& oldSchema,
+    const std::vector<FieldSchemaDescriptor>& newSchema) {
+    std::map<std::string, std::string> newToOld;
+    if (newSchema.empty()) {
+        return newToOld;
+    }
+
+    std::map<std::int32_t, std::size_t> tagCount;
+    std::map<std::int32_t, std::string> uniqueTagToOldName;
+    std::map<std::string, const FieldSchemaDescriptor*> oldByName;
+    for (const auto& oldField : oldSchema) {
+        if (oldField.currentName.empty()) continue;
+        oldByName.emplace(oldField.currentName, &oldField);
+        if (oldField.fieldTag) {
+            const auto count = ++tagCount[*oldField.fieldTag];
+            if (count == 1) {
+                uniqueTagToOldName[*oldField.fieldTag] = oldField.currentName;
+            } else {
+                uniqueTagToOldName.erase(*oldField.fieldTag);
+            }
+        }
+    }
+
+    std::vector<bool> matched(newSchema.size(), false);
+    std::vector<std::string> claimedOldNames;
+    claimedOldNames.reserve(newSchema.size());
+    const auto isClaimed = [&](const std::string& oldName) {
+        return std::find(claimedOldNames.begin(), claimedOldNames.end(), oldName) !=
+            claimedOldNames.end();
+    };
+    const auto claim = [&](std::size_t idx, const std::string& newName, const std::string& oldName) {
+        matched[idx] = true;
+        claimedOldNames.push_back(oldName);
+        newToOld.emplace(newName, oldName);
+    };
+
+    // Priority 1: [FieldTag(N)] exact integer identity across renames/swaps.
+    for (std::size_t i = 0; i < newSchema.size(); ++i) {
+        const auto& nf = newSchema[i];
+        if (nf.currentName.empty() || !nf.fieldTag) continue;
+        const auto tIt = uniqueTagToOldName.find(*nf.fieldTag);
+        if (tIt != uniqueTagToOldName.end() && !isClaimed(tIt->second)) {
+            claim(i, nf.currentName, tIt->second);
+        }
+    }
+
+    // Priority 2: Exact field name.
+    for (std::size_t i = 0; i < newSchema.size(); ++i) {
+        if (matched[i]) continue;
+        const auto& nf = newSchema[i];
+        if (nf.currentName.empty()) continue;
+        const auto oIt = oldByName.find(nf.currentName);
+        if (oIt != oldByName.end() && !isClaimed(nf.currentName)) {
+            claim(i, nf.currentName, nf.currentName);
+        }
+    }
+
+    // Priority 3: Ordered multi-alias [FormerlySerializedAs] match against oldSchema.
+    for (std::size_t i = 0; i < newSchema.size(); ++i) {
+        if (matched[i]) continue;
+        const auto& nf = newSchema[i];
+        if (nf.currentName.empty()) continue;
+        for (const auto& alias : nf.formerNames) {
+            if (alias.empty() || isClaimed(alias)) continue;
+            if (oldByName.find(alias) != oldByName.end()) {
+                claim(i, nf.currentName, alias);
+                break;
+            }
+        }
+    }
+
+    return newToOld;
+}
+
+std::map<std::string, GameplayValue> applyFieldMigrationWithFallback(
+    const std::map<std::string, GameplayValue>& savedFields,
+    const std::vector<FieldSchemaDescriptor>& oldSchema,
+    const std::vector<FieldSchemaDescriptor>& newSchema,
+    const std::map<std::string, GameplayValue>& defaultValues) {
+    std::map<std::string, GameplayValue> migrated;
+    const auto plan = resolveSchemaMigrationWithUnorderedState(oldSchema, newSchema);
+
+    std::vector<std::string> claimedSavedKeys;
+    claimedSavedKeys.reserve(newSchema.size());
+    const auto isSavedClaimed = [&](const std::string& key) {
+        return std::find(claimedSavedKeys.begin(), claimedSavedKeys.end(), key) !=
+            claimedSavedKeys.end();
+    };
+
+    // First materialize schema-matched keys (which already respect Tag > Exact > Alias).
+    std::vector<bool> resolved(newSchema.size(), false);
+    for (std::size_t i = 0; i < newSchema.size(); ++i) {
+        const auto& nf = newSchema[i];
+        if (nf.currentName.empty()) continue;
+        const auto pIt = plan.find(nf.currentName);
+        if (pIt == plan.end() || isSavedClaimed(pIt->second)) continue;
+        const auto sIt = savedFields.find(pIt->second);
+        if (sIt != savedFields.end()) {
+            claimedSavedKeys.push_back(pIt->second);
+            migrated.emplace(nf.currentName, sIt->second);
+            resolved[i] = true;
+        }
+    }
+
+    // Next check exact field name directly against unclaimed saved keys (when oldSchema omitted/partial).
+    for (std::size_t i = 0; i < newSchema.size(); ++i) {
+        if (resolved[i]) continue;
+        const auto& nf = newSchema[i];
+        if (nf.currentName.empty() || isSavedClaimed(nf.currentName)) continue;
+        const auto sIt = savedFields.find(nf.currentName);
+        if (sIt != savedFields.end()) {
+            claimedSavedKeys.push_back(nf.currentName);
+            migrated.emplace(nf.currentName, sIt->second);
+            resolved[i] = true;
+        }
+    }
+
+    // Finally check multi-alias formerNames directly against unclaimed saved keys (historical aliases).
+    for (std::size_t i = 0; i < newSchema.size(); ++i) {
+        if (resolved[i]) continue;
+        const auto& nf = newSchema[i];
+        if (nf.currentName.empty()) continue;
+        for (const auto& alias : nf.formerNames) {
+            if (alias.empty() || isSavedClaimed(alias)) continue;
+            const auto sIt = savedFields.find(alias);
+            if (sIt != savedFields.end()) {
+                claimedSavedKeys.push_back(alias);
+                migrated.emplace(nf.currentName, sIt->second);
+                resolved[i] = true;
+                break;
+            }
+        }
+    }
+
+    // Populate defaults for remaining fields when provided.
+    for (std::size_t i = 0; i < newSchema.size(); ++i) {
+        if (resolved[i]) continue;
+        const auto& nf = newSchema[i];
+        if (nf.currentName.empty()) continue;
+        const auto dIt = defaultValues.find(nf.currentName);
+        if (dIt != defaultValues.end()) {
+            migrated.emplace(nf.currentName, dIt->second);
+        }
+    }
+
+    return migrated;
+}
+
+} // namespace
+
+std::map<std::string, std::string> resolveFieldSchemaMigrationPlan(
+    const std::vector<FieldSchemaDescriptor>& oldSchema,
+    const std::vector<FieldSchemaDescriptor>& newSchema) {
+    return resolveSchemaMigrationWithUnorderedState(oldSchema, newSchema);
+}
+
+std::map<std::string, GameplayValue> migrateComponentFieldValues(
+    const std::map<std::string, GameplayValue>& savedFields,
+    const std::vector<FieldSchemaDescriptor>& oldSchema,
+    const std::vector<FieldSchemaDescriptor>& newSchema,
+    const std::map<std::string, GameplayValue>& defaultValues) {
+    return applyFieldMigrationWithFallback(savedFields, oldSchema, newSchema, defaultValues);
+}
+
+std::map<std::string, GameplayValue> migrateComponentFieldValues(
+    const std::map<std::string, GameplayValue>& savedFields,
+    const std::vector<FieldSchemaDescriptor>& newSchema,
+    const std::map<std::string, GameplayValue>& defaultValues) {
+    return applyFieldMigrationWithFallback(savedFields, {}, newSchema, defaultValues);
+}
+
 const char* gameplayStateErrorCodeName(
     GameplayStateErrorCode code) noexcept {
     switch (code) {

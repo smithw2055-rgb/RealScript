@@ -4,7 +4,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
+#include <limits>
+#include <optional>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -77,28 +81,165 @@ std::vector<std::string> findRequiredComponents(
     return required;
 }
 
+bool isSceneAttrNamed(std::string_view attrName, std::string_view expectedBase) noexcept {
+    if (attrName == expectedBase) return true;
+    const std::string expectedSuffix = std::string(expectedBase) + "Attribute";
+    if (attrName == expectedSuffix) return true;
+    const auto sep = attrName.rfind("::");
+    if (sep != std::string_view::npos) {
+        const auto tail = attrName.substr(sep + 2);
+        return tail == expectedBase || tail == expectedSuffix;
+    }
+    const auto dot = attrName.rfind('.');
+    if (dot != std::string_view::npos) {
+        const auto tail = attrName.substr(dot + 1);
+        return tail == expectedBase || tail == expectedSuffix;
+    }
+    return false;
+}
+
+std::optional<std::int32_t> parseSceneFieldTagRaw(const std::string& raw) {
+    std::size_t b = 0;
+    std::size_t e = raw.size();
+    while (b < e && std::isspace(static_cast<unsigned char>(raw[b]))) ++b;
+    while (e > b && std::isspace(static_cast<unsigned char>(raw[e - 1]))) --e;
+    std::string trimmed = raw.substr(b, e - b);
+    if (trimmed.size() >= 2 && trimmed.front() == '"' && trimmed.back() == '"') {
+        trimmed = trimmed.substr(1, trimmed.size() - 2);
+    }
+    if (trimmed.empty()) return std::nullopt;
+    char* endPtr = nullptr;
+    const long long parsed = std::strtoll(trimmed.c_str(), &endPtr, 10);
+    if (!endPtr || *endPtr != '\0') return std::nullopt;
+    if (parsed < std::numeric_limits<std::int32_t>::min() ||
+        parsed > std::numeric_limits<std::int32_t>::max()) {
+        return std::nullopt;
+    }
+    return static_cast<std::int32_t>(parsed);
+}
+
+std::optional<std::int32_t> parseSceneFieldTagValue(const GameplayValue& val) {
+    if (const auto* iv64 = std::get_if<std::int64_t>(&val)) {
+        if (*iv64 < std::numeric_limits<std::int32_t>::min() ||
+            *iv64 > std::numeric_limits<std::int32_t>::max()) {
+            return std::nullopt;
+        }
+        return static_cast<std::int32_t>(*iv64);
+    }
+    if (const auto* iv32 = std::get_if<std::int32_t>(&val)) {
+        return *iv32;
+    }
+    if (const auto* sv = std::get_if<std::string>(&val)) {
+        return parseSceneFieldTagRaw(*sv);
+    }
+    return std::nullopt;
+}
+
+std::optional<std::int32_t> findFieldTagAttribute(
+    const runtime::ProgramImage* program,
+    const ScriptMetadataRegistry* metadata,
+    const std::string& canonicalTypeName,
+    const std::string& fieldName) {
+    if (metadata) {
+        if (const auto* attributes = metadata->memberAttributes(canonicalTypeName, fieldName)) {
+            for (const auto& attr : *attributes) {
+                if (!isSceneAttrNamed(attr.name, "FieldTag")) continue;
+                static const char* const kTagKeys[] = {"tag", "id", "arg0", "value"};
+                for (const char* key : kTagKeys) {
+                    const auto found = attr.arguments.find(key);
+                    if (found != attr.arguments.end()) {
+                        if (const auto parsed = parseSceneFieldTagValue(found->second)) {
+                            return parsed;
+                        }
+                    }
+                }
+                if (attr.arguments.size() == 1) {
+                    if (const auto parsed = parseSceneFieldTagValue(attr.arguments.begin()->second)) {
+                        return parsed;
+                    }
+                }
+            }
+        }
+    }
+    if (program) {
+        const std::string fieldTarget = canonicalTypeName + "::field:" + fieldName;
+        const bool isAutoPropBacking = fieldName.size() > 1 && fieldName.front() == '$';
+        const std::string propTarget = isAutoPropBacking
+            ? (canonicalTypeName + "::property:" + fieldName.substr(1))
+            : std::string{};
+        for (const auto& module : program->modules()) {
+            for (const auto& attr : module.languageMetadata.attributes) {
+                if (!isSceneAttrNamed(attr.name, "FieldTag")) continue;
+                if (attr.target != fieldTarget &&
+                    (!isAutoPropBacking || attr.target != propTarget)) {
+                    continue;
+                }
+                static const char* const kTagKeys[] = {"tag", "id", "arg0", "value"};
+                for (const char* key : kTagKeys) {
+                    for (const auto& arg : attr.arguments) {
+                        if (arg.name == key) {
+                            if (const auto parsed = parseSceneFieldTagRaw(arg.value)) {
+                                return parsed;
+                            }
+                        }
+                    }
+                }
+                if (attr.arguments.size() == 1) {
+                    if (const auto parsed = parseSceneFieldTagRaw(attr.arguments.front().value)) {
+                        return parsed;
+                    }
+                }
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+std::vector<std::string> findRenamedFieldSources(
+    const ScriptMetadataRegistry& metadata,
+    const std::string& canonicalTypeName,
+    const std::string& newFieldName) {
+    std::vector<std::string> aliases;
+    const auto* attributes = metadata.memberAttributes(canonicalTypeName, newFieldName);
+    if (!attributes) return aliases;
+    const auto appendAlias = [&](const std::string& alias) {
+        if (!alias.empty() &&
+            std::find(aliases.begin(), aliases.end(), alias) == aliases.end()) {
+            aliases.push_back(alias);
+        }
+    };
+    static const char* const kKeys[] = {"oldName", "name", "arg0"};
+    for (const auto& attr : *attributes) {
+        if (!isSceneAttrNamed(attr.name, "FormerlySerializedAs")) continue;
+        bool extracted = false;
+        for (const char* key : kKeys) {
+            const auto found = attr.arguments.find(key);
+            if (found != attr.arguments.end()) {
+                if (const auto* str = std::get_if<std::string>(&found->second)) {
+                    appendAlias(*str);
+                    extracted = true;
+                    break;
+                }
+            }
+        }
+        if (!extracted) {
+            for (const auto& entry : attr.arguments) {
+                if (const auto* str = std::get_if<std::string>(&entry.second)) {
+                    appendAlias(*str);
+                    break;
+                }
+            }
+        }
+    }
+    return aliases;
+}
+
 std::string findRenamedFieldSource(
     const ScriptMetadataRegistry& metadata,
     const std::string& canonicalTypeName,
     const std::string& newFieldName) {
-    const auto* attr = metadata.findMemberAttribute(
-        canonicalTypeName, newFieldName, "FormerlySerializedAs");
-    if (!attr) return {};
-    static const char* const kKeys[] = {"oldName", "name", "arg0"};
-    for (const char* key : kKeys) {
-        const auto found = attr->arguments.find(key);
-        if (found != attr->arguments.end()) {
-            if (const auto* str = std::get_if<std::string>(&found->second)) {
-                return *str;
-            }
-        }
-    }
-    for (const auto& entry : attr->arguments) {
-        if (const auto* str = std::get_if<std::string>(&entry.second)) {
-            return *str;
-        }
-    }
-    return {};
+    const auto aliases = findRenamedFieldSources(metadata, canonicalTypeName, newFieldName);
+    return aliases.empty() ? std::string{} : aliases.front();
 }
 
 bool isNonZeroSequenceValue(const std::optional<runtime::Value>& val) noexcept {
@@ -2704,7 +2845,29 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
         bool enabled = true;
         bool started = false;
         std::unordered_map<std::string, runtime::Value> fields;
+        std::unordered_map<std::int32_t, std::string> fieldNameByTag;
         std::unordered_set<std::string> abortedSequenceFields;
+    };
+    const auto recordSavedFieldTags = [&](
+        SavedComponentState& saved,
+        const std::vector<semantic::FieldSymbol>& oldFields) {
+        if (!oldProgramPtr) return;
+        std::unordered_map<std::int32_t, std::size_t> tagCounts;
+        for (const auto& f : oldFields) {
+            if (f.staticField || f.constField) continue;
+            if (saved.abortedSequenceFields.find(f.name) !=
+                saved.abortedSequenceFields.end()) {
+                continue;
+            }
+            const auto tag = findFieldTagAttribute(
+                oldProgramPtr.get(), nullptr, saved.canonicalTypeName, f.name);
+            if (!tag) continue;
+            if (++tagCounts[*tag] == 1) {
+                saved.fieldNameByTag[*tag] = f.name;
+            } else {
+                saved.fieldNameByTag.erase(*tag);
+            }
+        }
     };
     std::map<SceneEntityId, std::vector<SavedComponentState>> savedEntities;
     std::map<std::string, SavedComponentState> savedAssets;
@@ -2933,6 +3096,7 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
                     saved.fields.emplace(field.name, std::move(*val));
                 }
             }
+            recordSavedFieldTags(saved, oldTypeDesc.fields);
             savedList.push_back(std::move(saved));
         }
     }
@@ -2948,7 +3112,51 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
                 saved.fields.emplace(field.name, std::move(*val));
             }
         }
+        recordSavedFieldTags(saved, assetObj.type().descriptor.fields);
         savedAssets.emplace(assetPath, std::move(saved));
+    }
+
+    // Snapshot `[FieldTag(N)]` static fields on `oldProgramPtr` before replacing the program.
+    struct OldStaticTaggedField {
+        semantic::SymbolId staticId = 0;
+        std::string oldCanonicalType;
+        std::string oldFieldName;
+        runtime::Value value;
+    };
+    std::map<std::pair<std::string, std::int32_t>, OldStaticTaggedField> oldStaticTaggedFields;
+    std::map<std::pair<std::string, std::int32_t>, std::size_t> oldStaticTagCounts;
+    std::unordered_map<std::string, std::string> oldTypeByNewCanonical;
+    if (oldProgramPtr && newProgramPtr) {
+        if (auto* heap = runtime_.heap().get()) {
+            for (const auto& module : oldProgramPtr->modules()) {
+                for (const auto& typeDesc : module.types) {
+                    const std::string oldCanon = semantic::canonicalTypeName(typeDesc);
+                    const std::string explicitGuid =
+                        findExplicitTypeGuidAttribute(oldProgramPtr.get(), oldCanon);
+                    if (!explicitGuid.empty()) {
+                        const auto gIt = newTypeNameByExplicitGuid.find(explicitGuid);
+                        if (gIt != newTypeNameByExplicitGuid.end()) {
+                            oldTypeByNewCanonical.emplace(gIt->second, oldCanon);
+                        }
+                    }
+                    for (const auto& oldField : typeDesc.fields) {
+                        if (!oldField.staticField || oldField.constField) continue;
+                        const auto tag = findFieldTagAttribute(
+                            oldProgramPtr.get(), nullptr, oldCanon, oldField.name);
+                        if (!tag) continue;
+                        const auto key = std::make_pair(oldCanon, *tag);
+                        if (++oldStaticTagCounts[key] == 1) {
+                            if (const auto val = heap->getStaticField(oldField.id)) {
+                                oldStaticTaggedFields.emplace(
+                                    key, OldStaticTaggedField{oldField.id, oldCanon, oldField.name, *val});
+                            }
+                        } else {
+                            oldStaticTaggedFields.erase(key);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Collect currently allocated `async Awaitable` CoroutineFrames in `CoroutineFramePool`
@@ -2999,47 +3207,96 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
         const ScriptObject& newObj,
         runtime::RuntimeError& allocError) {
         const std::string newCanonicalName = newType.canonicalName();
-        for (const auto& newField : newType.descriptor.fields) {
+        const auto& newFields = newType.descriptor.fields;
+        std::vector<std::optional<std::string>> matchedOldNames(newFields.size());
+        std::unordered_set<std::string> claimedSavedNames;
+
+        const auto matchesSavedField = [&](
+            const std::string& oldName,
+            const semantic::FieldSymbol& newField) -> bool {
+            if (claimedSavedNames.find(oldName) != claimedSavedNames.end()) {
+                return false;
+            }
+            const auto it = saved.fields.find(oldName);
+            if (it == saved.fields.end()) return false;
+            const auto newFieldTypeId = exactFieldTypeId(
+                newField.type, newField.typeName);
+            return runtime_.valueMatches(it->second, newField.type, newFieldTypeId);
+        };
+
+        // Priority 1: [FieldTag(N)] matching (old tag == new tag).
+        for (std::size_t idx = 0; idx < newFields.size(); ++idx) {
+            const auto& newField = newFields[idx];
+            if (newField.staticField || newField.constField) continue;
+            auto newTag = findFieldTagAttribute(
+                newProgramPtr.get(), &mergedMetadata, newCanonicalName, newField.name);
+            if (!newTag && newCanonicalName != saved.canonicalTypeName) {
+                newTag = findFieldTagAttribute(
+                    newProgramPtr.get(), &mergedMetadata, saved.canonicalTypeName, newField.name);
+            }
+            if (!newTag) continue;
+            const auto tagIt = saved.fieldNameByTag.find(*newTag);
+            if (tagIt != saved.fieldNameByTag.end() &&
+                matchesSavedField(tagIt->second, newField)) {
+                claimedSavedNames.insert(tagIt->second);
+                matchedOldNames[idx] = tagIt->second;
+            }
+        }
+
+        // Priority 2: Exact field name.
+        for (std::size_t idx = 0; idx < newFields.size(); ++idx) {
+            if (matchedOldNames[idx]) continue;
+            const auto& newField = newFields[idx];
+            if (matchesSavedField(newField.name, newField)) {
+                claimedSavedNames.insert(newField.name);
+                matchedOldNames[idx] = newField.name;
+            }
+        }
+
+        // Priority 3: Ordered multi-alias [FormerlySerializedAs].
+        for (std::size_t idx = 0; idx < newFields.size(); ++idx) {
+            if (matchedOldNames[idx]) continue;
+            const auto& newField = newFields[idx];
+            std::vector<std::string> aliases = findRenamedFieldSources(
+                mergedMetadata, newCanonicalName, newField.name);
+            if (newCanonicalName != saved.canonicalTypeName) {
+                for (auto& extra : findRenamedFieldSources(
+                         mergedMetadata, saved.canonicalTypeName, newField.name)) {
+                    if (std::find(aliases.begin(), aliases.end(), extra) == aliases.end()) {
+                        aliases.push_back(std::move(extra));
+                    }
+                }
+            }
+            for (const auto& alias : aliases) {
+                if (matchesSavedField(alias, newField)) {
+                    claimedSavedNames.insert(alias);
+                    matchedOldNames[idx] = alias;
+                    break;
+                }
+            }
+        }
+
+        for (std::size_t idx = 0; idx < newFields.size(); ++idx) {
+            const auto& newField = newFields[idx];
             const bool isSequenceSynthetic =
                 newField.synthetic && newField.name.rfind("$sequence_", 0) == 0;
             const bool isInstanceField =
                 !newField.synthetic && !newField.staticField && !newField.constField;
-            const auto newFieldTypeId = exactFieldTypeId(
-                newField.type, newField.typeName);
-            const auto directIt = saved.fields.find(newField.name);
-            if (directIt != saved.fields.end() &&
-                runtime_.valueMatches(
-                    directIt->second, newField.type, newFieldTypeId)) {
+            if (matchedOldNames[idx]) {
+                const auto& oldFieldName = *matchedOldNames[idx];
                 (void)runtime_.heap()->fieldSet(
-                    newObj.reference(), newField.index, directIt->second, &allocError);
-                if (isInstanceField || isSequenceSynthetic) {
-                    if (isInstanceField) ++report.fieldsMigrated;
-                }
-                continue;
-            }
-
-            std::string oldFieldName = findRenamedFieldSource(
-                mergedMetadata, newCanonicalName, newField.name);
-            if (oldFieldName.empty() && newCanonicalName != saved.canonicalTypeName) {
-                oldFieldName = findRenamedFieldSource(
-                    mergedMetadata, saved.canonicalTypeName, newField.name);
-            }
-            if (!oldFieldName.empty()) {
-                const auto renamedIt = saved.fields.find(oldFieldName);
-                if (renamedIt != saved.fields.end() &&
-                    runtime_.valueMatches(
-                        renamedIt->second, newField.type, newFieldTypeId)) {
-                    (void)runtime_.heap()->fieldSet(
-                        newObj.reference(),
-                        newField.index,
-                        renamedIt->second,
-                        &allocError);
-                    if (isInstanceField) {
-                        ++report.fieldsMigrated;
+                    newObj.reference(),
+                    newField.index,
+                    saved.fields.at(oldFieldName),
+                    &allocError);
+                if (isInstanceField) {
+                    ++report.fieldsMigrated;
+                    if (oldFieldName != newField.name) {
                         ++report.fieldsRenamed;
                     }
-                    continue;
                 }
+                (void)isSequenceSynthetic;
+                continue;
             }
             if (isInstanceField) {
                 auto protoIt = prototypeCache.find(newCanonicalName);
@@ -3494,37 +3751,112 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
         }
     }
 
-    // Migrate [FormerlySerializedAs] static fields on reloaded types
+    // Migrate [FieldTag(N)] and [FormerlySerializedAs] static fields on reloaded types
     if (auto* heap = runtime_.heap().get()) {
         if (const auto prog = runtime_.program()) {
+            std::unordered_set<semantic::SymbolId> claimedOldStaticIds;
             for (const auto& module : prog->modules()) {
                 for (const auto& typeDesc : module.types) {
                     const std::string canonicalType = semantic::canonicalTypeName(typeDesc);
+                    std::string oldCanonicalType = canonicalType;
+                    if (const auto oldIt = oldTypeByNewCanonical.find(canonicalType);
+                        oldIt != oldTypeByNewCanonical.end()) {
+                        oldCanonicalType = oldIt->second;
+                    }
+
+                    std::unordered_set<semantic::SymbolId> declaredStaticIds;
+                    for (const auto& f : typeDesc.fields) {
+                        if (f.staticField && !f.constField) {
+                            declaredStaticIds.insert(f.id);
+                        }
+                    }
+
+                    // Pass 1: [FieldTag(N)] static fields (batch before writing so swapped tags don't collide).
+                    struct PendingStaticTagWrite {
+                        semantic::SymbolId targetId = 0;
+                        semantic::SymbolId oldId = 0;
+                        runtime::Value value;
+                        bool renamed = false;
+                    };
+                    std::vector<PendingStaticTagWrite> pendingTagWrites;
+                    for (const auto& newField : typeDesc.fields) {
+                        if (!newField.staticField || newField.constField) continue;
+                        auto newTag = findFieldTagAttribute(
+                            prog.get(), &mergedMetadata, canonicalType, newField.name);
+                        if (!newTag && oldCanonicalType != canonicalType) {
+                            newTag = findFieldTagAttribute(
+                                prog.get(), &mergedMetadata, oldCanonicalType, newField.name);
+                        }
+                        if (!newTag) continue;
+
+                        auto oldTagIt = oldStaticTaggedFields.find({oldCanonicalType, *newTag});
+                        if (oldTagIt == oldStaticTaggedFields.end() && oldCanonicalType != canonicalType) {
+                            oldTagIt = oldStaticTaggedFields.find({canonicalType, *newTag});
+                        }
+                        if (oldTagIt == oldStaticTaggedFields.end()) continue;
+                        if (claimedOldStaticIds.find(oldTagIt->second.staticId) !=
+                            claimedOldStaticIds.end()) {
+                            continue;
+                        }
+                        const auto newFieldTypeId = exactFieldTypeId(
+                            newField.type, newField.typeName);
+                        if (runtime_.valueMatches(
+                                oldTagIt->second.value, newField.type, newFieldTypeId)) {
+                            claimedOldStaticIds.insert(oldTagIt->second.staticId);
+                            pendingTagWrites.push_back(PendingStaticTagWrite{
+                                newField.id,
+                                oldTagIt->second.staticId,
+                                oldTagIt->second.value,
+                                oldTagIt->second.oldFieldName != newField.name,
+                            });
+                        }
+                    }
+                    for (const auto& writeOp : pendingTagWrites) {
+                        heap->setStaticField(writeOp.targetId, writeOp.value);
+                        if (writeOp.oldId != writeOp.targetId &&
+                            declaredStaticIds.find(writeOp.oldId) == declaredStaticIds.end()) {
+                            (void)heap->removeStaticField(writeOp.oldId);
+                        }
+                        ++report.fieldsMigrated;
+                        if (writeOp.renamed) {
+                            ++report.fieldsRenamed;
+                        }
+                    }
+
+                    // Pass 2: Ordered multi-alias [FormerlySerializedAs] static fields.
                     for (const auto& newField : typeDesc.fields) {
                         if (!newField.staticField || newField.constField) continue;
                         if (heap->hasStaticField(newField.id)) continue;
-                        const std::string oldFieldName = findRenamedFieldSource(
+                        std::vector<std::string> aliases = findRenamedFieldSources(
                             mergedMetadata, canonicalType, newField.name);
-                        if (oldFieldName.empty()) continue;
-                        const auto oldStaticId = semantic::stableTypeId(
-                            canonicalType + "::field:" + oldFieldName);
-                        const auto oldVal = heap->getStaticField(oldStaticId);
-                        const auto newFieldTypeId = exactFieldTypeId(
-                            newField.type, newField.typeName);
-                        if (oldVal && runtime_.valueMatches(*oldVal, newField.type, newFieldTypeId)) {
-                            heap->setStaticField(newField.id, *oldVal);
-                            bool oldFieldStillDeclared = false;
-                            for (const auto& f : typeDesc.fields) {
-                                if (f.staticField && !f.constField && f.name == oldFieldName) {
-                                    oldFieldStillDeclared = true;
-                                    break;
+                        if (oldCanonicalType != canonicalType) {
+                            for (auto& extra : findRenamedFieldSources(
+                                     mergedMetadata, oldCanonicalType, newField.name)) {
+                                if (std::find(aliases.begin(), aliases.end(), extra) == aliases.end()) {
+                                    aliases.push_back(std::move(extra));
                                 }
                             }
-                            if (!oldFieldStillDeclared) {
-                                (void)heap->removeStaticField(oldStaticId);
+                        }
+                        const auto newFieldTypeId = exactFieldTypeId(
+                            newField.type, newField.typeName);
+                        for (const auto& oldFieldName : aliases) {
+                            const auto oldStaticId = semantic::stableTypeId(
+                                oldCanonicalType + "::field:" + oldFieldName);
+                            if (claimedOldStaticIds.find(oldStaticId) != claimedOldStaticIds.end()) {
+                                continue;
                             }
-                            ++report.fieldsMigrated;
-                            ++report.fieldsRenamed;
+                            const auto oldVal = heap->getStaticField(oldStaticId);
+                            if (oldVal &&
+                                runtime_.valueMatches(*oldVal, newField.type, newFieldTypeId)) {
+                                claimedOldStaticIds.insert(oldStaticId);
+                                heap->setStaticField(newField.id, *oldVal);
+                                if (declaredStaticIds.find(oldStaticId) == declaredStaticIds.end()) {
+                                    (void)heap->removeStaticField(oldStaticId);
+                                }
+                                ++report.fieldsMigrated;
+                                ++report.fieldsRenamed;
+                                break;
+                            }
                         }
                     }
                 }

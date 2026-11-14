@@ -3,9 +3,12 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -20,6 +23,7 @@ struct FunctionView {
 using FunctionMap = std::unordered_map<semantic::SymbolId, FunctionView>;
 using TypeMap = std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*>;
 using FormerNamesMap = std::unordered_map<std::string, std::vector<std::string>>;
+using FieldTagsMap = std::unordered_map<std::string, std::int32_t>;
 
 std::string moduleSet(const std::vector<bytecode::Module>& modules) {
     std::vector<std::string> names;
@@ -360,6 +364,174 @@ std::vector<std::string> lookupFormerFieldNames(
     return candidates;
 }
 
+bool isFieldTagName(std::string_view attrName) noexcept {
+    if (attrName == "FieldTag" || attrName == "FieldTagAttribute") {
+        return true;
+    }
+    const auto sep = attrName.rfind("::");
+    if (sep != std::string_view::npos) {
+        const auto tail = attrName.substr(sep + 2);
+        return tail == "FieldTag" || tail == "FieldTagAttribute";
+    }
+    const auto dot = attrName.rfind('.');
+    if (dot != std::string_view::npos) {
+        const auto tail = attrName.substr(dot + 1);
+        return tail == "FieldTag" || tail == "FieldTagAttribute";
+    }
+    return false;
+}
+
+std::optional<std::int32_t> extractFieldTagValue(
+    const compiler::LanguageAttributeRecord& attr) {
+    const auto parseTagStr = [](const std::string& raw) -> std::optional<std::int32_t> {
+        std::size_t b = 0;
+        std::size_t e = raw.size();
+        while (b < e && std::isspace(static_cast<unsigned char>(raw[b]))) ++b;
+        while (e > b && std::isspace(static_cast<unsigned char>(raw[e - 1]))) --e;
+        std::string trimmed = raw.substr(b, e - b);
+        if (trimmed.size() >= 2 && trimmed.front() == '"' && trimmed.back() == '"') {
+            trimmed = trimmed.substr(1, trimmed.size() - 2);
+        }
+        if (trimmed.empty()) return std::nullopt;
+        char* endPtr = nullptr;
+        const long long parsed = std::strtoll(trimmed.c_str(), &endPtr, 10);
+        if (!endPtr || *endPtr != '\0') return std::nullopt;
+        if (parsed < std::numeric_limits<std::int32_t>::min() ||
+            parsed > std::numeric_limits<std::int32_t>::max()) {
+            return std::nullopt;
+        }
+        return static_cast<std::int32_t>(parsed);
+    };
+
+    static const char* const kTagKeys[] = {"tag", "id", "arg0", "value"};
+    for (const char* key : kTagKeys) {
+        for (const auto& arg : attr.arguments) {
+            if (arg.name == key) {
+                if (const auto tag = parseTagStr(arg.value)) {
+                    return tag;
+                }
+            }
+        }
+    }
+    if (attr.arguments.size() == 1) {
+        return parseTagStr(attr.arguments.front().value);
+    }
+    return std::nullopt;
+}
+
+FieldTagsMap collectFieldTagsMap(
+    const std::vector<bytecode::Module>& modules) {
+    FieldTagsMap map;
+    for (const auto& module : modules) {
+        for (const auto& attr : module.languageMetadata.attributes) {
+            if (!isFieldTagName(attr.name)) continue;
+            const auto tag = extractFieldTagValue(attr);
+            if (!tag) continue;
+            map[attr.target] = *tag;
+        }
+    }
+    return map;
+}
+
+std::optional<std::int32_t> lookupFieldTag(
+    const FieldTagsMap& map,
+    const std::string& ownerCanonicalName,
+    const semantic::FieldSymbol& field) {
+    const auto tryTarget = [&](const std::string& target) -> std::optional<std::int32_t> {
+        const auto it = map.find(target);
+        return it == map.end() ? std::nullopt : std::optional<std::int32_t>{it->second};
+    };
+
+    if (!field.declaringTypeName.empty()) {
+        if (const auto t = tryTarget(field.declaringTypeName + "::field:" + field.name)) {
+            return t;
+        }
+    }
+    if (field.declaringTypeName != ownerCanonicalName) {
+        if (const auto t = tryTarget(ownerCanonicalName + "::field:" + field.name)) {
+            return t;
+        }
+    }
+    if (field.synthetic && field.name.size() > 1 && field.name.front() == '$') {
+        const std::string propName = field.name.substr(1);
+        if (!field.declaringTypeName.empty()) {
+            if (const auto t = tryTarget(field.declaringTypeName + "::property:" + propName)) {
+                return t;
+            }
+        }
+        if (field.declaringTypeName != ownerCanonicalName) {
+            if (const auto t = tryTarget(ownerCanonicalName + "::property:" + propName)) {
+                return t;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+std::vector<const semantic::FieldSymbol*> matchTypeFieldsBySchema(
+    const std::vector<semantic::FieldSymbol>& oldFields,
+    const std::vector<semantic::FieldSymbol>& newFields,
+    const std::string& canonicalOld,
+    const std::string& canonicalNew,
+    const FieldTagsMap& oldFieldTags,
+    const FieldTagsMap& newFieldTags,
+    const FormerNamesMap& formerNames,
+    bool staticFields) {
+    std::vector<const semantic::FieldSymbol*> matched(newFields.size(), nullptr);
+    std::unordered_map<std::string, const semantic::FieldSymbol*> oldByName;
+    std::unordered_map<std::int32_t, const semantic::FieldSymbol*> oldByTag;
+    std::unordered_map<std::int32_t, std::size_t> oldTagCounts;
+    for (const auto& of : oldFields) {
+        if (of.staticField != staticFields || of.constField) continue;
+        oldByName.emplace(of.name, &of);
+        if (const auto tag = lookupFieldTag(oldFieldTags, canonicalOld, of)) {
+            const auto count = ++oldTagCounts[*tag];
+            if (count == 1) {
+                oldByTag[*tag] = &of;
+            } else {
+                oldByTag.erase(*tag);
+            }
+        }
+    }
+
+    std::unordered_set<std::string> claimedOldNames;
+    // Priority 1: [FieldTag(N)] exact numeric tag identity across renames or swaps.
+    for (std::size_t i = 0; i < newFields.size(); ++i) {
+        const auto& nf = newFields[i];
+        if (nf.staticField != staticFields || (staticFields && nf.constField)) continue;
+        const auto newTag = lookupFieldTag(newFieldTags, canonicalNew, nf);
+        if (!newTag) continue;
+        const auto tIt = oldByTag.find(*newTag);
+        if (tIt != oldByTag.end() && claimedOldNames.insert(tIt->second->name).second) {
+            matched[i] = tIt->second;
+        }
+    }
+    // Priority 2: Exact field name.
+    for (std::size_t i = 0; i < newFields.size(); ++i) {
+        if (matched[i]) continue;
+        const auto& nf = newFields[i];
+        if (nf.staticField != staticFields || (staticFields && nf.constField)) continue;
+        const auto oIt = oldByName.find(nf.name);
+        if (oIt != oldByName.end() && claimedOldNames.insert(oIt->second->name).second) {
+            matched[i] = oIt->second;
+        }
+    }
+    // Priority 3: Ordered multi-alias [FormerlySerializedAs] match.
+    for (std::size_t i = 0; i < newFields.size(); ++i) {
+        if (matched[i]) continue;
+        const auto& nf = newFields[i];
+        if (nf.staticField != staticFields || (staticFields && nf.constField)) continue;
+        for (const auto& former : lookupFormerFieldNames(formerNames, canonicalNew, nf)) {
+            const auto fIt = oldByName.find(former);
+            if (fIt != oldByName.end() && claimedOldNames.insert(former).second) {
+                matched[i] = fIt->second;
+                break;
+            }
+        }
+    }
+    return matched;
+}
+
 semantic::SymbolId exactFieldTypeId(const semantic::FieldSymbol& field) {
     return semantic::isExactType(field.type) && !field.typeName.empty()
         ? semantic::stableTypeId(field.typeName)
@@ -688,6 +860,8 @@ bool buildStructuralTypeMigrations(
     }
 
     const auto formerNames = collectFormerlySerializedAsMap(newModules);
+    const auto oldFieldTags = collectFieldTagsMap(oldModules);
+    const auto newFieldTags = collectFieldTagsMap(newModules);
     const auto oldAssignable = buildAssignableConcreteTypesMap(oldTypes);
     const auto newAssignable = buildAssignableConcreteTypesMap(newTypes);
     const auto delegateUpdates = computeDelegateSlotUpdates(
@@ -830,29 +1004,24 @@ bool buildStructuralTypeMigrations(
             continue;
         }
 
-        std::unordered_map<std::string, const semantic::FieldSymbol*> oldInstanceByName;
-        std::unordered_map<std::string, const semantic::FieldSymbol*> oldStaticByName;
-        for (const auto& of : oldType.fields) {
-            if (of.staticField) {
-                if (!of.constField) {
-                    oldStaticByName.emplace(of.name, &of);
-                }
-            } else {
-                oldInstanceByName.emplace(of.name, &of);
-            }
-        }
-
-        std::unordered_set<std::string> claimedOldInstanceNames;
-        std::unordered_set<std::string> claimedOldStaticNames;
-        for (const auto& nf : newType.fields) {
-            if (nf.staticField) {
-                if (!nf.constField && oldStaticByName.find(nf.name) != oldStaticByName.end()) {
-                    claimedOldStaticNames.insert(nf.name);
-                }
-            } else if (oldInstanceByName.find(nf.name) != oldInstanceByName.end()) {
-                claimedOldInstanceNames.insert(nf.name);
-            }
-        }
+        const auto matchedStaticOld = matchTypeFieldsBySchema(
+            oldType.fields,
+            newType.fields,
+            canonicalOld,
+            canonicalNew,
+            oldFieldTags,
+            newFieldTags,
+            formerNames,
+            true);
+        const auto matchedInstOld = matchTypeFieldsBySchema(
+            oldType.fields,
+            newType.fields,
+            canonicalOld,
+            canonicalNew,
+            oldFieldTags,
+            newFieldTags,
+            formerNames,
+            false);
 
         std::unordered_set<semantic::SymbolId> retainedStaticIds;
         mig.fieldOps.reserve(newType.fields.size());
@@ -888,20 +1057,7 @@ bool buildStructuralTypeMigrations(
                         if (aIt != newAssignable.end()) sop.assignableTypeIds = aIt->second;
                     }
 
-                    const semantic::FieldSymbol* matchedOldStatic = nullptr;
-                    const auto exactIt = oldStaticByName.find(nf.name);
-                    if (exactIt != oldStaticByName.end()) {
-                        matchedOldStatic = exactIt->second;
-                    } else {
-                        for (const auto& former : lookupFormerFieldNames(formerNames, canonicalNew, nf)) {
-                            const auto fIt = oldStaticByName.find(former);
-                            if (fIt != oldStaticByName.end() &&
-                                claimedOldStaticNames.insert(former).second) {
-                                matchedOldStatic = fIt->second;
-                                break;
-                            }
-                        }
-                    }
+                    const semantic::FieldSymbol* matchedOldStatic = matchedStaticOld[idx];
 
                     if (matchedOldStatic) {
                         sop.sourceFieldId = resolveFieldSymbolId(canonicalOld, *matchedOldStatic);
@@ -937,20 +1093,7 @@ bool buildStructuralTypeMigrations(
                 if (aIt != newAssignable.end()) fop.assignableTypeIds = aIt->second;
             }
 
-            const semantic::FieldSymbol* matchedOldInst = nullptr;
-            const auto exactIt = oldInstanceByName.find(nf.name);
-            if (exactIt != oldInstanceByName.end()) {
-                matchedOldInst = exactIt->second;
-            } else {
-                for (const auto& former : lookupFormerFieldNames(formerNames, canonicalNew, nf)) {
-                    const auto fIt = oldInstanceByName.find(former);
-                    if (fIt != oldInstanceByName.end() &&
-                        claimedOldInstanceNames.insert(former).second) {
-                        matchedOldInst = fIt->second;
-                        break;
-                    }
-                }
-            }
+            const semantic::FieldSymbol* matchedOldInst = matchedInstOld[idx];
 
             if (matchedOldInst) {
                 fop.sourceIndex = matchedOldInst->index;
