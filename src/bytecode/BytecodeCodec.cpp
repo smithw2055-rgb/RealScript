@@ -31,6 +31,21 @@ bool hasSequenceResultMetadata(const Version& version) noexcept {
 constexpr std::uint32_t kInlineMetadataTrailerMagic = 0x52534944u; // "RSID"
 constexpr std::uint32_t kFunctionAccessMetadataTrailerMagic = 0x52534641u; // "RSFA"
 constexpr std::uint32_t kLineMapDebugTrailerMagic = 0x52534C4Du; // "RSLM"
+constexpr std::uint32_t kTypeFieldSchemaTrailerMagic = 0x52534653u; // "RSFS"
+
+[[nodiscard]] bool hasTypeFieldSchemaMetadata(const Module& module) {
+    for (const auto& type : module.types) {
+        if (type.blittable || type.hasBlittableAttribute) {
+            return true;
+        }
+        for (const auto& field : type.fields) {
+            if (field.fieldTag.has_value() || !field.formerlySerializedAs.empty()) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
 bool hasInlineDependencyMetadata(const Module& mod) noexcept {
     return mod.version.major == 0 && mod.version.minor >= 7 &&
@@ -754,6 +769,15 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
             strings.add(dep.calleeFunction);
         }
     }
+    if (hasTypeFieldSchemaMetadata(module)) {
+        for (const auto& type : module.types) {
+            for (const auto& field : type.fields) {
+                for (const auto& alias : field.formerlySerializedAs) {
+                    strings.add(alias);
+                }
+            }
+        }
+    }
 
     Writer stringSection;
     stringSection.u32(static_cast<std::uint32_t>(strings.values().size()));
@@ -1109,6 +1133,52 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
             metadataSection.u8(entry.accessibility);
         }
     }
+    if (hasTypeFieldSchemaMetadata(module)) {
+        struct FieldSchemaOut {
+            std::uint32_t fieldIndex = 0;
+            const semantic::FieldSymbol* field = nullptr;
+        };
+        struct TypeSchemaOut {
+            std::uint32_t typeIndex = 0;
+            std::uint8_t flags = 0;
+            std::vector<FieldSchemaOut> fields;
+        };
+        std::vector<TypeSchemaOut> schemaEntries;
+        for (std::uint32_t ti = 0; ti < static_cast<std::uint32_t>(module.types.size()); ++ti) {
+            const auto& t = module.types[ti];
+            std::uint8_t flags = 0;
+            if (t.blittable) flags |= 0x01u;
+            if (t.hasBlittableAttribute) flags |= 0x02u;
+            std::vector<FieldSchemaOut> fieldsOut;
+            for (std::uint32_t fi = 0; fi < static_cast<std::uint32_t>(t.fields.size()); ++fi) {
+                const auto& f = t.fields[fi];
+                if (f.fieldTag.has_value() || !f.formerlySerializedAs.empty()) {
+                    fieldsOut.push_back(FieldSchemaOut{fi, &f});
+                }
+            }
+            if (flags != 0 || !fieldsOut.empty()) {
+                schemaEntries.push_back(TypeSchemaOut{ti, flags, std::move(fieldsOut)});
+            }
+        }
+        metadataSection.u32(kTypeFieldSchemaTrailerMagic);
+        metadataSection.u32(static_cast<std::uint32_t>(schemaEntries.size()));
+        for (const auto& ts : schemaEntries) {
+            metadataSection.u32(ts.typeIndex);
+            metadataSection.u8(ts.flags);
+            metadataSection.u32(static_cast<std::uint32_t>(ts.fields.size()));
+            for (const auto& fs : ts.fields) {
+                metadataSection.u32(fs.fieldIndex);
+                metadataSection.u8(fs.field->fieldTag.has_value() ? 1u : 0u);
+                if (fs.field->fieldTag.has_value()) {
+                    metadataSection.u32(static_cast<std::uint32_t>(*fs.field->fieldTag));
+                }
+                metadataSection.u32(static_cast<std::uint32_t>(fs.field->formerlySerializedAs.size()));
+                for (const auto& alias : fs.field->formerlySerializedAs) {
+                    metadataSection.u32(strings.indexOf(alias));
+                }
+            }
+        }
+    }
 
     Writer writer;
     writer.bytes("RSBC", 4);
@@ -1274,6 +1344,18 @@ bool decodeModule(
         return false;
     }
     module.name = strings.front();
+
+    struct DecodedFieldSchema {
+        std::uint32_t fieldIndex = 0;
+        std::optional<std::int32_t> fieldTag;
+        std::vector<std::string> formerlySerializedAs;
+    };
+    struct DecodedTypeSchema {
+        std::uint32_t typeIndex = 0;
+        std::uint8_t flags = 0;
+        std::vector<DecodedFieldSchema> fields;
+    };
+    std::vector<DecodedTypeSchema> decodedTypeSchemas;
 
     {
         const auto section = sections.at(SectionMetadata);
@@ -1495,6 +1577,56 @@ bool decodeModule(
                 module.languageMetadata.nonPublicFunctions.push_back(entry);
             }
         }
+        if (reader.valid() && !reader.empty() &&
+            reader.remaining() >= 8 &&
+            reader.peekU32() == kTypeFieldSchemaTrailerMagic) {
+            (void)reader.u32();
+            const auto entryCount = reader.u32();
+            if (!reader.valid() || entryCount > reader.remaining() / 9) {
+                diagnostics.report("RS5010", "truncated type/field schema metadata", {});
+                return false;
+            }
+            decodedTypeSchemas.reserve(entryCount);
+            for (std::uint32_t i = 0; i < entryCount; ++i) {
+                DecodedTypeSchema ts;
+                ts.typeIndex = reader.u32();
+                ts.flags = reader.u8();
+                const auto fieldEntryCount = reader.u32();
+                if (!reader.valid() || fieldEntryCount > reader.remaining() / 9) {
+                    diagnostics.report("RS5010", "truncated field schema metadata", {});
+                    return false;
+                }
+                ts.fields.reserve(fieldEntryCount);
+                for (std::uint32_t j = 0; j < fieldEntryCount; ++j) {
+                    DecodedFieldSchema fs;
+                    fs.fieldIndex = reader.u32();
+                    const auto hasTag = reader.u8();
+                    if (!reader.valid() || hasTag > 1u) {
+                        diagnostics.report("RS5010", "invalid field tag marker", {});
+                        return false;
+                    }
+                    if (hasTag != 0) {
+                        const auto rawTag = reader.u32();
+                        fs.fieldTag = static_cast<std::int32_t>(rawTag);
+                    }
+                    const auto aliasCount = reader.u32();
+                    if (!reader.valid() || aliasCount > reader.remaining() / 4) {
+                        diagnostics.report("RS5010", "truncated formerly-serialized-as metadata", {});
+                        return false;
+                    }
+                    fs.formerlySerializedAs.reserve(aliasCount);
+                    for (std::uint32_t a = 0; a < aliasCount; ++a) {
+                        std::string alias;
+                        if (!readStringValue(alias, "invalid formerly-serialized-as string index")) {
+                            return false;
+                        }
+                        fs.formerlySerializedAs.push_back(std::move(alias));
+                    }
+                    ts.fields.push_back(std::move(fs));
+                }
+                decodedTypeSchemas.push_back(std::move(ts));
+            }
+        }
         if (!reader.valid() || !reader.empty()) {
             diagnostics.report("RS5010", "invalid language metadata section", {});
             return false;
@@ -1585,6 +1717,24 @@ bool decodeModule(
         if (!reader.valid() || !reader.empty()) {
             diagnostics.report("RS5003", "invalid type descriptor section", {});
             return false;
+        }
+        for (auto& ts : decodedTypeSchemas) {
+            if (ts.typeIndex >= module.types.size()) {
+                diagnostics.report("RS5010", "out-of-range type index in schema trailer", {});
+                return false;
+            }
+            auto& targetType = module.types[ts.typeIndex];
+            targetType.blittable = (ts.flags & 0x01u) != 0;
+            targetType.hasBlittableAttribute = (ts.flags & 0x02u) != 0;
+            for (auto& fs : ts.fields) {
+                if (fs.fieldIndex >= targetType.fields.size()) {
+                    diagnostics.report("RS5010", "out-of-range field index in schema trailer", {});
+                    return false;
+                }
+                auto& targetField = targetType.fields[fs.fieldIndex];
+                targetField.fieldTag = fs.fieldTag;
+                targetField.formerlySerializedAs = std::move(fs.formerlySerializedAs);
+            }
         }
     }
 

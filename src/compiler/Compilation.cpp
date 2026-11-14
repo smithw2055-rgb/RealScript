@@ -706,11 +706,36 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         }
     }
     std::uint64_t configFp = 14695981039346656037ull;
+    configFp = combineFingerprint(configFp, options_.allowDefaultBuiltinPacks ? 1ull : 0ull);
+    configFp = combineFingerprint(configFp, options_.projectConfigFingerprint);
+    {
+        std::vector<std::string> sortedDisabled(
+            options_.disabledPacks.begin(), options_.disabledPacks.end());
+        std::sort(sortedDisabled.begin(), sortedDisabled.end());
+        for (const auto& d : sortedDisabled) {
+            configFp = combineFingerprint(configFp, stableFingerprint("disabled:" + d));
+        }
+    }
     for (const auto& p : effectivePacks) {
         configFp = combineFingerprint(configFp, stableFingerprint(p.moduleName));
+        configFp = combineFingerprint(configFp, stableFingerprint(p.virtualSourcePath));
+    }
+    for (const auto& ep : options_.extraPacks) {
+        configFp = combineFingerprint(configFp, stableFingerprint("extra:" + ep.moduleName));
+        configFp = combineFingerprint(configFp, stableFingerprint(ep.virtualSourcePath));
+        if (ep.sourceProvider) {
+            configFp = combineFingerprint(configFp, stableFingerprint(ep.sourceProvider()));
+        }
     }
     for (const auto& mp : options_.macroPlugins) {
-        if (mp) configFp = combineFingerprint(configFp, stableFingerprint("macro:" + mp->name()));
+        if (!mp) continue;
+        configFp = combineFingerprint(configFp, stableFingerprint("macro:" + mp->name()));
+        configFp = combineFingerprint(configFp, mp->fingerprint());
+        auto mNames = mp->macroNames();
+        std::sort(mNames.begin(), mNames.end());
+        for (const auto& mn : mNames) {
+            configFp = combineFingerprint(configFp, stableFingerprint("mname:" + mn));
+        }
     }
 
     const auto addSourceUnit = [&](const SourceFile& sourceFile) {

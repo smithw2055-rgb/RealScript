@@ -143,6 +143,7 @@ realscript_add_layer_library(realscript_layer_compiler_core
     src/compiler/MetadataAndValidation.cpp
     src/compiler/Compilation.cpp
     src/compiler/ModuleBuildCache.cpp
+    src/compiler/ProjectConfig.cpp
 )
 realscript_add_slice_library(realscript_slice_compiler_core Compiler
     $<TARGET_OBJECTS:realscript_layer_compiler_core>

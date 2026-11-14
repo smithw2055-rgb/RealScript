@@ -2,6 +2,7 @@
 #include "realscript/aot_cpp/AotRuntime.h"
 #include "realscript/compiler/Compilation.h"
 #include "realscript/compiler/ModuleBuildCache.h"
+#include "realscript/compiler/ProjectConfig.h"
 #include "realscript/diagnostics/Diagnostic.h"
 #include "realscript/optimization/Optimizer.h"
 #include "realscript/Version.h"
@@ -50,7 +51,11 @@ bool writeFileIfChanged(
 void printDiagnostics(const realscript::diagnostics::DiagnosticBag& diagnostics) {
     for (const auto& diagnostic : diagnostics.items()) {
         std::cerr << (diagnostic.sourceName.empty() ? "<aot>" : diagnostic.sourceName)
-            << ": error " << diagnostic.code << ": "
+            << ": "
+            << (diagnostic.severity == realscript::diagnostics::DiagnosticSeverity::Error
+                ? "error"
+                : "warning")
+            << ' ' << diagnostic.code << ": "
             << diagnostic.message << '\n';
     }
 }
@@ -84,6 +89,8 @@ void usage() {
     std::cerr
         << "usage: rsaot [options] <file.rscript>...\n"
         << "  --output-dir <directory>\n"
+        << "  --project <file>\n"
+        << "  --no-project-config\n"
         << "  --cache-dir <directory>\n"
         << "  --cache-stats\n"
         << "  --program-name <identifier>\n"
@@ -109,6 +116,8 @@ int main(int argc, char** argv) {
     try {
         std::filesystem::path outputDirectory = ".";
         std::filesystem::path cacheDirectory;
+        std::string projectConfigPath;
+        bool noProjectConfig = false;
         bool printCacheStats = false;
         realscript::aot::GenerationOptions options;
         realscript::optimization::Options optimizationOptions;
@@ -134,6 +143,18 @@ int main(int argc, char** argv) {
                 return 0;
             } else if (argument == "--output-dir") {
                 outputDirectory = requireValue("--output-dir");
+            } else if (argument == "--project") {
+                projectConfigPath = requireValue("--project");
+                if (projectConfigPath.empty()) {
+                    throw std::runtime_error("--project requires a value");
+                }
+            } else if (argument.rfind("--project=", 0) == 0) {
+                projectConfigPath = argument.substr(10);
+                if (projectConfigPath.empty()) {
+                    throw std::runtime_error("--project requires a value");
+                }
+            } else if (argument == "--no-project-config") {
+                noProjectConfig = true;
             } else if (argument == "--cache-dir") {
                 cacheDirectory = requireValue("--cache-dir");
             } else if (argument.rfind("--cache-dir=", 0) == 0) {
@@ -174,18 +195,40 @@ int main(int argc, char** argv) {
             return 2;
         }
 
-        if (!cacheDirectory.empty() || printCacheStats) {
-            std::vector<realscript::compiler::SourceFile> sourceFiles;
-            sourceFiles.reserve(sources.size());
-            for (const auto& path : sources) {
-                requireScriptExtension(path);
-                sourceFiles.push_back({path, readFile(path)});
-            }
+        std::vector<realscript::compiler::SourceFile> sourceFiles;
+        sourceFiles.reserve(sources.size());
+        for (const auto& path : sources) {
+            requireScriptExtension(path);
+            sourceFiles.push_back({path, readFile(path)});
+        }
 
+        realscript::compiler::CompilationOptions projectOptions;
+        realscript::diagnostics::DiagnosticBag projectDiagnostics;
+        std::optional<std::filesystem::path> explicitProjectPath;
+        if (!projectConfigPath.empty()) {
+            explicitProjectPath = std::filesystem::path(projectConfigPath);
+        }
+        if (!realscript::compiler::resolveAndApplyProjectConfigForInputs(
+                sourceFiles,
+                explicitProjectPath,
+                noProjectConfig,
+                projectOptions,
+                &projectDiagnostics) ||
+            projectDiagnostics.hasErrors()) {
+            printDiagnostics(projectDiagnostics);
+            return 1;
+        }
+        printDiagnostics(projectDiagnostics);
+
+        if (!cacheDirectory.empty() || printCacheStats) {
             realscript::compiler::ModuleBuildCacheOptions cacheOptions;
             cacheOptions.cacheDirectory = cacheDirectory;
             cacheOptions.optimizationOptions = optimizationOptions;
+            if (noProjectConfig) {
+                cacheOptions.flags |= realscript::compiler::kBuildCacheFlagNoProjectConfig;
+            }
 
+            realscript::compiler::ScopedProjectCompilationOptions scopedProject(projectOptions);
             realscript::compiler::ModuleBuildCache buildCache(cacheDirectory);
             auto cached = buildCache.buildAot(sourceFiles, cacheOptions, options);
             if (printCacheStats) {
@@ -219,11 +262,7 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        realscript::compiler::Compilation compilation;
-        for (const auto& path : sources) {
-            requireScriptExtension(path);
-            compilation.addSource({path, readFile(path)});
-        }
+        realscript::compiler::Compilation compilation(sourceFiles, projectOptions);
         auto build = compilation.build();
         if (build.diagnostics.hasErrors()) {
             printDiagnostics(build.diagnostics);

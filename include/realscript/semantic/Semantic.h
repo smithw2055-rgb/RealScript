@@ -149,6 +149,8 @@ struct FieldSymbol {
     const syntax::ExpressionSyntax* initializerSyntax = nullptr;
     std::string sourceName;
     text::TextSpan declarationSpan;
+    std::optional<std::int32_t> fieldTag;
+    std::vector<std::string> formerlySerializedAs;
     SymbolId id = 0;
 };
 
@@ -245,6 +247,8 @@ struct PropertySymbol {
     std::size_t backingFieldIndex = std::numeric_limits<std::size_t>::max();
     std::string sourceName;
     text::TextSpan declarationSpan;
+    std::optional<std::int32_t> fieldTag;
+    std::vector<std::string> formerlySerializedAs;
     SymbolId id = 0;
 };
 
@@ -253,6 +257,8 @@ struct EnumMemberSymbol {
     std::int64_t value = 0;
     std::string sourceName;
     text::TextSpan declarationSpan;
+    std::optional<std::int32_t> fieldTag;
+    std::vector<std::string> formerlySerializedAs;
     SymbolId id = 0;
 };
 
@@ -287,6 +293,8 @@ struct TypeSymbol {
     bool partialType = false;
     bool stackOnly = false;
     bool hasValueLifecycle = false;
+    bool blittable = false;
+    bool hasBlittableAttribute = false;
     bool awaitableProtocol = false;
     bool deterministic = false;
     SymbolId baseTypeId = 0;
@@ -331,6 +339,36 @@ struct SymbolOccurrence {
 using TypeSymbolMap = std::unordered_map<std::string, TypeSymbol>;
 using FunctionOverloadMap =
     std::unordered_map<std::string, std::vector<FunctionSymbol>>;
+
+struct BlittableFieldLayout {
+    std::string name;
+    PrimitiveType type = PrimitiveType::Error;
+    SymbolId typeId = 0;
+    std::uint32_t offsetBytes = 0;
+    std::uint32_t sizeBytes = 0;
+    std::uint32_t alignBytes = 1;
+    bool isNestedStruct = false;
+};
+
+struct BlittableStructLayout {
+    SymbolId typeId = 0;
+    std::uint32_t strideBytes = 0;
+    std::uint32_t alignBytes = 1;
+    std::vector<BlittableFieldLayout> fields;
+};
+
+[[nodiscard]] std::optional<BlittableStructLayout> computeBlittableStructLayout(
+    const TypeSymbol& type,
+    const TypeSymbolMap& visibleTypes,
+    std::string* outReason = nullptr);
+[[nodiscard]] std::optional<BlittableStructLayout> computeBlittableStructLayout(
+    const TypeSymbol& type,
+    const std::unordered_map<SymbolId, const TypeSymbol*>& typesById,
+    std::string* outReason = nullptr);
+[[nodiscard]] std::optional<BlittableStructLayout> computeBlittableStructLayout(
+    const TypeSymbol& type,
+    const std::vector<TypeSymbol>& moduleTypes,
+    std::string* outReason = nullptr);
 
 [[nodiscard]] bool hasModifier(
     const std::vector<syntax::SyntaxToken>& modifiers,

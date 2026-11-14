@@ -1056,6 +1056,9 @@ bool isInlineSafeInstruction(const mir::Instruction& inst) noexcept {
     case mir::Opcode::CheckNotNull:
     case mir::Opcode::LoadField:
     case mir::Opcode::StoreField:
+    case mir::Opcode::ArrayLength:
+    case mir::Opcode::LoadElement:
+    case mir::Opcode::StoreElement:
     case mir::Opcode::ConvertNumeric:
     case mir::Opcode::Parameter:
     case mir::Opcode::LoadLocal:
@@ -1064,15 +1067,44 @@ bool isInlineSafeInstruction(const mir::Instruction& inst) noexcept {
     case mir::Opcode::AddInt:
     case mir::Opcode::SubtractInt:
     case mir::Opcode::MultiplyInt:
+    case mir::Opcode::DivideInt:
+    case mir::Opcode::RemainderInt:
     case mir::Opcode::AddLong:
     case mir::Opcode::SubtractLong:
     case mir::Opcode::MultiplyLong:
+    case mir::Opcode::DivideLong:
+    case mir::Opcode::RemainderLong:
     case mir::Opcode::NegateInt:
     case mir::Opcode::NegateLong:
         return true;
     default:
         return false;
     }
+}
+
+bool isPrioritySpanInlineFunction(const mir::Function& func) noexcept {
+    const auto dot = func.name.rfind('.');
+    if (dot == std::string::npos || dot == 0 || dot + 1 >= func.name.size()) {
+        return false;
+    }
+    const auto spanPos = func.name.find(".Span__");
+    const auto roSpanPos = func.name.find(".ReadOnlySpan__");
+    const bool isSpanType =
+        func.name.compare(0, 6, "Span__") == 0 ||
+        func.name.compare(0, 14, "ReadOnlySpan__") == 0 ||
+        (spanPos != std::string::npos && spanPos < dot) ||
+        (roSpanPos != std::string::npos && roSpanPos < dot);
+    if (!isSpanType) {
+        return false;
+    }
+    const std::size_t methodStart = dot + 1;
+    const std::size_t methodLen = func.name.size() - methodStart;
+    return (methodLen == 3 && func.name.compare(methodStart, 3, "Get") == 0) ||
+        (methodLen == 3 && func.name.compare(methodStart, 3, "Set") == 0) ||
+        (methodLen == 5 && func.name.compare(methodStart, 5, "Slice") == 0) ||
+        (methodLen == 9 && func.name.compare(methodStart, 9, "FromArray") == 0) ||
+        (methodLen == 10 && func.name.compare(methodStart, 10, "get_Length") == 0) ||
+        (methodLen == 11 && func.name.compare(methodStart, 11, "get_IsEmpty") == 0);
 }
 
 mir::ValueId findMaxValueId(const mir::Function& function) noexcept {
@@ -1190,38 +1222,74 @@ bool inlineSmallFunctions(
         }
     };
     std::unordered_map<semantic::SymbolId, const mir::Function*> inlineCandidates;
+    std::unordered_set<semantic::SymbolId> prioritySpanCandidates;
     const auto collectFromModule = [&](const mir::Module& candMod) {
         for (const auto& func : candMod.functions) {
-            if (func.blocks.size() != 1 ||
+            const bool prioritySpan = isPrioritySpanInlineFunction(func);
+            if (func.blocks.empty() ||
                 !func.exceptionHandlers.empty() ||
                 func.name.find("..ctor") != std::string::npos ||
                 func.name.find("..cctor") != std::string::npos ||
                 func.name.find("$") != std::string::npos) {
                 continue;
             }
-            const auto& entry = func.blocks.front();
-            if ((entry.terminator.kind != mir::TerminatorKind::ReturnValue &&
-                 entry.terminator.kind != mir::TerminatorKind::ReturnVoid) ||
-                !entry.parameters.empty()) {
+            if (!prioritySpan && func.blocks.size() != 1) {
                 continue;
             }
-            std::size_t materializedCount = 0;
+            if (prioritySpan && func.blocks.size() > 16) {
+                continue;
+            }
+            const auto& entry = func.blocks.front();
+            if (!entry.parameters.empty()) {
+                continue;
+            }
+            if (func.blocks.size() == 1 &&
+                entry.terminator.kind != mir::TerminatorKind::ReturnValue &&
+                entry.terminator.kind != mir::TerminatorKind::ReturnVoid) {
+                continue;
+            }
             bool allSafe = true;
-            for (const auto& inst : entry.instructions) {
-                if (!isInlineSafeInstruction(inst) ||
-                    !isTypeAvailableOrImportable(inst.typeId) ||
-                    !isTypeAvailableOrImportable(inst.resultTypeId)) {
+            for (const auto tid : func.localTypeIds) {
+                if (!isTypeAvailableOrImportable(tid)) {
                     allSafe = false;
                     break;
                 }
-                if (inst.opcode != mir::Opcode::Parameter &&
-                    inst.opcode != mir::Opcode::LoadLocal &&
-                    inst.opcode != mir::Opcode::StoreLocal) {
-                    ++materializedCount;
+            }
+            std::size_t materializedCount = 0;
+            for (const auto& blk : func.blocks) {
+                if (!allSafe) break;
+                const auto tk = blk.terminator.kind;
+                if (tk != mir::TerminatorKind::Jump &&
+                    tk != mir::TerminatorKind::Branch &&
+                    tk != mir::TerminatorKind::ReturnValue &&
+                    tk != mir::TerminatorKind::ReturnVoid &&
+                    tk != mir::TerminatorKind::Throw) {
+                    allSafe = false;
+                    break;
+                }
+                for (const auto& inst : blk.instructions) {
+                    if (!isInlineSafeInstruction(inst) ||
+                        !isTypeAvailableOrImportable(inst.typeId) ||
+                        !isTypeAvailableOrImportable(inst.resultTypeId) ||
+                        !isTypeAvailableOrImportable(inst.elementTypeId)) {
+                        allSafe = false;
+                        break;
+                    }
+                    if (inst.opcode != mir::Opcode::Parameter &&
+                        inst.opcode != mir::Opcode::LoadLocal &&
+                        inst.opcode != mir::Opcode::StoreLocal) {
+                        ++materializedCount;
+                    }
                 }
             }
-            if (allSafe && materializedCount <= options.maxInlineInstructions) {
+            const std::size_t budget = prioritySpan
+                ? std::max<std::size_t>(options.maxInlineInstructions * 4, 64u)
+                : options.maxInlineInstructions;
+            if (allSafe && materializedCount <= budget) {
                 inlineCandidates[func.symbolId] = &func;
+                if (prioritySpan) {
+                    prioritySpanCandidates.insert(func.symbolId);
+                }
             }
         }
     };
@@ -1314,6 +1382,10 @@ bool inlineSmallFunctions(
     bool anyInlined = false;
     for (auto& caller : module.functions) {
         mir::ValueId nextId = findMaxValueId(caller) + 1;
+        mir::BlockId nextBlockId = 0;
+        for (const auto& b : caller.blocks) {
+            nextBlockId = std::max(nextBlockId, static_cast<mir::BlockId>(b.id + 1));
+        }
         bool callerChanged = false;
         std::unordered_map<mir::ValueId, mir::ValueId> replacements;
         const auto resolveVal = [&](mir::ValueId v) {
@@ -1324,112 +1396,327 @@ bool inlineSmallFunctions(
             }
             return v;
         };
-        for (auto& block : caller.blocks) {
-            std::vector<mir::Instruction> expanded;
-            expanded.reserve(block.instructions.size());
-            for (auto& inst : block.instructions) {
-                for (auto& op : inst.operands) op = resolveVal(op);
-                if (inst.opcode == mir::Opcode::Call &&
-                    !inst.virtualDispatch && !inst.interfaceDispatch &&
-                    inst.symbolId != 0) {
-                    const auto targetSym = inst.symbolId;
-                    const auto candIt = inlineCandidates.find(targetSym);
-                    if (candIt != inlineCandidates.end() &&
-                        targetSym != caller.symbolId &&
-                        candIt->second->parameterTypes.size() == inst.operands.size()) {
-                        const auto& callee = *candIt->second;
-                        const auto& calleeBlock = callee.blocks.front();
-                        std::unordered_map<mir::ValueId, mir::ValueId> valueMap;
-                        std::unordered_map<std::size_t, mir::ValueId> localMap;
-                        bool inlineOk = true;
-                        std::vector<mir::Instruction> stagedClones;
-                        for (const auto& calleeInst : calleeBlock.instructions) {
-                            if (calleeInst.opcode == mir::Opcode::Parameter) {
-                                const auto pIdx = static_cast<std::size_t>(calleeInst.integerImmediate);
-                                if (pIdx < inst.operands.size()) {
-                                    valueMap[calleeInst.result] = inst.operands[pIdx];
-                                } else {
-                                    inlineOk = false;
-                                    break;
-                                }
-                                continue;
-                            }
-                            if (calleeInst.opcode == mir::Opcode::StoreLocal) {
-                                if (calleeInst.operands.size() == 1) {
-                                    const auto m = valueMap.find(calleeInst.operands[0]);
-                                    if (m != valueMap.end()) {
-                                        localMap[calleeInst.localIndex] = m->second;
+
+        auto inlineMultiBlockCfg = [&](std::size_t blockIdx,
+                                       std::size_t callInstIdx,
+                                       const mir::Function& callee) -> bool {
+            const auto& callInst = caller.blocks[blockIdx].instructions[callInstIdx];
+            const bool expectsValue =
+                callInst.resultType != semantic::PrimitiveType::Void && callInst.result >= 0;
+            for (const auto& cb : callee.blocks) {
+                if (cb.terminator.kind == mir::TerminatorKind::ReturnValue && !expectsValue) {
+                    return false;
+                }
+                if (cb.terminator.kind == mir::TerminatorKind::ReturnVoid && expectsValue) {
+                    return false;
+                }
+            }
+
+            std::unordered_map<mir::BlockId, mir::BlockId> blockIdMap;
+            blockIdMap.reserve(callee.blocks.size());
+            std::unordered_map<mir::ValueId, mir::ValueId> valueMap;
+            for (const auto& cb : callee.blocks) {
+                blockIdMap[cb.id] = nextBlockId++;
+                for (const auto& p : cb.parameters) {
+                    valueMap[p.value] = nextId++;
+                }
+                for (const auto& ci : cb.instructions) {
+                    if (ci.opcode == mir::Opcode::Parameter) {
+                        const auto pIdx = static_cast<std::size_t>(ci.integerImmediate);
+                        if (pIdx >= callInst.operands.size()) return false;
+                        valueMap[ci.result] = callInst.operands[pIdx];
+                    } else if (isValueInstruction(ci)) {
+                        valueMap[ci.result] = nextId++;
+                    }
+                }
+            }
+            auto resolveCalleeVal = [&](mir::ValueId v) -> mir::ValueId {
+                if (v < 0) return v;
+                const auto it = valueMap.find(v);
+                return it == valueMap.end() ? v : it->second;
+            };
+
+            const mir::BlockId contBlockId = nextBlockId++;
+            mir::BasicBlock contBlock;
+            contBlock.id = contBlockId;
+            if (expectsValue) {
+                const mir::ValueId contRetVal = nextId++;
+                contBlock.parameters.push_back(mir::BlockParameter{
+                    contRetVal, callInst.resultType, callInst.resultTypeId});
+                replacements[callInst.result] = contRetVal;
+            }
+            for (std::size_t j = callInstIdx + 1; j < caller.blocks[blockIdx].instructions.size(); ++j) {
+                auto tailInst = std::move(caller.blocks[blockIdx].instructions[j]);
+                for (auto& op : tailInst.operands) op = resolveVal(op);
+                contBlock.instructions.push_back(std::move(tailInst));
+            }
+            contBlock.terminator = std::move(caller.blocks[blockIdx].terminator);
+            contBlock.terminator.condition = resolveVal(contBlock.terminator.condition);
+            contBlock.terminator.value = resolveVal(contBlock.terminator.value);
+            for (auto& arg : contBlock.terminator.arguments) arg = resolveVal(arg);
+            for (auto& arg : contBlock.terminator.falseArguments) arg = resolveVal(arg);
+
+            const std::size_t localBase = caller.localTypes.size();
+            for (std::size_t li = 0; li < callee.localTypes.size(); ++li) {
+                caller.localTypes.push_back(callee.localTypes[li]);
+                const auto ltid = li < callee.localTypeIds.size() ? callee.localTypeIds[li] : 0;
+                ensureTypeImported(ltid);
+                caller.localTypeIds.push_back(ltid);
+            }
+
+            const bool crossOrigin =
+                callee.moduleName != caller.moduleName ||
+                callee.debugInfo.sourceFileId != caller.debugInfo.sourceFileId;
+            std::vector<mir::BasicBlock> newBlocks;
+            newBlocks.reserve(callee.blocks.size() + 1);
+            for (const auto& cb : callee.blocks) {
+                mir::BasicBlock nb;
+                nb.id = blockIdMap[cb.id];
+                for (const auto& p : cb.parameters) {
+                    ensureTypeImported(p.typeId);
+                    nb.parameters.push_back(mir::BlockParameter{
+                        resolveCalleeVal(p.value), p.type, p.typeId});
+                }
+                for (const auto& ci : cb.instructions) {
+                    if (ci.opcode == mir::Opcode::Parameter) continue;
+                    mir::Instruction cloned = ci;
+                    if (crossOrigin) {
+                        cloned.sourceSpan = callInst.sourceSpan;
+                    }
+                    if (cloned.opcode == mir::Opcode::LoadLocal ||
+                        cloned.opcode == mir::Opcode::StoreLocal) {
+                        cloned.localIndex += localBase;
+                    }
+                    for (auto& op : cloned.operands) {
+                        op = resolveCalleeVal(op);
+                    }
+                    if (isValueInstruction(cloned)) {
+                        cloned.result = resolveCalleeVal(ci.result);
+                    }
+                    ensureTypeImported(cloned.typeId);
+                    ensureTypeImported(cloned.resultTypeId);
+                    ensureTypeImported(cloned.elementTypeId);
+                    nb.instructions.push_back(std::move(cloned));
+                }
+                nb.terminator = cb.terminator;
+                if (crossOrigin) {
+                    nb.terminator.sourceSpan = callInst.sourceSpan;
+                }
+                switch (cb.terminator.kind) {
+                case mir::TerminatorKind::ReturnVoid:
+                    nb.terminator.kind = mir::TerminatorKind::Jump;
+                    nb.terminator.target = contBlockId;
+                    nb.terminator.value = -1;
+                    nb.terminator.arguments.clear();
+                    break;
+                case mir::TerminatorKind::ReturnValue:
+                    nb.terminator.kind = mir::TerminatorKind::Jump;
+                    nb.terminator.target = contBlockId;
+                    nb.terminator.arguments = {resolveCalleeVal(cb.terminator.value)};
+                    nb.terminator.value = -1;
+                    break;
+                case mir::TerminatorKind::Jump:
+                    nb.terminator.target = blockIdMap[cb.terminator.target];
+                    for (auto& arg : nb.terminator.arguments) {
+                        arg = resolveCalleeVal(arg);
+                    }
+                    break;
+                case mir::TerminatorKind::Branch:
+                    nb.terminator.condition = resolveCalleeVal(cb.terminator.condition);
+                    nb.terminator.target = blockIdMap[cb.terminator.target];
+                    nb.terminator.falseTarget = blockIdMap[cb.terminator.falseTarget];
+                    for (auto& arg : nb.terminator.arguments) {
+                        arg = resolveCalleeVal(arg);
+                    }
+                    for (auto& arg : nb.terminator.falseArguments) {
+                        arg = resolveCalleeVal(arg);
+                    }
+                    break;
+                case mir::TerminatorKind::Throw:
+                    nb.terminator.value = resolveCalleeVal(cb.terminator.value);
+                    break;
+                case mir::TerminatorKind::None:
+                    break;
+                }
+                newBlocks.push_back(std::move(nb));
+            }
+
+            const mir::BlockId origBlockId = caller.blocks[blockIdx].id;
+            caller.blocks[blockIdx].instructions.resize(callInstIdx);
+            caller.blocks[blockIdx].terminator = mir::Terminator{};
+            caller.blocks[blockIdx].terminator.kind = mir::TerminatorKind::Jump;
+            caller.blocks[blockIdx].terminator.target = blockIdMap[callee.blocks.front().id];
+            caller.blocks[blockIdx].terminator.sourceSpan = callInst.sourceSpan;
+
+            for (auto& eh : caller.exceptionHandlers) {
+                if (std::find(eh.protectedBlocks.begin(), eh.protectedBlocks.end(), origBlockId) !=
+                    eh.protectedBlocks.end()) {
+                    for (const auto& nb : newBlocks) {
+                        eh.protectedBlocks.push_back(nb.id);
+                    }
+                    eh.protectedBlocks.push_back(contBlockId);
+                }
+            }
+
+            for (auto& nb : newBlocks) {
+                caller.blocks.push_back(std::move(nb));
+            }
+            caller.blocks.push_back(std::move(contBlock));
+
+            recordInlinedEdge(caller, callee);
+            ++statistics.functionsInlined;
+            callerChanged = true;
+            anyInlined = true;
+            return true;
+        };
+
+        std::size_t inlinesInCaller = 0;
+        for (const bool priorityPass : {true, false}) {
+            if (priorityPass && prioritySpanCandidates.empty()) continue;
+            for (std::size_t bi = 0; bi < caller.blocks.size() && inlinesInCaller < 64; ++bi) {
+                bool splitHappened = false;
+                std::vector<mir::Instruction> expanded;
+                expanded.reserve(caller.blocks[bi].instructions.size());
+                for (std::size_t ii = 0; ii < caller.blocks[bi].instructions.size(); ++ii) {
+                    auto& inst = caller.blocks[bi].instructions[ii];
+                    for (auto& op : inst.operands) op = resolveVal(op);
+                    if (inst.opcode == mir::Opcode::Call &&
+                        !inst.virtualDispatch && !inst.interfaceDispatch &&
+                        inst.symbolId != 0 &&
+                        inlinesInCaller < 64) {
+                        const auto targetSym = inst.symbolId;
+                        const bool isPriorityTarget =
+                            prioritySpanCandidates.find(targetSym) != prioritySpanCandidates.end();
+                        const auto candIt = inlineCandidates.find(targetSym);
+                        if ((!priorityPass || isPriorityTarget) &&
+                            candIt != inlineCandidates.end() &&
+                            targetSym != caller.symbolId &&
+                            candIt->second->parameterTypes.size() == inst.operands.size()) {
+                            const auto& callee = *candIt->second;
+                            bool singleBlockDone = false;
+                            if (callee.blocks.size() == 1) {
+                                const auto& calleeBlock = callee.blocks.front();
+                                std::unordered_map<mir::ValueId, mir::ValueId> valueMap;
+                                std::unordered_map<std::size_t, mir::ValueId> localMap;
+                                bool inlineOk = true;
+                                std::vector<mir::Instruction> stagedClones;
+                                for (const auto& calleeInst : calleeBlock.instructions) {
+                                    if (calleeInst.opcode == mir::Opcode::Parameter) {
+                                        const auto pIdx = static_cast<std::size_t>(calleeInst.integerImmediate);
+                                        if (pIdx < inst.operands.size()) {
+                                            valueMap[calleeInst.result] = inst.operands[pIdx];
+                                        } else {
+                                            inlineOk = false;
+                                            break;
+                                        }
                                         continue;
                                     }
+                                    if (calleeInst.opcode == mir::Opcode::StoreLocal) {
+                                        if (calleeInst.operands.size() == 1) {
+                                            const auto m = valueMap.find(calleeInst.operands[0]);
+                                            if (m != valueMap.end()) {
+                                                localMap[calleeInst.localIndex] = m->second;
+                                                continue;
+                                            }
+                                        }
+                                        inlineOk = false;
+                                        break;
+                                    }
+                                    if (calleeInst.opcode == mir::Opcode::LoadLocal) {
+                                        const auto lm = localMap.find(calleeInst.localIndex);
+                                        if (lm != localMap.end()) {
+                                            valueMap[calleeInst.result] = lm->second;
+                                            continue;
+                                        }
+                                        inlineOk = false;
+                                        break;
+                                    }
+                                    mir::Instruction cloned = calleeInst;
+                                    if (callee.moduleName != caller.moduleName ||
+                                        callee.debugInfo.sourceFileId != caller.debugInfo.sourceFileId) {
+                                        cloned.sourceSpan = inst.sourceSpan;
+                                    }
+                                    for (auto& op : cloned.operands) {
+                                        const auto m = valueMap.find(op);
+                                        if (m == valueMap.end()) {
+                                            inlineOk = false;
+                                            break;
+                                        }
+                                        op = m->second;
+                                    }
+                                    if (!inlineOk) break;
+                                    if (isValueInstruction(cloned)) {
+                                        const mir::ValueId fresh = nextId++;
+                                        valueMap[calleeInst.result] = fresh;
+                                        cloned.result = fresh;
+                                    }
+                                    stagedClones.push_back(std::move(cloned));
                                 }
-                                inlineOk = false;
-                                break;
-                            }
-                            if (calleeInst.opcode == mir::Opcode::LoadLocal) {
-                                const auto lm = localMap.find(calleeInst.localIndex);
-                                if (lm != localMap.end()) {
-                                    valueMap[calleeInst.result] = lm->second;
-                                    continue;
+                                if (calleeBlock.terminator.kind == mir::TerminatorKind::ReturnVoid) {
+                                    if (inlineOk && inst.resultType == semantic::PrimitiveType::Void) {
+                                        for (auto& sc : stagedClones) {
+                                            ensureTypeImported(sc.typeId);
+                                            ensureTypeImported(sc.resultTypeId);
+                                            ensureTypeImported(sc.elementTypeId);
+                                            expanded.push_back(std::move(sc));
+                                        }
+                                        recordInlinedEdge(caller, callee);
+                                        ++statistics.functionsInlined;
+                                        ++inlinesInCaller;
+                                        callerChanged = true;
+                                        anyInlined = true;
+                                        singleBlockDone = true;
+                                    }
+                                } else {
+                                    const auto retVal = calleeBlock.terminator.value;
+                                    const auto mappedRet = valueMap.find(retVal);
+                                    if (inlineOk && mappedRet != valueMap.end()) {
+                                        for (auto& sc : stagedClones) {
+                                            ensureTypeImported(sc.typeId);
+                                            ensureTypeImported(sc.resultTypeId);
+                                            ensureTypeImported(sc.elementTypeId);
+                                            expanded.push_back(std::move(sc));
+                                        }
+                                        replacements[inst.result] = mappedRet->second;
+                                        recordInlinedEdge(caller, callee);
+                                        ++statistics.functionsInlined;
+                                        ++inlinesInCaller;
+                                        callerChanged = true;
+                                        anyInlined = true;
+                                        singleBlockDone = true;
+                                    }
                                 }
-                                inlineOk = false;
-                                break;
                             }
-                            mir::Instruction cloned = calleeInst;
-                            if (callee.moduleName != caller.moduleName ||
-                                callee.debugInfo.sourceFileId != caller.debugInfo.sourceFileId) {
-                                cloned.sourceSpan = inst.sourceSpan;
+                            if (singleBlockDone) {
+                                continue;
                             }
-                            for (auto& op : cloned.operands) {
-                                const auto m = valueMap.find(op);
-                                if (m == valueMap.end()) {
-                                    inlineOk = false;
+                            if (callee.blocks.size() > 1 || isPriorityTarget) {
+                                std::vector<mir::Instruction> rebuilt;
+                                rebuilt.reserve(expanded.size() + (caller.blocks[bi].instructions.size() - ii));
+                                for (auto& e : expanded) rebuilt.push_back(std::move(e));
+                                const std::size_t newCallIdx = rebuilt.size();
+                                for (std::size_t k = ii; k < caller.blocks[bi].instructions.size(); ++k) {
+                                    auto& rem = caller.blocks[bi].instructions[k];
+                                    for (auto& op : rem.operands) op = resolveVal(op);
+                                    rebuilt.push_back(std::move(rem));
+                                }
+                                caller.blocks[bi].instructions = std::move(rebuilt);
+                                if (inlineMultiBlockCfg(bi, newCallIdx, callee)) {
+                                    ++inlinesInCaller;
+                                    splitHappened = true;
                                     break;
                                 }
-                                op = m->second;
-                            }
-                            if (!inlineOk) break;
-                            if (isValueInstruction(cloned)) {
-                                const mir::ValueId fresh = nextId++;
-                                valueMap[calleeInst.result] = fresh;
-                                cloned.result = fresh;
-                            }
-                            stagedClones.push_back(std::move(cloned));
-                        }
-                        if (calleeBlock.terminator.kind == mir::TerminatorKind::ReturnVoid) {
-                            if (inlineOk && inst.resultType == semantic::PrimitiveType::Void) {
-                                for (auto& sc : stagedClones) {
-                                    ensureTypeImported(sc.typeId);
-                                    ensureTypeImported(sc.resultTypeId);
-                                    expanded.push_back(std::move(sc));
-                                }
-                                recordInlinedEdge(caller, callee);
-                                ++statistics.functionsInlined;
-                                callerChanged = true;
-                                anyInlined = true;
-                                continue;
-                            }
-                        } else {
-                            const auto retVal = calleeBlock.terminator.value;
-                            const auto mappedRet = valueMap.find(retVal);
-                            if (inlineOk && mappedRet != valueMap.end()) {
-                                for (auto& sc : stagedClones) {
-                                    ensureTypeImported(sc.typeId);
-                                    ensureTypeImported(sc.resultTypeId);
-                                    expanded.push_back(std::move(sc));
-                                }
-                                replacements[inst.result] = mappedRet->second;
-                                recordInlinedEdge(caller, callee);
-                                ++statistics.functionsInlined;
-                                callerChanged = true;
-                                anyInlined = true;
-                                continue;
+                                expanded = std::move(caller.blocks[bi].instructions);
+                                break;
                             }
                         }
                     }
+                    expanded.push_back(std::move(inst));
                 }
-                expanded.push_back(std::move(inst));
+                if (!splitHappened) {
+                    caller.blocks[bi].instructions = std::move(expanded);
+                }
             }
-            block.instructions = std::move(expanded);
         }
         if (!replacements.empty()) {
             for (auto& block : caller.blocks) {

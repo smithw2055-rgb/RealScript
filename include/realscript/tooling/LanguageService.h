@@ -1,12 +1,15 @@
 #pragma once
 
 #include "realscript/compiler/Compilation.h"
+#include "realscript/compiler/ProjectConfig.h"
 #include "realscript/debug/DebugInfo.h"
 #include "realscript/syntax/Syntax.h"
 #include "realscript/tooling/Formatter.h"
 #include "realscript/tooling/GovernanceLinter.h"
 
 #include <cstdint>
+#include <filesystem>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -134,6 +137,8 @@ struct SceneAssetManifest {
 
 class LanguageService {
 public:
+    LanguageService();
+
     void open(std::string path, std::string content, std::int64_t version = 1);
     void update(std::string path, std::string content, std::int64_t version);
     bool applyContentChanges(
@@ -151,6 +156,13 @@ public:
         const std::string& baseDir = {},
         bool merge = false);
     bool loadProjectConfigFile(const std::string& configPath, bool merge = false);
+    bool loadProjectConfig(
+        const std::filesystem::path& pathOrDir,
+        diagnostics::DiagnosticBag* diagnostics = nullptr);
+    void setCompilationOptions(compiler::CompilationOptions options);
+    [[nodiscard]] const compiler::CompilationOptions& compilationOptions() const noexcept {
+        return compilationOptions_;
+    }
 
     void setLintConfig(LintConfig config);
     [[nodiscard]] const LintConfig& lintConfig() const noexcept { return lintConfig_; }
@@ -211,6 +223,9 @@ public:
     [[nodiscard]] std::size_t lastRebuiltModuleCount() const noexcept {
         return lastRebuiltModuleCount_;
     }
+    [[nodiscard]] std::size_t peerRevalidationSkips() const noexcept {
+        return peerRevalidationSkips_;
+    }
 
 private:
     struct Document {
@@ -261,8 +276,29 @@ private:
     static DocHeaderInfo parseDocHeader(const Document& doc);
     void recordFullBuildGraph();
     bool tryIncrementalSubgraphRebuild();
+    [[nodiscard]] compiler::CompilationOptions effectiveCompilationOptions() const;
+    [[nodiscard]] std::uint64_t computeDeclarationSkeletonHash(
+        const std::string& path,
+        const Document& doc) const;
+    void tryAutoDiscoverProjectConfig(const std::string& normalizedPath);
+    [[nodiscard]] bool applyCompilerProjectConfigFile(
+        const std::filesystem::path& configPath,
+        diagnostics::DiagnosticBag* diagnostics);
+    void populateCachedDiagnostics() const;
+    void updateCachedDiagnosticsForPaths(
+        const std::set<std::string>& targetPaths,
+        const diagnostics::DiagnosticBag& sourceBag) const;
+    void updateCachedDefinitionsForPaths(
+        const std::set<std::string>& targetPaths,
+        const compiler::BuildResult& buildResult) const;
+
+    std::shared_ptr<compiler::CompilerSession> session_;
+    compiler::CompilationOptions compilationOptions_;
+    bool explicitCompilationOptions_ = false;
+    std::string autoDiscoveredConfigPath_;
 
     std::unordered_map<std::string, DocHeaderInfo> docHeaders_;
+    std::unordered_map<std::string, std::uint64_t> docSkeletonHashes_;
     std::unordered_map<std::string, std::set<std::string>> moduleToPaths_;
     std::unordered_map<std::string, std::set<std::string>> moduleImports_;
     std::unordered_map<std::string, std::set<std::string>> reverseImports_;
@@ -270,7 +306,9 @@ private:
     std::unordered_map<std::string, std::uint64_t> modulePublicFingerprints_;
     std::set<std::string> dirtyPaths_;
     std::size_t lastRebuiltModuleCount_ = 0;
+    std::size_t peerRevalidationSkips_ = 0;
     bool structuralDirty_ = true;
+    bool hasLastValidBuild_ = false;
 
     mutable std::vector<DocumentSymbol> cachedDefinitions_;
     mutable std::unordered_map<semantic::SymbolId, std::size_t> cachedDefById_;

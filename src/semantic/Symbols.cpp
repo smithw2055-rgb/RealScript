@@ -1056,6 +1056,9 @@ TypeSymbol declareTypeShell(
         syntaxTree.modifiers, syntax::SyntaxKind::PartialKeyword);
     result.awaitableProtocol = hasAttributeName(
         syntaxTree.attributes, "Awaitable");
+    result.hasBlittableAttribute =
+        hasAttributeName(syntaxTree.attributes, "Blittable") ||
+        hasAttributeName(syntaxTree.attributes, "BlittableAttribute");
     result.deterministic = hasAttributeName(
         syntaxTree.attributes, "Deterministic");
     result.moduleName = moduleName;
@@ -1079,6 +1082,9 @@ TypeSymbol declareTypeShell(
     result.hasValueLifecycle =
         hasAttributeName(syntaxTree.attributes, "ValueLifecycle") ||
         hasAttributeName(syntaxTree.attributes, "RefCounted");
+    result.hasBlittableAttribute =
+        hasAttributeName(syntaxTree.attributes, "Blittable") ||
+        hasAttributeName(syntaxTree.attributes, "BlittableAttribute");
     result.awaitableProtocol = hasAttributeName(
         syntaxTree.attributes, "Awaitable");
     result.deterministic = hasAttributeName(
@@ -1097,6 +1103,9 @@ TypeSymbol declareTypeShell(
     result.kind = TypeKind::Enum;
     result.accessibility = accessibilityFromModifiers(syntaxTree.modifiers);
     result.sealedType = true;
+    result.hasBlittableAttribute =
+        hasAttributeName(syntaxTree.attributes, "Blittable") ||
+        hasAttributeName(syntaxTree.attributes, "BlittableAttribute");
     result.moduleName = moduleName;
     result.name = syntaxTree.identifierToken.text;
     result.id = stableTypeId(result);

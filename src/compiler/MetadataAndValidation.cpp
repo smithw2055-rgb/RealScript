@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -206,6 +207,7 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
             AttrTarget_Parameter = 1u << 10,
             AttrTarget_Event     = 1u << 11,
             AttrTarget_Module    = 1u << 12,
+            AttrTarget_EnumMember = 1u << 13,
             AttrTarget_All       = 0xFFFFFFFFu
         };
         struct AttributeUsageRule {
@@ -238,7 +240,8 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
                 else if (low == "class" || low == "classes") flags |= AttrTarget_Class;
                 else if (low == "struct" || low == "structs") flags |= AttrTarget_Struct;
                 else if (low == "interface" || low == "interfaces") flags |= AttrTarget_Interface;
-                else if (low == "enum" || low == "enums" || low == "enummember") flags |= AttrTarget_Enum;
+                else if (low == "enum" || low == "enums") flags |= AttrTarget_Enum;
+                else if (low == "enummember" || low == "enummembers") flags |= AttrTarget_EnumMember;
                 else if (low == "delegate" || low == "delegates") flags |= AttrTarget_Delegate;
                 else if (low == "constructor" || low == "constructors" || low == "ctor") flags |= AttrTarget_Ctor;
                 else if (low == "method" || low == "methods") flags |= (AttrTarget_Method | AttrTarget_Function);
@@ -307,6 +310,50 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
             syntax::TokenValue tv;
             if (evalAttrConstValue(arg, src, visTypes, tv)) {
                 if (const auto* b = std::get_if<bool>(&tv)) return *b;
+            }
+            return std::nullopt;
+        };
+        auto evalAttrArgInt64 = [&](const syntax::AttributeArgumentSyntax& arg,
+                                    const text::SourceText& src,
+                                    const semantic::TypeSymbolMap& visTypes) -> std::optional<std::int64_t> {
+            if (arg.valueTokens.size() == 1) {
+                const auto& tok = arg.valueTokens[0];
+                if (tok.kind == syntax::SyntaxKind::IntegerLiteralToken &&
+                    std::holds_alternative<std::int64_t>(tok.value)) {
+                    return std::get<std::int64_t>(tok.value);
+                }
+                return std::nullopt;
+            }
+            const auto sp = arg.valueSpan();
+            if (sp.empty()) return std::nullopt;
+            text::SourceText wrapSrc(
+                "class __RsAttrEval { const long __V = " + std::string(src.view(sp)) + "; }",
+                "$attr_eval");
+            diagnostics::DiagnosticBag ignored;
+            syntax::Parser p(wrapSrc, ignored);
+            auto cu = p.parseCompilationUnit();
+            if (ignored.hasErrors() || cu.classes.empty() ||
+                cu.classes[0].fields.empty() || !cu.classes[0].fields[0].initializer) {
+                return std::nullopt;
+            }
+            syntax::TokenValue tv;
+            semantic::PrimitiveType pt = semantic::PrimitiveType::Error;
+            if (!semantic::evaluateConstantSyntaxExpression(
+                    *cu.classes[0].fields[0].initializer, nullptr, visTypes, tv, pt)) {
+                return std::nullopt;
+            }
+            if (pt != semantic::PrimitiveType::Int &&
+                pt != semantic::PrimitiveType::Long &&
+                pt != semantic::PrimitiveType::Short &&
+                pt != semantic::PrimitiveType::SByte &&
+                pt != semantic::PrimitiveType::Byte &&
+                pt != semantic::PrimitiveType::UShort &&
+                pt != semantic::PrimitiveType::UInt &&
+                pt != semantic::PrimitiveType::ULong) {
+                return std::nullopt;
+            }
+            if (const auto* iv = std::get_if<std::int64_t>(&tv)) {
+                return *iv;
             }
             return std::nullopt;
         };
@@ -425,6 +472,7 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
             case AttrTarget_Parameter: return "parameter";
             case AttrTarget_Event: return "event";
             case AttrTarget_Module: return "module";
+            case AttrTarget_EnumMember: return "enum member";
             default: return "declaration";
             }
         };
@@ -484,6 +532,59 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
                                 "RS4104",
                                 "duplicate attribute '" + rawName +
                                     "' is not allowed because allowMultiple is false",
+                                attr.nameToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                srcName);
+                            mod.invalid = true;
+                        }
+                        continue;
+                    }
+                    if (shortName == "Blittable") {
+                        if ((targetFlag & AttrTarget_Struct) == 0) {
+                            result.diagnostics.report(
+                                "RS2698",
+                                "attribute '" + rawName + "' is only valid on struct declarations",
+                                attr.nameToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                srcName);
+                            mod.invalid = true;
+                        } else if (!attr.arguments.empty()) {
+                            result.diagnostics.report(
+                                "RS2698",
+                                "attribute '" + rawName + "' does not accept arguments",
+                                attr.nameToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                srcName);
+                            mod.invalid = true;
+                        }
+                        continue;
+                    }
+                    if (shortName == "FieldTag") {
+                        if ((targetFlag & AttrTarget_Field) == 0) {
+                            result.diagnostics.report(
+                                "RS2699",
+                                "attribute '" + rawName + "' is only valid on field declarations",
+                                attr.nameToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                srcName);
+                            mod.invalid = true;
+                        }
+                        if (!seenSingleUseKeys.insert("$builtin::FieldTag").second) {
+                            result.diagnostics.report(
+                                "RS2699",
+                                "duplicate attribute '" + rawName + "' is not allowed on a field",
+                                attr.nameToken.span,
+                                diagnostics::DiagnosticSeverity::Error,
+                                srcName);
+                            mod.invalid = true;
+                        }
+                        continue;
+                    }
+                    if (shortName == "FormerlySerializedAs") {
+                        if ((targetFlag & AttrTarget_Field) == 0) {
+                            result.diagnostics.report(
+                                "RS2699",
+                                "attribute '" + rawName + "' is only valid on field declarations",
                                 attr.nameToken.span,
                                 diagnostics::DiagnosticSeverity::Error,
                                 srcName);
@@ -566,8 +667,17 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
                         if (validateThisMod) {
                             validateAttrLists(mod, srcName, decl.attributes, recordFlag);
                         }
-                        const auto* owner = findOwnType(mod, decl.identifierToken.text);
+                        auto* owner = findOwnType(mod, decl.identifierToken.text);
                         if (owner) {
+                            if (recordFlag == AttrTarget_Struct) {
+                                for (const auto& list : decl.attributes) {
+                                    for (const auto& attr : list.attributes) {
+                                        if (stripAttributeSuffix(attr.nameToken.text) == "Blittable") {
+                                            owner->hasBlittableAttribute = true;
+                                        }
+                                    }
+                                }
+                            }
                             if (const auto obs = extractObsolete(decl.attributes, *unit->source, mod.visibleTypes)) {
                                 globalObsoleteSymbols[owner->id] = *obs;
                             }
@@ -577,13 +687,96 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
                             if (validateThisMod) {
                                 validateAttrLists(mod, memberSrc, fSyn.attributes, AttrTarget_Field);
                             }
+                            semantic::FieldSymbol* fSymPtr = nullptr;
                             if (owner) {
-                                for (const auto& fSym : owner->fields) {
+                                for (auto& fSym : owner->fields) {
                                     if (fSym.declaringTypeId == owner->id &&
                                         fSym.name == fSyn.identifierToken.text) {
+                                        fSymPtr = &fSym;
                                         if (const auto obs = extractObsolete(
                                                 fSyn.attributes, memberSourceText(fSyn), mod.visibleTypes)) {
                                             globalObsoleteSymbols[fSym.id] = *obs;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!validateThisMod) continue;
+                            bool isStaticOrConst = fSymPtr && (fSymPtr->staticField || fSymPtr->constField);
+                            for (const auto& modTok : fSyn.modifiers) {
+                                if (modTok.text == "static" || modTok.text == "const") {
+                                    isStaticOrConst = true;
+                                }
+                            }
+                            const auto& fText = memberSourceText(fSyn);
+                            for (const auto& list : fSyn.attributes) {
+                                for (const auto& attr : list.attributes) {
+                                    const auto shortName = stripAttributeSuffix(attr.nameToken.text);
+                                    if (shortName == "FieldTag") {
+                                        if (isStaticOrConst) {
+                                            result.diagnostics.report(
+                                                "RS2699",
+                                                "[FieldTag] is only valid on instance non-const fields ('" +
+                                                    fSyn.identifierToken.text + "')",
+                                                attr.nameToken.span,
+                                                diagnostics::DiagnosticSeverity::Error,
+                                                memberSrc);
+                                            mod.invalid = true;
+                                            continue;
+                                        }
+                                        bool validArg = (attr.arguments.size() == 1);
+                                        if (validArg && attr.arguments[0].nameToken) {
+                                            const auto& an = attr.arguments[0].nameToken->text;
+                                            validArg = (an == "tag" || an == "value" || an == "id");
+                                        }
+                                        std::optional<std::int64_t> tagVal;
+                                        if (validArg) {
+                                            tagVal = evalAttrArgInt64(attr.arguments[0], fText, mod.visibleTypes);
+                                        }
+                                        if (!tagVal.has_value() ||
+                                            *tagVal < 0 ||
+                                            *tagVal > std::numeric_limits<std::int32_t>::max()) {
+                                            result.diagnostics.report(
+                                                "RS2699",
+                                                "[FieldTag] requires a single non-negative 32-bit integer argument on field '" +
+                                                    fSyn.identifierToken.text + "'",
+                                                attr.nameToken.span,
+                                                diagnostics::DiagnosticSeverity::Error,
+                                                memberSrc);
+                                            mod.invalid = true;
+                                            continue;
+                                        }
+                                        if (fSymPtr && !fSymPtr->fieldTag.has_value()) {
+                                            fSymPtr->fieldTag = static_cast<std::int32_t>(*tagVal);
+                                        }
+                                    } else if (shortName == "FormerlySerializedAs") {
+                                        bool validArg = (attr.arguments.size() == 1);
+                                        if (validArg && attr.arguments[0].nameToken) {
+                                            const auto& an = attr.arguments[0].nameToken->text;
+                                            validArg = (an == "oldName" || an == "name");
+                                        }
+                                        std::optional<std::string> oldName;
+                                        if (validArg) {
+                                            oldName = evalAttrArgString(attr.arguments[0], fText, mod.visibleTypes);
+                                        }
+                                        if (!oldName.has_value() || oldName->empty()) {
+                                            result.diagnostics.report(
+                                                "RS2699",
+                                                "[FormerlySerializedAs] requires a single non-empty string argument on field '" +
+                                                    fSyn.identifierToken.text + "'",
+                                                attr.nameToken.span,
+                                                diagnostics::DiagnosticSeverity::Error,
+                                                memberSrc);
+                                            mod.invalid = true;
+                                            continue;
+                                        }
+                                        if (fSymPtr) {
+                                            if (std::find(
+                                                    fSymPtr->formerlySerializedAs.begin(),
+                                                    fSymPtr->formerlySerializedAs.end(),
+                                                    *oldName) == fSymPtr->formerlySerializedAs.end()) {
+                                                fSymPtr->formerlySerializedAs.push_back(*oldName);
+                                            }
                                         }
                                     }
                                 }
@@ -676,7 +869,7 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
                     }
                     for (const auto& em : en.members) {
                         if (validateThisMod) {
-                            validateAttrLists(mod, srcName, em.attributes, AttrTarget_Field);
+                            validateAttrLists(mod, srcName, em.attributes, AttrTarget_EnumMember);
                         }
                         if (owner) {
                             if (const auto obs = extractObsolete(em.attributes, *unit->source, mod.visibleTypes)) {
@@ -748,6 +941,85 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
                         const auto fnSym = semantic::declareFunctionSymbol(
                             mod.name, fn, mod.visibleTypes, ignored);
                         globalObsoleteSymbols[fnSym.id] = *obs;
+                    }
+                }
+            }
+        }
+
+        // Propagate [FieldTag] / [FormerlySerializedAs] from base classes to derived field copies
+        // and enforce [FieldTag(N)] uniqueness across each type and its base hierarchy.
+        for (auto& [modName, mod] : modules) {
+            (void)modName;
+            if (mod.frontendCached) continue;
+            for (auto& type : mod.types) {
+                if (type.kind != semantic::TypeKind::Class &&
+                    type.kind != semantic::TypeKind::Struct) {
+                    continue;
+                }
+                if (type.kind == semantic::TypeKind::Class && !type.baseTypeName.empty()) {
+                    struct InheritedFieldMeta {
+                        std::optional<std::int32_t> fieldTag;
+                        std::vector<std::string> formerlySerializedAs;
+                    };
+                    std::unordered_map<semantic::SymbolId,
+                        std::unordered_map<std::string, InheritedFieldMeta>> ancestorMeta;
+                    std::unordered_set<semantic::SymbolId> visitedBases{type.id};
+                    auto curBase = type.baseTypeName;
+                    while (!curBase.empty()) {
+                        const auto* base = findGlobalType(modules, curBase);
+                        if (!base || !visitedBases.insert(base->id).second) break;
+                        auto& perBase = ancestorMeta[base->id];
+                        for (const auto& bf : base->fields) {
+                            if (bf.declaringTypeId == base->id) {
+                                perBase[bf.name] = InheritedFieldMeta{bf.fieldTag, bf.formerlySerializedAs};
+                            }
+                        }
+                        curBase = base->baseTypeName;
+                    }
+                    for (auto& df : type.fields) {
+                        if (df.declaringTypeId == type.id) continue;
+                        const auto bIt = ancestorMeta.find(df.declaringTypeId);
+                        if (bIt == ancestorMeta.end()) continue;
+                        const auto fIt = bIt->second.find(df.name);
+                        if (fIt == bIt->second.end()) continue;
+                        df.fieldTag = fIt->second.fieldTag;
+                        df.formerlySerializedAs = fIt->second.formerlySerializedAs;
+                    }
+                }
+
+                std::unordered_map<std::int32_t, std::pair<semantic::SymbolId, std::string>> seenTags;
+                auto recordTag = [&](const semantic::FieldSymbol& f) {
+                    if (!f.fieldTag.has_value()) return;
+                    const auto it = seenTags.find(*f.fieldTag);
+                    if (it == seenTags.end()) {
+                        seenTags.emplace(*f.fieldTag, std::make_pair(f.declaringTypeId, f.name));
+                    } else if (it->second.first != f.declaringTypeId || it->second.second != f.name) {
+                        result.diagnostics.report(
+                            "RS2699",
+                            "duplicate [FieldTag(" + std::to_string(*f.fieldTag) + ")] on type '" +
+                                semantic::canonicalTypeName(type) + "': conflicts between '" +
+                                it->second.second + "' and '" + f.name + "'",
+                            {});
+                        mod.invalid = true;
+                    }
+                };
+                for (const auto& f : type.fields) {
+                    if (!f.staticField && !f.constField) {
+                        recordTag(f);
+                    }
+                }
+                if (type.kind == semantic::TypeKind::Class && !type.baseTypeName.empty()) {
+                    std::unordered_set<semantic::SymbolId> visitedBases{type.id};
+                    auto curBase = type.baseTypeName;
+                    while (!curBase.empty()) {
+                        const auto* base = findGlobalType(modules, curBase);
+                        if (!base || !visitedBases.insert(base->id).second) break;
+                        for (const auto& bf : base->fields) {
+                            if (bf.declaringTypeId == base->id && !bf.staticField && !bf.constField) {
+                                recordTag(bf);
+                            }
+                        }
+                        curBase = base->baseTypeName;
                     }
                 }
             }
@@ -969,11 +1241,158 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
         }
     }
 
+    // Validate [Blittable] struct contracts (RS2698) bottom-up across all modules
+    // and finalize TypeSymbol::blittable before refreshing visible type maps.
+    {
+        std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> allTypesById;
+        struct TypeLoc {
+            std::string sourceName;
+            text::TextSpan span;
+        };
+        std::unordered_map<semantic::SymbolId, TypeLoc> typeLocations;
+        struct PendingBlittable {
+            ModuleWork* module = nullptr;
+            semantic::TypeSymbol* type = nullptr;
+        };
+        std::vector<PendingBlittable> pending;
+        std::unordered_set<semantic::SymbolId> pendingIds;
+
+        for (auto& [modName, mod] : modules) {
+            (void)modName;
+            for (const auto& t : mod.types) {
+                allTypesById[t.id] = &t;
+            }
+            if (mod.frontendCached) continue;
+            for (const auto* unit : mod.units) {
+                if (!unit || !unit->syntaxTree || !unit->source) continue;
+                for (const auto& st : unit->syntaxTree->structs) {
+                    if (!st.typeParameters.empty()) continue;
+                    if (const auto* own = findOwnType(mod, st.identifierToken.text)) {
+                        typeLocations.emplace(own->id, TypeLoc{unit->source->name(), st.identifierToken.span});
+                    }
+                }
+            }
+            for (auto& t : mod.types) {
+                if (!t.hasBlittableAttribute) continue;
+                if (t.kind != semantic::TypeKind::Struct) {
+                    t.blittable = false;
+                    mod.invalid = true;
+                    continue;
+                }
+                t.blittable = false;
+                pending.push_back(PendingBlittable{&mod, &t});
+                pendingIds.insert(t.id);
+            }
+        }
+
+        const auto validateBlittableStruct = [&](PendingBlittable& item) {
+            auto& type = *item.type;
+            auto& mod = *item.module;
+            std::string srcName;
+            text::TextSpan span;
+            if (const auto locIt = typeLocations.find(type.id); locIt != typeLocations.end()) {
+                srcName = locIt->second.sourceName;
+                span = locIt->second.span;
+            }
+            if (type.hasValueLifecycle || type.stackOnly) {
+                result.diagnostics.report(
+                    "RS2698",
+                    "[Blittable] struct '" + semantic::canonicalTypeName(type) +
+                        "' cannot declare [ValueLifecycle] or [StackOnly]",
+                    span,
+                    diagnostics::DiagnosticSeverity::Error,
+                    srcName);
+                mod.invalid = true;
+                type.blittable = false;
+                return;
+            }
+            std::string reason;
+            const auto layout = semantic::computeBlittableStructLayout(type, allTypesById, &reason);
+            if (!layout.has_value()) {
+                result.diagnostics.report(
+                    "RS2698",
+                    reason.empty()
+                        ? ("struct '" + semantic::canonicalTypeName(type) + "' is not valid for [Blittable]")
+                        : reason,
+                    span,
+                    diagnostics::DiagnosticSeverity::Error,
+                    srcName);
+                mod.invalid = true;
+                type.blittable = false;
+                return;
+            }
+            type.blittable = true;
+        };
+
+        while (!pending.empty()) {
+            bool madeProgress = false;
+            std::vector<PendingBlittable> nextPending;
+            std::vector<PendingBlittable> readyBatch;
+            for (const auto& item : pending) {
+                bool hasPendingDep = false;
+                for (const auto& f : item.type->fields) {
+                    if (f.staticField || f.constField) continue;
+                    if (f.type == semantic::PrimitiveType::Struct && !f.typeName.empty()) {
+                        const auto depIt = item.module->visibleTypes.find(f.typeName);
+                        if (depIt != item.module->visibleTypes.end() &&
+                            depIt->second.id != item.type->id &&
+                            pendingIds.find(depIt->second.id) != pendingIds.end()) {
+                            hasPendingDep = true;
+                            break;
+                        }
+                    }
+                }
+                if (hasPendingDep) {
+                    nextPending.push_back(item);
+                } else {
+                    readyBatch.push_back(item);
+                }
+            }
+            if (!readyBatch.empty()) {
+                madeProgress = true;
+                for (auto& item : readyBatch) {
+                    validateBlittableStruct(item);
+                    pendingIds.erase(item.type->id);
+                }
+                pending = std::move(nextPending);
+            }
+            if (!madeProgress) {
+                for (auto& item : pending) {
+                    validateBlittableStruct(item);
+                    pendingIds.erase(item.type->id);
+                }
+                pending.clear();
+            }
+        }
+    }
+
     // Member tables are part of the visible type descriptors.
     for (auto& [name, module] : modules) {
         (void)name;
         if (module.frontendCached) continue;
         refreshVisibleTypes(modules, module);
+        std::ostringstream schemaExtra;
+        for (const auto& t : module.types) {
+            if (t.synthetic) continue;
+            if (t.blittable || t.hasBlittableAttribute) {
+                schemaExtra << "B:" << semantic::canonicalTypeName(t) << '=' << (t.blittable ? 1 : 0) << '\n';
+            }
+            for (const auto& f : t.fields) {
+                if (f.fieldTag.has_value() || !f.formerlySerializedAs.empty()) {
+                    schemaExtra << "F:" << semantic::canonicalTypeName(t) << '.' << f.name;
+                    if (f.fieldTag.has_value()) schemaExtra << '#' << *f.fieldTag;
+                    for (const auto& alias : f.formerlySerializedAs) {
+                        schemaExtra << '@' << alias;
+                    }
+                    schemaExtra << '\n';
+                }
+            }
+        }
+        const auto extraStr = schemaExtra.str();
+        if (!extraStr.empty()) {
+            module.publicFingerprint = combineFingerprint(
+                module.publicFingerprint, stableFingerprint(extraStr));
+        }
     }
 
     for (auto& [moduleName, module] : modules) {
