@@ -1,0 +1,328 @@
+module Kernel.AotSuite;
+import RealScript.Async;
+
+// ---------------------------------------------------------------------------
+// 1. OOP, Polymorphism, Interfaces & Sequence Coroutines
+// ---------------------------------------------------------------------------
+public long Schedule(long target, string callback, int delay) {
+    return target + delay;
+}
+
+public bool CancelTimer(long timer) {
+    return timer != 0;
+}
+
+public interface IAsyncStage {
+    Awaitable<int> ComputeAsync(int seed, Awaitable<int> gate);
+}
+
+public class MultiplierStage : IAsyncStage {
+    public int factor;
+    public string tag;
+
+    public MultiplierStage(int f, string t) {
+        factor = f;
+        tag = t;
+    }
+
+    public virtual async Awaitable<int> ComputeAsync(int seed, Awaitable<int> gate) {
+        string localPrefix = tag + ":ok";
+        int remote = await gate;
+        return (seed + remote) * factor + localPrefix.Length;
+    }
+}
+
+public class BonusStage : MultiplierStage {
+    public int bonus;
+
+    public BonusStage(int f, string t, int b) : base(f, t) {
+        bonus = b;
+    }
+
+    public override async Awaitable<int> ComputeAsync(int seed, Awaitable<int> gate) {
+        int baseVal = await base.ComputeAsync(seed, gate);
+        return baseVal + bonus;
+    }
+}
+
+public class SequenceWorker {
+    public int result;
+
+    public sequence Run(long target, int bonus) {
+        int index = 0;
+        int sum = 0;
+        while (index < 3) {
+            yield wait_ticks(1);
+            if (index == 1) {
+                sum = sum + 10;
+            } else {
+                sum = sum + index;
+            }
+            index = index + 1;
+        }
+        result = sum + bonus;
+    }
+
+    public int Read() {
+        return result;
+    }
+}
+
+public SequenceWorker CreateSequenceWorker() {
+    return new SequenceWorker();
+}
+
+// ---------------------------------------------------------------------------
+// 2. Delegates, Closures, Generics & Collections
+// ---------------------------------------------------------------------------
+public delegate int TransformInt(int value);
+
+public class GenericBox<T> {
+    private T stored;
+
+    public GenericBox(T initial) {
+        stored = initial;
+    }
+
+    public T Get() {
+        return stored;
+    }
+}
+
+public int RunOopDelegatesGenericsAndCollections(int factor, int bias) {
+    TransformInt fn = x => x * factor + bias;
+    int d1 = fn(4);
+
+    GenericBox<int> box = new GenericBox<int>(9);
+    int b = box.Get();
+
+    List<int> list = new List<int>(2);
+    list.Add(1);
+    list.Add(2);
+    list.Add(3);
+    list.Insert(1, 5);
+    list.RemoveAt(0);
+    int listSum = 0;
+    foreach (int item in list) {
+        listSum = listSum + item;
+    }
+
+    Dictionary<string, int> map = new Dictionary<string, int>();
+    map.Set("a", 7);
+    map.Set("b", 8);
+    int mapSum = map.Get("a") + (map.ContainsKey("b") ? map.Get("b") : 0);
+
+    return d1 + b + listSum + mapSum;
+}
+
+// ---------------------------------------------------------------------------
+// 3. Exact Numerics (byte/sbyte/short/ushort/uint/ulong/float/char)
+// ---------------------------------------------------------------------------
+public int RunExactNumerics() {
+    byte b = 250;
+    byte bWrap = unchecked((byte)(b + 10)); // 4
+    sbyte sb = (sbyte)(-12);
+    short sh = 300;
+    ushort ush = 65500;
+    uint u32 = 4000000000u;
+    ulong u64 = 5000000000ul;
+    char ch = 'A'; // 65
+    float flt = 2.5f;
+    int fltScaled = (int)(flt * 4.0f); // 10
+    int u32High = u32 > 100u ? 1 : 0;
+    int u64High = u64 > (ulong)ush ? 2 : 0;
+    return (int)bWrap + (int)sb + (int)sh + (int)ch + fltScaled + u32High + u64High;
+}
+
+// ---------------------------------------------------------------------------
+// 4. Async/Await (Fast-Path, Deep Chain, Exceptions, Host-Driven)
+// ---------------------------------------------------------------------------
+public class FaultPayload {
+    public int code;
+
+    public FaultPayload(int c) {
+        code = c;
+    }
+}
+
+public async Awaitable<int> SyncFastAdd(int a, int b) {
+    int x = await Awaitable<int>.FromResult(a * 2);
+    await Awaitable.Completed();
+    return x + b;
+}
+
+public async Awaitable CaptureIntInline(Awaitable<int> t, int[] box) {
+    int v = await t;
+    box[0] = v;
+}
+
+public int RunSyncFastPath(int a, int b) {
+    Awaitable<int> task = SyncFastAdd(a, b);
+    if (!task.IsCompleted()) {
+        return -1;
+    }
+    int[] box = new int[1];
+    CaptureIntInline(task, box);
+    return box[0];
+}
+
+public async Awaitable<int> DeepChainLeaf(Awaitable<int> sig, int delta) {
+    int v = await sig;
+    return v + delta;
+}
+
+public async Awaitable<int> DeepChainMid(Awaitable<int> sig, int mul) {
+    int a = await DeepChainLeaf(sig, 5);
+    await Awaitable.Yield();
+    return a * mul;
+}
+
+public async Awaitable DeepChainRoot(Awaitable<int> sig, int[] outBox) {
+    IAsyncStage stage = new BonusStage(3, "node", 7);
+    Awaitable<int> gate = Async.NewIntSignal();
+    Awaitable<int> polyTask = stage.ComputeAsync(4, gate);
+    int mid = await DeepChainMid(sig, 2);
+    Async.ResolveIntSignal(gate, 6);
+    int poly = await polyTask;
+    outBox[0] = mid + poly;
+}
+
+public int RunDeepChainAndPolymorphism(int inputVal) {
+    Awaitable<int> sig = Async.NewIntSignal();
+    int[] box = new int[1];
+    box[0] = -1;
+    Awaitable root = DeepChainRoot(sig, box);
+    if (root.IsCompleted()) {
+        return -10;
+    }
+    Async.ResolveIntSignal(sig, inputVal);
+    Async.StepUpdate();
+    Async.StepUpdate();
+    if (!root.IsCompleted()) {
+        return -20;
+    }
+    return box[0];
+}
+
+public async Awaitable<int> FaultyInnerAsync(Awaitable<int> gate, bool shouldThrow, int[] trace) {
+    trace[0] = trace[0] + 100;
+    try {
+        int val = await gate;
+        if (shouldThrow) {
+            throw new FaultPayload(77);
+        }
+        return val + 33;
+    } finally {
+        trace[0] = trace[0] + 1000;
+    }
+}
+
+public async Awaitable<int> FaultyOuterAsync(Awaitable<int> gate, bool shouldThrow, int[] trace) {
+    try {
+        return await FaultyInnerAsync(gate, shouldThrow, trace);
+    } catch (FaultPayload err) {
+        trace[0] = trace[0] + err.code;
+        return -err.code;
+    }
+}
+
+public int RunCrossAwaitTryFinally(bool shouldThrow) {
+    Awaitable<int> gate = Async.NewIntSignal();
+    int[] trace = new int[1];
+    trace[0] = 0;
+    Awaitable<int> t = FaultyOuterAsync(gate, shouldThrow, trace);
+    Async.ResolveIntSignal(gate, 10);
+    Async.StepUpdate();
+    int[] res = new int[1];
+    CaptureIntInline(t, res);
+    return trace[0] + res[0];
+}
+
+public async Awaitable HostDrivenWorker(Awaitable<int> externalGate, int[] outBox) {
+    int a = await externalGate;
+    await Awaitable.Yield();
+    outBox[0] = a * 10 + 3;
+}
+
+// ---------------------------------------------------------------------------
+// 5. SIMD Packed Array Range Kernels
+// ---------------------------------------------------------------------------
+public void SaxpyIntRange(int start, int count, int alpha, int[] x, int[] y, int[] dst) {
+    int end = start + count;
+    for (int i = start; i < end; i = i + 1) {
+        dst[i] = unchecked(alpha * x[i] + y[i]);
+    }
+}
+
+public double FmaDoubleRange(int start, int count, double alpha, double[] x, double[] y, double[] dst) {
+    int end = start + count;
+    double acc = 0.0;
+    for (int i = start; i < end; i = i + 1) {
+        double v = alpha * x[i] + y[i];
+        dst[i] = v;
+        acc = acc + v;
+    }
+    return acc;
+}
+
+// ---------------------------------------------------------------------------
+// 6. Custom [Awaitable] / GetAwaiter() AOT Typed-Analysis Fallback Verification
+// ---------------------------------------------------------------------------
+public class AwaitableAttribute {
+    public AwaitableAttribute() {}
+}
+
+[Awaitable]
+public struct CustomTaskInt {
+    public long __handle;
+
+    public CustomTaskInt(long h) {
+        __handle = h;
+    }
+
+    public static CustomTaskInt FromResult(int v) {
+        return new CustomTaskInt((long)v);
+    }
+
+    public bool IsCompleted() {
+        return true;
+    }
+
+    public int GetResult() {
+        return (int)__handle;
+    }
+}
+
+public struct CustomDuckAwaiter {
+    public int Payload;
+
+    public bool IsCompleted() {
+        return true;
+    }
+
+    public int GetResult() {
+        return Payload;
+    }
+}
+
+public struct CustomDuckTask {
+    public int Payload;
+
+    public CustomDuckAwaiter GetAwaiter() {
+        CustomDuckAwaiter a = new CustomDuckAwaiter();
+        a.Payload = Payload;
+        return a;
+    }
+}
+
+public async CustomTaskInt CustomDuckCompileFallbackAsync(int seed) {
+    CustomDuckTask t = new CustomDuckTask();
+    t.Payload = seed + 40;
+    int v = await t;
+    return v + 2;
+}
+
+public async CustomTaskInt CustomAwaitFallbackAsync(int seed) {
+    int v = await Awaitable<int>.FromResult(seed + 40);
+    return v + 2;
+}

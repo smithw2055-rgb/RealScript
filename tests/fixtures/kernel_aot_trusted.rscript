@@ -1,0 +1,120 @@
+module Kernel.AotTrusted;
+import RealScript.Async;
+
+public async Awaitable<int> SyncFormulaAsync(int a, int b) {
+    await Awaitable.Completed();
+    int left = (a * 3) + 5;
+    int right = (b * 2) - 1;
+    await Awaitable.Completed();
+    return left + right;
+}
+
+public async Awaitable CaptureIntInline(Awaitable<int> task, int[] outSlot) {
+    int v = await task;
+    outSlot[0] = v;
+}
+
+public async Awaitable ConsumeCompletedVoid(Awaitable task) {
+    await task;
+}
+
+public long RunSyncScalarBatch(int iterations) {
+    int[] slot = new int[1];
+    long acc = 0L;
+    int i = 0;
+    while (i < iterations) {
+        Awaitable<int> t = SyncFormulaAsync(i % 256, (i + 3) % 128);
+        CaptureIntInline(t, slot);
+        acc = acc + (long)slot[0];
+        i = i + 1;
+    }
+    return acc;
+}
+
+public async Awaitable MultiStageScalarCoro(
+    int seed,
+    Awaitable<int> gateA,
+    Awaitable<int> gateB,
+    long[] outBox) {
+    int s0 = seed + 11;
+    int s1 = (seed * 3) + 7;
+    long l0 = (long)s0 * 5L;
+    double d0 = (double)seed * 1.5 + 2.0;
+    bool flip = (seed % 2) == 0;
+    int bonus = flip ? 19 : 23;
+
+    int a = await gateA;
+    s0 = s0 + a;
+    l0 = l0 + (long)(s1 * 2);
+    d0 = d0 + (double)a * 0.5;
+
+    int b = await gateB;
+    long scaledD = (long)(d0 * 2.0);
+    long total = l0 + (long)(s0 + b + bonus) + scaledD;
+    outBox[0] = outBox[0] + total;
+}
+
+public long RunPooledSuspendResumeBatch(int iterations) {
+    long[] outBox = new long[1];
+    outBox[0] = 0L;
+    int i = 0;
+    while (i < iterations) {
+        Awaitable<int> gateA = Async.NewIntSignal();
+        Awaitable<int> gateB = Async.NewIntSignal();
+        Awaitable coro = MultiStageScalarCoro(i % 64, gateA, gateB, outBox);
+        Async.ResolveIntSignal(gateA, (i % 16) + 4);
+        Async.StepUpdate();
+        Async.ResolveIntSignal(gateB, (i % 32) + 9);
+        Async.StepUpdate();
+        ConsumeCompletedVoid(coro);
+        i = i + 1;
+    }
+    return outBox[0];
+}
+
+public async Awaitable<int> RefLocalCoro(
+    int seed,
+    Awaitable<int> gateA,
+    Awaitable<int> gateB) {
+    int[] scratch = new int[3];
+    scratch[0] = seed;
+    int a = await gateA;
+    scratch[1] = 10 + a + scratch[0];
+    int b = await gateB;
+    scratch[2] = 20 + b;
+    return scratch[0] + scratch[1] + scratch[2] + seed;
+}
+
+public class CoroFault {
+    public string msg;
+    public CoroFault(string m) { msg = m; }
+}
+
+public async Awaitable<int> ThrowAfterSuspendScalarCoro(Awaitable<int> gate) {
+    int v = await gate;
+    if (v < 0) {
+        throw new CoroFault("trusted_coro_uncaught_boom");
+    }
+    return v + 1;
+}
+
+public async Awaitable<int> FaultDivideAfterTwoSuspends(
+    int divisor,
+    Awaitable<int> gateA,
+    Awaitable<int> gateB) {
+    int x = await gateA;
+    int y = await gateB;
+    return (x + y) / divisor;
+}
+
+public int StepPackedMath(int n) {
+    int[] a = new int[n];
+    int[] b = new int[n];
+    int sum = 0;
+    for (int i = 0; i < n; i = i + 1) {
+        a[i] = i * 3 + 1;
+        b[i] = a[i] * 2;
+        sum = unchecked(sum + b[i]);
+    }
+    return sum;
+}

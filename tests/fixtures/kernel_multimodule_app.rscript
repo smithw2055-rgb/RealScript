@@ -1,0 +1,59 @@
+module Kernel.App;
+import Kernel.Model;
+
+public int SumArray(int count) {
+    int[] values = new int[count];
+    int index = 0;
+    int sum = 0;
+    while (index < count) {
+        values[index] = index + 1;
+        sum = sum + values[index];
+        index = index + 1;
+    }
+    return sum;
+}
+
+public int ObjectMath() {
+    Counter counter = CreateCounter(5);
+    return counter.Add(7) + counter.Value;
+}
+
+public int StructMath() {
+    Pair original = new Pair(2, 3);
+    Pair copy = original;
+    copy.x = 10;
+    return original.Sum() + copy.Sum();
+}
+
+public int EnumMath() {
+    Tier value = Tier.Bonus;
+    if (value == Tier.Bonus) {
+        return 3;
+    }
+    return 0;
+}
+
+public long LongMath() {
+    long value = 2147483648;
+    return value + 2;
+}
+
+public double DoubleMath() {
+    return Scale(4);
+}
+
+public string Greeting() {
+    return "kernel-ok";
+}
+
+public int Recurse(int value) {
+    if (value == 0) {
+        return 0;
+    }
+    return Recurse(value - 1) + 1;
+}
+
+public int main() {
+    // 15 + (12 + 12) + (5 + 13) + 3 = 60
+    return SumArray(5) + ObjectMath() + StructMath() + EnumMath();
+}
