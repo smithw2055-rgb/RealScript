@@ -65,6 +65,27 @@ bool restoreGameplayHostState(
     GameplayStateError& error,
     GameplayStateCodecLimits limits = {});
 
+struct FieldSchemaDescriptor {
+    std::string currentName;
+    std::optional<std::int32_t> fieldTag;
+    std::vector<std::string> formerNames;
+};
+
+[[nodiscard]] std::map<std::string, std::string> resolveFieldSchemaMigrationPlan(
+    const std::vector<FieldSchemaDescriptor>& oldSchema,
+    const std::vector<FieldSchemaDescriptor>& newSchema);
+
+[[nodiscard]] std::map<std::string, GameplayValue> migrateComponentFieldValues(
+    const std::map<std::string, GameplayValue>& savedFields,
+    const std::vector<FieldSchemaDescriptor>& oldSchema,
+    const std::vector<FieldSchemaDescriptor>& newSchema,
+    const std::map<std::string, GameplayValue>& defaultValues = {});
+
+[[nodiscard]] std::map<std::string, GameplayValue> migrateComponentFieldValues(
+    const std::map<std::string, GameplayValue>& savedFields,
+    const std::vector<FieldSchemaDescriptor>& newSchema,
+    const std::map<std::string, GameplayValue>& defaultValues = {});
+
 [[nodiscard]] const char* gameplayStateErrorCodeName(
     GameplayStateErrorCode code) noexcept;
 

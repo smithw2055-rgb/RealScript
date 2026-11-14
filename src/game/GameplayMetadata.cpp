@@ -37,22 +37,48 @@ bool validAttribute(const ScriptAttribute& attribute) {
             [](const auto& entry) { return !entry.first.empty(); });
 }
 
+bool isRepeatableMemberAttribute(std::string_view name) noexcept {
+    if (name == "FormerlySerializedAs" ||
+        name == "FormerlySerializedAsAttribute") {
+        return true;
+    }
+    const auto sep = name.rfind("::");
+    if (sep != std::string_view::npos) {
+        const auto tail = name.substr(sep + 2);
+        return tail == "FormerlySerializedAs" ||
+            tail == "FormerlySerializedAsAttribute";
+    }
+    const auto dot = name.rfind('.');
+    if (dot != std::string_view::npos) {
+        const auto tail = name.substr(dot + 1);
+        return tail == "FormerlySerializedAs" ||
+            tail == "FormerlySerializedAsAttribute";
+    }
+    return false;
+}
+
 bool attributeLess(
     const ScriptAttribute& left,
     const ScriptAttribute& right) {
     return left.name < right.name;
 }
 
-bool normalizeAttributes(std::vector<ScriptAttribute>& attributes) {
+bool normalizeAttributes(
+    std::vector<ScriptAttribute>& attributes,
+    bool allowRepeatableAliases) {
     if (!std::all_of(attributes.begin(), attributes.end(), validAttribute)) {
         return false;
     }
-    std::sort(attributes.begin(), attributes.end(), attributeLess);
-    return std::adjacent_find(
-        attributes.begin(), attributes.end(),
-        [](const auto& left, const auto& right) {
-            return left.name == right.name;
-        }) == attributes.end();
+    std::stable_sort(attributes.begin(), attributes.end(), attributeLess);
+    for (std::size_t i = 1; i < attributes.size(); ++i) {
+        if (attributes[i - 1].name == attributes[i].name) {
+            if (!allowRepeatableAliases ||
+                !isRepeatableMemberAttribute(attributes[i].name)) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 } // namespace
@@ -79,10 +105,21 @@ bool ScriptMetadataRegistry::addMemberAttribute(
     }
     auto& attributes = memberAttributes_[{
         std::move(canonicalTypeName), std::move(memberName)}];
-    const auto found = std::lower_bound(
+    const auto range = std::equal_range(
         attributes.begin(), attributes.end(), attribute, attributeLess);
-    if (found != attributes.end() && found->name == attribute.name) return false;
-    attributes.insert(found, std::move(attribute));
+    if (range.first != range.second) {
+        if (!isRepeatableMemberAttribute(attribute.name)) {
+            return false;
+        }
+        for (auto it = range.first; it != range.second; ++it) {
+            if (it->arguments == attribute.arguments) {
+                return false;
+            }
+        }
+        attributes.insert(range.second, std::move(attribute));
+        return true;
+    }
+    attributes.insert(range.first, std::move(attribute));
     return true;
 }
 
@@ -253,7 +290,7 @@ ScriptMetadataRegistry::State ScriptMetadataRegistry::snapshot() const {
 bool ScriptMetadataRegistry::restore(const State& state) {
     std::map<std::string, std::vector<ScriptAttribute>> typeAttributes;
     for (auto entry : state.typeAttributes) {
-        if (entry.first.empty() || !normalizeAttributes(entry.second)) return false;
+        if (entry.first.empty() || !normalizeAttributes(entry.second, false)) return false;
         typeAttributes.emplace(std::move(entry));
     }
 
@@ -261,7 +298,7 @@ bool ScriptMetadataRegistry::restore(const State& state) {
         memberAttributes;
     for (auto member : state.members) {
         if (member.canonicalTypeName.empty() || member.memberName.empty() ||
-            !normalizeAttributes(member.attributes) ||
+            !normalizeAttributes(member.attributes, true) ||
             !memberAttributes.emplace(
                 std::make_pair(
                     std::move(member.canonicalTypeName),
@@ -435,9 +472,17 @@ InspectorFieldSchema buildInspectorFieldSchema(
         }
     }
 
-    if (const auto* renamedAttr = metadata.findMemberAttribute(
-            ownerCanonicalTypeName, field.name, "FormerlySerializedAs")) {
+    const auto* renamedAttr = metadata.findMemberAttribute(
+        ownerCanonicalTypeName, field.name, "FormerlySerializedAs");
+    if (!renamedAttr) {
+        renamedAttr = metadata.findMemberAttribute(
+            ownerCanonicalTypeName, field.name, "FormerlySerializedAsAttribute");
+    }
+    if (renamedAttr) {
         auto it = renamedAttr->arguments.find("oldName");
+        if (it == renamedAttr->arguments.end()) {
+            it = renamedAttr->arguments.find("name");
+        }
         if (it == renamedAttr->arguments.end()) {
             it = renamedAttr->arguments.find("arg0");
         }
