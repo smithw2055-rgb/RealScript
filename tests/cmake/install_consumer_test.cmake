@@ -55,3 +55,29 @@ if(NOT build_result EQUAL 0)
         "installed SDK consumer build failed (${build_result})\n"
         "${build_output}\n${build_error}")
 endif()
+
+if(NOT DEFINED CMAKE_CTEST_COMMAND OR CMAKE_CTEST_COMMAND STREQUAL "")
+    get_filename_component(_cmake_bin_dir "${CMAKE_COMMAND}" DIRECTORY)
+    find_program(REALSCRIPT_CTEST_COMMAND
+        NAMES ctest ctest.exe
+        HINTS "${_cmake_bin_dir}"
+        REQUIRED
+    )
+else()
+    set(REALSCRIPT_CTEST_COMMAND "${CMAKE_CTEST_COMMAND}")
+endif()
+
+execute_process(
+    COMMAND "${REALSCRIPT_CTEST_COMMAND}"
+        --test-dir "${REALSCRIPT_CONSUMER_BUILD_DIR}"
+        -C "${REALSCRIPT_CONFIG}"
+        --output-on-failure
+    RESULT_VARIABLE test_result
+    OUTPUT_VARIABLE test_output
+    ERROR_VARIABLE test_error
+)
+if(NOT test_result EQUAL 0)
+    message(FATAL_ERROR
+        "installed SDK consumer tests failed (${test_result})\n"
+        "${test_output}\n${test_error}")
+endif()
