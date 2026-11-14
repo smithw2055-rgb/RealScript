@@ -23,7 +23,7 @@ if(NOT result EQUAL 0)
         "multi-module bytecode emission failed (${result})\n${output}\n${error}")
 endif()
 
-foreach(module IN ITEMS Phase5.Model Phase5.App)
+foreach(module IN ITEMS Kernel.Model Kernel.App)
     set(artifact "${REALSCRIPT_OUTPUT_DIR}/${module}.rsbc")
     if(NOT EXISTS "${artifact}")
         message(FATAL_ERROR "missing emitted bytecode module: ${artifact}")
