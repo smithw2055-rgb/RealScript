@@ -65,6 +65,16 @@ const SourceFileInfo* sourceFile(
     return nullptr;
 }
 
+std::string sequencePointSourcePath(
+    const bytecode::Module& module,
+    const SequencePoint& point) {
+    if (!point.mappedPath.empty()) return point.mappedPath;
+    if (const auto* source = sourceFile(module, point.range.fileId)) {
+        return source->path;
+    }
+    return {};
+}
+
 DebugStackFrame captureSingleFrame(
     const DebugFrameView& view,
     std::uint32_t frameId) {
@@ -76,9 +86,7 @@ DebugStackFrame captureSingleFrame(
         (sourceLambda ? "<lambda>" : view.function->name);
     if (view.point) {
         frame.location = view.point->range;
-        if (const auto* source = sourceFile(*view.module, view.point->range.fileId)) {
-            frame.sourcePath = source->path;
-        }
+        frame.sourcePath = sequencePointSourcePath(*view.module, *view.point);
     }
     for (const auto& local : view.function->debugInfo.locals) {
         if (sourceLambda && local.parameter && local.name == "this") {
@@ -1808,10 +1816,11 @@ void DebugController::bindModules(const std::vector<bytecode::Module>& modules) 
         }
         for (const auto& function : module.functions) {
             for (const auto& point : function.debugInfo.sequencePoints) {
-                const auto* source = sourceFile(module, point.range.fileId);
-                if (!source) continue;
-                executableLocations_[source->path].push_back({
-                    source->path,
+                if (point.hidden) continue;
+                std::string effectivePath = sequencePointSourcePath(module, point);
+                if (effectivePath.empty()) continue;
+                executableLocations_[effectivePath].push_back({
+                    effectivePath,
                     point.range.start.line,
                     point.range.start.column,
                 });
@@ -2110,12 +2119,14 @@ std::uint32_t DebugController::matchingBreakpoint(
     runtime::ManagedHeap* heap) const {
     if (frames.empty() || !frames.back().point || !frames.back().module) return 0;
     const auto& current = frames.back();
-    const auto* source = sourceFile(*current.module, current.point->range.fileId);
-    if (!source) return 0;
+    if (current.point->hidden) return 0;
+    const std::string effectivePath =
+        sequencePointSourcePath(*current.module, *current.point);
+    if (effectivePath.empty()) return 0;
     std::optional<DebugStackFrame> cachedFrame;
     for (const auto& breakpoint : breakpoints_) {
         if (!breakpoint.verified ||
-            !debugPathsMatch(breakpoint.sourcePath, source->path) ||
+            !debugPathsMatch(breakpoint.sourcePath, effectivePath) ||
             breakpoint.line != current.point->range.start.line) {
             continue;
         }
@@ -2180,13 +2191,13 @@ bool DebugController::shouldStop(
     const auto changed = !sameLocation(current.point->range, lastLocation_);
     switch (mode_) {
     case ResumeMode::StepIn:
-        if (changed) {
+        if (!current.point->hidden && changed) {
             reason = StopReason::Step;
             return true;
         }
         break;
     case ResumeMode::StepOver:
-        if (changed && depth <= stepDepth_) {
+        if (!current.point->hidden && changed && depth <= stepDepth_) {
             reason = StopReason::Step;
             return true;
         }

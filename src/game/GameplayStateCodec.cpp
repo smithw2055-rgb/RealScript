@@ -1,5 +1,7 @@
 #include "realscript/game/GameplayStateCodec.h"
 
+#include "realscript/AbiGovernance.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -8,6 +10,11 @@
 #include <utility>
 
 namespace realscript::game {
+
+static_assert(
+    kRsgsStateEncodingVersion == kGameplayStateCodecVersion,
+    "RSGS state version constant must stay synchronized with GameplayStateCodec");
+
 namespace {
 
 constexpr std::uint8_t Magic[] = {'R', 'S', 'G', 'S'};

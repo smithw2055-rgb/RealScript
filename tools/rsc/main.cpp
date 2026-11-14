@@ -7,9 +7,11 @@
 #include "realscript/runtime/Runtime.h"
 #include "realscript/syntax/Syntax.h"
 #include "realscript/text/Text.h"
+#if !defined(REALSCRIPT_HAS_TOOLING) || REALSCRIPT_HAS_TOOLING
 #include "realscript/tooling/Formatter.h"
 #include "realscript/tooling/GovernanceLinter.h"
 #include "realscript/tooling/Json.h"
+#endif
 
 #include <filesystem>
 #include <fstream>
@@ -157,6 +159,7 @@ void printDiagnostics(
     }
 }
 
+#if !defined(REALSCRIPT_HAS_TOOLING) || REALSCRIPT_HAS_TOOLING
 void printLintDiagnostics(
     const std::vector<realscript::tooling::LintDiagnostic>& diagnostics) {
     for (const auto& diag : diagnostics) {
@@ -212,6 +215,7 @@ realscript::tooling::LintConfig discoverLintConfig(
     }
     return cfg;
 }
+#endif
 
 int runLoadedBytecodeModules(
     std::vector<realscript::bytecode::Module> modules,
@@ -413,6 +417,7 @@ int main(int argc, char** argv) {
     }
 
     try {
+#if !defined(REALSCRIPT_HAS_TOOLING) || REALSCRIPT_HAS_TOOLING
         if (mode == "--format" || mode == "--check-format") {
             realscript::tooling::FormatOptions fmtOptions;
             fmtOptions.indentWidth = indentWidth;
@@ -485,6 +490,18 @@ int main(int argc, char** argv) {
             }
             return 0;
         }
+#else
+        (void)formatOutputPath;
+        (void)formatWriteInPlace;
+        (void)formatForceStdout;
+        (void)indentWidth;
+        (void)projectConfigPath;
+        (void)lintDenyWarnings;
+        if (mode == "--format" || mode == "--check-format" || mode == "--lint" || lintRequested) {
+            std::cerr << "rsc: tooling support (--format / --check-format / --lint) is disabled in this build (REALSCRIPT_ENABLE_TOOLING=OFF)\n";
+            return 2;
+        }
+#endif
 
         if (mode == "--tokens") {
             if (paths.size() != 1) {
@@ -757,6 +774,7 @@ int main(int argc, char** argv) {
         }
 
         printDiagnostics(result.diagnostics);
+#if !defined(REALSCRIPT_HAS_TOOLING) || REALSCRIPT_HAS_TOOLING
         if (lintRequested) {
             const auto lintCfg = discoverLintConfig(projectConfigPath, paths);
             realscript::tooling::GovernanceLinter linter(lintCfg);
@@ -769,6 +787,9 @@ int main(int argc, char** argv) {
                 }
             }
         }
+#else
+        (void)lintRequested;
+#endif
         return result.diagnostics.hasErrors() ? 1 : 0;
     } catch (const std::exception& error) {
         std::cerr << "rsc: " << error.what() << '\n';

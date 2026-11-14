@@ -484,9 +484,12 @@ void ScriptRuntime::replaceProgram(const GameProgram& program) {
     interpreter_.setBindingRegistry(bindings_);
     interpreter_.setAsyncRuntime(asyncRuntime_);
     clearNativeBackend();
+#if !defined(REALSCRIPT_HAS_DEBUG_SERVICES) || REALSCRIPT_HAS_DEBUG_SERVICES
     if (remoteDebugger_) {
         remoteDebugger_->rebindProgram(program_);
-    } else if (debugger_ && program_) {
+    } else
+#endif
+    if (debugger_ && program_) {
         debugger_->bindProgram(*program_);
     }
 }
@@ -501,6 +504,7 @@ void ScriptRuntime::setDebugger(std::shared_ptr<debug::DebugController> debugger
 bool ScriptRuntime::startRemoteDebugger(
     std::uint16_t port,
     const std::string& bindAddress) {
+#if !defined(REALSCRIPT_HAS_DEBUG_SERVICES) || REALSCRIPT_HAS_DEBUG_SERVICES
     if (!remoteDebugger_) {
         remoteDebugger_ = std::make_shared<debug::EmbeddedDapServer>(program_, heap_);
     } else {
@@ -511,9 +515,15 @@ bool ScriptRuntime::startRemoteDebugger(
     }
     debugger_ = remoteDebugger_->controller();
     return true;
+#else
+    (void)port;
+    (void)bindAddress;
+    return false;
+#endif
 }
 
 void ScriptRuntime::stopRemoteDebugger() noexcept {
+#if !defined(REALSCRIPT_HAS_DEBUG_SERVICES) || REALSCRIPT_HAS_DEBUG_SERVICES
     if (remoteDebugger_) {
         if (debugger_ == remoteDebugger_->controller()) {
             debugger_.reset();
@@ -521,10 +531,15 @@ void ScriptRuntime::stopRemoteDebugger() noexcept {
         remoteDebugger_->stop();
         remoteDebugger_.reset();
     }
+#endif
 }
 
 std::uint16_t ScriptRuntime::remoteDebuggerPort() const noexcept {
+#if !defined(REALSCRIPT_HAS_DEBUG_SERVICES) || REALSCRIPT_HAS_DEBUG_SERVICES
     return remoteDebugger_ ? remoteDebugger_->boundPort() : 0;
+#else
+    return 0;
+#endif
 }
 
 void ScriptRuntime::setAotBackend(const aot::ProgramDescriptor* descriptor) {
