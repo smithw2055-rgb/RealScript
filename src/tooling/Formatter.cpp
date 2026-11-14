@@ -16,6 +16,7 @@ namespace {
 
 struct TriviaComment {
     bool isLineComment = false;
+    bool isDirective = false;
     std::size_t newlinesBefore = 0;
     std::string text;
 };
@@ -100,21 +101,61 @@ std::string trimTrailingHorizSpace(std::string_view text) {
 
 void parseTriviaSlice(
     std::string_view slice,
+    bool startsAtLineStart,
     std::vector<TriviaComment>& outComments,
     std::size_t& outTrailingNewlines) {
     outComments.clear();
     std::size_t newlines = 0;
     std::size_t pos = 0;
+    bool atLineStart = startsAtLineStart;
+    if (startsAtLineStart && slice.size() >= 3 &&
+        static_cast<unsigned char>(slice[0]) == 0xEFu &&
+        static_cast<unsigned char>(slice[1]) == 0xBBu &&
+        static_cast<unsigned char>(slice[2]) == 0xBFu) {
+        pos = 3;
+    }
     while (pos < slice.size()) {
         const char ch = slice[pos];
         if (ch == '\n') {
             ++newlines;
             ++pos;
+            atLineStart = true;
             continue;
         }
         if (ch == ' ' || ch == '\t') {
             ++pos;
             continue;
+        }
+        if (atLineStart && ch == '#') {
+            std::size_t kwOff = 1;
+            while (pos + kwOff < slice.size() &&
+                   (slice[pos + kwOff] == ' ' || slice[pos + kwOff] == '\t')) {
+                ++kwOff;
+            }
+            std::size_t kwLen = 0;
+            while (pos + kwOff + kwLen < slice.size() &&
+                   ((slice[pos + kwOff + kwLen] >= 'a' && slice[pos + kwOff + kwLen] <= 'z') ||
+                    (slice[pos + kwOff + kwLen] >= 'A' && slice[pos + kwOff + kwLen] <= 'Z'))) {
+                ++kwLen;
+            }
+            const std::string_view kw = slice.substr(pos + kwOff, kwLen);
+            if (kw == "line" || kw == "region" || kw == "endregion" ||
+                kw == "nullable" || kw == "pragma") {
+                const std::size_t start = pos;
+                pos += kwOff + kwLen;
+                while (pos < slice.size() && slice[pos] != '\n') {
+                    ++pos;
+                }
+                TriviaComment c;
+                c.isLineComment = true;
+                c.isDirective = true;
+                c.newlinesBefore = newlines;
+                c.text = trimTrailingHorizSpace(slice.substr(start, pos - start));
+                outComments.push_back(std::move(c));
+                newlines = 0;
+                atLineStart = false;
+                continue;
+            }
         }
         if (ch == '/' && pos + 1 < slice.size() && slice[pos + 1] == '/') {
             const std::size_t start = pos;
@@ -128,6 +169,7 @@ void parseTriviaSlice(
             c.text = trimTrailingHorizSpace(slice.substr(start, pos - start));
             outComments.push_back(std::move(c));
             newlines = 0;
+            atLineStart = false;
             continue;
         }
         if (ch == '/' && pos + 1 < slice.size() && slice[pos + 1] == '*') {
@@ -147,8 +189,10 @@ void parseTriviaSlice(
             c.text = std::string(slice.substr(start, pos - start));
             outComments.push_back(std::move(c));
             newlines = 0;
+            atLineStart = false;
             continue;
         }
+        atLineStart = false;
         ++pos;
     }
     outTrailingNewlines = newlines;
@@ -1019,6 +1063,15 @@ bool needsSpaceBetween(const FmtToken& prev, const FmtToken& curr) noexcept {
         return true;
     }
 
+    // Tagged verbatim string literal `ident@"..."` must stay fused with zero whitespace
+    if (prev.kind == syntax::SyntaxKind::IdentifierToken &&
+        curr.kind == syntax::SyntaxKind::StringLiteralToken &&
+        prev.span.end() == curr.span.start &&
+        curr.leadingComments.empty() &&
+        curr.text.size() >= 2 && curr.text[0] == '@' && curr.text[1] == '"') {
+        return false;
+    }
+
     // 10. Two adjacent word/literal/string tokens (including unary prefix after keyword/operator)
     if (curr.isUnaryPrefix) {
         return true;
@@ -1067,6 +1120,7 @@ FormatResult formatSource(std::string_view sourceText, const FormatOptions& opti
         const std::size_t triviaLen = rt.span.start >= prevEnd ? (rt.span.start - prevEnd) : 0;
         parseTriviaSlice(
             std::string_view(normalized).substr(prevEnd, triviaLen),
+            prevEnd == 0,
             ft.leadingComments,
             ft.newlinesAfterComments);
         prevEnd = rt.span.end();
@@ -1100,6 +1154,7 @@ FormatResult formatSource(std::string_view sourceText, const FormatOptions& opti
                     std::string_view(normalized).substr(
                         rt.span.end(),
                         nextRt.span.start >= rt.span.end() ? (nextRt.span.start - rt.span.end()) : 0),
+                    false,
                     midComments,
                     midNl);
                 if (midComments.empty()) {
@@ -1237,7 +1292,8 @@ FormatResult formatSource(std::string_view sourceText, const FormatOptions& opti
             if (cm.newlinesBefore > 0) {
                 emitBlankLinesFromCount(cm.newlinesBefore);
             }
-            const bool sameLineTrailing = (cm.newlinesBefore == 0 && prevEmittedTok != nullptr && !atLineStart);
+            const bool sameLineTrailing =
+                !cm.isDirective && (cm.newlinesBefore == 0 && prevEmittedTok != nullptr && !atLineStart);
             if (sameLineTrailing) {
                 if (!out.empty() && out.back() != ' ') {
                     out.push_back(' ');
@@ -1254,7 +1310,7 @@ FormatResult formatSource(std::string_view sourceText, const FormatOptions& opti
                 if (!atLineStart) {
                     emitNewline();
                 }
-                const int cmIndent = isEof ? currentIndentDepth(false, false) : currentIndentDepth(false, false);
+                const int cmIndent = cm.isDirective ? 0 : currentIndentDepth(false, false);
                 ensureIndented(cmIndent);
                 out.append(cm.text);
                 justOpenedBlockBrace = false;

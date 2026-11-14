@@ -1,8 +1,8 @@
 #include "realscript/tooling/LanguageService.h"
 
 #include "realscript/syntax/Syntax.h"
+#include "realscript/text/AssetGuid.h"
 #include "realscript/text/Text.h"
-#include "realscript/game/GameProductization.h"
 #include "realscript/tooling/Json.h"
 
 #include <algorithm>
@@ -592,7 +592,7 @@ bool LanguageService::loadProjectConfigJson(
             if (item.isString() && !item.stringValue().empty()) {
                 AssetResourceInfo r;
                 r.path = item.stringValue();
-                r.guid = game::AssetGuid::fromAssetPath(r.path).toString();
+                r.guid = text::AssetGuid::fromAssetPath(r.path).toString();
                 configManifest_.resources.push_back(std::move(r));
                 continue;
             }
@@ -603,7 +603,7 @@ bool LanguageService::loadProjectConfigJson(
             if (const auto* t = item.find("resourceType"); t && t->isString()) r.resourceType = t->stringValue();
             else if (const auto* ty = item.find("type"); ty && ty->isString()) r.resourceType = ty->stringValue();
             if (!r.path.empty()) {
-                if (r.guid.empty()) r.guid = game::AssetGuid::fromAssetPath(r.path).toString();
+                if (r.guid.empty()) r.guid = text::AssetGuid::fromAssetPath(r.path).toString();
                 configManifest_.resources.push_back(std::move(r));
             }
         }
@@ -3242,7 +3242,7 @@ void LanguageService::rebuildSceneManifestIfNeeded() const {
             if (t.synthetic) continue;
             const std::string canon = semantic::canonicalTypeName(t);
             if (mergedManifest_.scriptGuidsByType.find(canon) == mergedManifest_.scriptGuidsByType.end()) {
-                const std::string detGuid = game::AssetGuid::fromTypeName(canon).toString();
+                const std::string detGuid = text::AssetGuid::fromTypeName(canon).toString();
                 mergedManifest_.scriptGuidsByType.emplace(canon, detGuid);
                 mergedManifest_.scriptGuidsByType.emplace(t.name, detGuid);
             }
@@ -3278,7 +3278,7 @@ void LanguageService::rebuildSceneManifestIfNeeded() const {
             if (seenResources.insert(resUri).second) {
                 AssetResourceInfo r;
                 r.path = resUri;
-                r.guid = game::AssetGuid::fromAssetPath(resUri).toString();
+                r.guid = text::AssetGuid::fromAssetPath(resUri).toString();
                 r.resourceType = endsWithIgnoreCase(filePath, ".prefab.txt") ? "Prefab" : "Scene";
                 r.sourceFile = filePath;
                 mergedManifest_.resources.push_back(std::move(r));
@@ -3352,7 +3352,7 @@ void LanguageService::rebuildSceneManifestIfNeeded() const {
                         if (seenResources.insert(rPath).second) {
                             AssetResourceInfo r;
                             r.path = rPath;
-                            r.guid = game::AssetGuid::fromAssetPath(rPath).toString();
+                            r.guid = text::AssetGuid::fromAssetPath(rPath).toString();
                             r.sourceFile = filePath;
                             mergedManifest_.resources.push_back(std::move(r));
                         }
