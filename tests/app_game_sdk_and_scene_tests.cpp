@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -481,6 +482,96 @@ public class PlayerStats {
     std::cout << "[PASS] Hot-reload [FormerlySerializedAs], GUID serialization, Inspector & Debug toggle\n";
 }
 
+void testSceneHotReloadFieldTagsAndGameplayCodecMigration() {
+    game::GameApi api;
+    const std::string v1Src = R"(module Game.SchemaEvol;
+
+public class HeroStats {
+    [FieldTag(11)]
+    public int hp = 100;
+
+    public int legacyMana = 40;
+}
+)";
+    const std::string v2Src = R"(module Game.SchemaEvol;
+
+public class HeroStats {
+    [FormerlySerializedAs("legacyMana")]
+    [FormerlySerializedAs("manaPool")]
+    public int mp = 5;
+
+    [FieldTag(11)]
+    public int currentHp = 10;
+
+    public int stamina = 55;
+}
+)";
+
+    const auto c1 = compileGameScript(api, {{"evol_v1.rscript", v1Src}});
+    game::ScriptRuntime rt(c1.program);
+    game::SceneScriptRuntime scene(rt);
+
+    const auto hero = scene.spawnGenerationalEntity("Hero");
+    RS_CHECK(scene.attachComponent(hero, "Game.SchemaEvol::HeroStats"));
+    RS_CHECK(scene.setInspectorMember(
+        hero, "Game.SchemaEvol::HeroStats", "hp", runtime::Value{std::int64_t{350}}));
+    RS_CHECK(scene.setInspectorMember(
+        hero, "Game.SchemaEvol::HeroStats", "legacyMana", runtime::Value{std::int64_t{75}}));
+
+    const auto c2 = compileGameScript(api, {{"evol_v2.rscript", v2Src}});
+    game::ScriptMetadataRegistry metaV2;
+    (void)metaV2.populateFromLanguageMetadata(c2.languageMetadata);
+    // Do NOT need FormerlySerializedAs for currentHp: [FieldTag(11)] in decoded .rsbc preserves it.
+    const auto reloadReport = scene.hotReload(c2.program, &metaV2);
+    RS_CHECK(reloadReport.succeeded);
+
+    const auto* migratedComp = scene.getComponent(hero, "Game.SchemaEvol::HeroStats");
+    RS_CHECK(migratedComp != nullptr);
+    runtime::RuntimeError readErr;
+    const auto hpVal = rt.getMember(*migratedComp, "currentHp", readErr);
+    RS_CHECK(hpVal.has_value() && std::get<std::int64_t>(*hpVal) == 350);
+    const auto mpVal = rt.getMember(*migratedComp, "mp", readErr);
+    RS_CHECK(mpVal.has_value() && std::get<std::int64_t>(*mpVal) == 75);
+    const auto stamVal = rt.getMember(*migratedComp, "stamina", readErr);
+    RS_CHECK(stamVal.has_value() && std::get<std::int64_t>(*stamVal) == 55);
+
+    // Also test GameplayStateCodec::migrateComponentFieldValues directly with FieldTag + multiple formerNames.
+    const std::vector<game::FieldSchemaDescriptor> oldSchema{
+        {"oldHp", std::optional<std::int32_t>{11}, {}},
+        {"legacyMana", std::nullopt, {}},
+    };
+    const std::vector<game::FieldSchemaDescriptor> newSchema{
+        {"currentHp", std::optional<std::int32_t>{11}, {}},
+        {"mp", std::nullopt, {"legacyMana", "manaPool"}},
+        {"stamina", std::nullopt, {}},
+    };
+    const std::map<std::string, game::GameplayValue> savedFields{
+        {"oldHp", game::GameplayValue{std::int64_t{350}}},
+        {"legacyMana", game::GameplayValue{std::int64_t{75}}},
+    };
+    const std::map<std::string, game::GameplayValue> defaultValues{
+        {"currentHp", game::GameplayValue{std::int64_t{10}}},
+        {"mp", game::GameplayValue{std::int64_t{5}}},
+        {"stamina", game::GameplayValue{std::int64_t{55}}},
+    };
+
+    const auto migratedTwoSchema = game::migrateComponentFieldValues(
+        savedFields, oldSchema, newSchema, defaultValues);
+    RS_CHECK(std::get<std::int64_t>(migratedTwoSchema.at("currentHp")) == 350);
+    RS_CHECK(std::get<std::int64_t>(migratedTwoSchema.at("mp")) == 75);
+    RS_CHECK(std::get<std::int64_t>(migratedTwoSchema.at("stamina")) == 55);
+
+    const std::map<std::string, game::GameplayValue> v2Saved{
+        {"manaPool", game::GameplayValue{std::int64_t{90}}},
+    };
+    const auto migratedAliasOnly = game::migrateComponentFieldValues(
+        v2Saved, newSchema, defaultValues);
+    RS_CHECK(std::get<std::int64_t>(migratedAliasOnly.at("mp")) == 90);
+    RS_CHECK(std::get<std::int64_t>(migratedAliasOnly.at("currentHp")) == 10);
+
+    std::cout << "[PASS] Pillar 6: SceneLifecycleRuntime & GameplayStateCodec [FieldTag]/multi-[FormerlySerializedAs] migration\n";
+}
+
 } // namespace
 
 int main() {
@@ -489,6 +580,7 @@ int main() {
     testPackageLoaderAbiAndGameplayStateCodec();
     testSceneLifecycleEventsTriggersAndAsyncCancellation();
     testHotReloadGuidsSerializationAndRemoteDebug();
+    testSceneHotReloadFieldTagsAndGameplayCodecMigration();
     std::cout << "All app_game_sdk_and_scene_tests passed!\n";
     return 0;
 }

@@ -1,5 +1,7 @@
 module Kernel.AotSuite;
 import RealScript.Async;
+import RealScript.Memory;
+import RealScript.Resource;
 
 // ---------------------------------------------------------------------------
 // 1. OOP, Polymorphism, Interfaces & Sequence Coroutines
@@ -325,4 +327,83 @@ public async CustomTaskInt CustomDuckCompileFallbackAsync(int seed) {
 public async CustomTaskInt CustomAwaitFallbackAsync(int seed) {
     int v = await Awaitable<int>.FromResult(seed + 40);
     return v + 2;
+}
+
+// ---------------------------------------------------------------------------
+// 5. Pillar 2 & 4 Integration: IAwaitScheduler Parity, [ValueLifecycle] Sweep,
+//    and Span<T> SIMD Vectorization
+// ---------------------------------------------------------------------------
+[Awaitable]
+public struct AotSchedTaskInt {
+    public long __handle;
+
+    public AotSchedTaskInt(long h) {
+        __handle = h;
+    }
+
+    public static AotSchedTaskInt Pending(long tag) {
+        return new AotSchedTaskInt(tag);
+    }
+
+    public static AotSchedTaskInt FromResult(int v) {
+        return new AotSchedTaskInt((long)v);
+    }
+
+    public bool IsCompleted() {
+        return false;
+    }
+
+    public int GetResult() {
+        return (int)__handle;
+    }
+}
+
+public async AotSchedTaskInt ComputeAotSchedulerAsync(int seed, long tag) {
+    int fetched = await AotSchedTaskInt.Pending(tag);
+    return seed * 2 + fetched;
+}
+
+public class AotResHolder {
+    public ResourceHandle Handle;
+    public AotResHolder(ResourceHandle h) {
+        Handle = h;
+    }
+}
+
+public long SpawnAotOrphanHolder(string path) {
+    AotResHolder h = new AotResHolder(ResourceHandle.Load(path));
+    return h.Handle.ResourceId();
+}
+
+public long SpawnAotOrphanArray(string path) {
+    ResourceHandle[] arr = new ResourceHandle[2];
+    arr[0] = ResourceHandle.Load(path);
+    arr[1] = arr[0].Retain();
+    return arr[0].ResourceId();
+}
+
+public int QueryAotResUseCount(long resId) {
+    return ResourceServer.GetUseCount(resId);
+}
+
+public bool QueryAotResDisposed(long resId) {
+    return ResourceServer.IsResourceDisposed(resId);
+}
+
+public int SumIntSpan(Span<int> span) {
+    int acc = 0;
+    for (int i = 0; i < span.Length; i = i + 1) {
+        acc = acc + span.Get(i);
+    }
+    return acc;
+}
+
+public float ScaleFloatSpan(Span<float> dst, float scale, ReadOnlySpan<float> src) {
+    float acc = 0.0f;
+    for (int i = 0; i < dst.Length; i = i + 1) {
+        float val = src.Get(i) * scale + 0.5f;
+        dst.Set(i, val);
+        acc = acc + val;
+    }
+    return acc;
 }

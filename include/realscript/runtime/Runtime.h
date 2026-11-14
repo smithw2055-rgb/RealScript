@@ -3488,8 +3488,22 @@ public:
         ExecutionOptions options) const;
 
 private:
+    struct EngineInvokeTag {};
     struct DispatchTarget;
+    friend class EngineRuntime;
+
+    Interpreter(
+        EngineInvokeTag,
+        std::shared_ptr<const ProgramImage> program,
+        std::shared_ptr<ManagedHeap> heap,
+        std::shared_ptr<const BindingRegistry> bindings,
+        std::shared_ptr<AsyncRuntimeContext> asyncRuntime);
+
     void registerValueLifecycleHooks();
+    static void installValueLifecycleHooks(
+        const std::shared_ptr<const ProgramImage>& program,
+        const std::shared_ptr<ManagedHeap>& heap,
+        std::shared_ptr<DispatchTarget> target);
 
     std::shared_ptr<const ProgramImage> program_;
     RuntimeError programError_;
@@ -3504,6 +3518,7 @@ private:
 class EngineRuntime {
 public:
     explicit EngineRuntime(std::shared_ptr<const ProgramImage> program);
+    ~EngineRuntime();
 
     void setBindings(std::shared_ptr<const BindingRegistry> bindings);
     void setHeap(std::shared_ptr<ManagedHeap> heap);
@@ -3530,6 +3545,8 @@ public:
         RuntimeError* error = nullptr);
 
 private:
+    void registerValueLifecycleHooks();
+
     mutable std::mutex programMutex_;
     std::shared_ptr<const ProgramImage> program_;
     std::vector<std::shared_ptr<const ProgramImage>> retiredPrograms_;
@@ -3537,6 +3554,7 @@ private:
     std::shared_ptr<ManagedHeap> heap_;
     std::shared_ptr<NativeHandleRegistry> nativeHandles_;
     std::shared_ptr<AsyncRuntimeContext> asyncRuntime_;
+    std::shared_ptr<Interpreter::DispatchTarget> lifecycleTarget_;
 };
 
 [[nodiscard]] semantic::SymbolId fixedTypeId() noexcept;

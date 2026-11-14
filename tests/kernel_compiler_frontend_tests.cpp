@@ -1,15 +1,21 @@
 #include "realscript/bytecode/Bytecode.h"
 #include "realscript/compiler/Compilation.h"
+#include "realscript/compiler/ModuleBuildCache.h"
+#include "realscript/compiler/ProjectConfig.h"
 #include "realscript/debug/DebugInfo.h"
 #include "realscript/diagnostics/Diagnostic.h"
 #include "realscript/optimization/Optimizer.h"
 #include "realscript/runtime/Runtime.h"
+#include "realscript/semantic/Semantic.h"
 #include "realscript/syntax/Syntax.h"
 #include "realscript/text/Text.h"
 
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -787,6 +793,351 @@ public partial class A { public partial int MissingImpl(); }
     }
 }
 
+struct FrontendTempDirGuard {
+    std::filesystem::path dir;
+    explicit FrontendTempDirGuard(const std::string& name) {
+        dir = std::filesystem::temp_directory_path() / ("rs_frontend_" + name);
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+        std::filesystem::create_directories(dir, ec);
+    }
+    ~FrontendTempDirGuard() {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+    FrontendTempDirGuard(const FrontendTempDirGuard&) = delete;
+    FrontendTempDirGuard& operator=(const FrontendTempDirGuard&) = delete;
+};
+
+void writeFrontendTextFile(const std::filesystem::path& p, const std::string& content) {
+    std::error_code ec;
+    std::filesystem::create_directories(p.parent_path(), ec);
+    std::ofstream out(p, std::ios::binary | std::ios::trunc);
+    require(out.good(), "failed to open file for writing: " + p.string());
+    out.write(content.data(), static_cast<std::streamsize>(content.size()));
+    require(out.good(), "failed to write file: " + p.string());
+}
+
+std::string jsonEscapePath(const std::filesystem::path& p) {
+    std::string raw = p.generic_string();
+    std::string escaped;
+    escaped.reserve(raw.size() + 8);
+    for (char ch : raw) {
+        if (ch == '\\' || ch == '"') {
+            escaped.push_back('\\');
+        }
+        escaped.push_back(ch);
+    }
+    return escaped;
+}
+
+int runFrontendProcess(const std::string& commandLine) {
+#ifdef _WIN32
+    const std::string wrapped = "\"" + commandLine + "\"";
+    return std::system(wrapped.c_str());
+#else
+    return std::system(commandLine.c_str());
+#endif
+}
+
+void testBlittableSchemaEvolutionProjectConfigAndMacroCache() {
+    // 1. [Blittable] struct layout offsets & ManagedHeap packed stride parity (incl. math types).
+    const std::string validBlitSrc = R"RS(
+module Test.BlitLayout;
+import RealScript.Math;
+
+[Blittable]
+public struct InnerPair {
+    public byte tag;
+    public int id;
+}
+
+[Blittable]
+public struct PackedFrame {
+    public byte kind;
+    public Vec2f pos2;
+    public Vec3f pos3;
+    public Quatf rotf;
+    public Vec2 fxPos2;
+    public Vec3 fxPos3;
+    public Quat fxRot;
+    public Fixed16 f16;
+    public InnerPair inner;
+    public byte tail;
+}
+
+public class TaggedRecord {
+    [FieldTag(101)]
+    [FormerlySerializedAs("v1Hp")]
+    [FormerlySerializedAs("v2Hp")]
+    public int hp = 100;
+
+    [FieldTag(202)]
+    public string label = "ok";
+}
+
+public int TouchPacked() {
+    var p = new PackedFrame();
+    p.kind = (byte)7;
+    p.tail = (byte)9;
+    return (int)p.kind + (int)p.tail;
+}
+)RS";
+    auto prog = buildAndLink({{"BlitLayout.rscript", validBlitSrc}});
+
+    const bytecode::Module* targetBc = nullptr;
+    for (const auto& m : prog->modules()) {
+        if (m.name == "Test.BlitLayout") {
+            targetBc = &m;
+            break;
+        }
+    }
+    require(targetBc != nullptr, "expected Test.BlitLayout bytecode module");
+
+    const semantic::TypeSymbol* packedSym = nullptr;
+    const semantic::TypeSymbol* innerSym = nullptr;
+    for (const auto& t : targetBc->types) {
+        if (t.name == "PackedFrame") packedSym = &t;
+        if (t.name == "InnerPair") innerSym = &t;
+    }
+    require(packedSym != nullptr && innerSym != nullptr, "expected PackedFrame and InnerPair types");
+    require(packedSym->blittable && innerSym->blittable, "expected TypeSymbol::blittable == true");
+
+    std::string layoutErr;
+    const auto innerLayout = semantic::computeBlittableStructLayout(*innerSym, targetBc->types, &layoutErr);
+    require(innerLayout.has_value(), "InnerPair computeBlittableStructLayout failed: " + layoutErr);
+    require(innerLayout->alignBytes == 4u && innerLayout->strideBytes == 8u, "InnerPair size/align mismatch");
+    require(innerLayout->fields.size() == 2u &&
+                innerLayout->fields[0].offsetBytes == 0u &&
+                innerLayout->fields[1].offsetBytes == 4u,
+        "InnerPair field offsets mismatch");
+
+    const auto packedLayout = semantic::computeBlittableStructLayout(*packedSym, targetBc->types, &layoutErr);
+    require(packedLayout.has_value(), "PackedFrame computeBlittableStructLayout failed: " + layoutErr);
+    require(packedLayout->fields.size() == 10u, "expected 10 fields in PackedFrame");
+    // Byte(0,1), Vec2f(4,8), Vec3f(12,12), Quatf(24,16), Vec2(40,8), Vec3(48,12), Quat(60,16),
+    // Fixed16(80,8) -> align 8! InnerPair(88,8), tail(96,1) -> total aligned to 8 = 104!
+    require(packedLayout->fields[0].offsetBytes == 0u &&
+                packedLayout->fields[1].offsetBytes == 4u &&
+                packedLayout->fields[2].offsetBytes == 12u &&
+                packedLayout->fields[3].offsetBytes == 24u &&
+                packedLayout->fields[4].offsetBytes == 40u &&
+                packedLayout->fields[5].offsetBytes == 48u &&
+                packedLayout->fields[6].offsetBytes == 60u &&
+                packedLayout->fields[7].offsetBytes == 80u &&
+                packedLayout->fields[8].offsetBytes == 88u &&
+                packedLayout->fields[9].offsetBytes == 96u &&
+                packedLayout->alignBytes == 8u &&
+                packedLayout->strideBytes == 104u,
+        "PackedFrame blittable offset/stride/alignment mismatch");
+
+    // Verify ManagedHeap packed struct registration parity with computeBlittableStructLayout.
+    {
+        runtime::EngineRuntime rt(prog);
+        auto heap = rt.heap();
+        require(heap != nullptr, "EngineRuntime heap missing");
+
+        const auto packedTid = semantic::stableTypeId("Test.BlitLayout::PackedFrame");
+        require(runtime::isBlittableStructType(packedTid), "expected PackedFrame registered as blittable");
+        const auto zeroFixed = runtime::Value{runtime::FixedValue{0}};
+        const auto zeroFloat = runtime::Value{runtime::FloatValue{0.0f}};
+        const auto v2f = runtime::Value{runtime::Vec2fValue{0.0f, 0.0f}};
+        const auto v3f = runtime::Value{runtime::Vec3fValue{0.0f, 0.0f, 0.0f}};
+        const auto qf = runtime::Value{runtime::QuatfValue{0.0f, 0.0f, 0.0f, 1.0f}};
+        const auto v2 = runtime::Value{runtime::Vec2Value{0, 0}};
+        const auto v3 = runtime::Value{runtime::Vec3Value{0, 0, 0}};
+        const auto q = runtime::Value{runtime::QuatValue{0, 0, 0, 1}};
+        const auto f16 = runtime::Value{runtime::Fixed16Value{0}};
+        const std::vector<runtime::Value> innerFields{
+            runtime::Value{runtime::ByteValue{0}}, runtime::Value{std::int64_t{0}}};
+        const auto innerVal = runtime::Value{runtime::makeStructValueFromFields(
+            semantic::stableTypeId("Test.BlitLayout::InnerPair"), innerFields)};
+        const std::vector<runtime::Value> pfFields{
+            runtime::Value{runtime::ByteValue{0}}, v2f, v3f, qf, v2, v3, q, f16, innerVal,
+            runtime::Value{runtime::ByteValue{0}}};
+        const auto pfVal = runtime::Value{runtime::makeStructValueFromFields(packedTid, pfFields)};
+        runtime::RuntimeError arrErr;
+        const auto arrRef = heap->allocateTypedArray(
+            semantic::stableTypeId("Test.BlitLayout::PackedFrame[]"),
+            semantic::PrimitiveType::Struct,
+            packedTid,
+            2u,
+            pfVal,
+            &arrErr);
+        require(arrRef.has_value(), "allocateTypedArray(PackedFrame[]) failed: " + arrErr.message);
+        runtime::PackedArrayFastView view{};
+        require(heap->tryBindPackedArrayFastView(*arrRef, view) &&
+                    view.encoding == runtime::PackedElemEncoding::BlittableStruct &&
+                    view.strideBytes == packedLayout->strideBytes,
+            "ManagedHeap PackedFrame stride must match computeBlittableStructLayout");
+        (void)zeroFixed;
+        (void)zeroFloat;
+    }
+
+    // 2. [FieldTag(N)] & multi-[FormerlySerializedAs] .rsbc round-trip + SectionCount == 8 / v0.7 unchanged.
+    {
+        const auto encoded = bytecode::encodeModule(*targetBc);
+        require(encoded.size() >= 16u &&
+                    encoded[0] == 'R' && encoded[1] == 'S' && encoded[2] == 'B' && encoded[3] == 'C',
+            "encoded .rsbc header magic mismatch");
+        const auto secCount =
+            static_cast<std::uint32_t>(encoded[12]) |
+            (static_cast<std::uint32_t>(encoded[13]) << 8u) |
+            (static_cast<std::uint32_t>(encoded[14]) << 16u) |
+            (static_cast<std::uint32_t>(encoded[15]) << 24u);
+        require(secCount == 8u, "expected .rsbc SectionCount == 8");
+
+        bytecode::Module decoded;
+        diagnostics::DiagnosticBag decDiag;
+        require(bytecode::decodeModule(encoded, decoded, decDiag) && !decDiag.hasErrors(),
+            "decodeModule BlitLayout failed: " + diagnosticsText(decDiag));
+        require(decoded.version.major == 0u && decoded.version.minor == 7u, "expected version 0.7");
+
+        const semantic::TypeSymbol* decTagged = nullptr;
+        const semantic::TypeSymbol* decPacked = nullptr;
+        for (const auto& t : decoded.types) {
+            if (t.name == "TaggedRecord") decTagged = &t;
+            if (t.name == "PackedFrame") decPacked = &t;
+        }
+        require(decTagged != nullptr && decPacked != nullptr, "decoded types missing");
+        require(decPacked->blittable, "decoded PackedFrame::blittable must persist across .rsbc");
+        require(decTagged->fields.size() == 2u, "expected 2 fields in TaggedRecord");
+        require(decTagged->fields[0].fieldTag == std::optional<std::int32_t>{101} &&
+                    decTagged->fields[0].formerlySerializedAs.size() == 2u &&
+                    decTagged->fields[0].formerlySerializedAs[0] == "v1Hp" &&
+                    decTagged->fields[0].formerlySerializedAs[1] == "v2Hp" &&
+                    decTagged->fields[1].fieldTag == std::optional<std::int32_t>{202},
+            "decoded FieldTag / multi-FormerlySerializedAs mismatch");
+    }
+
+    // 3. Negative RS2698 & RS2699 diagnostics.
+    {
+        compiler::Compilation cRefField({{"BadBlitRef.rscript",
+            "module Test.BadBlitRef; [Blittable] public struct Bad { public string s; }"}});
+        require(hasDiagnosticCode(cRefField.build().diagnostics, "RS2698"), "expected RS2698 for string field");
+
+        compiler::Compilation cClassBlit({{"BadBlitCls.rscript",
+            "module Test.BadBlitCls; [Blittable] public class Bad { public int x; }"}});
+        require(hasDiagnosticCode(cClassBlit.build().diagnostics, "RS2698"), "expected RS2698 for class");
+
+        compiler::Compilation cEmptyBlit({{"BadBlitEmpty.rscript",
+            "module Test.BadBlitEmpty; [Blittable] public struct Empty {}"}});
+        require(hasDiagnosticCode(cEmptyBlit.build().diagnostics, "RS2698"), "expected RS2698 for empty struct");
+
+        compiler::Compilation cDupTag({{"BadDupTag.rscript",
+            "module Test.BadDupTag; public class C { [FieldTag(7)] public int a; [FieldTag(7)] public int b; }"}});
+        require(hasDiagnosticCode(cDupTag.build().diagnostics, "RS2699"), "expected RS2699 for duplicate FieldTag");
+
+        compiler::Compilation cNegTag({{"BadNegTag.rscript",
+            "module Test.BadNegTag; public class C { [FieldTag(-1)] public int a; }"}});
+        require(hasDiagnosticCode(cNegTag.build().diagnostics, "RS2699"), "expected RS2699 for negative FieldTag");
+
+        compiler::Compilation cStaticTag({{"BadStatTag.rscript",
+            "module Test.BadStatTag; public class C { [FieldTag(3)] public static int a = 1; }"}});
+        require(hasDiagnosticCode(cStaticTag.build().diagnostics, "RS2699"), "expected RS2699 for static FieldTag");
+    }
+
+    // 4. realscript.project.json + C11 kernel_fixture_macro_plugin + ModuleBuildCache invalidation + rsc --project.
+#ifdef REALSCRIPT_TEST_MACRO_PLUGIN_PATH
+    const std::filesystem::path pluginDllPath = REALSCRIPT_TEST_MACRO_PLUGIN_PATH;
+    require(std::filesystem::exists(pluginDllPath),
+        "REALSCRIPT_TEST_MACRO_PLUGIN_PATH missing: " + pluginDllPath.string());
+
+    FrontendTempDirGuard guard("project_macro_cache");
+    const auto cfgPath = guard.dir / "realscript.project.json";
+    const auto srcPath = guard.dir / "src" / "Hero.rscript";
+    const auto cacheDir = guard.dir / ".rs_cache";
+
+    writeFrontendTextFile(cfgPath,
+        "{\n"
+        "  \"macroPlugins\": [ \"" + jsonEscapePath(pluginDllPath) + "\" ]\n"
+        "}\n");
+
+    const std::string heroV1 = R"RS(
+module Test.ProjMacro;
+
+[AutoGetter("hp")]
+public partial class Hero {
+    public int hp = 88;
+}
+
+public int Run() {
+    var h = new Hero();
+    return h.GetHp() + plugin_magic(12);
+}
+)RS";
+    writeFrontendTextFile(srcPath, heroV1);
+
+    const auto discovered = compiler::discoverProjectConfigFile(srcPath);
+    require(discovered.has_value() && std::filesystem::equivalent(*discovered, cfgPath),
+        "discoverProjectConfigFile failed to locate realscript.project.json");
+    diagnostics::DiagnosticBag cfgDiag;
+    const auto loadedCfg = compiler::loadProjectConfigFile(*discovered, &cfgDiag);
+    require(loadedCfg.has_value() && !cfgDiag.hasErrors() &&
+                loadedCfg->nativeMacroPluginPaths.size() == 1u,
+        "loadProjectConfigFile failed");
+    const auto directPlugin = compiler::loadNativeCompilerMacroPlugin(pluginDllPath, &cfgDiag);
+    require(directPlugin != nullptr && !cfgDiag.hasErrors(),
+        "loadNativeCompilerMacroPlugin failed");
+
+    compiler::ModuleBuildCache cache(cacheDir);
+    compiler::ModuleBuildCacheOptions cacheOpts;
+    cacheOpts.cacheDirectory = cacheDir;
+
+    const auto build1 = cache.build({{srcPath.string(), heroV1}}, cacheOpts);
+    require(build1.succeeded(), "Project Macro build1 failed: " + diagnosticsText(build1.diagnostics));
+    require(build1.statistics.cacheMisses >= 1u, "expected cold cache miss on build1");
+    {
+        runtime::RuntimeError linkErr;
+        auto linked = runtime::ProgramImage::link(build1.bytecodeModules, linkErr);
+        require(linked.has_value(), "link build1 failed: " + linkErr.message);
+        auto macroProg = std::make_shared<const runtime::ProgramImage>(std::move(*linked));
+        runtime::Interpreter interp(macroProg);
+        const auto r = interp.invoke("Test.ProjMacro::Run", {});
+        require(r.succeeded && std::get<std::int64_t>(r.value) == (88 + 12 + 1337),
+            "expected AutoGetter + plugin_magic(12) == 1437");
+    }
+
+    const auto build2 = cache.build({{srcPath.string(), heroV1}}, cacheOpts);
+    require(build2.succeeded(), "build2 failed: " + diagnosticsText(build2.diagnostics));
+    require(build2.statistics.cacheHits >= 1u && build2.statistics.cacheMisses == 0u,
+        "expected warm cache hit on unchanged build2");
+
+    // Modify source -> invalidates cache fingerprint cleanly.
+    std::string heroV2 = heroV1;
+    const auto pos = heroV2.find("hp = 88;");
+    require(pos != std::string::npos, "missing replacement anchor");
+    heroV2.replace(pos, 8, "hp = 99;");
+    writeFrontendTextFile(srcPath, heroV2);
+    const auto build3 = cache.build({{srcPath.string(), heroV2}}, cacheOpts);
+    require(build3.succeeded(), "build3 failed: " + diagnosticsText(build3.diagnostics));
+    require(build3.statistics.cacheMisses >= 1u, "expected cache invalidation on edited source");
+
+    // Touch project config (fingerprint change) -> invalidates cache cleanly too!
+    writeFrontendTextFile(cfgPath,
+        "{\n"
+        "  \"disabledPacks\": [],\n"
+        "  \"macroPlugins\": [ \"" + jsonEscapePath(pluginDllPath) + "\" ]\n"
+        "}\n");
+    const auto build4 = cache.build({{srcPath.string(), heroV2}}, cacheOpts);
+    require(build4.succeeded(), "build4 failed: " + diagnosticsText(build4.diagnostics));
+    require(build4.statistics.cacheMisses >= 1u,
+        "expected ModuleBuildCache invalidation when realscript.project.json fingerprint changes");
+
+#ifdef REALSCRIPT_RSC_PATH
+    const std::string rscExe = REALSCRIPT_RSC_PATH;
+    if (!rscExe.empty()) {
+        const auto cliLog = guard.dir / "rsc_project.log";
+        const std::string cmd =
+            "\"" + rscExe + "\" \"" + srcPath.string() + "\" --project \"" + cfgPath.string() +
+            "\" --check > \"" + cliLog.string() + "\" 2>&1";
+        const int rc = runFrontendProcess(cmd);
+        require(rc == 0, "rsc --project --check failed on macro plugin project");
+    }
+#endif
+#endif
+}
+
 } // namespace
 
 int main() {
@@ -808,6 +1159,7 @@ int main() {
     run("Exact numerics & [ValueLifecycle] using protocol", testExactNumericsAndValueLifecycle);
     run("[StackOnly] Span<T>/ReadOnlySpan<T> traps, privacy & RS2692..RS2697", testStackOnlySpanAndAllEscapeGuards);
     run("ModulePackRegistry, CompilerSession, ICompilerMacroPlugin & partial diagnostics", testPacksSessionMacrosAndPartials);
+    run("[Blittable] layout, [FieldTag]/[FormerlySerializedAs] .rsbc, ProjectConfig & C11 macro cache", testBlittableSchemaEvolutionProjectConfigAndMacroCache);
 
     return failures == 0 ? 0 : 1;
 }

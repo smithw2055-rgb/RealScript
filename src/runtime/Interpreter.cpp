@@ -245,16 +245,15 @@ thread_local bool tlsInValueLifecycleDispose = false;
 
 } // namespace
 
-struct Interpreter::DispatchTarget {
-    Interpreter* interpreter = nullptr;
-};
-
-void Interpreter::registerValueLifecycleHooks() {
-    if (!program_ || !heap_) {
+void Interpreter::installValueLifecycleHooks(
+    const std::shared_ptr<const ProgramImage>& program,
+    const std::shared_ptr<ManagedHeap>& heap,
+    std::shared_ptr<DispatchTarget> target) {
+    if (!program || !heap || !target) {
         return;
     }
     std::vector<std::string> attrTargets;
-    for (const auto& mod : program_->modules()) {
+    for (const auto& mod : program->modules()) {
         for (const auto& attr : mod.languageMetadata.attributes) {
             if (isValueLifecycleAttrName(attr.name) && !attr.target.empty()) {
                 attrTargets.push_back(attr.target);
@@ -263,7 +262,7 @@ void Interpreter::registerValueLifecycleHooks() {
     }
 
     std::unordered_map<semantic::SymbolId, semantic::SymbolId> disposeByTypeId;
-    for (const auto& mod : program_->modules()) {
+    for (const auto& mod : program->modules()) {
         for (const auto& ts : mod.types) {
             if (ts.kind != semantic::TypeKind::Struct || ts.id == 0) {
                 continue;
@@ -271,9 +270,9 @@ void Interpreter::registerValueLifecycleHooks() {
             const std::string canonical = semantic::canonicalTypeName(ts);
             bool hasLifecycle = ts.hasValueLifecycle;
             if (!hasLifecycle) {
-                for (const auto& target : attrTargets) {
-                    if (targetMatchesLifecycleStruct(target, canonical) ||
-                        targetMatchesLifecycleStruct(target, ts.name)) {
+                for (const auto& targetName : attrTargets) {
+                    if (targetMatchesLifecycleStruct(targetName, canonical) ||
+                        targetMatchesLifecycleStruct(targetName, ts.name)) {
                         hasLifecycle = true;
                         break;
                     }
@@ -283,7 +282,7 @@ void Interpreter::registerValueLifecycleHooks() {
                 continue;
             }
 
-            heap_->registerValueLifecycleType(ts.id);
+            heap->registerValueLifecycleType(ts.id);
 
             semantic::SymbolId disposeId = 0;
             for (const auto& m : ts.methods) {
@@ -294,16 +293,16 @@ void Interpreter::registerValueLifecycleHooks() {
                 if (m.name == "Dispose" ||
                     endsWithSv(m.name, ".Dispose") ||
                     endsWithSv(m.name, "::Dispose")) {
-                    if (program_->resolveFunction(m.id) != nullptr) {
+                    if (program->resolveFunction(m.id) != nullptr) {
                         disposeId = m.id;
                         break;
                     }
                 }
             }
             if (disposeId == 0) {
-                if (const auto found = program_->findFunction(canonical + ".Dispose")) {
+                if (const auto found = program->findFunction(canonical + ".Dispose")) {
                     disposeId = *found;
-                } else if (const auto foundScope = program_->findFunction(canonical + "::Dispose")) {
+                } else if (const auto foundScope = program->findFunction(canonical + "::Dispose")) {
                     disposeId = *foundScope;
                 }
             }
@@ -316,20 +315,39 @@ void Interpreter::registerValueLifecycleHooks() {
     if (disposeByTypeId.empty()) {
         return;
     }
-    if (!dispatchTarget_) {
-        dispatchTarget_ = std::make_shared<DispatchTarget>(DispatchTarget{this});
-    } else {
-        dispatchTarget_->interpreter = this;
-    }
 
-    heap_->setValueLifecycleSweepCallback(
-        [weakTarget = std::weak_ptr<DispatchTarget>(dispatchTarget_),
+    heap->setValueLifecycleSweepCallback(
+        [weakTarget = std::weak_ptr<DispatchTarget>(target),
          disposeMap = std::move(disposeByTypeId)](const Value& sweptValue) {
             if (tlsInValueLifecycleDispose || sweptValue.rawTag() != ValueTag::Struct) {
                 return;
             }
-            const auto target = weakTarget.lock();
-            if (!target || !target->interpreter || !target->interpreter->program_) {
+            const auto locked = weakTarget.lock();
+            if (!locked) {
+                return;
+            }
+            Interpreter* rawInterp = nullptr;
+            std::shared_ptr<const ProgramImage> prog;
+            std::shared_ptr<ManagedHeap> targetHeap;
+            std::shared_ptr<const BindingRegistry> bindings;
+            std::shared_ptr<AsyncRuntimeContext> asyncRt;
+            {
+                std::lock_guard<std::mutex> guardLock(locked->mutex);
+                if (!locked->alive) {
+                    return;
+                }
+                rawInterp = locked->interpreter;
+                if (rawInterp != nullptr) {
+                    prog = rawInterp->program_;
+                    targetHeap = rawInterp->heap_;
+                } else {
+                    prog = locked->program;
+                    targetHeap = locked->heap;
+                    bindings = locked->bindings;
+                    asyncRt = locked->asyncRuntime;
+                }
+            }
+            if (!prog || !targetHeap) {
                 return;
             }
             const auto& st = sweptValue.asStructUnchecked();
@@ -337,7 +355,7 @@ void Interpreter::registerValueLifecycleHooks() {
             if (it == disposeMap.end() || it->second == 0) {
                 return;
             }
-            const auto* loc = target->interpreter->program_->resolveFunction(it->second);
+            const auto* loc = prog->resolveFunction(it->second);
             if (!loc || !loc->function) {
                 return;
             }
@@ -361,7 +379,7 @@ void Interpreter::registerValueLifecycleHooks() {
                             loc->function->parameterTypeIds.empty()
                                 ? 0
                                 : loc->function->parameterTypeIds[0];
-                        if (wrapperTypeId == 0 || !target->interpreter->heap_) {
+                        if (wrapperTypeId == 0) {
                             return;
                         }
                         std::vector<std::size_t> refFields;
@@ -369,7 +387,7 @@ void Interpreter::registerValueLifecycleHooks() {
                             refFields.push_back(0);
                         }
                         RuntimeError allocErr;
-                        const auto wrappedThis = target->interpreter->heap_->allocateObject(
+                        const auto wrappedThis = targetHeap->allocateObject(
                             wrapperTypeId,
                             std::vector<Value>{sweptValue},
                             std::move(refFields),
@@ -382,17 +400,60 @@ void Interpreter::registerValueLifecycleHooks() {
                         args.push_back(sweptValue);
                     }
                 }
-                (void)target->interpreter->invoke(it->second, args, std::move(opts));
+                if (rawInterp != nullptr) {
+                    (void)rawInterp->invoke(it->second, args, std::move(opts));
+                } else {
+                    Interpreter transientInvoker(
+                        EngineInvokeTag{},
+                        std::move(prog),
+                        std::move(targetHeap),
+                        std::move(bindings),
+                        std::move(asyncRt));
+                    (void)transientInvoker.invoke(it->second, args, std::move(opts));
+                }
             } catch (...) {
                 // Sweep finalizers must never propagate errors out of GC cycles.
             }
         });
 }
 
+void Interpreter::registerValueLifecycleHooks() {
+    if (!program_ || !heap_) {
+        return;
+    }
+    if (!dispatchTarget_) {
+        dispatchTarget_ = std::make_shared<DispatchTarget>();
+    }
+    {
+        std::lock_guard<std::mutex> lock(dispatchTarget_->mutex);
+        dispatchTarget_->interpreter = this;
+        dispatchTarget_->alive = true;
+    }
+    installValueLifecycleHooks(program_, heap_, dispatchTarget_);
+}
+
+Interpreter::Interpreter(
+    EngineInvokeTag,
+    std::shared_ptr<const ProgramImage> program,
+    std::shared_ptr<ManagedHeap> heap,
+    std::shared_ptr<const BindingRegistry> bindings,
+    std::shared_ptr<AsyncRuntimeContext> asyncRuntime)
+    : program_(std::move(program)),
+      bindings_(std::move(bindings)),
+      heap_(heap ? std::move(heap) : std::make_shared<ManagedHeap>()),
+      asyncRuntime_(std::move(asyncRuntime)) {
+    if (!asyncRuntime_) {
+        asyncRuntime_ = std::make_shared<AsyncRuntimeContext>(heap_.get());
+    }
+    if (heap_ && asyncRuntime_->awaitables().heap() == nullptr) {
+        asyncRuntime_->setHeap(heap_.get());
+    }
+}
+
 Interpreter::Interpreter(std::vector<bytecode::Module> modules)
     : heap_(std::make_shared<ManagedHeap>()),
       asyncRuntime_(std::make_shared<AsyncRuntimeContext>(heap_.get())),
-      dispatchTarget_(std::make_shared<DispatchTarget>(DispatchTarget{this})) {
+      dispatchTarget_(std::make_shared<DispatchTarget>(this)) {
     auto linked = ProgramImage::link(std::move(modules), programError_);
     if (linked) {
         program_ = std::make_shared<ProgramImage>(std::move(*linked));
@@ -410,7 +471,7 @@ Interpreter::Interpreter(
     : program_(std::move(program)),
       heap_(heap ? std::move(heap) : std::make_shared<ManagedHeap>()),
       asyncRuntime_(std::make_shared<AsyncRuntimeContext>(heap_.get())),
-      dispatchTarget_(std::make_shared<DispatchTarget>(DispatchTarget{this})) {
+      dispatchTarget_(std::make_shared<DispatchTarget>(this)) {
     if (!program_) {
         programError_.code = ErrorCode::InvalidProgram;
         programError_.message = "interpreter has no linked program image";
@@ -422,7 +483,9 @@ Interpreter::Interpreter(
 
 Interpreter::~Interpreter() {
     if (dispatchTarget_) {
+        std::lock_guard<std::mutex> lock(dispatchTarget_->mutex);
         dispatchTarget_->interpreter = nullptr;
+        dispatchTarget_->alive = false;
     }
 }
 
@@ -433,7 +496,7 @@ Interpreter::Interpreter(const Interpreter& other)
       bindings_(other.bindings_),
       heap_(other.heap_),
       asyncRuntime_(other.asyncRuntime_),
-      dispatchTarget_(std::make_shared<DispatchTarget>(DispatchTarget{this})) {
+      dispatchTarget_(std::make_shared<DispatchTarget>(this)) {
     registerValueLifecycleHooks();
 }
 
@@ -442,7 +505,9 @@ Interpreter& Interpreter::operator=(const Interpreter& other) {
         return *this;
     }
     if (dispatchTarget_) {
+        std::lock_guard<std::mutex> lock(dispatchTarget_->mutex);
         dispatchTarget_->interpreter = nullptr;
+        dispatchTarget_->alive = false;
     }
     program_ = other.program_;
     programError_ = other.programError_;
@@ -451,7 +516,7 @@ Interpreter& Interpreter::operator=(const Interpreter& other) {
     heap_ = other.heap_;
     asyncRuntime_ = other.asyncRuntime_;
     resumeEnv_.reset();
-    dispatchTarget_ = std::make_shared<DispatchTarget>(DispatchTarget{this});
+    dispatchTarget_ = std::make_shared<DispatchTarget>(this);
     registerValueLifecycleHooks();
     return *this;
 }
@@ -466,6 +531,7 @@ Interpreter::Interpreter(Interpreter&& other) noexcept
       resumeEnv_(std::move(other.resumeEnv_)),
       dispatchTarget_(std::move(other.dispatchTarget_)) {
     if (dispatchTarget_) {
+        std::lock_guard<std::mutex> lock(dispatchTarget_->mutex);
         dispatchTarget_->interpreter = this;
     }
 }
@@ -475,7 +541,9 @@ Interpreter& Interpreter::operator=(Interpreter&& other) noexcept {
         return *this;
     }
     if (dispatchTarget_) {
+        std::lock_guard<std::mutex> lock(dispatchTarget_->mutex);
         dispatchTarget_->interpreter = nullptr;
+        dispatchTarget_->alive = false;
     }
     program_ = std::move(other.program_);
     programError_ = std::move(other.programError_);
@@ -486,6 +554,7 @@ Interpreter& Interpreter::operator=(Interpreter&& other) noexcept {
     resumeEnv_ = std::move(other.resumeEnv_);
     dispatchTarget_ = std::move(other.dispatchTarget_);
     if (dispatchTarget_) {
+        std::lock_guard<std::mutex> lock(dispatchTarget_->mutex);
         dispatchTarget_->interpreter = this;
     }
     return *this;

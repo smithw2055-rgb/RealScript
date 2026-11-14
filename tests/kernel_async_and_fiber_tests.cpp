@@ -692,6 +692,162 @@ public async HostTaskInt ComputeSuspended(int seed) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 6. Pillar 2: IAwaitScheduler Faulted / Try-Finally & Delayed Resumption Parity
+// ---------------------------------------------------------------------------
+class FaultAwareAwaitScheduler final : public runtime::IAwaitScheduler {
+public:
+    bool allowCompleted = true;
+    bool shouldFault = false;
+    std::int64_t nextPayload = 0;
+    int suspendCalls = 0;
+    std::function<void()> savedResume;
+
+    bool handlesValue(const runtime::Value& awaited) const noexcept override {
+        return awaited.rawTag() == runtime::ValueTag::Struct;
+    }
+
+    bool isCompleted(const runtime::Value&) const noexcept override {
+        return allowCompleted;
+    }
+
+    bool tryGetResult(
+        const runtime::Value&,
+        bool hasResult,
+        runtime::Value& outResult,
+        runtime::RuntimeError& outError) override {
+        if (shouldFault) {
+            outError.code = runtime::ErrorCode::ScriptException;
+            outError.message = "scheduler-faulted";
+            return false;
+        }
+        if (hasResult) {
+            outResult = runtime::Value{nextPayload};
+        }
+        return true;
+    }
+
+    bool onSuspend(
+        const runtime::Value&,
+        std::function<void()> resumeCallback,
+        runtime::RuntimeError&) override {
+        ++suspendCalls;
+        savedResume = std::move(resumeCallback);
+        return true;
+    }
+};
+
+void testAwaitSchedulerFaultAndDelayedResumePaths() {
+    compiler::CompilationOptions noBuiltinAsync;
+    noBuiltinAsync.disabledPacks.insert("RealScript.Async");
+
+    const std::string src = R"RS(
+module Kernel.FaultSched;
+
+public class AwaitableAttribute {
+    public AwaitableAttribute() {}
+}
+
+[Awaitable]
+public struct NativeTaskInt {
+    public int Tag;
+    public NativeTaskInt(int t) { Tag = t; }
+    public static NativeTaskInt FromResult(int v) { return new NativeTaskInt(v); }
+    public bool IsCompleted() { return true; }
+    public int GetResult() { return Tag; }
+}
+
+public async NativeTaskInt RunDelayedOrFault(int mult, int[] cleanupFlag) {
+    try {
+        int val = await new NativeTaskInt(1);
+        return val * mult;
+    } finally {
+        cleanupFlag[0] = cleanupFlag[0] + 1;
+    }
+}
+)RS";
+
+    const auto bundle = compileAndLink({{"FaultSched.rscript", src}}, noBuiltinAsync);
+    auto asyncCtx = std::make_shared<runtime::AsyncRuntimeContext>();
+    runtime::Interpreter interp(bundle.program);
+    interp.setAsyncRuntime(asyncCtx);
+    auto& heap = *interp.heap();
+
+    // 1. Immediate fault propagates cleanly & runs finally block.
+    {
+        FaultAwareAwaitScheduler sched;
+        sched.allowCompleted = true;
+        sched.shouldFault = true;
+        runtime::ExecutionOptions opts;
+        opts.awaitScheduler = &sched;
+
+        auto flagArr = heap.allocateTypedArray(
+            semantic::stableTypeId("int[]"), semantic::PrimitiveType::Int, 0, 1, std::int64_t{0});
+        require(flagArr.has_value(), "allocate flagArr failed");
+        auto pin = heap.retain(runtime::Value{*flagArr});
+
+        const auto res = interp.invoke(
+            "Kernel.FaultSched::RunDelayedOrFault",
+            {runtime::Value{std::int64_t{3}}, runtime::Value{*flagArr}},
+            opts);
+        require(heap.arrayGet(*flagArr, 0) == std::optional<runtime::Value>{runtime::Value{std::int64_t{1}}},
+            "Expected finally block execution on immediate scheduler fault");
+        if (res.succeeded && res.value.rawTag() == runtime::ValueTag::Struct) {
+            const auto packed = runtime::structValueFieldAt(res.value.asStructUnchecked(), 0);
+            require(packed && std::holds_alternative<runtime::LongValue>(*packed),
+                "Missing packed AwaitableHandle on immediate faulted task");
+            const auto h = runtime::AwaitableHandle::unpack64(
+                static_cast<std::uint64_t>(std::get<runtime::LongValue>(*packed).value));
+            runtime::Value outVal;
+            runtime::RuntimeError outErr;
+            require(asyncCtx->awaitables().getResult(h, outVal, outErr) == runtime::AwaitStatus::Faulted &&
+                    outErr.message.find("scheduler-faulted") != std::string::npos,
+                "Expected immediate IAwaitScheduler fault propagation");
+        } else {
+            require(!res.succeeded && res.error.message.find("scheduler-faulted") != std::string::npos,
+                "Expected immediate IAwaitScheduler fault propagation");
+        }
+    }
+
+    // 2. Suspend then resume-into-fault marks outer Awaitable faulted & preserves finally cleanup.
+    {
+        FaultAwareAwaitScheduler sched;
+        sched.allowCompleted = false;
+        sched.shouldFault = false;
+        runtime::ExecutionOptions opts;
+        opts.awaitScheduler = &sched;
+
+        auto flagArr = heap.allocateTypedArray(
+            semantic::stableTypeId("int[]"), semantic::PrimitiveType::Int, 0, 1, std::int64_t{0});
+        require(flagArr.has_value(), "allocate flagArr failed");
+        auto pin = heap.retain(runtime::Value{*flagArr});
+
+        const auto res = interp.invoke(
+            "Kernel.FaultSched::RunDelayedOrFault",
+            {runtime::Value{std::int64_t{4}}, runtime::Value{*flagArr}},
+            opts);
+        require(res.succeeded && sched.suspendCalls == 1 && sched.savedResume != nullptr,
+            "Expected suspension on delayed fault test");
+        const auto packed = runtime::structValueFieldAt(res.value.asStructUnchecked(), 0);
+        require(packed && std::holds_alternative<runtime::LongValue>(*packed),
+            "Missing packed AwaitableHandle on suspended fault test");
+        const auto h = runtime::AwaitableHandle::unpack64(
+            static_cast<std::uint64_t>(std::get<runtime::LongValue>(*packed).value));
+
+        sched.allowCompleted = true;
+        sched.shouldFault = true;
+        sched.savedResume();
+
+        runtime::Value outVal;
+        runtime::RuntimeError outErr;
+        require(asyncCtx->awaitables().getResult(h, outVal, outErr) == runtime::AwaitStatus::Faulted &&
+                outErr.message.find("scheduler-faulted") != std::string::npos,
+            "Expected Faulted outer Awaitable after resumed scheduler fault");
+        require(heap.arrayGet(*flagArr, 0) == std::optional<runtime::Value>{runtime::Value{std::int64_t{1}}},
+            "Expected finally cleanup when resumed IAwaitScheduler faults");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -702,6 +858,7 @@ int main() {
             {"ParallelJobScheduler verifier, aliasing & multi-core parity", testParallelJobVerifierAliasingAndDeterminism},
             {"AwaitableCorePool ABA safety, GC roots & CancellationTokenSource", testAwaitablePoolAbaAndCancellation},
             {"IAwaitScheduler fast path & true suspension/resumption", testDuckTypedAwaitSchedulerFastAndSuspendedPaths},
+            {"Pillar 2: IAwaitScheduler immediate & resumed faults + finally cleanup", testAwaitSchedulerFaultAndDelayedResumePaths},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

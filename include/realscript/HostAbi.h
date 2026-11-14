@@ -237,6 +237,7 @@ enum {
     RS_VALUE_KIND_V2_NULL_ARRAY = 9,
     RS_VALUE_KIND_V2_FIXED16 = 10,
     RS_VALUE_KIND_V2_CHAR = 11,
+    RS_VALUE_KIND_V2_SPAN = 12,
 };
 
 typedef uint8_t RsTypeKindV2;

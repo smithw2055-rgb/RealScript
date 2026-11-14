@@ -3,6 +3,7 @@
 #include "realscript/bytecode/Bytecode.h"
 #include "realscript/runtime/AsyncRuntime.h"
 #include "realscript/runtime/Runtime.h"
+#include "realscript/semantic/Semantic.h"
 
 #include <atomic>
 #include <cctype>
@@ -23,17 +24,11 @@
 
 struct RsDomainOpaque {
     std::mutex mutex;
+    std::shared_ptr<realscript::runtime::ValuePoolDomain> valuePoolDomain;
     std::vector<std::weak_ptr<realscript::runtime::ManagedHeap>> heaps;
 };
 
 struct RsHeapOpaque {
-    struct NativeBufferRecord {
-        realscript::runtime::ObjectRef ref{};
-        void* dataPtr = nullptr;
-        std::size_t byteLength = 0;
-        bool readOnly = false;
-        bool revoked = false;
-    };
     struct CachedBlittableSchema {
         std::uint32_t strideBytes = 0;
         std::uint32_t blittableSchemaId = 0;
@@ -44,7 +39,6 @@ struct RsHeapOpaque {
 
     std::shared_ptr<realscript::runtime::ManagedHeap> heap;
     std::mutex v2Mutex;
-    std::vector<NativeBufferRecord> wrappedNativeBuffers;
     std::unordered_map<realscript::semantic::SymbolId, CachedBlittableSchema> blittableCache;
 };
 
@@ -170,12 +164,23 @@ NativeHandle fromAbiNativeHandle(RsNativeHandleV1 h) noexcept {
     return NativeHandle{h.slot, h.generation, h.type_id, h.registry_id};
 }
 
+std::optional<Value> readStructFieldForAbi(
+    const Value& v,
+    std::size_t fieldIndex) noexcept {
+    if (const auto* sv = std::get_if<StructValue>(&v)) {
+        return structValueFieldAt(*sv, fieldIndex);
+    }
+    return loadInlineStructField(v, fieldIndex);
+}
+
 RsStatusV1 marshalValueToAbi(
     ManagedHeap* targetHeapForTempStrings,
     const Value& v,
     RsValueV1* out) noexcept {
     if (!out) return RS_STATUS_V1_INVALID_ARGUMENT;
     std::memset(out, 0, sizeof(*out));
+    ScopedValuePoolDomain domainScope(
+        targetHeapForTempStrings ? targetHeapForTempStrings->valuePoolDomain() : nullptr);
     if (std::holds_alternative<std::monostate>(v)) {
         out->kind = RS_VALUE_KIND_V1_VOID;
         return RS_STATUS_V1_OK;
@@ -294,6 +299,24 @@ RsStatusV1 marshalValueToAbi(
         out->kind = RS_VALUE_KIND_V2_NULL_ARRAY;
         return RS_STATUS_V1_OK;
     }
+    if (v.rawTag() == ValueTag::Struct) {
+        const auto f0 = readStructFieldForAbi(v, 0);
+        const auto f1 = readStructFieldForAbi(v, 1);
+        const auto f2 = readStructFieldForAbi(v, 2);
+        const auto f3 = readStructFieldForAbi(v, 3);
+        if (f0 && f1 && f2 && !f3 &&
+            (f0->rawTag() == ValueTag::ObjectRef || f0->rawTag() == ValueTag::NullArray) &&
+            std::get_if<std::int64_t>(&*f1) &&
+            std::get_if<std::int64_t>(&*f2)) {
+            out->kind = RS_VALUE_KIND_V2_SPAN;
+            if (const auto* r = std::get_if<ObjectRef>(&*f0)) {
+                out->payload.obj_ref = toAbiObjectRef(*r);
+            } else {
+                out->payload.obj_ref = RsObjectRefV1{};
+            }
+            return RS_STATUS_V1_OK;
+        }
+    }
     return RS_STATUS_V1_RUNTIME_ERROR;
 }
 
@@ -335,6 +358,9 @@ bool marshalValueFromAbi(const RsValueV1& in, Value& out) noexcept {
     case RS_VALUE_KIND_V2_CHAR:
         out = Value{CharValue{static_cast<char16_t>(in.payload.u64_val)}};
         return true;
+    case RS_VALUE_KIND_V2_SPAN:
+        out = Value{fromAbiObjectRef(in.payload.obj_ref)};
+        return true;
     default:
         return false;
     }
@@ -344,6 +370,7 @@ bool coerceAbiValueForType(
     const RsValueV1& in,
     semantic::PrimitiveType expectedType,
     semantic::SymbolId expectedTypeId,
+    ManagedHeap* heap,
     Value& out) noexcept {
     Value raw{};
     if (!marshalValueFromAbi(in, raw)) return false;
@@ -507,6 +534,22 @@ bool coerceAbiValueForType(
         }
         if (in.kind == RS_VALUE_KIND_V1_INT64 && expectedTypeId == fixed64TypeId()) {
             out = Value{Fixed64Value{in.payload.i64_val}};
+            return true;
+        }
+        if (in.kind == RS_VALUE_KIND_V2_SPAN) {
+            if (!heap || expectedTypeId == 0) return false;
+            const ObjectRef bufRef = fromAbiObjectRef(in.payload.obj_ref);
+            if (!bufRef.valid()) {
+                out = heap->makeNativeSpanValue(expectedTypeId, ObjectRef{}, 0, 0);
+                return true;
+            }
+            const auto lenOpt = heap->arrayLength(bufRef);
+            if (!lenOpt ||
+                *lenOpt > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+                return false;
+            }
+            out = heap->makeNativeSpanValue(
+                expectedTypeId, bufRef, 0, static_cast<std::int32_t>(*lenOpt));
             return true;
         }
         out = std::move(raw);
@@ -752,6 +795,28 @@ void cAsyncResumeThunk(void* resumeCtx) noexcept {
     }
 }
 
+RsStatusV1 marshalAwaitedValueToAbi(
+    ManagedHeap* heap,
+    const Value& awaited,
+    RsValueV1* out) noexcept {
+    const RsStatusV1 direct = marshalValueToAbi(heap, awaited, out);
+    if (direct == RS_STATUS_V1_OK) {
+        return RS_STATUS_V1_OK;
+    }
+    if (awaited.rawTag() == ValueTag::Struct) {
+        if (const auto f0 = readStructFieldForAbi(awaited, 0)) {
+            if (marshalValueToAbi(heap, *f0, out) == RS_STATUS_V1_OK) {
+                return RS_STATUS_V1_OK;
+            }
+        }
+        std::memset(out, 0, sizeof(*out));
+        out->kind = RS_VALUE_KIND_V1_UINT64;
+        out->payload.u64_val = static_cast<uint64_t>(awaited.asStructUnchecked().typeId);
+        return RS_STATUS_V1_OK;
+    }
+    return direct;
+}
+
 class CAwaitSchedulerAdapter final : public IAwaitScheduler {
 public:
     CAwaitSchedulerAdapter(
@@ -765,7 +830,7 @@ public:
     [[nodiscard]] bool handlesValue(const Value& awaited) const noexcept override {
         if (!callbacks_.handles_value) return false;
         RsValueV1 abiVal{};
-        if (marshalValueToAbi(heap_, awaited, &abiVal) != RS_STATUS_V1_OK) {
+        if (marshalAwaitedValueToAbi(heap_, awaited, &abiVal) != RS_STATUS_V1_OK) {
             return false;
         }
         return callbacks_.handles_value(callbacks_.user_data, &abiVal) != 0;
@@ -774,7 +839,7 @@ public:
     [[nodiscard]] bool isCompleted(const Value& awaited) const noexcept override {
         if (!callbacks_.is_completed) return false;
         RsValueV1 abiVal{};
-        if (marshalValueToAbi(heap_, awaited, &abiVal) != RS_STATUS_V1_OK) {
+        if (marshalAwaitedValueToAbi(heap_, awaited, &abiVal) != RS_STATUS_V1_OK) {
             return false;
         }
         return callbacks_.is_completed(callbacks_.user_data, &abiVal) != 0;
@@ -791,7 +856,7 @@ public:
             return false;
         }
         RsValueV1 abiAwaited{};
-        if (marshalValueToAbi(heap_, awaited, &abiAwaited) != RS_STATUS_V1_OK) {
+        if (marshalAwaitedValueToAbi(heap_, awaited, &abiAwaited) != RS_STATUS_V1_OK) {
             outError.code = ErrorCode::InvalidArguments;
             outError.message = "failed to marshal custom awaitable to C11 ABI";
             return false;
@@ -833,7 +898,7 @@ public:
             return false;
         }
         RsValueV1 abiAwaited{};
-        if (marshalValueToAbi(heap_, awaited, &abiAwaited) != RS_STATUS_V1_OK) {
+        if (marshalAwaitedValueToAbi(heap_, awaited, &abiAwaited) != RS_STATUS_V1_OK) {
             outError.code = ErrorCode::InvalidArguments;
             outError.message = "failed to marshal custom awaitable to C11 ABI";
             return false;
@@ -911,6 +976,11 @@ public:
             outError.code = ErrorCode::TypeMismatch;
             outError.message = "custom C await scheduler returned unmarshalable carrier";
             return false;
+        }
+        if (returnTypeId != 0 && outWrapped.rawTag() != ValueTag::Struct) {
+            std::vector<Value> fields;
+            fields.push_back(std::move(outWrapped));
+            outWrapped = Value{makeStructValueFromFields(returnTypeId, std::move(fields))};
         }
         return true;
     }
@@ -1052,88 +1122,18 @@ std::optional<std::int32_t> extractFieldTagAttrValue(
     return std::nullopt;
 }
 
-bool computeProgramBlittableFieldOffsets(
-    const ProgramImage& prog,
-    const semantic::TypeSymbol& ts,
-    std::uint32_t& outSize,
-    std::uint32_t& outAlign,
-    std::vector<std::uint32_t>& outOffsets,
-    std::vector<semantic::SymbolId>& visiting) {
-    if (ts.kind != semantic::TypeKind::Struct) return false;
-    if (ts.id == fixedTypeId())   { outSize = 4;  outAlign = 4; return true; }
-    if (ts.id == fixed16TypeId()) { outSize = 8;  outAlign = 8; return true; }
-    if (ts.id == fixed64TypeId()) { outSize = 8;  outAlign = 8; return true; }
-    if (ts.id == vec2TypeId())    { outSize = 8;  outAlign = 4; return true; }
-    if (ts.id == vec3TypeId())    { outSize = 12; outAlign = 4; return true; }
-    if (ts.id == quatTypeId())    { outSize = 16; outAlign = 4; return true; }
-    if (ts.id == vec2fTypeId())   { outSize = 8;  outAlign = 4; return true; }
-    if (ts.id == vec3fTypeId())   { outSize = 12; outAlign = 4; return true; }
-    if (ts.id == quatfTypeId())   { outSize = 16; outAlign = 4; return true; }
-
-    for (const auto seen : visiting) {
-        if (seen == ts.id) return false;
-    }
-    visiting.push_back(ts.id);
-    std::uint32_t cursor = 0;
-    std::uint32_t maxAlign = 1;
-    outOffsets.clear();
-    outOffsets.reserve(ts.fields.size());
-
-    for (const auto& f : ts.fields) {
-        std::uint32_t fSize = 0;
-        std::uint32_t fAlign = 1;
-        switch (f.type) {
-        case semantic::PrimitiveType::Bool:
-        case semantic::PrimitiveType::Byte:
-        case semantic::PrimitiveType::SByte:   fSize = 1; fAlign = 1; break;
-        case semantic::PrimitiveType::Short:
-        case semantic::PrimitiveType::UShort:
-        case semantic::PrimitiveType::Char:    fSize = 2; fAlign = 2; break;
-        case semantic::PrimitiveType::Int:
-        case semantic::PrimitiveType::UInt:
-        case semantic::PrimitiveType::Float:
-        case semantic::PrimitiveType::Enum:    fSize = 4; fAlign = 4; break;
-        case semantic::PrimitiveType::Long:
-        case semantic::PrimitiveType::ULong:
-        case semantic::PrimitiveType::Double:  fSize = 8; fAlign = 8; break;
-        case semantic::PrimitiveType::Struct: {
-            const auto* nestedTs = prog.resolveType(exactFieldTypeId(f.type, f.typeName));
-            if (!nestedTs) {
-                visiting.pop_back();
-                return false;
-            }
-            std::vector<std::uint32_t> nestedOffsets;
-            if (!computeProgramBlittableFieldOffsets(
-                    prog, *nestedTs, fSize, fAlign, nestedOffsets, visiting)) {
-                visiting.pop_back();
-                return false;
-            }
-            break;
-        }
-        default:
-            visiting.pop_back();
-            return false;
-        }
-        cursor = (cursor + fAlign - 1u) & ~(fAlign - 1u);
-        outOffsets.push_back(cursor);
-        cursor += fSize;
-        if (fAlign > maxAlign) maxAlign = fAlign;
-    }
-    visiting.pop_back();
-    if (cursor == 0) cursor = 1;
-    outAlign = maxAlign;
-    outSize = (cursor + maxAlign - 1u) & ~(maxAlign - 1u);
-    return true;
-}
-
 void ensureProgramIntrospection(RsProgramOpaque* progHandle) {
     std::call_once(progHandle->introspectOnce, [progHandle]() {
         const ProgramImage& prog = *progHandle->program;
         static const char* const kFormerKeys[] = {"oldName", "name", "arg0"};
         std::unordered_map<std::string, std::vector<std::string>> formerByTarget;
         std::unordered_map<std::string, std::int32_t> tagByTarget;
+        semantic::TypeSymbolMap visibleTypes;
 
         for (const auto& mod : prog.modules()) {
+            for (const auto& ts : mod.types) {
+                visibleTypes.try_emplace(semantic::canonicalTypeName(ts), ts);
+            }
             for (const auto& attr : mod.languageMetadata.attributes) {
                 if (matchAttrTail(attr.name, "FormerlySerializedAs", "FormerlySerializedAsAttribute")) {
                     auto oldName = extractAttrStringArg(attr, kFormerKeys, 3);
@@ -1170,16 +1170,20 @@ void ensureProgramIntrospection(RsProgramOpaque* progHandle) {
                 } else {
                     tm.kind = RS_TYPE_KIND_V2_CLASS;
                 }
-                tm.isBlittable = isBlittableStructType(ts.id);
+                const auto layout = (ts.kind == semantic::TypeKind::Struct)
+                    ? semantic::computeBlittableStructLayout(ts, visibleTypes)
+                    : std::nullopt;
+                tm.isBlittable = (ts.kind == semantic::TypeKind::Struct) &&
+                    !ts.hasValueLifecycle &&
+                    layout.has_value() &&
+                    (ts.blittable || isBlittableStructType(ts.id));
 
-                std::vector<std::uint32_t> fieldOffsets;
-                std::uint32_t layoutSize = 0;
-                std::uint32_t layoutAlign = 1;
-                std::vector<semantic::SymbolId> visiting;
-                if (ts.kind == semantic::TypeKind::Struct &&
-                    computeProgramBlittableFieldOffsets(
-                        prog, ts, layoutSize, layoutAlign, fieldOffsets, visiting)) {
-                    tm.nativeByteSize = layoutSize;
+                std::unordered_map<std::string, std::uint32_t> offsetByField;
+                if (layout) {
+                    tm.nativeByteSize = layout->strideBytes;
+                    for (const auto& blf : layout->fields) {
+                        offsetByField.emplace(blf.name, blf.offsetBytes);
+                    }
                 }
 
                 tm.fields.reserve(ts.fields.size());
@@ -1192,16 +1196,30 @@ void ensureProgramIntrospection(RsProgramOpaque* progHandle) {
                     fm.primitiveKind = mapPrimitiveKindToV2(f.type);
                     fm.isSynthetic = f.synthetic;
                     fm.fieldIndex = static_cast<std::uint32_t>(f.index);
-                    if (fi < fieldOffsets.size()) {
-                        fm.byteOffset = fieldOffsets[fi];
+                    if (const auto offIt = offsetByField.find(f.name);
+                        offIt != offsetByField.end()) {
+                        fm.byteOffset = offIt->second;
                     }
 
                     const std::string ownTarget = tm.canonicalName + "::field:" + f.name;
                     const std::string declTarget = f.declaringTypeName.empty()
                         ? std::string()
                         : (f.declaringTypeName + "::field:" + f.name);
+                    std::string propTarget;
+                    std::string declPropTarget;
+                    if (f.synthetic && f.name.size() > 1u && f.name.front() == '$') {
+                        const std::string propName = f.name.substr(1u);
+                        propTarget = tm.canonicalName + "::property:" + propName;
+                        if (!f.declaringTypeName.empty()) {
+                            declPropTarget =
+                                f.declaringTypeName + "::property:" + propName;
+                        }
+                    }
 
-                    if (const auto tagIt = tagByTarget.find(ownTarget);
+                    if (f.fieldTag.has_value()) {
+                        fm.hasFieldTag = true;
+                        fm.fieldTag = *f.fieldTag;
+                    } else if (const auto tagIt = tagByTarget.find(ownTarget);
                         tagIt != tagByTarget.end()) {
                         fm.hasFieldTag = true;
                         fm.fieldTag = tagIt->second;
@@ -1212,15 +1230,36 @@ void ensureProgramIntrospection(RsProgramOpaque* progHandle) {
                             fm.fieldTag = dTagIt->second;
                         }
                     }
+                    if (!fm.hasFieldTag && !propTarget.empty()) {
+                        if (const auto pTagIt = tagByTarget.find(propTarget);
+                            pTagIt != tagByTarget.end()) {
+                            fm.hasFieldTag = true;
+                            fm.fieldTag = pTagIt->second;
+                        } else if (!declPropTarget.empty()) {
+                            if (const auto dpIt = tagByTarget.find(declPropTarget);
+                                dpIt != tagByTarget.end()) {
+                                fm.hasFieldTag = true;
+                                fm.fieldTag = dpIt->second;
+                            }
+                        }
+                    }
 
+                    const auto pushFormer = [&](const std::string& alias) {
+                        if (!alias.empty() &&
+                            std::find(fm.formerNames.begin(), fm.formerNames.end(), alias) ==
+                                fm.formerNames.end()) {
+                            fm.formerNames.push_back(alias);
+                        }
+                    };
+                    for (const auto& alias : f.formerlySerializedAs) {
+                        pushFormer(alias);
+                    }
                     const auto appendFormers = [&](const std::string& target) {
+                        if (target.empty()) return;
                         if (const auto it = formerByTarget.find(target);
                             it != formerByTarget.end()) {
                             for (const auto& alias : it->second) {
-                                if (std::find(fm.formerNames.begin(), fm.formerNames.end(), alias) ==
-                                    fm.formerNames.end()) {
-                                    fm.formerNames.push_back(alias);
-                                }
+                                pushFormer(alias);
                             }
                         }
                     };
@@ -1228,6 +1267,10 @@ void ensureProgramIntrospection(RsProgramOpaque* progHandle) {
                         appendFormers(declTarget);
                     }
                     appendFormers(ownTarget);
+                    if (!declPropTarget.empty() && declPropTarget != propTarget) {
+                        appendFormers(declPropTarget);
+                    }
+                    appendFormers(propTarget);
                     for (std::size_t ai = 0; ai < fm.formerNames.size(); ++ai) {
                         if (ai > 0) fm.formerNamesCsv.push_back(',');
                         fm.formerNamesCsv += fm.formerNames[ai];
@@ -1825,6 +1868,7 @@ RsStatusV1 invokeWithOptionsAndRecord(
 }
 
 RsStatusV1 coerceInvocationArgs(
+    ManagedHeap* heap,
     const bytecode::Function* fn,
     const RsValueV1* arguments,
     uint32_t argumentCount,
@@ -1836,7 +1880,7 @@ RsStatusV1 coerceInvocationArgs(
             const semantic::SymbolId pTid =
                 dstIdx < fn->parameterTypeIds.size() ? fn->parameterTypeIds[dstIdx] : 0;
             if (!coerceAbiValueForType(
-                    arguments[i], fn->parameterTypes[dstIdx], pTid, outCppArgs[dstIdx])) {
+                    arguments[i], fn->parameterTypes[dstIdx], pTid, heap, outCppArgs[dstIdx])) {
                 return RS_STATUS_V1_INVALID_ARGUMENT;
             }
         } else {
@@ -1866,6 +1910,8 @@ RsStatusV1 apiVmInvoke(
         return RS_STATUS_V1_INVALID_ARGUMENT;
     }
     try {
+        ScopedValuePoolDomain domainScope(
+            vm->heap ? vm->heap->valuePoolDomain() : nullptr);
         std::vector<Value> cppArgs(argumentCount);
         const bytecode::Function* fnMeta = nullptr;
         if (vm->program) {
@@ -1876,7 +1922,13 @@ RsStatusV1 apiVmInvoke(
             }
         }
         if (fnMeta && fnMeta->parameterTypes.size() == argumentCount) {
-            if (coerceInvocationArgs(fnMeta, arguments, argumentCount, 0u, cppArgs) !=
+            if (coerceInvocationArgs(
+                    vm->heap.get(),
+                    fnMeta,
+                    arguments,
+                    argumentCount,
+                    0u,
+                    cppArgs) !=
                 RS_STATUS_V1_OK) {
                 recordVmHostError(
                     vm,
@@ -1915,9 +1967,11 @@ RsStatusV1 apiVmInvoke(
 RsStatusV1 apiDomainCreate(RsDomainHandleV2* outDomain) noexcept {
     if (!outDomain) return RS_STATUS_V1_INVALID_ARGUMENT;
     try {
-        // TODO(wave2-glue): construct runtime::ValuePoolDomain inside RsDomainOpaque once rt-domain-gc merges.
+        auto poolDomain = ValuePoolDomain::create();
+        if (!poolDomain) return RS_STATUS_V1_OUT_OF_MEMORY;
         auto* dom = new (std::nothrow) RsDomainOpaque{};
         if (!dom) return RS_STATUS_V1_OUT_OF_MEMORY;
+        dom->valuePoolDomain = std::move(poolDomain);
         *outDomain = dom;
         return RS_STATUS_V1_OK;
     } catch (...) {
@@ -1926,7 +1980,12 @@ RsStatusV1 apiDomainCreate(RsDomainHandleV2* outDomain) noexcept {
 }
 
 void apiDomainDestroy(RsDomainHandleV2 domain) noexcept {
-    // TODO(wave2-glue): release domain-level ValuePoolDomain state once rt-domain-gc merges.
+    if (!domain) return;
+    {
+        std::lock_guard<std::mutex> lock(domain->mutex);
+        domain->heaps.clear();
+    }
+    domain->valuePoolDomain.reset();
     delete domain;
 }
 
@@ -1935,7 +1994,6 @@ RsStatusV1 apiDomainCollect(
     uint64_t* outReclaimedBytes) noexcept {
     if (!domain) return RS_STATUS_V1_INVALID_ARGUMENT;
     try {
-        // TODO(wave2-glue): delegate to ValuePoolDomain::collect() + cross-heap domain reclamation once rt-domain-gc merges.
         std::vector<std::shared_ptr<ManagedHeap>> liveHeaps;
         {
             std::lock_guard<std::mutex> lock(domain->mutex);
@@ -1950,6 +2008,7 @@ RsStatusV1 apiDomainCollect(
         }
         std::uint64_t totalReclaimed = 0;
         ShadowStack emptyRoots;
+        ScopedValuePoolDomain domainScope(domain->valuePoolDomain.get());
         for (const auto& h : liveHeaps) {
             const std::uint64_t before = h->statistics().bytesReclaimed;
             h->collectFull(emptyRoots);
@@ -1957,6 +2016,9 @@ RsStatusV1 apiDomainCollect(
             if (after >= before) {
                 totalReclaimed += (after - before);
             }
+        }
+        if (domain->valuePoolDomain) {
+            domain->valuePoolDomain->collectGarbage();
         }
         if (outReclaimedBytes) *outReclaimedBytes = totalReclaimed;
         return RS_STATUS_V1_OK;
@@ -1972,8 +2034,8 @@ RsStatusV1 apiHeapCreateInDomain(
     RsHeapHandleV1* outHeap) noexcept {
     if (!domain || !outHeap) return RS_STATUS_V1_INVALID_ARGUMENT;
     try {
-        // TODO(wave2-glue): bind created ManagedHeap to ValuePoolDomain once rt-domain-gc merges.
         HeapConfig cfg{};
+        cfg.valuePoolDomain = domain->valuePoolDomain;
         if (initialThresholdBytes > 0) cfg.initialCollectionThresholdBytes = initialThresholdBytes;
         if (maxHeapBytes > 0) cfg.maximumHeapBytes = maxHeapBytes;
         auto managed = std::make_shared<ManagedHeap>(cfg);
@@ -1995,13 +2057,9 @@ RsStatusV1 apiHeapTrimExcess(
     uint64_t* outTrimmedBytes) noexcept {
     if (!heap || !heap->heap) return RS_STATUS_V1_INVALID_ARGUMENT;
     try {
-        // TODO(wave2-glue): invoke heap->heap->trimExcessCapacity() once rt-domain-gc merges.
-        ShadowStack emptyRoots;
-        const std::uint64_t before = heap->heap->statistics().bytesReclaimed;
-        heap->heap->collectFull(emptyRoots);
-        const std::uint64_t after = heap->heap->statistics().bytesReclaimed;
+        const std::size_t trimmed = heap->heap->trimExcessCapacity();
         if (outTrimmedBytes) {
-            *outTrimmedBytes = (after >= before) ? (after - before) : 0u;
+            *outTrimmedBytes = static_cast<uint64_t>(trimmed);
         }
         return RS_STATUS_V1_OK;
     } catch (...) {
@@ -2276,6 +2334,8 @@ RsStatusV1 apiVmInvokeIdV2(
         return RS_STATUS_V1_INVALID_ARGUMENT;
     }
     try {
+        ScopedValuePoolDomain domainScope(
+            vm->heap ? vm->heap->valuePoolDomain() : nullptr);
         const auto sid = static_cast<semantic::SymbolId>(functionId);
         const auto* loc = vm->program->resolveFunction(sid);
         if (!loc || !loc->function) {
@@ -2287,7 +2347,13 @@ RsStatusV1 apiVmInvokeIdV2(
             return RS_STATUS_V1_INVALID_ARGUMENT;
         }
         std::vector<Value> cppArgs(argumentCount);
-        if (coerceInvocationArgs(loc->function, arguments, argumentCount, 0u, cppArgs) !=
+        if (coerceInvocationArgs(
+                vm->heap.get(),
+                loc->function,
+                arguments,
+                argumentCount,
+                0u,
+                cppArgs) !=
             RS_STATUS_V1_OK) {
             recordVmHostError(
                 vm,
@@ -2327,6 +2393,8 @@ RsStatusV1 apiVmInvokeMethodV2(
         return RS_STATUS_V1_INVALID_ARGUMENT;
     }
     try {
+        ScopedValuePoolDomain domainScope(
+            vm->heap ? vm->heap->valuePoolDomain() : nullptr);
         const ObjectRef recvRef = fromAbiObjectRef(receiver);
         const auto dynTid = vm->heap->objectTypeId(recvRef);
         if (!dynTid) {
@@ -2412,7 +2480,12 @@ RsStatusV1 apiVmInvokeMethodV2(
         std::vector<Value> cppArgs(static_cast<std::size_t>(argumentCount) + 1u);
         cppArgs[0] = Value{recvRef};
         if (coerceInvocationArgs(
-                loc ? loc->function : nullptr, arguments, argumentCount, 1u, cppArgs) !=
+                vm->heap.get(),
+                loc ? loc->function : nullptr,
+                arguments,
+                argumentCount,
+                1u,
+                cppArgs) !=
             RS_STATUS_V1_OK) {
             recordVmHostError(
                 vm,
@@ -2532,6 +2605,7 @@ RsStatusV1 apiHeapArrayGetV2(
     RsValueV1* outElement) noexcept {
     if (!heap || !heap->heap || !outElement) return RS_STATUS_V1_INVALID_ARGUMENT;
     try {
+        ScopedValuePoolDomain domainScope(heap->heap->valuePoolDomain());
         const auto ref = fromAbiObjectRef(arrayRef);
         const auto len = heap->heap->arrayLength(ref);
         if (!len) {
@@ -2555,6 +2629,7 @@ RsStatusV1 apiHeapArraySetV2(
     const RsValueV1* value) noexcept {
     if (!heap || !heap->heap || !value) return RS_STATUS_V1_INVALID_ARGUMENT;
     try {
+        ScopedValuePoolDomain domainScope(heap->heap->valuePoolDomain());
         const auto ref = fromAbiObjectRef(arrayRef);
         const auto len = heap->heap->arrayLength(ref);
         if (!len) {
@@ -2569,7 +2644,7 @@ RsStatusV1 apiHeapArraySetV2(
         const auto elemTid = heap->heap->arrayElementTypeId(ref);
         if (elemPrim && *elemPrim != semantic::PrimitiveType::Error) {
             if (!coerceAbiValueForType(
-                    *value, *elemPrim, elemTid.value_or(0), cppVal)) {
+                    *value, *elemPrim, elemTid.value_or(0), heap->heap.get(), cppVal)) {
                 return RS_STATUS_V1_INVALID_ARGUMENT;
             }
         } else if (!marshalValueFromAbi(*value, cppVal)) {
@@ -2633,6 +2708,7 @@ RsStatusV1 apiHeapPackBlittableStruct(
         return RS_STATUS_V1_INVALID_ARGUMENT;
     }
     try {
+        ScopedValuePoolDomain domainScope(heap->heap->valuePoolDomain());
         const auto sid = static_cast<semantic::SymbolId>(structTypeId);
         RsHeapOpaque::CachedBlittableSchema schema{};
         const RsStatusV1 schemaSt = resolveBlittableSchemaOnHeap(heap, sid, schema);
@@ -2650,21 +2726,29 @@ RsStatusV1 apiHeapPackBlittableStruct(
         const semantic::TypeSymbol* ts =
             (program && program->program) ? program->program->resolveType(sid) : nullptr;
         const FlatStructSchema* flatSchema = findFlatStructSchemaByTypeId(sid);
+        std::vector<const semantic::FieldSymbol*> instFields;
+        if (ts) {
+            instFields.reserve(ts->fields.size());
+            for (const auto& f : ts->fields) {
+                if (!f.staticField && !f.constField) instFields.push_back(&f);
+            }
+        }
         const std::size_t expectedFieldCount = ts
-            ? ts->fields.size()
+            ? instFields.size()
             : (flatSchema ? flatSchema->directFields.size() : 0);
         if (expectedFieldCount != fieldCount) {
             return RS_STATUS_V1_INVALID_ARGUMENT;
         }
         for (uint32_t fi = 0; fi < fieldCount; ++fi) {
             const semantic::PrimitiveType fType = ts
-                ? ts->fields[fi].type
+                ? instFields[fi]->type
                 : flatSchema->directFields[fi].type;
             const semantic::SymbolId fTypeId = ts
-                ? exactFieldTypeId(ts->fields[fi].type, ts->fields[fi].typeName)
+                ? exactFieldTypeId(instFields[fi]->type, instFields[fi]->typeName)
                 : flatSchema->directFields[fi].typeId;
             Value coerced{};
-            if (!coerceAbiValueForType(fieldValues[fi], fType, fTypeId, coerced)) {
+            if (!coerceAbiValueForType(
+                    fieldValues[fi], fType, fTypeId, heap->heap.get(), coerced)) {
                 return RS_STATUS_V1_INVALID_ARGUMENT;
             }
             const auto updated = storeInlineStructField(structVal, fi, coerced);
@@ -2702,6 +2786,7 @@ RsStatusV1 apiHeapUnpackBlittableStruct(
         return RS_STATUS_V1_INVALID_ARGUMENT;
     }
     try {
+        ScopedValuePoolDomain domainScope(heap->heap->valuePoolDomain());
         const auto sid = static_cast<semantic::SymbolId>(structTypeId);
         RsHeapOpaque::CachedBlittableSchema schema{};
         const RsStatusV1 schemaSt = resolveBlittableSchemaOnHeap(heap, sid, schema);
@@ -2711,8 +2796,14 @@ RsStatusV1 apiHeapUnpackBlittableStruct(
         const semantic::TypeSymbol* ts =
             (program && program->program) ? program->program->resolveType(sid) : nullptr;
         const FlatStructSchema* flatSchema = findFlatStructSchemaByTypeId(sid);
+        std::size_t instFieldCount = 0;
+        if (ts) {
+            for (const auto& f : ts->fields) {
+                if (!f.staticField && !f.constField) ++instFieldCount;
+            }
+        }
         const uint32_t nFields = ts
-            ? static_cast<uint32_t>(ts->fields.size())
+            ? static_cast<uint32_t>(instFieldCount)
             : (flatSchema ? static_cast<uint32_t>(flatSchema->directFields.size()) : 0u);
         *outFieldCount = nFields;
         if (!outFieldValues) return RS_STATUS_V1_OK;
@@ -2728,7 +2819,7 @@ RsStatusV1 apiHeapUnpackBlittableStruct(
             return RS_STATUS_V1_RUNTIME_ERROR;
         }
         for (uint32_t fi = 0; fi < nFields; ++fi) {
-            const auto fOpt = loadInlineStructField(unpacked, fi);
+            const auto fOpt = readStructFieldForAbi(unpacked, fi);
             if (!fOpt) return RS_STATUS_V1_RUNTIME_ERROR;
             const RsStatusV1 mst = marshalValueToAbi(
                 heap->heap.get(), *fOpt, &outFieldValues[fi]);
@@ -2750,32 +2841,17 @@ RsStatusV1 apiHeapWrapNativeBuffer(
         return RS_STATUS_V1_INVALID_ARGUMENT;
     }
     try {
-        // TODO(wave2-glue): forward directly to heap->heap->allocateNativeBufferView(dataPtr, byteLength, readOnly != 0) once rt-domain-gc merges.
+        NativeBufferViewDesc desc{};
+        desc.data = dataPtr;
+        desc.elementCount = byteLength;
+        desc.elementType = semantic::PrimitiveType::Byte;
+        desc.elementTypeId = 0;
+        desc.strideBytes = 1u;
+        desc.readOnly = (readOnly != 0);
         RuntimeError err;
-        const auto allocated = heap->heap->allocateTypedArray(
-            0,
-            semantic::PrimitiveType::Byte,
-            0,
-            byteLength,
-            Value{ByteValue{0}},
-            &err);
+        const auto allocated = heap->heap->allocateNativeBufferView(
+            semantic::stableTypeId("byte[]"), desc, &err);
         if (!allocated) return mapRuntimeError(err.code);
-        if (byteLength > 0 && dataPtr) {
-            PackedArrayFastView view{};
-            if (heap->heap->tryBindPackedArrayFastView(*allocated, view) && view.rawData) {
-                std::memcpy(view.rawData, dataPtr, byteLength);
-            } else {
-                const auto* src = static_cast<const uint8_t*>(dataPtr);
-                for (size_t i = 0; i < byteLength; ++i) {
-                    (void)heap->heap->arraySet(*allocated, i, Value{ByteValue{src[i]}}, &err);
-                }
-            }
-        }
-        {
-            std::lock_guard<std::mutex> lock(heap->v2Mutex);
-            heap->wrappedNativeBuffers.push_back(RsHeapOpaque::NativeBufferRecord{
-                *allocated, dataPtr, byteLength, readOnly != 0, false});
-        }
         *outBufferRef = toAbiObjectRef(*allocated);
         return RS_STATUS_V1_OK;
     } catch (...) {
@@ -2788,21 +2864,9 @@ RsStatusV1 apiHeapRevokeNativeBuffer(
     RsObjectRefV1 bufferRef) noexcept {
     if (!heap || !heap->heap) return RS_STATUS_V1_INVALID_ARGUMENT;
     try {
-        // TODO(wave2-glue): forward directly to heap->heap->revokeNativeBufferView(fromAbiObjectRef(bufferRef)) once rt-domain-gc merges.
-        const ObjectRef target = fromAbiObjectRef(bufferRef);
-        std::lock_guard<std::mutex> lock(heap->v2Mutex);
-        for (auto& rec : heap->wrappedNativeBuffers) {
-            if (rec.ref.slot == target.slot &&
-                rec.ref.generation == target.generation &&
-                rec.ref.heapId == target.heapId) {
-                if (rec.revoked) return RS_STATUS_V1_STALE_REFERENCE;
-                rec.revoked = true;
-                rec.dataPtr = nullptr;
-                rec.byteLength = 0;
-                return RS_STATUS_V1_OK;
-            }
-        }
-        return RS_STATUS_V1_STALE_REFERENCE;
+        return heap->heap->revokeNativeBufferView(fromAbiObjectRef(bufferRef))
+            ? RS_STATUS_V1_OK
+            : RS_STATUS_V1_STALE_REFERENCE;
     } catch (...) {
         return RS_STATUS_V1_RUNTIME_ERROR;
     }

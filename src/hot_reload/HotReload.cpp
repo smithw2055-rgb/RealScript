@@ -346,6 +346,15 @@ std::vector<std::string> lookupFormerFieldNames(
         }
     };
 
+    const bool isAutoPropBacking =
+        field.synthetic && field.name.size() > 1 && field.name.front() == '$';
+    for (const auto& alias : field.formerlySerializedAs) {
+        if (isAutoPropBacking) {
+            appendUnique("$" + alias);
+        }
+        appendUnique(alias);
+    }
+
     if (!field.declaringTypeName.empty()) {
         appendFromTarget(field.declaringTypeName + "::field:" + field.name, false);
     }
@@ -437,6 +446,9 @@ std::optional<std::int32_t> lookupFieldTag(
     const FieldTagsMap& map,
     const std::string& ownerCanonicalName,
     const semantic::FieldSymbol& field) {
+    if (field.fieldTag.has_value()) {
+        return field.fieldTag;
+    }
     const auto tryTarget = [&](const std::string& target) -> std::optional<std::int32_t> {
         const auto it = map.find(target);
         return it == map.end() ? std::nullopt : std::optional<std::int32_t>{it->second};

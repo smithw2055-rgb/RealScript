@@ -5,11 +5,13 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -536,6 +538,490 @@ public void MutateBossFlat(BossEntity b) {
     bossPin.reset();
 }
 
+// ---------------------------------------------------------------------------
+// 6. Pillar 1: ValuePoolDomain Concurrency, >20k Single-Shard Scaling,
+//    Large String Sweep Shrink & >70 Domain Cycle Epoch Isolation
+// ---------------------------------------------------------------------------
+std::uint64_t testFnv1a64(std::string_view text) noexcept {
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (const unsigned char ch : text) {
+        hash ^= static_cast<std::uint64_t>(ch);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+void testValuePoolDomainsConcurrencyScaleAndEpochIsolation() {
+    static_assert(sizeof(runtime::Value) == 16, "Value must remain 16 bytes");
+
+    auto domainA = runtime::ValuePoolDomain::create();
+    auto domainB = runtime::ValuePoolDomain::create();
+    require(domainA && domainB && domainA->domainId() != domainB->domainId(),
+        "Expected distinct non-default ValuePoolDomains");
+
+    runtime::HeapConfig cfgA;
+    cfgA.valuePoolDomain = domainA;
+    runtime::HeapConfig cfgB;
+    cfgB.valuePoolDomain = domainB;
+    runtime::ManagedHeap heapA(cfgA);
+    runtime::ManagedHeap heapB(cfgB);
+
+    // Concurrent GC on domainA while domainB allocates strings & arrays.
+    std::string threadErr;
+    std::thread tA([&]() {
+        try {
+            runtime::ScopedValuePoolDomain scope(domainA);
+            auto keepArr = heapA.allocateArray(16, runtime::Value{});
+            if (!keepArr) {
+                threadErr = "domainA keepArr alloc failed";
+                return;
+            }
+            auto keepPin = heapA.retain(runtime::Value{*keepArr});
+            for (int round = 0; round < 35; ++round) {
+                runtime::StringValue sv("domA_keep_" + std::to_string(round % 16));
+                heapA.arraySet(*keepArr, static_cast<std::size_t>(round % 16), runtime::Value{sv});
+                {
+                    auto tmpArr = heapA.allocateArray(8, runtime::Value{});
+                    if (tmpArr) {
+                        heapA.arraySet(
+                            *tmpArr,
+                            0,
+                            runtime::Value{runtime::StringValue(
+                                "domA_trash_" + std::to_string(round) + "_" + std::string(400, 'a'))});
+                    }
+                }
+                if ((round % 5) == 0) {
+                    runtime::RootSet emptyRoots;
+                    heapA.collect(emptyRoots);
+                    domainA->collectGarbage();
+                }
+            }
+            const auto checkVal = heapA.arrayGet(*keepArr, 3);
+            if (!checkVal || !std::holds_alternative<runtime::StringValue>(*checkVal) ||
+                std::get<runtime::StringValue>(*checkVal).str() != "domA_keep_3") {
+                threadErr = "domainA keepArr content corrupted during concurrent GC";
+            }
+        } catch (const std::exception& ex) {
+            threadErr = ex.what();
+        }
+    });
+
+    std::string threadBErr;
+    std::thread tB([&]() {
+        try {
+            runtime::ScopedValuePoolDomain scope(domainB);
+            auto arrB = heapB.allocateArray(1500, runtime::Value{});
+            if (!arrB) {
+                threadBErr = "domainB arr alloc failed";
+                return;
+            }
+            auto pinB = heapB.retain(runtime::Value{*arrB});
+            for (int i = 0; i < 1500; ++i) {
+                const std::string txt = "domB_item_" + std::to_string(i);
+                heapB.arraySet(*arrB, static_cast<std::size_t>(i),
+                    runtime::Value{runtime::StringValue(txt)});
+            }
+            for (int i = 0; i < 1500; ++i) {
+                const auto v = heapB.arrayGet(*arrB, static_cast<std::size_t>(i));
+                if (!v || !std::holds_alternative<runtime::StringValue>(*v) ||
+                    std::get<runtime::StringValue>(*v).str() != ("domB_item_" + std::to_string(i))) {
+                    threadBErr = "domainB string mismatch at index " + std::to_string(i);
+                    return;
+                }
+            }
+        } catch (const std::exception& ex) {
+            threadBErr = ex.what();
+        }
+    });
+    tA.join();
+    tB.join();
+    require(threadErr.empty(), "Concurrent domainA failure: " + threadErr);
+    require(threadBErr.empty(), "Concurrent domainB failure: " + threadBErr);
+
+    // >20,000 live strings in a SINGLE shard (>16,384 legacy cap).
+    {
+        runtime::ScopedValuePoolDomain scope(domainA);
+        constexpr std::size_t kTargetCount = 20500;
+        std::vector<std::string> shard0Keys;
+        shard0Keys.reserve(kTargetCount);
+        for (std::uint64_t cand = 0; shard0Keys.size() < kTargetCount; ++cand) {
+            std::string s = "sh0_" + std::to_string(cand);
+            if (((testFnv1a64(s) >> 60u) & 0xFu) == 0u) {
+                shard0Keys.push_back(std::move(s));
+            }
+        }
+        auto shardArr = heapA.allocateArray(kTargetCount, runtime::Value{});
+        require(shardArr.has_value(), "Failed allocating root array for 20,500 shard strings");
+        auto shardPin = heapA.retain(runtime::Value{*shardArr});
+        for (std::size_t i = 0; i < kTargetCount; ++i) {
+            heapA.arraySet(*shardArr, i, runtime::Value{runtime::StringValue(shard0Keys[i])});
+        }
+        runtime::RootSet roots;
+        heapA.collect(roots);
+        domainA->collectGarbage();
+        require(domainA->stats().liveStrings >= kTargetCount,
+            "Expected >= 20,500 live strings in single shard after GC mark");
+        for (std::size_t probe : {std::size_t{0}, std::size_t{8191}, std::size_t{16385}, std::size_t{20499}}) {
+            const auto readBack = heapA.arrayGet(*shardArr, probe);
+            require(readBack && std::holds_alternative<runtime::StringValue>(*readBack) &&
+                std::get<runtime::StringValue>(*readBack).str() == shard0Keys[probe],
+                "Single-shard >20k string lookup mismatch");
+        }
+    }
+
+    // Large string (>256B capacity) shrink & sweep inside an isolated domain.
+    {
+        auto shrinkDomain = runtime::ValuePoolDomain::create();
+        runtime::HeapConfig shrinkCfg;
+        shrinkCfg.valuePoolDomain = shrinkDomain;
+        runtime::ManagedHeap shrinkHeap(shrinkCfg);
+        runtime::ScopedValuePoolDomain scope(shrinkDomain);
+        {
+            auto bigArr = shrinkHeap.allocateArray(64, runtime::Value{});
+            require(bigArr.has_value(), "shrinkHeap array alloc failed");
+            auto pinBig = shrinkHeap.retain(runtime::Value{*bigArr});
+            for (int i = 0; i < 64; ++i) {
+                shrinkHeap.arraySet(
+                    *bigArr,
+                    static_cast<std::size_t>(i),
+                    runtime::Value{runtime::StringValue("big_payload_" + std::to_string(i) + "_" + std::string(2048, 'X'))});
+            }
+            require(shrinkDomain->stats().liveStrings >= 64u, "Expected large strings registered in domain");
+        }
+        runtime::RootSet emptyRoots;
+        shrinkHeap.collect(emptyRoots);
+        const auto beforeCount = shrinkDomain->stats().collectionCount;
+        shrinkDomain->collectGarbage();
+        const auto statsAfter = shrinkDomain->stats();
+        require(statsAfter.collectionCount > beforeCount && statsAfter.liveStrings == 0u,
+            "Expected large strings swept cleanly when orphaned");
+    }
+
+    // >70 sequential domain create/destroy cycles: verify 6-bit ID recycling + StringInternCache epoch isolation.
+    {
+        std::vector<std::uint64_t> lastEpochById(64u, 0u);
+        bool sawRecycledDomainId = false;
+        const std::string sharedKey = "tls_intern_cache_epoch_probe";
+        for (int cycle = 0; cycle < 76; ++cycle) {
+            auto dom = runtime::ValuePoolDomain::create();
+            const std::uint8_t id = dom->domainId();
+            const std::uint64_t epoch = dom->domainEpoch();
+            require(id > 0u && id < 64u && epoch > 0u, "Invalid domainId/domainEpoch");
+            if (lastEpochById[id] != 0u) {
+                require(epoch > lastEpochById[id], "Recycled domainId must advance domainEpoch");
+                sawRecycledDomainId = true;
+            }
+            lastEpochById[id] = epoch;
+
+            {
+                runtime::ScopedValuePoolDomain scope(dom);
+                runtime::StringValue sv(sharedKey);
+                require(sv.str() == sharedKey, "TLS intern cache returned corrupt value");
+                require(dom->stats().liveStrings >= 1u,
+                    "Recycled domainId must miss stale TLS StringInternCache entry via domainEpoch");
+            }
+        }
+        require(sawRecycledDomainId, "Expected >70 cycles to recycle at least one 6-bit domainId");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7. Pillar 2: [ValueLifecycle] ManagedHeap Sweep (Holder Class & Arrays)
+// ---------------------------------------------------------------------------
+void testValueLifecycleHeapSweepResourceServer() {
+    const std::string src = R"RS(
+module Kernel.ValueLifecycleGc;
+import RealScript.Resource;
+
+public class ResHolder {
+    public ResourceHandle Handle;
+    public ResHolder(ResourceHandle h) {
+        Handle = h;
+    }
+}
+
+public ResHolder CreateHolder(string path) {
+    return new ResHolder(ResourceHandle.Load(path));
+}
+
+public long SpawnOrphanArray(string path) {
+    ResourceHandle[] arr = new ResourceHandle[2];
+    arr[0] = ResourceHandle.Load(path);
+    arr[1] = arr[0].Retain();
+    return arr[0].ResourceId();
+}
+
+public int QueryUseCount(long resId) {
+    return ResourceServer.GetUseCount(resId);
+}
+
+public bool QueryDisposed(long resId) {
+    return ResourceServer.IsResourceDisposed(resId);
+}
+)RS";
+
+    auto program = compileAndLink({{"ValueLifecycleGc.rscript", src}});
+    runtime::EngineRuntime rt(program);
+    auto& heap = *rt.heap();
+
+    // 1. Orphaned ResourceHolder instance collected via GC -> Dispose() drops useCount to 0.
+    std::int64_t holderResId = 0;
+    {
+        auto pathRef = heap.allocateString("vl_holder_asset.png");
+        require(pathRef.has_value(), "allocateString failed");
+        const auto holderRes = rt.invoke("Kernel.ValueLifecycleGc::CreateHolder", {runtime::Value{*pathRef}});
+        require(holderRes.succeeded && std::holds_alternative<runtime::ObjectRef>(holderRes.value),
+            "CreateHolder failed: " + holderRes.error.message);
+        const auto holderObj = std::get<runtime::ObjectRef>(holderRes.value);
+        auto pin = heap.retain(runtime::Value{holderObj});
+
+        const auto hVal = heap.fieldGet(holderObj, 0);
+        require(hVal.has_value() && std::holds_alternative<runtime::StructValue>(*hVal),
+            "Missing ResourceHandle field");
+        const auto ridField = runtime::structValueFieldAt(std::get<runtime::StructValue>(*hVal), 1);
+        require(ridField.has_value() && std::holds_alternative<runtime::LongValue>(*ridField),
+            "Missing __resourceId field");
+        holderResId = std::get<runtime::LongValue>(*ridField).value;
+        require(holderResId > 0, "Expected positive resourceId");
+
+        const auto liveUse = rt.invoke("Kernel.ValueLifecycleGc::QueryUseCount",
+            {runtime::Value{runtime::LongValue{holderResId}}});
+        require(liveUse.succeeded && std::get<std::int64_t>(liveUse.value) == 1,
+            "Expected live useCount == 1 before GC");
+    }
+
+    {
+        runtime::RootSet emptyRoots;
+        heap.collect(emptyRoots);
+    }
+
+    const auto afterUse = rt.invoke("Kernel.ValueLifecycleGc::QueryUseCount",
+        {runtime::Value{runtime::LongValue{holderResId}}});
+    const auto afterDisposed = rt.invoke("Kernel.ValueLifecycleGc::QueryDisposed",
+        {runtime::Value{runtime::LongValue{holderResId}}});
+    require(afterUse.succeeded && std::get<std::int64_t>(afterUse.value) == 0,
+        "Expected GC sweep Dispose() to drop ResourceServer.GetUseCount to 0");
+    require(afterDisposed.succeeded && std::get<bool>(afterDisposed.value),
+        "Expected swept ResourceHandle resource to report IsResourceDisposed == true");
+
+    // 2. Orphaned ResourceHandle[] array collected via GC -> all elements Dispose().
+    auto arrPathRef = heap.allocateString("vl_array_asset.png");
+    require(arrPathRef.has_value(), "allocateString failed");
+    const auto spawnArrRes = rt.invoke("Kernel.ValueLifecycleGc::SpawnOrphanArray", {runtime::Value{*arrPathRef}});
+    require(spawnArrRes.succeeded && std::holds_alternative<runtime::LongValue>(spawnArrRes.value),
+        "SpawnOrphanArray failed: " + spawnArrRes.error.message);
+    const std::int64_t arrResId = std::get<runtime::LongValue>(spawnArrRes.value).value;
+
+    {
+        runtime::RootSet emptyRoots;
+        heap.collect(emptyRoots);
+    }
+
+    const auto arrUse = rt.invoke("Kernel.ValueLifecycleGc::QueryUseCount",
+        {runtime::Value{runtime::LongValue{arrResId}}});
+    require(arrUse.succeeded && std::get<std::int64_t>(arrUse.value) == 0,
+        "Expected GC sweep of ResourceHandle[] to dispose every element lease");
+}
+
+// ---------------------------------------------------------------------------
+// 8. Pillar 4: Zero-Copy NativeBufferView + Span<T> + ReadOnly + Revocation
+// ---------------------------------------------------------------------------
+void testZeroCopyNativeBufferViewsAndRevocation() {
+    const std::string src = R"RS(
+module Kernel.NativeSpanTest;
+import RealScript.Memory;
+
+[Blittable]
+public struct Particle {
+    public float X;
+    public float Y;
+    public int Id;
+}
+
+public float MutateFloatSpan(Span<float> s) {
+    float sum = 0.0f;
+    for (int i = 0; i < s.Length; i = i + 1) {
+        float v = s.Get(i);
+        s.Set(i, v * 2.0f + 1.0f);
+        sum = sum + s.Get(i);
+    }
+    return sum;
+}
+
+public float ReadFloatSpan(ReadOnlySpan<float> s) {
+    return s.Get(0) + s.Get(s.Length - 1);
+}
+
+public int MutateParticles(Span<Particle> s) {
+    int totalId = 0;
+    for (int i = 0; i < s.Length; i = i + 1) {
+        Particle p = s.Get(i);
+        p.X = p.X + 10.0f;
+        p.Y = p.Y * 3.0f;
+        p.Id = p.Id + i;
+        s.Set(i, p);
+        totalId = totalId + p.Id;
+    }
+    return totalId;
+}
+
+public void WriteFloatAt(Span<float> s, int idx, float v) {
+    s.Set(idx, v);
+}
+
+public float ReadFloatAt(Span<float> s, int idx) {
+    return s.Get(idx);
+}
+)RS";
+
+    auto program = compileAndLink({{"ValueLifecycleGc.rscript", src}});
+    runtime::EngineRuntime rt(program);
+    auto& heap = *rt.heap();
+
+    const semantic::SymbolId particleTid = semantic::stableTypeId("Kernel.NativeSpanTest::Particle");
+    const auto resolveParamTypeId = [&](const std::string& fnName) -> semantic::SymbolId {
+        if (const auto sid = program->findFunction(fnName)) {
+            if (const auto* loc = program->resolveFunction(*sid);
+                loc && loc->function && !loc->function->parameterTypeIds.empty()) {
+                return loc->function->parameterTypeIds[0];
+            }
+        }
+        return 0;
+    };
+    const semantic::SymbolId effSpanFloatTid =
+        resolveParamTypeId("Kernel.NativeSpanTest::MutateFloatSpan");
+    const semantic::SymbolId effRoSpanFloatTid =
+        resolveParamTypeId("Kernel.NativeSpanTest::ReadFloatSpan");
+    const semantic::SymbolId resolvedSpanParticleTid =
+        resolveParamTypeId("Kernel.NativeSpanTest::MutateParticles");
+    require(effSpanFloatTid != 0 && effRoSpanFloatTid != 0 && resolvedSpanParticleTid != 0,
+        "Expected resolved Span parameter type IDs");
+
+    // 1. Float[256] zero-copy NativeBufferView mutated in place via Span<float>.
+    std::vector<float> hostFloats(256u, 1.5f);
+    runtime::NativeBufferViewDesc floatDesc{};
+    floatDesc.data = hostFloats.data();
+    floatDesc.elementCount = hostFloats.size();
+    floatDesc.elementType = semantic::PrimitiveType::Float;
+    floatDesc.elementTypeId = 0;
+    floatDesc.strideBytes = sizeof(float);
+    floatDesc.readOnly = false;
+
+    runtime::RuntimeError nbErr;
+    const auto floatBufRef = heap.allocateNativeBufferView(
+        semantic::stableTypeId("float[]"), floatDesc, &nbErr);
+    require(floatBufRef.has_value(), "allocateNativeBufferView(float[]) failed: " + nbErr.message);
+    auto floatPin = heap.retain(runtime::Value{*floatBufRef});
+
+    const auto floatSpanVal = heap.makeNativeSpanValue(
+        effSpanFloatTid, *floatBufRef, 0, static_cast<std::int32_t>(hostFloats.size()));
+    const auto mutateRes = rt.invoke("Kernel.NativeSpanTest::MutateFloatSpan", {floatSpanVal});
+    require(mutateRes.succeeded, "MutateFloatSpan failed: " + mutateRes.error.message);
+    require(hostFloats[0] == 4.0f && hostFloats[255] == 4.0f,
+        "Expected in-place C++ float[256] mutation via Span<float>");
+
+    // 2. [Blittable] struct Particle[] zero-copy NativeBufferView mutated in place via Span<Particle>.
+    struct HostParticle {
+        float x;
+        float y;
+        std::int32_t id;
+    };
+    static_assert(sizeof(HostParticle) == 12, "Particle natural packed size mismatch");
+    std::vector<HostParticle> hostParticles(8u, HostParticle{1.0f, 2.0f, 10});
+    runtime::NativeBufferViewDesc partDesc{};
+    partDesc.data = hostParticles.data();
+    partDesc.elementCount = hostParticles.size();
+    partDesc.elementType = semantic::PrimitiveType::Struct;
+    partDesc.elementTypeId = particleTid;
+    partDesc.strideBytes = sizeof(HostParticle);
+    partDesc.readOnly = false;
+
+    const auto partBufRef = heap.allocateNativeBufferView(
+        semantic::stableTypeId("Kernel.NativeSpanTest::Particle[]"), partDesc, &nbErr);
+    require(partBufRef.has_value(), "allocateNativeBufferView(Particle[]) failed: " + nbErr.message);
+    auto partPin = heap.retain(runtime::Value{*partBufRef});
+
+    const auto partSpanVal = heap.makeNativeSpanValue(
+        resolvedSpanParticleTid, *partBufRef, 0, static_cast<std::int32_t>(hostParticles.size()));
+    const auto partMutRes = rt.invoke("Kernel.NativeSpanTest::MutateParticles", {partSpanVal});
+    require(partMutRes.succeeded, "MutateParticles failed: " + partMutRes.error.message);
+    require(hostParticles[0].x == 11.0f && hostParticles[0].y == 6.0f && hostParticles[0].id == 10 &&
+            hostParticles[7].x == 11.0f && hostParticles[7].y == 6.0f && hostParticles[7].id == 17,
+        "Expected in-place C++ Particle[] mutation via Span<Particle>");
+
+    // 3. ReadOnly NativeBufferView & ReadOnlySpan<float>: read succeeds, write rejected cleanly.
+    std::vector<float> roFloats(4u, 7.5f);
+    runtime::NativeBufferViewDesc roDesc{};
+    roDesc.data = roFloats.data();
+    roDesc.elementCount = roFloats.size();
+    roDesc.elementType = semantic::PrimitiveType::Float;
+    roDesc.strideBytes = sizeof(float);
+    roDesc.readOnly = true;
+
+    const auto roBufRef = heap.allocateNativeBufferView(
+        semantic::stableTypeId("float[]"), roDesc, &nbErr);
+    require(roBufRef.has_value(), "allocateNativeBufferView(ro float[]) failed: " + nbErr.message);
+    auto roPin = heap.retain(runtime::Value{*roBufRef});
+
+    const auto roSpanVal = heap.makeNativeSpanValue(
+        effRoSpanFloatTid, *roBufRef, 0, static_cast<std::int32_t>(roFloats.size()));
+    const auto roReadRes = rt.invoke("Kernel.NativeSpanTest::ReadFloatSpan", {roSpanVal});
+    require(roReadRes.succeeded, "ReadFloatSpan on readOnly native buffer failed");
+
+    const auto rwViewOfRoBuf = heap.makeNativeSpanValue(
+        effSpanFloatTid, *roBufRef, 0, static_cast<std::int32_t>(roFloats.size()));
+    const auto roWriteTrap = rt.invoke("Kernel.NativeSpanTest::WriteFloatAt",
+        {rwViewOfRoBuf, runtime::Value{std::int64_t{0}}, runtime::Value{runtime::FloatValue{99.0f}}});
+    require(!roWriteTrap.succeeded && roFloats[0] == 7.5f,
+        "Write to readOnly NativeBufferView must trap without mutating C++ memory");
+
+    // 4. Revocation traps deterministically with ErrorCode::InvalidObjectReference.
+    require(heap.revokeNativeBufferView(*floatBufRef), "revokeNativeBufferView failed");
+    require(heap.isNativeBufferViewRevoked(*floatBufRef), "Expected revoked flag on NativeBufferView");
+    const auto postRevokeRead = rt.invoke("Kernel.NativeSpanTest::ReadFloatAt",
+        {floatSpanVal, runtime::Value{std::int64_t{0}}});
+    require(!postRevokeRead.succeeded &&
+            postRevokeRead.error.code == runtime::ErrorCode::InvalidObjectReference,
+        "Post-revoke NativeBufferView access must trap with InvalidObjectReference");
+}
+
+// ---------------------------------------------------------------------------
+// 9. Pillar 6: ManagedHeap::trimExcessCapacity Reclamation & ABA Safety
+// ---------------------------------------------------------------------------
+void testManagedHeapTrimExcessCapacity() {
+    runtime::ManagedHeap heap;
+    {
+        std::vector<runtime::PersistentRoot> pins;
+        for (int i = 0; i < 1200; ++i) {
+            auto arr = heap.allocateArray(256, runtime::Value{std::int64_t{i}});
+            require(arr.has_value(), "burst array allocation failed");
+            if ((i % 4) == 0) {
+                pins.push_back(heap.retain(runtime::Value{*arr}));
+            }
+        }
+    }
+    runtime::RootSet emptyRoots;
+    heap.collect(emptyRoots);
+    const std::size_t trimmedBytes = heap.trimExcessCapacity();
+    require(trimmedBytes > 0u, "Expected trimExcessCapacity to reclaim > 0 bytes after burst peak");
+
+    // Verify subsequent allocations, weak references, and GC cycles remain ABA-safe.
+    auto obj1 = heap.allocateRecord(4u);
+    require(obj1.has_value(), "post-trim record alloc failed");
+    heap.fieldSet(*obj1, 0u, runtime::Value{std::int64_t{4242}});
+    const runtime::ObjectRef weak1 = *obj1;
+    {
+        auto pin1 = heap.retain(runtime::Value{*obj1});
+        heap.collect(emptyRoots);
+        require(heap.isAlive(weak1), "Pinned object ref must stay alive after GC");
+    }
+    heap.collect(emptyRoots);
+    require(!heap.isAlive(weak1), "Unpinned object ref must become stale after GC");
+    auto obj2 = heap.allocateRecord(4u);
+    require(obj2.has_value() && !heap.isAlive(weak1),
+        "Slot reuse after trimExcessCapacity must preserve generation ABA safety");
+}
+
 } // namespace
 
 int main() {
@@ -546,6 +1032,10 @@ int main() {
             {"Generational GC, write barriers & idle incremental budget", testGcWriteBarriersAndIncrementalBudget},
             {"Multi-heap NativeHandleRegistry, re-entrant sweep & generation safety", testNativeHandleReentrantSweepAndGenerationSafety},
             {"CrossHeapAccessPolicy (Host+VM) & FlatLoop dirty bitmask", testCrossHeapPolicyAndFlatLoopDirtyBitmask},
+            {"Pillar 1: ValuePoolDomain concurrency, >20k single shard, shrink & >70 cycles", testValuePoolDomainsConcurrencyScaleAndEpochIsolation},
+            {"Pillar 2: [ValueLifecycle] ManagedHeap sweep & ResourceServer useCount", testValueLifecycleHeapSweepResourceServer},
+            {"Pillar 4: Zero-copy NativeBufferView, Span<T>, readOnly & revocation", testZeroCopyNativeBufferViewsAndRevocation},
+            {"Pillar 6: ManagedHeap::trimExcessCapacity & ABA safety", testManagedHeapTrimExcessCapacity},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

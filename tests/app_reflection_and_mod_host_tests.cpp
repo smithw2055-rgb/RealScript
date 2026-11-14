@@ -558,6 +558,69 @@ public void bad() { throw "nope"; }
     std::cout << "[PASS] ModHost AST passes, capability gates, OOM/timeout isolation & marshaling\n";
 }
 
+void testModHostValuePoolDomainsAndUnload() {
+    plugin::ModHost host;
+
+    plugin::ModPackage modAlpha;
+    modAlpha.manifest.id = "mod.alpha";
+    modAlpha.manifest.version = {1, 0, 0};
+    modAlpha.manifest.maxHeapBytes = 2u * 1024u * 1024u;
+    modAlpha.manifest.tickInstructionBudget = 50000u;
+    modAlpha.sources.push_back({
+        "alpha.rscript",
+        R"(module Mod.Alpha;
+public string Greeting(string who) {
+    return "alpha:" + who;
+}
+)",
+    });
+
+    plugin::ModPackage modBeta;
+    modBeta.manifest.id = "mod.beta";
+    modBeta.manifest.version = {1, 0, 0};
+    modBeta.manifest.maxHeapBytes = 2u * 1024u * 1024u;
+    modBeta.manifest.tickInstructionBudget = 50000u;
+    modBeta.sources.push_back({
+        "beta.rscript",
+        R"(module Mod.Beta;
+public string Greeting(string who) {
+    return "beta:" + who;
+}
+)",
+    });
+
+    const auto loadRep = host.loadMods({modAlpha, modBeta});
+    RS_CHECK(loadRep.succeeded);
+
+    auto alphaHeap = host.modHeap("mod.alpha");
+    auto betaHeap = host.modHeap("mod.beta");
+    RS_CHECK(alphaHeap != nullptr && betaHeap != nullptr);
+    RS_CHECK(alphaHeap->valuePoolDomain() != nullptr && betaHeap->valuePoolDomain() != nullptr);
+
+    const std::uint8_t alphaId = alphaHeap->valuePoolDomain()->domainId();
+    const std::uint8_t betaId = betaHeap->valuePoolDomain()->domainId();
+    RS_CHECK(alphaId != 0u && betaId != 0u && alphaId != betaId);
+
+    const auto argA = alphaHeap->allocateString("one");
+    const auto argB = betaHeap->allocateString("two");
+    RS_CHECK(argA.has_value() && argB.has_value());
+    const auto resA = host.invokeModEndpoint("mod.alpha", "Mod.Alpha::Greeting", {runtime::Value{*argA}});
+    const auto resB = host.invokeModEndpoint("mod.beta", "Mod.Beta::Greeting", {runtime::Value{*argB}});
+    RS_CHECK(resA.status == plugin::BusCallStatus::Succeeded);
+    RS_CHECK(resB.status == plugin::BusCallStatus::Succeeded);
+
+    const std::weak_ptr<runtime::ValuePoolDomain> weakAlphaDomain = alphaHeap->valuePoolDomain();
+    alphaHeap.reset();
+    RS_CHECK(host.unloadMod("mod.alpha"));
+    RS_CHECK(!host.modHeap("mod.alpha"));
+    RS_CHECK(weakAlphaDomain.expired());
+
+    RS_CHECK(host.unloadMod("mod.beta"));
+    RS_CHECK(!host.modHeap("mod.beta"));
+
+    std::cout << "[PASS] Pillar 1: ModHost distinct ValuePoolDomains & clean domain teardown on unload\n";
+}
+
 } // namespace
 
 int main() {
@@ -566,6 +629,7 @@ int main() {
     testFastViewSafetyPolymorphismAndStaticConstructors();
     testSemVerAndKahnDagModPlanner();
     testModHostSandboxQuotasCircuitBreakerAndMarshaling();
+    testModHostValuePoolDomainsAndUnload();
     std::cout << "All app_reflection_and_mod_host_tests passed!\n";
     return 0;
 }

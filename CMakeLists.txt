@@ -496,11 +496,43 @@ if(REALSCRIPT_BUILD_TESTS)
     endif()
     add_test(NAME realscript.kernel.host-abi-c COMMAND realscript_kernel_host_abi_c_tests)
 
+    add_library(kernel_fixture_macro_plugin SHARED tests/fixtures/kernel_fixture_macro_plugin.c)
+    target_include_directories(
+        kernel_fixture_macro_plugin
+        PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    set_target_properties(
+        kernel_fixture_macro_plugin
+        PROPERTIES
+            C_STANDARD 11
+            C_STANDARD_REQUIRED YES
+            C_EXTENSIONS NO)
+    if(MSVC)
+        target_compile_options(kernel_fixture_macro_plugin PRIVATE /utf-8 /W4)
+        if(REALSCRIPT_WARNINGS_AS_ERRORS)
+            target_compile_options(kernel_fixture_macro_plugin PRIVATE /WX)
+        endif()
+    else()
+        target_compile_options(
+            kernel_fixture_macro_plugin PRIVATE -Wall -Wextra -Wpedantic)
+        if(REALSCRIPT_WARNINGS_AS_ERRORS)
+            target_compile_options(kernel_fixture_macro_plugin PRIVATE -Werror)
+        endif()
+    endif()
+
     realscript_add_cpp_test(
         realscript_kernel_compiler_frontend_tests
         realscript.kernel.compiler-frontend
         RealScript::Kernel
         tests/kernel_compiler_frontend_tests.cpp)
+    add_dependencies(
+        realscript_kernel_compiler_frontend_tests
+        kernel_fixture_macro_plugin
+        rsc)
+    target_compile_definitions(
+        realscript_kernel_compiler_frontend_tests
+        PRIVATE
+            REALSCRIPT_TEST_MACRO_PLUGIN_PATH="$<TARGET_FILE:kernel_fixture_macro_plugin>"
+            REALSCRIPT_RSC_PATH="$<TARGET_FILE:rsc>")
 
     realscript_add_cpp_test(
         realscript_kernel_mir_and_bytecode_tests
@@ -590,9 +622,14 @@ if(REALSCRIPT_BUILD_TESTS)
             realscript.app.tooling-and-lsp
             RealScript::Tooling
             tests/app_tooling_and_lsp_tests.cpp)
+        add_dependencies(
+            realscript_app_tooling_and_lsp_tests
+            kernel_fixture_macro_plugin)
         target_compile_definitions(
             realscript_app_tooling_and_lsp_tests
-            PRIVATE REALSCRIPT_RSC_PATH="$<TARGET_FILE:rsc>")
+            PRIVATE
+                REALSCRIPT_RSC_PATH="$<TARGET_FILE:rsc>"
+                REALSCRIPT_TEST_MACRO_PLUGIN_PATH="$<TARGET_FILE:kernel_fixture_macro_plugin>")
     endif()
 
     if(REALSCRIPT_ENABLE_EXTENSIBILITY)

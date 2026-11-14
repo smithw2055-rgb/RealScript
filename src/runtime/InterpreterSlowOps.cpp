@@ -1979,6 +1979,12 @@ std::string extractScriptExceptionMessage(const State& state, const Value& excVa
             }
         }
         if (!typeDesc->name.empty()) return typeDesc->name;
+    } else if (const auto f0 = state.heap->fieldGet(ref, 0)) {
+        if (const auto* sObj = std::get_if<ObjectRef>(&*f0)) {
+            if (const auto sv = state.heap->stringView(*sObj); sv && !sv->empty()) {
+                return std::string(*sv);
+            }
+        }
     }
     return "unhandled script exception in async function";
 }
@@ -2258,9 +2264,23 @@ bool resumeInterpreterAwaitable(
         RuntimeError schedErr;
         Value payload{};
         if (!state.awaitScheduler->tryGetResult(awaitableVal, hasResult, payload, schedErr)) {
+            const ErrorCode effCode =
+                schedErr.code == ErrorCode::None ? ErrorCode::ScriptException : schedErr.code;
+            if (effCode == ErrorCode::ScriptException && state.heap != nullptr) {
+                schedErr.code = effCode;
+                if (schedErr.message.empty()) {
+                    schedErr.message = "custom awaiter GetResult failed";
+                }
+                const auto matRef = materializeAsyncResumeException(
+                    state.heap, AwaitStatus::Faulted, schedErr, Value{});
+                if (matRef) {
+                    state.pendingException = Value(*matRef);
+                    return false;
+                }
+            }
             return fail(
                 state,
-                schedErr.code == ErrorCode::None ? ErrorCode::ScriptException : schedErr.code,
+                effCode,
                 schedErr.message.empty() ? "custom awaiter GetResult failed" : schedErr.message);
         }
         if (hasResult) {

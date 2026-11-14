@@ -415,6 +415,15 @@ template <typename LookupFn>
     if (fields.empty()) {
         return fail("blittable struct '" + canonicalTypeName(type) + "' must have at least one instance field");
     }
+    std::uint32_t mathSize = 0u;
+    std::uint32_t mathAlign = 1u;
+    if (typeId != 0 && classifyBuiltinMathStruct(typeId, mathSize, mathAlign)) {
+        if (fields.size() == 1u) {
+            fields[0].sizeBytes = mathSize;
+            fields[0].alignBytes = mathAlign;
+        }
+        return BlittableStructLayout{typeId, mathSize, mathAlign, std::move(fields)};
+    }
     const std::uint32_t stride = alignUpBlittable(offset, maxAlign);
     if (stride == 0u || stride > (1u << 20u)) {
         return fail("blittable struct '" + canonicalTypeName(type) + "' exceeds maximum blittable stride");

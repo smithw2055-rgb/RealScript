@@ -436,6 +436,281 @@ public int Compute(int x) {
         "AOT generated C++ emitted #line when emitLineDirectives=false");
 }
 
+// ---------------------------------------------------------------------------
+// 4. Pillar 2 & 4: AotRuntime IAwaitScheduler Parity (Immediate / Suspended /
+//    Faulted), AOT [ValueLifecycle] Sweep, & AotSimdVectorizer Span<T>
+// ---------------------------------------------------------------------------
+class ParityCustomAwaitScheduler final : public runtime::IAwaitScheduler {
+public:
+    semantic::SymbolId targetTaskTypeId = 0;
+    bool allowCompleted = true;
+    bool faultTryGet = false;
+    std::int64_t nextValue = 0;
+    int suspendCount = 0;
+    std::function<void()> savedResume;
+
+    bool handlesValue(const runtime::Value& awaited) const noexcept override {
+        return awaited.rawTag() == runtime::ValueTag::Struct &&
+            awaited.asStructUnchecked().typeId == targetTaskTypeId;
+    }
+
+    bool isCompleted(const runtime::Value&) const noexcept override {
+        return allowCompleted;
+    }
+
+    bool tryGetResult(
+        const runtime::Value& awaited,
+        bool hasResult,
+        runtime::Value& outResult,
+        runtime::RuntimeError& outError) override {
+        if (faultTryGet) {
+            outError.code = runtime::ErrorCode::ScriptException;
+            outError.message = "aot-vm-sched-fault";
+            return false;
+        }
+        if (hasResult) {
+            if (nextValue != 0) {
+                outResult = runtime::Value{nextValue};
+            } else {
+                const auto f0 = runtime::structValueFieldAt(awaited.asStructUnchecked(), 0);
+                if (f0 && std::holds_alternative<runtime::LongValue>(*f0)) {
+                    outResult = runtime::Value{std::get<runtime::LongValue>(*f0).value};
+                } else {
+                    outResult = runtime::Value{std::int64_t{0}};
+                }
+            }
+        }
+        return true;
+    }
+
+    bool onSuspend(
+        const runtime::Value&,
+        std::function<void()> resumeCallback,
+        runtime::RuntimeError&) override {
+        ++suspendCount;
+        savedResume = std::move(resumeCallback);
+        return true;
+    }
+
+    bool tryResolveAsyncReturn(
+        semantic::SymbolId,
+        const runtime::Value*,
+        runtime::Value&,
+        runtime::RuntimeError&) override {
+        return false;
+    }
+};
+
+void testAotAwaitSchedulerValueLifecycleAndSpanSimd() {
+    const std::string src = readFixtureFile("tests/fixtures/kernel_aot_suite.rscript");
+    auto vmProg = compileFixtureForVm("tests/fixtures/kernel_aot_suite.rscript", src);
+
+    runtime::EngineRuntime vm(vmProg);
+    aot::Program aotProg(kernel_aot_ns::KernelAotSuiteProgram());
+    auto aotHeap = std::make_shared<runtime::ManagedHeap>();
+    auto aotAsync = std::make_shared<runtime::AsyncRuntimeContext>();
+    aotProg.setHeap(aotHeap);
+    aotProg.setAsyncRuntime(aotAsync);
+
+    const auto taskTid = semantic::stableTypeId("Kernel.AotSuite::AotSchedTaskInt");
+
+    // 1. Custom C++ IAwaitScheduler parity (immediate-ready, suspended/resumed, faulted).
+    const auto runSchedImmediate = [&](auto& exec) -> std::int64_t {
+        ParityCustomAwaitScheduler sched;
+        sched.targetTaskTypeId = taskTid;
+        sched.allowCompleted = true;
+        sched.faultTryGet = false;
+        sched.nextValue = 30;
+        runtime::ExecutionOptions opts;
+        opts.awaitScheduler = &sched;
+        const auto res = exec.invoke(
+            "Kernel.AotSuite::ComputeAotSchedulerAsync",
+            {runtime::Value{std::int64_t{5}}, runtime::Value{runtime::LongValue{10}}},
+            opts);
+        require(res.succeeded && res.value.rawTag() == runtime::ValueTag::Struct,
+            "ComputeAotSchedulerAsync immediate failed: " + res.error.message);
+        const auto f0 = runtime::structValueFieldAt(res.value.asStructUnchecked(), 0);
+        require(f0 && std::holds_alternative<runtime::LongValue>(*f0),
+            "Missing AotSchedTaskInt.__handle on immediate");
+        const auto h = runtime::AwaitableHandle::unpack64(
+            static_cast<std::uint64_t>(std::get<runtime::LongValue>(*f0).value));
+        runtime::Value got;
+        runtime::RuntimeError gotErr;
+        require(exec.asyncRuntime()->awaitables().getResult(h, got, gotErr) == runtime::AwaitStatus::Succeeded &&
+                std::holds_alternative<std::int64_t>(got),
+            "Immediate ComputeAotSchedulerAsync Awaitable not completed");
+        return std::get<std::int64_t>(got);
+    };
+    require(runSchedImmediate(vm) == 40 && runSchedImmediate(aotProg) == 40,
+        "Immediate IAwaitScheduler parity mismatch between VM and AOT");
+
+    const auto runSchedSuspended = [&](auto& exec) -> std::int64_t {
+        ParityCustomAwaitScheduler sched;
+        sched.targetTaskTypeId = taskTid;
+        sched.allowCompleted = false;
+        sched.faultTryGet = false;
+        sched.nextValue = 77;
+        runtime::ExecutionOptions opts;
+        opts.awaitScheduler = &sched;
+        const auto res = exec.invoke(
+            "Kernel.AotSuite::ComputeAotSchedulerAsync",
+            {runtime::Value{std::int64_t{6}}, runtime::Value{runtime::LongValue{99}}},
+            opts);
+        require(res.succeeded && sched.suspendCount == 1 && sched.savedResume != nullptr,
+            "Expected ComputeAotSchedulerAsync to suspend on custom IAwaitScheduler");
+        const auto f0 = runtime::structValueFieldAt(res.value.asStructUnchecked(), 0);
+        require(f0 && std::holds_alternative<runtime::LongValue>(*f0),
+            "Missing AotSchedTaskInt.__handle on suspend");
+        const auto h = runtime::AwaitableHandle::unpack64(
+            static_cast<std::uint64_t>(std::get<runtime::LongValue>(*f0).value));
+        require(!exec.asyncRuntime()->awaitables().isCompleted(h),
+            "Outer AotSchedTaskInt must remain pending before resumeCallback");
+        sched.allowCompleted = true;
+        sched.savedResume();
+        exec.asyncRuntime()->stepResumeQueue(runtime::ResumeQueue::Update);
+        exec.asyncRuntime()->stepResumeQueue(runtime::ResumeQueue::Update);
+        runtime::Value got;
+        runtime::RuntimeError gotErr;
+        require(exec.asyncRuntime()->awaitables().getResult(h, got, gotErr) == runtime::AwaitStatus::Succeeded &&
+                std::holds_alternative<std::int64_t>(got),
+            "Resumed ComputeAotSchedulerAsync did not complete");
+        return std::get<std::int64_t>(got);
+    };
+    require(runSchedSuspended(vm) == 89 && runSchedSuspended(aotProg) == 89,
+        "Suspended/resumed IAwaitScheduler parity mismatch between VM and AOT");
+
+    const auto runSchedFaulted = [&](auto& exec) {
+        ParityCustomAwaitScheduler sched;
+        sched.targetTaskTypeId = taskTid;
+        sched.allowCompleted = true;
+        sched.faultTryGet = true;
+        runtime::ExecutionOptions opts;
+        opts.awaitScheduler = &sched;
+        const auto res = exec.invoke(
+            "Kernel.AotSuite::ComputeAotSchedulerAsync",
+            {runtime::Value{std::int64_t{1}}, runtime::Value{runtime::LongValue{1}}},
+            opts);
+        if (res.succeeded && res.value.rawTag() == runtime::ValueTag::Struct) {
+            const auto f0 = runtime::structValueFieldAt(res.value.asStructUnchecked(), 0);
+            require(f0 && std::holds_alternative<runtime::LongValue>(*f0),
+                "Missing AotSchedTaskInt.__handle on fault");
+            const auto h = runtime::AwaitableHandle::unpack64(
+                static_cast<std::uint64_t>(std::get<runtime::LongValue>(*f0).value));
+            runtime::Value got;
+            runtime::RuntimeError gotErr;
+            require(exec.asyncRuntime()->awaitables().getResult(h, got, gotErr) == runtime::AwaitStatus::Faulted &&
+                    gotErr.message.find("aot-vm-sched-fault") != std::string::npos,
+                "Expected identical Faulted Awaitable on VM & AOT: " + gotErr.message);
+        } else {
+            require(!res.succeeded && res.error.message.find("aot-vm-sched-fault") != std::string::npos,
+                "Expected identical scheduler fault on VM & AOT: " + res.error.message);
+        }
+    };
+    runSchedFaulted(vm);
+    runSchedFaulted(aotProg);
+
+    // 2. AOT [ValueLifecycle] heap-sweep Dispose() parity via ResourceServer.
+    {
+        auto path1 = aotHeap->allocateString("aot_holder_sweep.png");
+        require(path1.has_value(), "aotHeap allocateString failed");
+        const auto holderRes = aotProg.invoke("Kernel.AotSuite::SpawnAotOrphanHolder", {runtime::Value{*path1}});
+        require(holderRes.succeeded && std::holds_alternative<runtime::LongValue>(holderRes.value),
+            "SpawnAotOrphanHolder failed: " + holderRes.error.message);
+        const std::int64_t resId1 = std::get<runtime::LongValue>(holderRes.value).value;
+
+        auto path2 = aotHeap->allocateString("aot_array_sweep.png");
+        require(path2.has_value(), "aotHeap allocateString failed");
+        const auto arrRes = aotProg.invoke("Kernel.AotSuite::SpawnAotOrphanArray", {runtime::Value{*path2}});
+        require(arrRes.succeeded && std::holds_alternative<runtime::LongValue>(arrRes.value),
+            "SpawnAotOrphanArray failed: " + arrRes.error.message);
+        const std::int64_t resId2 = std::get<runtime::LongValue>(arrRes.value).value;
+
+        runtime::RootSet emptyRoots;
+        aotHeap->collect(emptyRoots);
+
+        const auto use1 = aotProg.invoke("Kernel.AotSuite::QueryAotResUseCount", {runtime::Value{runtime::LongValue{resId1}}});
+        const auto disp1 = aotProg.invoke("Kernel.AotSuite::QueryAotResDisposed", {runtime::Value{runtime::LongValue{resId1}}});
+        const auto use2 = aotProg.invoke("Kernel.AotSuite::QueryAotResUseCount", {runtime::Value{runtime::LongValue{resId2}}});
+        require(use1.succeeded && std::get<std::int64_t>(use1.value) == 0 &&
+                disp1.succeeded && std::get<bool>(disp1.value),
+            "Expected AOT GC sweep to Dispose() orphaned ResourceHandle in class");
+        require(use2.succeeded && std::get<std::int64_t>(use2.value) == 0,
+            "Expected AOT GC sweep to Dispose() orphaned ResourceHandle[] array elements");
+    }
+
+    // 3. AotSimdVectorizer Span<T> numeric loops verified via VM/AOT parity + codegen marker.
+    {
+        const auto resolveParamTypeId = [&](const std::string& fnName, std::size_t paramIdx) -> semantic::SymbolId {
+            if (const auto sid = vmProg->findFunction(fnName)) {
+                if (const auto* loc = vmProg->resolveFunction(*sid);
+                    loc && loc->function && paramIdx < loc->function->parameterTypeIds.size()) {
+                    return loc->function->parameterTypeIds[paramIdx];
+                }
+            }
+            return 0;
+        };
+        const semantic::SymbolId effSpanIntTid =
+            resolveParamTypeId("Kernel.AotSuite::SumIntSpan", 0);
+        const semantic::SymbolId effSpanFloatTid =
+            resolveParamTypeId("Kernel.AotSuite::ScaleFloatSpan", 0);
+        const semantic::SymbolId effRoFloatTid =
+            resolveParamTypeId("Kernel.AotSuite::ScaleFloatSpan", 2);
+        require(effSpanIntTid != 0 && effSpanFloatTid != 0 && effRoFloatTid != 0,
+            "Expected resolved Span parameter type IDs");
+
+        constexpr std::size_t kLen = 32;
+        const auto runSpan = [&](auto& exec, semantic::SymbolId intSpanId, semantic::SymbolId floatSpanId, semantic::SymbolId roFloatSpanId) -> std::pair<std::int64_t, float> {
+            auto h = exec.heap();
+            auto intArr = h->allocateTypedArray(semantic::stableTypeId("int[]"), semantic::PrimitiveType::Int, 0, kLen, std::int64_t{0});
+            auto srcArr = h->allocateTypedArray(semantic::stableTypeId("float[]"), semantic::PrimitiveType::Float, 0, kLen, runtime::Value{runtime::FloatValue{0.0f}});
+            auto dstArr = h->allocateTypedArray(semantic::stableTypeId("float[]"), semantic::PrimitiveType::Float, 0, kLen, runtime::Value{runtime::FloatValue{0.0f}});
+            require(intArr && srcArr && dstArr, "Span parity array alloc failed");
+            auto p1 = h->retain(runtime::Value{*intArr});
+            auto p2 = h->retain(runtime::Value{*srcArr});
+            auto p3 = h->retain(runtime::Value{*dstArr});
+            for (std::size_t i = 0; i < kLen; ++i) {
+                h->arraySet(*intArr, i, runtime::Value{static_cast<std::int64_t>(i + 1)});
+                h->arraySet(*srcArr, i, runtime::Value{runtime::FloatValue{static_cast<float>(i + 1)}});
+            }
+            const auto intSpan = h->makeNativeSpanValue(intSpanId, *intArr, 0, static_cast<std::int32_t>(kLen));
+            const auto dstSpan = h->makeNativeSpanValue(floatSpanId, *dstArr, 0, static_cast<std::int32_t>(kLen));
+            const auto srcSpan = h->makeNativeSpanValue(roFloatSpanId, *srcArr, 0, static_cast<std::int32_t>(kLen));
+
+            const auto sumRes = exec.invoke("Kernel.AotSuite::SumIntSpan", {intSpan});
+            require(sumRes.succeeded, "SumIntSpan failed: " + sumRes.error.message);
+            const auto scaleRes = exec.invoke(
+                "Kernel.AotSuite::ScaleFloatSpan",
+                {dstSpan, runtime::Value{runtime::FloatValue{2.0f}}, srcSpan});
+            require(scaleRes.succeeded, "ScaleFloatSpan failed: " + scaleRes.error.message);
+            return {
+                std::get<std::int64_t>(sumRes.value),
+                std::get<runtime::FloatValue>(scaleRes.value).value
+            };
+        };
+
+        const auto [vmSum, vmFloat] = runSpan(vm, effSpanIntTid, effSpanFloatTid, effRoFloatTid);
+        const auto [aotSum, aotFloat] = runSpan(aotProg, effSpanIntTid, effSpanFloatTid, effRoFloatTid);
+        require(vmSum == 528 && aotSum == 528, "SumIntSpan VM vs AOT mismatch");
+        require(vmFloat == aotFloat && std::abs(aotFloat - 1072.0f) < 0.01f,
+            "ScaleFloatSpan VM vs AOT mismatch");
+
+        compiler::Compilation comp({{"tests/fixtures/kernel_aot_suite.rscript", src}});
+        auto build = comp.build();
+        require(!build.diagnostics.hasErrors(), "AotSuite rebuild for vectorizer check failed");
+        diagnostics::DiagnosticBag optDiag;
+        optimization::Options optOpts;
+        optOpts.level = optimization::Level::Aggressive;
+        auto optResult = optimization::Optimizer{}.optimize(std::move(build.modules), optDiag, optOpts);
+        require(!optDiag.hasErrors(), "AotSuite optimization failed");
+        diagnostics::DiagnosticBag diag;
+        aot::CppGenerator gen;
+        const auto generated = gen.generate(optResult.modules, diag);
+        require(!diag.hasErrors(), "AOT C++ codegen failed: " + generated.source);
+        require(generated.source.find("SIMD Fast-Loop") != std::string::npos,
+            "Expected AotSimdVectorizer to emit SIMD Fast-Loop for Array/Span kernels");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -444,6 +719,7 @@ int main() {
             {"Kernel.AotSuite VM vs AOT parity & SIMD kernels", testAotSuiteParityAndSimdKernels},
             {"Kernel.AotTrusted TrustedRelease & scalar coroutines parity", testAotTrustedScalarCoroutinesParity},
             {"CppGenerator #line directive emission control", testAotCppLineDirectivesGeneration},
+            {"Pillar 2 & 4: AotRuntime IAwaitScheduler, [ValueLifecycle] sweep & Span SIMD", testAotAwaitSchedulerValueLifecycleAndSpanSimd},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

@@ -17,6 +17,7 @@
 #include <exception>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -378,6 +379,8 @@ struct FieldDescriptor {
     semantic::SymbolId typeId = 0;
     std::uint32_t index = 0;
     bool synthetic = false;
+    bool staticField = false;
+    bool constField = false;
 };
 
 struct EnumMemberDescriptor {
@@ -407,6 +410,7 @@ struct TypeDescriptor {
     const InterfaceDispatchDescriptor* interfaceDispatchMaps = nullptr;
     std::uint32_t interfaceDispatchMapCount = 0;
     bool delegateType = false;
+    bool hasValueLifecycle = false;
 };
 
 class ExecutionContext;
@@ -2274,6 +2278,11 @@ private:
 class Program {
 public:
     explicit Program(const ProgramDescriptor& descriptor);
+    ~Program();
+    Program(const Program&) = delete;
+    Program& operator=(const Program&) = delete;
+    Program(Program&&) = delete;
+    Program& operator=(Program&&) = delete;
 
     void setBindings(std::shared_ptr<const runtime::BindingRegistry> bindings);
     void setHeap(std::shared_ptr<runtime::ManagedHeap> heap);
@@ -2303,11 +2312,19 @@ public:
         runtime::ExecutionOptions options = {}) const;
 
 private:
+    struct LifecycleTarget {
+        std::mutex mutex;
+        const Program* program = nullptr;
+    };
+
+    void registerValueLifecycleHooks();
+
     const ProgramDescriptor* descriptor_ = nullptr;
     std::shared_ptr<const runtime::BindingRegistry> bindings_;
     std::shared_ptr<runtime::ManagedHeap> heap_;
     std::shared_ptr<runtime::AsyncRuntimeContext> asyncRuntime_;
     mutable std::shared_ptr<void> resumeEnv_;
+    std::shared_ptr<LifecycleTarget> lifecycleTarget_;
     std::unordered_map<std::string, semantic::SymbolId> names_;
     std::unordered_map<semantic::SymbolId, const TypeDescriptor*> types_;
     std::unordered_map<semantic::SymbolId, const FunctionDescriptor*> functions_;

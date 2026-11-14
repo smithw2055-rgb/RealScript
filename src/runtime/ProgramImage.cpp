@@ -301,16 +301,19 @@ bool validateObjectModel(
     {
         std::vector<std::pair<semantic::SymbolId, std::vector<BlittableFieldInput>>> structSpecs;
         for (const auto& [typeId, type] : types) {
-            if (type->kind != semantic::TypeKind::Struct) continue;
+            if (type->kind != semantic::TypeKind::Struct || type->hasValueLifecycle) continue;
             std::vector<BlittableFieldInput> fInputs;
             fInputs.reserve(type->fields.size());
             for (const auto& field : type->fields) {
+                if (field.staticField || field.constField) continue;
                 const semantic::SymbolId fTid = semantic::isExactType(field.type)
                     ? semantic::stableTypeId(field.typeName)
                     : 0;
                 fInputs.push_back(BlittableFieldInput{field.type, fTid});
             }
-            structSpecs.emplace_back(typeId, std::move(fInputs));
+            if (!fInputs.empty()) {
+                structSpecs.emplace_back(typeId, std::move(fInputs));
+            }
         }
         if (!structSpecs.empty()) {
             registerBlittableStructTypes(structSpecs);

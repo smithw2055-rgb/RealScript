@@ -1,5 +1,6 @@
 #include "realscript/bytecode/Bytecode.h"
 #include "realscript/compiler/Compilation.h"
+#include "realscript/compiler/ProjectConfig.h"
 #include "realscript/text/AssetGuid.h"
 #include "realscript/text/Text.h"
 #include "realscript/tooling/Formatter.h"
@@ -51,6 +52,10 @@ struct TempDirGuard {
 };
 
 void writeTextFile(const std::filesystem::path& path, const std::string& content) {
+    if (path.has_parent_path()) {
+        std::error_code ec;
+        std::filesystem::create_directories(path.parent_path(), ec);
+    }
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     RS_CHECK(out.is_open());
     out.write(content.data(), static_cast<std::streamsize>(content.size()));
@@ -621,6 +626,152 @@ void testRscCliFormatAndLintSmoke() {
 #endif
 }
 
+std::string jsonEscapeLspPath(const std::filesystem::path& p) {
+    const std::string raw = p.generic_string();
+    std::string out;
+    out.reserve(raw.size() + 8);
+    for (char ch : raw) {
+        if (ch == '\\' || ch == '"') out.push_back('\\');
+        out.push_back(ch);
+    }
+    return out;
+}
+
+void testProjectConfigMacroPluginsAndSkeletonFastpath() {
+#ifdef REALSCRIPT_TEST_MACRO_PLUGIN_PATH
+    const std::filesystem::path pluginPath = REALSCRIPT_TEST_MACRO_PLUGIN_PATH;
+    RS_CHECK(std::filesystem::exists(pluginPath));
+
+    TempDirGuard guard("rs_lsp_macro");
+    const auto cfgPath = guard.dir / "realscript.project.json";
+    writeTextFile(cfgPath,
+        "{\n"
+        "  \"macroPlugins\": [ \"" + jsonEscapeLspPath(pluginPath) + "\" ]\n"
+        "}\n");
+
+    const std::string actorSrc =
+        "module Tooling.MacroLsp;\n"
+        "\n"
+        "[AutoGetter(\"health\")]\n"
+        "public partial class Actor {\n"
+        "    public int health = 50;\n"
+        "    public int Compute() {\n"
+        "        int x = this.GetHealth() + plugin_magic(10);\n"
+        "        return x;\n"
+        "    }\n"
+        "}\n";
+    const auto actorPathFs = guard.dir / "src" / "Actor.rscript";
+    writeTextFile(actorPathFs, actorSrc);
+    const std::string actorPath = actorPathFs.generic_string();
+
+    // 1. LanguageService via loadProjectConfig(dir)
+    {
+        tooling::LanguageService svc;
+        diagnostics::DiagnosticBag cfgDiag;
+        RS_CHECK(svc.loadProjectConfig(guard.dir, &cfgDiag));
+        RS_CHECK(!cfgDiag.hasErrors());
+
+        svc.open(actorPath, actorSrc, 1);
+        const auto diags = svc.diagnostics(actorPath);
+        RS_CHECK(diags.empty());
+
+        const std::string dotLine = "        int x = this.GetHealth() + plugin_magic(10);";
+        const auto dotCol = dotLine.find("this.") + 5;
+        const auto comps = svc.completion(actorPath, text::LinePosition{6u, static_cast<std::uint32_t>(dotCol)});
+        bool hasGetHealth = false;
+        bool hasGetAutoValue = false;
+        for (const auto& c : comps) {
+            if (c.label == "GetHealth") hasGetHealth = true;
+            if (c.label == "GetAutoValue") hasGetAutoValue = true;
+        }
+        RS_CHECK(hasGetHealth && hasGetAutoValue);
+    }
+
+    // 2. LanguageService via explicit setCompilationOptions(CompilationOptions)
+    {
+        tooling::LanguageService manualSvc;
+        diagnostics::DiagnosticBag pluginDiag;
+        auto plugin = compiler::loadNativeCompilerMacroPlugin(pluginPath, &pluginDiag);
+        RS_CHECK(plugin != nullptr && !pluginDiag.hasErrors());
+
+        compiler::CompilationOptions opts;
+        opts.macroPlugins.push_back(std::move(plugin));
+        manualSvc.setCompilationOptions(std::move(opts));
+
+        manualSvc.open("ActorManual.rscript", actorSrc, 1);
+        RS_CHECK(manualSvc.diagnostics("ActorManual.rscript").empty());
+
+        const std::string dotLine = "        int x = this.GetHealth() + plugin_magic(10);";
+        const auto dotCol = dotLine.find("this.") + 5;
+        const auto comps = manualSvc.completion(
+            "ActorManual.rscript", text::LinePosition{6u, static_cast<std::uint32_t>(dotCol)});
+        bool hasGetHealth = false;
+        for (const auto& c : comps) {
+            if (c.label == "GetHealth") {
+                hasGetHealth = true;
+                break;
+            }
+        }
+        RS_CHECK(hasGetHealth);
+    }
+#endif
+
+    // 3. Declaration-skeleton fastpath: body-only edit increments peerRevalidationSkips(); signature edit does not.
+    {
+        tooling::LanguageService svcSkel;
+        const std::string peerV1 =
+            "module Tooling.SkelPeer;\n"
+            "public class Helper {\n"
+            "    public int Double(int v) {\n"
+            "        return v * 2;\n"
+            "    }\n"
+            "}\n";
+        const std::string mainSrc =
+            "module Tooling.SkelMain;\n"
+            "import Tooling.SkelPeer;\n"
+            "public class Caller {\n"
+            "    public int Run(Helper h) {\n"
+            "        return h.Double(4);\n"
+            "    }\n"
+            "}\n";
+
+        svcSkel.open("skel_peer.rscript", peerV1, 1);
+        svcSkel.open("skel_main.rscript", mainSrc, 1);
+        RS_CHECK(svcSkel.diagnostics("skel_peer.rscript").empty());
+        RS_CHECK(svcSkel.diagnostics("skel_main.rscript").empty());
+        const std::size_t skipsInitial = svcSkel.peerRevalidationSkips();
+
+        const std::string peerBodyEdit =
+            "module Tooling.SkelPeer;\n"
+            "public class Helper {\n"
+            "    public int Double(int v) {\n"
+            "        return v * 3 + 1;\n"
+            "    }\n"
+            "}\n";
+        svcSkel.update("skel_peer.rscript", peerBodyEdit, 2);
+        RS_CHECK(svcSkel.diagnostics("skel_peer.rscript").empty());
+        const std::size_t skipsAfterBody = svcSkel.peerRevalidationSkips();
+        RS_CHECK(skipsAfterBody > skipsInitial);
+
+        const std::string peerSigEdit =
+            "module Tooling.SkelPeer;\n"
+            "public class Helper {\n"
+            "    public int Double(int v) {\n"
+            "        return v * 3 + 1;\n"
+            "    }\n"
+            "    public int Extra(int k) {\n"
+            "        return k;\n"
+            "    }\n"
+            "}\n";
+        svcSkel.update("skel_peer.rscript", peerSigEdit, 3);
+        RS_CHECK(svcSkel.diagnostics("skel_peer.rscript").empty());
+        const std::size_t skipsAfterSig = svcSkel.peerRevalidationSkips();
+        RS_CHECK(skipsAfterSig == skipsAfterBody);
+    }
+
+    std::cout << "[PASS] Pillar 5: LanguageService project config, C11 macros & declaration-skeleton fastpath\n";
+}
+
 } // namespace
 
 int main() {
@@ -630,6 +781,7 @@ int main() {
     testLspServerFramingAndUtf16RoundTrip();
     testGovernanceFuzzerDifferentialAndMutation();
     testRscCliFormatAndLintSmoke();
+    testProjectConfigMacroPluginsAndSkeletonFastpath();
     std::cout << "All app_tooling_and_lsp_tests passed!\n";
     return 0;
 }

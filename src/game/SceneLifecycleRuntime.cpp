@@ -139,7 +139,11 @@ std::optional<std::int32_t> findFieldTagAttribute(
     const runtime::ProgramImage* program,
     const ScriptMetadataRegistry* metadata,
     const std::string& canonicalTypeName,
-    const std::string& fieldName) {
+    const std::string& fieldName,
+    const semantic::FieldSymbol* field = nullptr) {
+    if (field && field->fieldTag.has_value()) {
+        return field->fieldTag;
+    }
     if (metadata) {
         if (const auto* attributes = metadata->memberAttributes(canonicalTypeName, fieldName)) {
             for (const auto& attr : *attributes) {
@@ -198,35 +202,89 @@ std::optional<std::int32_t> findFieldTagAttribute(
 std::vector<std::string> findRenamedFieldSources(
     const ScriptMetadataRegistry& metadata,
     const std::string& canonicalTypeName,
-    const std::string& newFieldName) {
+    const std::string& newFieldName,
+    const semantic::FieldSymbol* field = nullptr,
+    const runtime::ProgramImage* program = nullptr) {
     std::vector<std::string> aliases;
-    const auto* attributes = metadata.memberAttributes(canonicalTypeName, newFieldName);
-    if (!attributes) return aliases;
     const auto appendAlias = [&](const std::string& alias) {
         if (!alias.empty() &&
             std::find(aliases.begin(), aliases.end(), alias) == aliases.end()) {
             aliases.push_back(alias);
         }
     };
-    static const char* const kKeys[] = {"oldName", "name", "arg0"};
-    for (const auto& attr : *attributes) {
-        if (!isSceneAttrNamed(attr.name, "FormerlySerializedAs")) continue;
-        bool extracted = false;
-        for (const char* key : kKeys) {
-            const auto found = attr.arguments.find(key);
-            if (found != attr.arguments.end()) {
-                if (const auto* str = std::get_if<std::string>(&found->second)) {
-                    appendAlias(*str);
-                    extracted = true;
-                    break;
+    if (field) {
+        for (const auto& alias : field->formerlySerializedAs) {
+            appendAlias(alias);
+        }
+    }
+    const auto* attributes = metadata.memberAttributes(canonicalTypeName, newFieldName);
+    if (attributes) {
+        static const char* const kKeys[] = {"oldName", "name", "arg0"};
+        for (const auto& attr : *attributes) {
+            if (!isSceneAttrNamed(attr.name, "FormerlySerializedAs")) continue;
+            bool extracted = false;
+            for (const char* key : kKeys) {
+                const auto found = attr.arguments.find(key);
+                if (found != attr.arguments.end()) {
+                    if (const auto* str = std::get_if<std::string>(&found->second)) {
+                        appendAlias(*str);
+                        extracted = true;
+                        break;
+                    }
+                }
+            }
+            if (!extracted) {
+                for (const auto& entry : attr.arguments) {
+                    if (const auto* str = std::get_if<std::string>(&entry.second)) {
+                        appendAlias(*str);
+                        break;
+                    }
                 }
             }
         }
-        if (!extracted) {
-            for (const auto& entry : attr.arguments) {
-                if (const auto* str = std::get_if<std::string>(&entry.second)) {
-                    appendAlias(*str);
-                    break;
+    }
+    if (program) {
+        static const char* const kAttrKeys[] = {"oldName", "name", "arg0"};
+        const std::string fieldTarget = canonicalTypeName + "::field:" + newFieldName;
+        const bool isAutoPropBacking = newFieldName.size() > 1 && newFieldName.front() == '$';
+        const std::string propTarget = isAutoPropBacking
+            ? (canonicalTypeName + "::property:" + newFieldName.substr(1))
+            : std::string{};
+        const auto unquoteArg = [](std::string val) -> std::string {
+            std::size_t b = 0;
+            std::size_t e = val.size();
+            while (b < e && std::isspace(static_cast<unsigned char>(val[b]))) ++b;
+            while (e > b && std::isspace(static_cast<unsigned char>(val[e - 1]))) --e;
+            val = val.substr(b, e - b);
+            if (val.size() >= 2 && val.front() == '"' && val.back() == '"') {
+                val = val.substr(1, val.size() - 2);
+            }
+            return val;
+        };
+        for (const auto& module : program->modules()) {
+            for (const auto& attr : module.languageMetadata.attributes) {
+                if (!isSceneAttrNamed(attr.name, "FormerlySerializedAs")) continue;
+                if (attr.target != fieldTarget &&
+                    (!isAutoPropBacking || attr.target != propTarget)) {
+                    continue;
+                }
+                bool extracted = false;
+                for (const char* key : kAttrKeys) {
+                    for (const auto& arg : attr.arguments) {
+                        if (arg.name == key) {
+                            auto v = unquoteArg(arg.value);
+                            if (!v.empty()) {
+                                appendAlias(v);
+                                extracted = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (extracted) break;
+                }
+                if (!extracted && !attr.arguments.empty()) {
+                    auto v = unquoteArg(attr.arguments.front().value);
+                    if (!v.empty()) appendAlias(v);
                 }
             }
         }
@@ -2860,7 +2918,7 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
                 continue;
             }
             const auto tag = findFieldTagAttribute(
-                oldProgramPtr.get(), nullptr, saved.canonicalTypeName, f.name);
+                oldProgramPtr.get(), nullptr, saved.canonicalTypeName, f.name, &f);
             if (!tag) continue;
             if (++tagCounts[*tag] == 1) {
                 saved.fieldNameByTag[*tag] = f.name;
@@ -3142,7 +3200,7 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
                     for (const auto& oldField : typeDesc.fields) {
                         if (!oldField.staticField || oldField.constField) continue;
                         const auto tag = findFieldTagAttribute(
-                            oldProgramPtr.get(), nullptr, oldCanon, oldField.name);
+                            oldProgramPtr.get(), nullptr, oldCanon, oldField.name, &oldField);
                         if (!tag) continue;
                         const auto key = std::make_pair(oldCanon, *tag);
                         if (++oldStaticTagCounts[key] == 1) {
@@ -3229,10 +3287,10 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
             const auto& newField = newFields[idx];
             if (newField.staticField || newField.constField) continue;
             auto newTag = findFieldTagAttribute(
-                newProgramPtr.get(), &mergedMetadata, newCanonicalName, newField.name);
+                newProgramPtr.get(), &mergedMetadata, newCanonicalName, newField.name, &newField);
             if (!newTag && newCanonicalName != saved.canonicalTypeName) {
                 newTag = findFieldTagAttribute(
-                    newProgramPtr.get(), &mergedMetadata, saved.canonicalTypeName, newField.name);
+                    newProgramPtr.get(), &mergedMetadata, saved.canonicalTypeName, newField.name, &newField);
             }
             if (!newTag) continue;
             const auto tagIt = saved.fieldNameByTag.find(*newTag);
@@ -3258,10 +3316,10 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
             if (matchedOldNames[idx]) continue;
             const auto& newField = newFields[idx];
             std::vector<std::string> aliases = findRenamedFieldSources(
-                mergedMetadata, newCanonicalName, newField.name);
+                mergedMetadata, newCanonicalName, newField.name, &newField, newProgramPtr.get());
             if (newCanonicalName != saved.canonicalTypeName) {
                 for (auto& extra : findRenamedFieldSources(
-                         mergedMetadata, saved.canonicalTypeName, newField.name)) {
+                         mergedMetadata, saved.canonicalTypeName, newField.name, &newField, newProgramPtr.get())) {
                     if (std::find(aliases.begin(), aliases.end(), extra) == aliases.end()) {
                         aliases.push_back(std::move(extra));
                     }
@@ -3782,10 +3840,10 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
                     for (const auto& newField : typeDesc.fields) {
                         if (!newField.staticField || newField.constField) continue;
                         auto newTag = findFieldTagAttribute(
-                            prog.get(), &mergedMetadata, canonicalType, newField.name);
+                            prog.get(), &mergedMetadata, canonicalType, newField.name, &newField);
                         if (!newTag && oldCanonicalType != canonicalType) {
                             newTag = findFieldTagAttribute(
-                                prog.get(), &mergedMetadata, oldCanonicalType, newField.name);
+                                prog.get(), &mergedMetadata, oldCanonicalType, newField.name, &newField);
                         }
                         if (!newTag) continue;
 
@@ -3828,10 +3886,10 @@ SceneHotReloadReport SceneScriptRuntime::hotReload(
                         if (!newField.staticField || newField.constField) continue;
                         if (heap->hasStaticField(newField.id)) continue;
                         std::vector<std::string> aliases = findRenamedFieldSources(
-                            mergedMetadata, canonicalType, newField.name);
+                            mergedMetadata, canonicalType, newField.name, &newField, prog.get());
                         if (oldCanonicalType != canonicalType) {
                             for (auto& extra : findRenamedFieldSources(
-                                     mergedMetadata, oldCanonicalType, newField.name)) {
+                                     mergedMetadata, oldCanonicalType, newField.name, &newField, prog.get())) {
                                 if (std::find(aliases.begin(), aliases.end(), extra) == aliases.end()) {
                                     aliases.push_back(std::move(extra));
                                 }

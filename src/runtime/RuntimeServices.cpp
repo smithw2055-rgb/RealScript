@@ -1891,10 +1891,52 @@ EngineRuntime::EngineRuntime(std::shared_ptr<const ProgramImage> program)
     : program_(std::move(program)),
       heap_(std::make_shared<ManagedHeap>()),
       nativeHandles_(std::make_shared<NativeHandleRegistry>()),
-      asyncRuntime_(std::make_shared<AsyncRuntimeContext>(heap_.get())) {}
+      asyncRuntime_(std::make_shared<AsyncRuntimeContext>(heap_.get())),
+      lifecycleTarget_(std::make_shared<Interpreter::DispatchTarget>()) {
+    registerValueLifecycleHooks();
+}
+
+EngineRuntime::~EngineRuntime() {
+    if (lifecycleTarget_) {
+        std::lock_guard<std::mutex> lock(lifecycleTarget_->mutex);
+        lifecycleTarget_->alive = false;
+        lifecycleTarget_->program.reset();
+        lifecycleTarget_->heap.reset();
+        lifecycleTarget_->bindings.reset();
+        lifecycleTarget_->asyncRuntime.reset();
+    }
+}
+
+void EngineRuntime::registerValueLifecycleHooks() {
+    std::shared_ptr<const ProgramImage> prog;
+    {
+        std::lock_guard<std::mutex> lock(programMutex_);
+        prog = program_;
+    }
+    if (!lifecycleTarget_) {
+        lifecycleTarget_ = std::make_shared<Interpreter::DispatchTarget>();
+    }
+    {
+        std::lock_guard<std::mutex> lock(lifecycleTarget_->mutex);
+        lifecycleTarget_->interpreter = nullptr;
+        lifecycleTarget_->program = prog;
+        lifecycleTarget_->heap = heap_;
+        lifecycleTarget_->bindings = bindings_;
+        lifecycleTarget_->asyncRuntime = asyncRuntime_;
+        lifecycleTarget_->alive = true;
+    }
+    if (prog && heap_) {
+        heap_->registerTypeHierarchy(*prog);
+        Interpreter::installValueLifecycleHooks(prog, heap_, lifecycleTarget_);
+    }
+}
 
 void EngineRuntime::setBindings(std::shared_ptr<const BindingRegistry> bindings) {
     bindings_ = std::move(bindings);
+    if (lifecycleTarget_) {
+        std::lock_guard<std::mutex> lock(lifecycleTarget_->mutex);
+        lifecycleTarget_->bindings = bindings_;
+    }
 }
 
 void EngineRuntime::setHeap(std::shared_ptr<ManagedHeap> heap) {
@@ -1903,6 +1945,7 @@ void EngineRuntime::setHeap(std::shared_ptr<ManagedHeap> heap) {
     if (asyncRuntime_) {
         asyncRuntime_->setHeap(heap_.get());
     }
+    registerValueLifecycleHooks();
 }
 
 std::shared_ptr<ManagedHeap> EngineRuntime::heap() const noexcept { return heap_; }
@@ -1924,6 +1967,10 @@ void EngineRuntime::setAsyncRuntime(
         ? std::move(asyncRuntime)
         : std::make_shared<AsyncRuntimeContext>(heap_.get());
     asyncRuntime_->setHeap(heap_.get());
+    if (lifecycleTarget_) {
+        std::lock_guard<std::mutex> lock(lifecycleTarget_->mutex);
+        lifecycleTarget_->asyncRuntime = asyncRuntime_;
+    }
 }
 
 std::shared_ptr<AsyncRuntimeContext> EngineRuntime::asyncRuntime() const noexcept {
@@ -1949,9 +1996,12 @@ ExecutionResult EngineRuntime::invoke(
             "entry function '" + qualifiedName + "' was not found";
         return result;
     }
-    Interpreter interpreter(std::move(program), heap_);
-    interpreter.setBindingRegistry(bindings_);
-    interpreter.setAsyncRuntime(asyncRuntime_);
+    Interpreter interpreter(
+        Interpreter::EngineInvokeTag{},
+        std::move(program),
+        heap_,
+        bindings_,
+        asyncRuntime_);
     return interpreter.invoke(*entry, arguments, std::move(options));
 }
 
@@ -1966,9 +2016,12 @@ ExecutionResult EngineRuntime::invoke(
         result.error.message = "runtime has no linked program image";
         return result;
     }
-    Interpreter interpreter(std::move(program), heap_);
-    interpreter.setBindingRegistry(bindings_);
-    interpreter.setAsyncRuntime(asyncRuntime_);
+    Interpreter interpreter(
+        Interpreter::EngineInvokeTag{},
+        std::move(program),
+        heap_,
+        bindings_,
+        asyncRuntime_);
     return interpreter.invoke(symbolId, arguments, std::move(options));
 }
 
@@ -1984,9 +2037,12 @@ std::shared_ptr<const ProgramImage> EngineRuntime::programSnapshot() const noexc
 
 void EngineRuntime::replaceProgram(std::shared_ptr<const ProgramImage> program) {
     if (!program) return;
-    std::lock_guard<std::mutex> lock(programMutex_);
-    if (program_) retiredPrograms_.push_back(program_);
-    program_ = std::move(program);
+    {
+        std::lock_guard<std::mutex> lock(programMutex_);
+        if (program_) retiredPrograms_.push_back(program_);
+        program_ = std::move(program);
+    }
+    registerValueLifecycleHooks();
 }
 
 bool EngineRuntime::replaceProgram(
@@ -2001,14 +2057,17 @@ bool EngineRuntime::replaceProgram(
         }
         return false;
     }
-    std::lock_guard<std::mutex> lock(programMutex_);
-    if (heap_ && !migrations.empty()) {
-        if (!heap_->migrateTypeLayouts(migrations, outStats, error)) {
-            return false;
+    {
+        std::lock_guard<std::mutex> lock(programMutex_);
+        if (heap_ && !migrations.empty()) {
+            if (!heap_->migrateTypeLayouts(migrations, outStats, error)) {
+                return false;
+            }
         }
+        if (program_) retiredPrograms_.push_back(program_);
+        program_ = std::move(program);
     }
-    if (program_) retiredPrograms_.push_back(program_);
-    program_ = std::move(program);
+    registerValueLifecycleHooks();
     return true;
 }
 

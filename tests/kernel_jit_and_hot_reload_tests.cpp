@@ -456,6 +456,143 @@ Actor Create() { return new Actor(); }
     }
 }
 
+void testHotReloadFieldTagAndMultiHopFormerlySerializedAs() {
+    // 1. Field rename matched solely via [FieldTag(N)] (no [FormerlySerializedAs]).
+    const std::string tagV1 = R"RS(
+module Kernel.HrTag;
+
+public class Hero {
+    [FieldTag(10)]
+    public int hp = 100;
+
+    [FieldTag(20)]
+    public string heroName = "Init";
+
+    public int ReadHp() { return hp; }
+    public string ReadHeroName() { return heroName; }
+}
+
+public Hero Create() {
+    var h = new Hero();
+    h.hp = 432;
+    h.heroName = "Knight";
+    return h;
+}
+)RS";
+    const std::string tagV2 = R"RS(
+module Kernel.HrTag;
+
+public class Hero {
+    [FieldTag(20)]
+    public string callsign = "Default";
+
+    [FieldTag(10)]
+    public int currentHealth = 1;
+
+    public int ReadCurrentHealth() { return currentHealth; }
+    public string ReadCallsign() { return callsign; }
+}
+
+public Hero Create() { return new Hero(); }
+)RS";
+
+    {
+        auto b1 = compileAndLink({{"hr_tag_v1.rscript", tagV1}}, optimization::Level::None);
+        auto b2 = compileAndLink({{"hr_tag_v2.rscript", tagV2}}, optimization::Level::None);
+        runtime::EngineRuntime rt(b1.program);
+        const auto createRes = rt.invoke("Kernel.HrTag::Create");
+        require(createRes.succeeded, "FieldTag Create failed");
+        const auto heroRef = std::get<runtime::ObjectRef>(createRes.value);
+        auto root = rt.heap()->retain(runtime::Value{heroRef});
+
+        hot_reload::ReloadOptions opts;
+        opts.allowStructuralChanges = true;
+        const auto plan = hot_reload::apply(rt, b2.bytecodeModules, opts);
+        require(plan.compatible, "FieldTag-only structural hot reload failed");
+
+        const auto hpRes = rt.invoke("Kernel.HrTag::Hero.ReadCurrentHealth", {runtime::Value{heroRef}});
+        require(hpRes.succeeded && std::get<std::int64_t>(hpRes.value) == 432,
+            "FieldTag(10) must preserve value 432 across reordered rename hp -> currentHealth");
+        const auto nameRes = rt.invoke("Kernel.HrTag::Hero.ReadCallsign", {runtime::Value{heroRef}});
+        require(nameRes.succeeded, "ReadCallsign failed");
+        const auto nameStr = rt.heap()->stringView(std::get<runtime::ObjectRef>(nameRes.value));
+        require(nameStr.has_value() && *nameStr == "Knight",
+            "FieldTag(20) must preserve string 'Knight' across heroName -> callsign");
+    }
+
+    // 2. Multi-hop [FormerlySerializedAs("v1")] [FormerlySerializedAs("v2")] matching a v1 instance directly to v3.
+    const std::string hopV1 = R"RS(
+module Kernel.HrMultiHop;
+
+public class Stats {
+    public int v1 = 10;
+}
+
+public Stats Create() {
+    var s = new Stats();
+    s.v1 = 777;
+    return s;
+}
+)RS";
+    const std::string hopV2 = R"RS(
+module Kernel.HrMultiHop;
+
+public class Stats {
+    [FormerlySerializedAs("v1")]
+    public int v2 = 20;
+}
+
+public Stats Create() { return new Stats(); }
+)RS";
+    const std::string hopV3 = R"RS(
+module Kernel.HrMultiHop;
+
+public class Stats {
+    [FormerlySerializedAs("v1")]
+    [FormerlySerializedAs("v2")]
+    public int v3 = 30;
+
+    public int ReadV3() { return v3; }
+}
+
+public Stats Create() { return new Stats(); }
+)RS";
+
+    // Path A: v1 -> v3 direct (matches first [FormerlySerializedAs("v1")]).
+    {
+        auto b1 = compileAndLink({{"hop_v1.rscript", hopV1}}, optimization::Level::None);
+        auto b3 = compileAndLink({{"hop_v3.rscript", hopV3}}, optimization::Level::None);
+        runtime::EngineRuntime rt(b1.program);
+        const auto sRef = std::get<runtime::ObjectRef>(rt.invoke("Kernel.HrMultiHop::Create").value);
+        auto root = rt.heap()->retain(runtime::Value{sRef});
+        hot_reload::ReloadOptions opts;
+        opts.allowStructuralChanges = true;
+        const auto plan = hot_reload::apply(rt, b3.bytecodeModules, opts);
+        require(plan.compatible, "Multi-hop direct v1 -> v3 hot reload failed");
+        const auto v3Res = rt.invoke("Kernel.HrMultiHop::Stats.ReadV3", {runtime::Value{sRef}});
+        require(v3Res.succeeded && std::get<std::int64_t>(v3Res.value) == 777,
+            "v1 -> v3 migration must preserve value 777 via first [FormerlySerializedAs]");
+    }
+
+    // Path B: v1 -> v2 (set v2 value = 888) -> v3 (matches second [FormerlySerializedAs("v2")]).
+    {
+        auto b1 = compileAndLink({{"hop_v1.rscript", hopV1}}, optimization::Level::None);
+        auto b2 = compileAndLink({{"hop_v2.rscript", hopV2}}, optimization::Level::None);
+        auto b3 = compileAndLink({{"hop_v3.rscript", hopV3}}, optimization::Level::None);
+        runtime::EngineRuntime rt(b1.program);
+        const auto sRef = std::get<runtime::ObjectRef>(rt.invoke("Kernel.HrMultiHop::Create").value);
+        auto root = rt.heap()->retain(runtime::Value{sRef});
+
+        hot_reload::ReloadOptions opts;
+        opts.allowStructuralChanges = true;
+        require(hot_reload::apply(rt, b2.bytecodeModules, opts).compatible, "v1 -> v2 reload failed");
+        require(hot_reload::apply(rt, b3.bytecodeModules, opts).compatible, "v2 -> v3 reload failed");
+        const auto v3Res = rt.invoke("Kernel.HrMultiHop::Stats.ReadV3", {runtime::Value{sRef}});
+        require(v3Res.succeeded && std::get<std::int64_t>(v3Res.value) == 777,
+            "v1 -> v2 -> v3 migration must preserve 777 across multi-hop [FormerlySerializedAs]");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -464,6 +601,7 @@ int main() {
             {"StencilJit Tier-1/Tier-2/Simulated ARM64 & budget parity", testStencilJitTiersAndSimulatedArm64Parity},
             {"ToolchainJit shell-free hardening & AOT sync header diet", testToolchainJitShellFreeAndHeaderDiet},
             {"HotReload -O2 inline invalidation, structural migration & active sequence", testHotReloadInlineStructuralAndSequences},
+            {"HotReload Pillar 6: [FieldTag(N)] rename & multi-hop [FormerlySerializedAs]", testHotReloadFieldTagAndMultiHopFormerlySerializedAs},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

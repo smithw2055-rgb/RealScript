@@ -84,7 +84,12 @@ std::string canonicalInput(
                 ":abstract=" + (type.abstractType ? "1" : "0") +
                 ":sealed=" + (type.sealedType ? "1" : "0") +
                 ":delegate=" + (type.delegateType ? "1" : "0") +
-                ":interface=" + (type.interfaceType ? "1" : "0") + ":";
+                ":interface=" + (type.interfaceType ? "1" : "0") +
+                ":lifecycle=" + (type.hasValueLifecycle ? "1" : "0") + ":";
+            for (const auto& field : type.fields) {
+                value += field.name +
+                    (field.staticField ? ":s;" : (field.constField ? ":c;" : ";"));
+            }
             for (const auto symbolId : type.virtualDispatchTable) {
                 value += std::to_string(symbolId) + ";";
             }
@@ -228,8 +233,25 @@ GeneratedProgram CppGenerator::generate(
 
     std::vector<FunctionView> functions;
     std::map<semantic::SymbolId, TypeView> types;
+    std::set<std::string> lifecycleTargets;
     std::set<semantic::SymbolId> symbols;
+    const auto isValueLifecycleAttrName = [](std::string_view attrName) noexcept {
+        if (attrName == "ValueLifecycle" || attrName == "ValueLifecycleAttribute") {
+            return true;
+        }
+        const auto sep = attrName.rfind("::");
+        if (sep != std::string_view::npos) {
+            const auto tail = attrName.substr(sep + 2);
+            return tail == "ValueLifecycle" || tail == "ValueLifecycleAttribute";
+        }
+        return false;
+    };
     for (const auto& module : modules) {
+        for (const auto& attr : module.languageMetadata.attributes) {
+            if (isValueLifecycleAttrName(attr.name) && !attr.target.empty()) {
+                lifecycleTargets.insert(attr.target);
+            }
+        }
         for (const auto& type : module.types) {
             const auto inserted = types.emplace(
                 type.id,
@@ -359,7 +381,9 @@ GeneratedProgram CppGenerator::generate(
                     primitiveExpression(field.type) + ", 0x" +
                     hexId(exactTypeId(field.type, field.typeName)) + "ULL, " +
                     std::to_string(field.index) + "u, " +
-                    (field.synthetic ? "true" : "false") + "},");
+                    (field.synthetic ? "true" : "false") + ", " +
+                    (field.staticField ? "true" : "false") + ", " +
+                    (field.constField ? "true" : "false") + "},");
             }
             source.line("};");
         }
@@ -419,6 +443,11 @@ GeneratedProgram CppGenerator::generate(
         for (const auto& [id, view] : types) {
             (void)id;
             const auto& type = *view.type;
+            const std::string canonical = semantic::canonicalTypeName(type);
+            const bool hasLifecycle = type.hasValueLifecycle ||
+                lifecycleTargets.count(canonical) > 0 ||
+                canonical == "Core::ResourceHandle" ||
+                canonical.rfind("Core::ResourceHandle<", 0) == 0;
             source.line("    {0x" + hexId(type.id) + "ULL, " +
                 typeKindExpression(type.kind) + ", 0x" +
                 hexId(type.baseTypeId) + "ULL, \"" +
@@ -437,7 +466,8 @@ GeneratedProgram CppGenerator::generate(
                     ? "nullptr"
                     : view.cppName + "_interfaceMaps") +
                 ", " + std::to_string(type.interfaceDispatchMaps.size()) +
-                "u, " + (type.delegateType ? "true" : "false") + "},");
+                "u, " + (type.delegateType ? "true" : "false") +
+                ", " + (hasLifecycle ? "true" : "false") + "},");
         }
         source.line("};");
     }

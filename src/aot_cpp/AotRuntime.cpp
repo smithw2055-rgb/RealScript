@@ -245,14 +245,19 @@ ExecutionContext::ExecutionContext(
         for (std::uint32_t index = 0; index < program.typeCount; ++index) {
             const auto& type = program.types[index];
             ownedTypes_.emplace(type.id, &type);
-            if (type.kind == semantic::TypeKind::Struct && type.fields && type.fieldCount > 0) {
+            if (type.kind == semantic::TypeKind::Struct &&
+                !type.hasValueLifecycle &&
+                type.fields && type.fieldCount > 0) {
                 std::vector<runtime::BlittableFieldInput> fInputs;
                 fInputs.reserve(type.fieldCount);
                 for (std::uint32_t fi = 0; fi < type.fieldCount; ++fi) {
+                    if (type.fields[fi].staticField || type.fields[fi].constField) continue;
                     fInputs.push_back(runtime::BlittableFieldInput{
                         type.fields[fi].type, type.fields[fi].typeId});
                 }
-                structSpecs.emplace_back(type.id, std::move(fInputs));
+                if (!fInputs.empty()) {
+                    structSpecs.emplace_back(type.id, std::move(fInputs));
+                }
             }
         }
         if (!structSpecs.empty()) {
@@ -813,6 +818,8 @@ bool ExecutionContext::invoke(
     const runtime::Value* arguments,
     std::size_t argumentCount,
     runtime::Value& result) {
+    runtime::ScopedValuePoolDomain domainScope(
+        heap_ ? heap_->valuePoolDomain().get() : nullptr);
     const auto* function = findFunction(symbolId);
     if (!function || !function->implementation) {
         return fail(
@@ -1787,6 +1794,8 @@ bool ExecutionContext::invokeDelegate(
     const runtime::Value* arguments,
     std::size_t argumentCount,
     runtime::Value& result) {
+    runtime::ScopedValuePoolDomain domainScope(
+        heap_ ? heap_->valuePoolDomain().get() : nullptr);
     const auto* delegateType = findType(delegateTypeId);
     if (!delegateType || !delegateType->delegateType ||
         !arguments || argumentCount == 0) {
@@ -3310,7 +3319,9 @@ std::size_t ExecutionContext::replayEntriesConsumed() const noexcept {
 Program::Program(const ProgramDescriptor& descriptor)
     : descriptor_(&descriptor),
       heap_(std::make_shared<runtime::ManagedHeap>()),
-      asyncRuntime_(std::make_shared<runtime::AsyncRuntimeContext>(heap_.get())) {
+      asyncRuntime_(std::make_shared<runtime::AsyncRuntimeContext>(heap_.get())),
+      lifecycleTarget_(std::make_shared<LifecycleTarget>()) {
+    lifecycleTarget_->program = this;
     if (descriptor.abiMajor != RuntimeAbiMajor ||
         descriptor.abiMinor > RuntimeAbiMinor) {
         throw std::invalid_argument("AOT program requires an incompatible runtime ABI");
@@ -3393,14 +3404,19 @@ Program::Program(const ProgramDescriptor& descriptor)
         std::vector<std::pair<semantic::SymbolId, std::vector<runtime::BlittableFieldInput>>> structSpecs;
         for (std::uint32_t index = 0; index < descriptor.typeCount; ++index) {
             const auto& type = descriptor.types[index];
-            if (type.kind == semantic::TypeKind::Struct && type.fields && type.fieldCount > 0) {
+            if (type.kind == semantic::TypeKind::Struct &&
+                !type.hasValueLifecycle &&
+                type.fields && type.fieldCount > 0) {
                 std::vector<runtime::BlittableFieldInput> fInputs;
                 fInputs.reserve(type.fieldCount);
                 for (std::uint32_t fi = 0; fi < type.fieldCount; ++fi) {
+                    if (type.fields[fi].staticField || type.fields[fi].constField) continue;
                     fInputs.push_back(runtime::BlittableFieldInput{
                         type.fields[fi].type, type.fields[fi].typeId});
                 }
-                structSpecs.emplace_back(type.id, std::move(fInputs));
+                if (!fInputs.empty()) {
+                    structSpecs.emplace_back(type.id, std::move(fInputs));
+                }
             }
         }
         if (!structSpecs.empty()) {
@@ -3459,6 +3475,18 @@ Program::Program(const ProgramDescriptor& descriptor)
             throw std::invalid_argument("AOT program contains an invalid source map");
         }
     }
+
+    registerValueLifecycleHooks();
+}
+
+Program::~Program() {
+    if (lifecycleTarget_) {
+        std::lock_guard<std::mutex> lock(lifecycleTarget_->mutex);
+        lifecycleTarget_->program = nullptr;
+    }
+    if (heap_) {
+        heap_->setValueLifecycleSweepCallback({});
+    }
 }
 
 
@@ -3473,6 +3501,8 @@ struct AotResumeEnv {
 };
 
 namespace {
+
+thread_local bool tlsInAotValueLifecycleDispose = false;
 
 std::string extractAotExceptionMessage(
     const std::unordered_map<semantic::SymbolId, const TypeDescriptor*>* typesMap,
@@ -3647,6 +3677,15 @@ void ExecutionContext::resumeCoroutineThunk(
     runtime::CoroutineFrame& frame,
     runtime::AsyncRuntimeContext& asyncContext,
     const char* faultFallback) {
+    auto* env = static_cast<AotResumeEnv*>(runnerContext);
+    runtime::ValuePoolDomain* domainPtr = nullptr;
+    if (env && env->heap) {
+        domainPtr = env->heap->valuePoolDomain().get();
+    } else if (asyncContext.awaitables().heap()) {
+        domainPtr = asyncContext.awaitables().heap()->valuePoolDomain().get();
+    }
+    runtime::ScopedValuePoolDomain domainScope(domainPtr);
+
     const auto faultUnresolvedFrame = [&](const runtime::RuntimeError& err) {
         if (auto* f = asyncContext.coroutines().resolve(frameHandle)) {
             if (f->invalidated) {
@@ -3669,7 +3708,6 @@ void ExecutionContext::resumeCoroutineThunk(
         }
     };
 
-    auto* env = static_cast<AotResumeEnv*>(runnerContext);
     if (void* activeRaw = asyncContext.activeAotContext()) {
         auto* activeCtx = static_cast<ExecutionContext*>(activeRaw);
         if (activeCtx->hasFunction(frame.functionSymbolId)) {
@@ -4014,10 +4052,24 @@ bool ExecutionContext::awaitResume(
         const bool hasResult = (optionalOutResult != nullptr);
         if (!options_.awaitScheduler->tryGetResult(
                 awaitableVal, hasResult, payload, schedErr)) {
-            return fail(
+            const runtime::ErrorCode effCode =
                 schedErr.code == runtime::ErrorCode::None
                     ? runtime::ErrorCode::ScriptException
-                    : schedErr.code,
+                    : schedErr.code;
+            if (effCode == runtime::ErrorCode::ScriptException && heap_ != nullptr) {
+                schedErr.code = effCode;
+                if (schedErr.message.empty()) {
+                    schedErr.message = "custom awaiter GetResult failed";
+                }
+                const auto matRef = runtime::materializeAsyncResumeException(
+                    heap_.get(), runtime::AwaitStatus::Faulted, schedErr, runtime::Value{});
+                if (matRef) {
+                    pendingException_ = runtime::Value(*matRef);
+                    return false;
+                }
+            }
+            return fail(
+                effCode,
                 schedErr.message.empty()
                     ? std::string("custom awaiter GetResult failed")
                     : schedErr.message);
@@ -4590,9 +4642,113 @@ void Program::setBindings(
 }
 
 void Program::setHeap(std::shared_ptr<runtime::ManagedHeap> heap) {
+    if (heap_ && heap_.get() != heap.get()) {
+        heap_->setValueLifecycleSweepCallback({});
+    }
     heap_ = heap ? std::move(heap) : std::make_shared<runtime::ManagedHeap>();
     if (asyncRuntime_) asyncRuntime_->setHeap(heap_.get());
     resumeEnv_.reset();
+    registerValueLifecycleHooks();
+}
+
+void Program::registerValueLifecycleHooks() {
+    if (!heap_) return;
+    std::unordered_map<semantic::SymbolId, semantic::SymbolId> disposeMap;
+    const auto canonicalTypeName = [](const TypeDescriptor& td) -> std::string {
+        if (td.moduleName && td.moduleName[0] != '\0') {
+            return std::string(td.moduleName) + "::" + (td.name ? td.name : "");
+        }
+        return td.name ? std::string(td.name) : std::string();
+    };
+    for (const auto& [typeId, tdPtr] : types_) {
+        if (!tdPtr || tdPtr->kind != semantic::TypeKind::Struct) continue;
+        const std::string canonical = canonicalTypeName(*tdPtr);
+        const bool isLifecycle = tdPtr->hasValueLifecycle ||
+            canonical == "Core::ResourceHandle" ||
+            canonical.rfind("Core::ResourceHandle<", 0) == 0;
+        if (!isLifecycle) continue;
+        heap_->registerValueLifecycleType(typeId);
+        const std::string disposeName = canonical + ".Dispose";
+        semantic::SymbolId disposeId = 0;
+        if (const auto found = names_.find(disposeName); found != names_.end()) {
+            const auto fnIt = functions_.find(found->second);
+            if (fnIt != functions_.end() && fnIt->second &&
+                fnIt->second->parameterCount <= 1) {
+                disposeId = found->second;
+            }
+        }
+        if (disposeId == 0 && descriptor_ && descriptor_->functions) {
+            for (std::uint32_t fi = 0; fi < descriptor_->functionCount; ++fi) {
+                const auto& fn = descriptor_->functions[fi];
+                if (fn.name && disposeName == fn.name && fn.parameterCount <= 1) {
+                    disposeId = fn.symbolId;
+                    break;
+                }
+            }
+        }
+        if (disposeId != 0) {
+            disposeMap.emplace(typeId, disposeId);
+        }
+    }
+    if (disposeMap.empty()) {
+        heap_->setValueLifecycleSweepCallback({});
+        return;
+    }
+    if (!lifecycleTarget_) {
+        lifecycleTarget_ = std::make_shared<LifecycleTarget>();
+        lifecycleTarget_->program = this;
+    }
+    heap_->setValueLifecycleSweepCallback(
+        [weakTarget = std::weak_ptr<LifecycleTarget>(lifecycleTarget_),
+         disposeMap = std::move(disposeMap),
+         heapPtr = heap_.get()](const runtime::Value& sweptValue) {
+            if (tlsInAotValueLifecycleDispose) return;
+            if (sweptValue.rawTag() != runtime::ValueTag::Struct) return;
+            const auto locked = weakTarget.lock();
+            if (!locked) return;
+            std::lock_guard<std::mutex> lock(locked->mutex);
+            const Program* self = locked->program;
+            if (!self || !self->heap_ || self->heap_.get() != heapPtr) return;
+            const auto& st = sweptValue.asStructUnchecked();
+            const auto it = disposeMap.find(st.typeId);
+            if (it == disposeMap.end() || it->second == 0) return;
+            const auto fnIt = self->functions_.find(it->second);
+            if (fnIt == self->functions_.end() || !fnIt->second) return;
+            const FunctionDescriptor* disposeFn = fnIt->second;
+
+            struct DisposeGuard {
+                bool& flag;
+                explicit DisposeGuard(bool& f) noexcept : flag(f) { flag = true; }
+                ~DisposeGuard() noexcept { flag = false; }
+            } guard(tlsInAotValueLifecycleDispose);
+
+            runtime::ScopedValuePoolDomain domainScope(
+                self->heap_->valuePoolDomain().get());
+            try {
+                std::vector<runtime::Value> args;
+                if (disposeFn->parameterCount > 0 && disposeFn->parameterTypes) {
+                    if (disposeFn->parameterTypes[0] == semantic::PrimitiveType::Object &&
+                        disposeFn->parameterTypeIds) {
+                        const semantic::SymbolId wrapperTypeId =
+                            disposeFn->parameterTypeIds[0];
+                        if (wrapperTypeId == 0) return;
+                        const auto wrapped = self->heap_->allocateObject(
+                            wrapperTypeId,
+                            std::vector<runtime::Value>{sweptValue},
+                            std::vector<std::size_t>{});
+                        if (!wrapped) return;
+                        args.emplace_back(*wrapped);
+                    } else {
+                        args.push_back(sweptValue);
+                    }
+                }
+                runtime::ExecutionOptions opts;
+                opts.limits.instructionBudget = 1'000'000;
+                opts.limits.recursionLimit = 128;
+                (void)self->invoke(disposeFn->symbolId, args, std::move(opts));
+            } catch (...) {
+            }
+        });
 }
 
 std::shared_ptr<runtime::ManagedHeap> Program::heap() const noexcept {
@@ -4622,6 +4778,8 @@ runtime::ExecutionResult Program::invoke(
     semantic::SymbolId symbolId,
     const std::vector<runtime::Value>& arguments,
     runtime::ExecutionOptions options) const {
+    runtime::ScopedValuePoolDomain domainScope(
+        heap_ ? heap_->valuePoolDomain().get() : nullptr);
     const runtime::ExecutionOptions invokeOptionsCopy = options;
     ExecutionContext context(
         *descriptor_,

@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -164,3 +165,20 @@ void hostEnterHeapSyncLockBridge() noexcept;
 void hostLeaveHeapSyncLockBridge(bool flushDeferred) noexcept;
 
 } // namespace realscript::runtime::detail
+
+namespace realscript::runtime {
+
+struct Interpreter::DispatchTarget {
+    explicit DispatchTarget(Interpreter* owner = nullptr) noexcept
+        : interpreter(owner) {}
+
+    std::mutex mutex;
+    Interpreter* interpreter = nullptr;
+    std::shared_ptr<const ProgramImage> program;
+    std::shared_ptr<ManagedHeap> heap;
+    std::shared_ptr<const BindingRegistry> bindings;
+    std::shared_ptr<AsyncRuntimeContext> asyncRuntime;
+    bool alive = true;
+};
+
+} // namespace realscript::runtime
