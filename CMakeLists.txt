@@ -455,713 +455,217 @@ endif()
 if(REALSCRIPT_BUILD_TESTS)
     enable_testing()
 
-    function(realscript_add_cpp_test target test_name source)
+    function(realscript_add_cpp_test target test_name slice_target source)
         add_executable(${target} ${source})
-        target_link_libraries(${target} PRIVATE RealScript::Full)
+        target_link_libraries(${target} PRIVATE ${slice_target})
         target_compile_features(${target} PRIVATE cxx_std_17)
         realscript_enable_cxx_warnings(${target})
         add_test(NAME ${test_name} COMMAND ${target})
     endfunction()
 
-    realscript_add_cpp_test(realscript_tests realscript.frontend tests/tests.cpp)
+    # Tier-0 L0 Kernel Suites (always built; zero L1 dependency)
+    realscript_add_cpp_test(
+        realscript_kernel_architecture_and_abi_tests
+        realscript.kernel.architecture-and-abi
+        RealScript::Kernel
+        tests/kernel_architecture_and_abi_tests.cpp)
     target_compile_definitions(
-        realscript_tests PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        realscript_kernel_architecture_and_abi_tests
+        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 
-    realscript_add_cpp_test(
-        realscript_phase1c_tests realscript.phase1c tests/phase1c_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_phase2a_tests realscript.phase2a tests/phase2a_tests.cpp)
-    target_compile_definitions(
-        realscript_phase2a_tests PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    realscript_add_cpp_test(
-        realscript_phase2b_tests realscript.phase2b tests/phase2b_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_phase2c_tests realscript.phase2c tests/phase2c_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_phase3a_tests realscript.phase3a tests/phase3a_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_phase3b_tests realscript.phase3b tests/phase3b_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_phase3c_tests realscript.phase3c tests/phase3c_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_phase3d_tests realscript.phase3d tests/phase3d_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_phase3e_tests realscript.phase3e tests/phase3e_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_phase4_tests realscript.phase4 tests/phase4_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_phase5_tests realscript.phase5.generator tests/phase5_tests.cpp)
-    target_compile_definitions(
-        realscript_phase5_tests PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-
-    add_executable(realscript_phase5_abi_c_test tests/phase5_abi_c_test.c)
-    target_include_directories(
-        realscript_phase5_abi_c_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    add_executable(realscript_kernel_host_abi_c_tests tests/kernel_host_abi_c_tests.c)
+    target_link_libraries(realscript_kernel_host_abi_c_tests PRIVATE RealScript::Runtime)
     set_target_properties(
-        realscript_phase5_abi_c_test
-        PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED YES C_EXTENSIONS NO)
+        realscript_kernel_host_abi_c_tests
+        PROPERTIES
+            C_STANDARD 11
+            C_STANDARD_REQUIRED YES
+            C_EXTENSIONS NO)
     if(MSVC)
-        target_compile_options(realscript_phase5_abi_c_test PRIVATE /W4)
+        target_compile_options(realscript_kernel_host_abi_c_tests PRIVATE /utf-8 /W4)
         if(REALSCRIPT_WARNINGS_AS_ERRORS)
-            target_compile_options(realscript_phase5_abi_c_test PRIVATE /WX)
+            target_compile_options(realscript_kernel_host_abi_c_tests PRIVATE /WX)
         endif()
     else()
         target_compile_options(
-            realscript_phase5_abi_c_test PRIVATE -Wall -Wextra -Wpedantic)
+            realscript_kernel_host_abi_c_tests PRIVATE -Wall -Wextra -Wpedantic)
         if(REALSCRIPT_WARNINGS_AS_ERRORS)
-            target_compile_options(realscript_phase5_abi_c_test PRIVATE -Werror)
+            target_compile_options(realscript_kernel_host_abi_c_tests PRIVATE -Werror)
         endif()
     endif()
-    add_test(NAME realscript.phase5.abi-c COMMAND realscript_phase5_abi_c_test)
+    add_test(NAME realscript.kernel.host-abi-c COMMAND realscript_kernel_host_abi_c_tests)
 
-    set(REALSCRIPT_PHASE5_GENERATED_DIR
-        "${CMAKE_CURRENT_BINARY_DIR}/generated/phase5")
-    realscript_add_aot_library(
-        realscript_phase5_generated
-        PROGRAM_NAME Phase5Fixture
-        OUTPUT_DIRECTORY "${REALSCRIPT_PHASE5_GENERATED_DIR}"
-        OPT_LEVEL 0
-        SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_model.rscript"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_app.rscript"
-    )
+    realscript_add_cpp_test(
+        realscript_kernel_compiler_frontend_tests
+        realscript.kernel.compiler-frontend
+        RealScript::Kernel
+        tests/kernel_compiler_frontend_tests.cpp)
 
-    add_executable(realscript_phase5_aot_tests tests/phase5_aot_tests.cpp)
-    target_link_libraries(
-        realscript_phase5_aot_tests
-        PRIVATE realscript_phase5_generated RealScript::Full)
-    target_compile_features(realscript_phase5_aot_tests PRIVATE cxx_std_17)
-    target_compile_definitions(
-        realscript_phase5_aot_tests
-        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    add_test(NAME realscript.phase5.aot COMMAND realscript_phase5_aot_tests)
+    realscript_add_cpp_test(
+        realscript_kernel_mir_and_bytecode_tests
+        realscript.kernel.mir-and-bytecode
+        RealScript::Kernel
+        tests/kernel_mir_and_bytecode_tests.cpp)
 
+    realscript_add_cpp_test(
+        realscript_kernel_runtime_vm_and_gc_tests
+        realscript.kernel.runtime-vm-and-gc
+        RealScript::Kernel
+        tests/kernel_runtime_vm_and_gc_tests.cpp)
+
+    realscript_add_cpp_test(
+        realscript_kernel_async_and_fiber_tests
+        realscript.kernel.async-and-fiber
+        RealScript::Kernel
+        tests/kernel_async_and_fiber_tests.cpp)
+
+    realscript_add_cpp_test(
+        realscript_kernel_jit_and_hot_reload_tests
+        realscript.kernel.jit-and-hot-reload
+        RealScript::Kernel
+        tests/kernel_jit_and_hot_reload_tests.cpp)
     if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
-        realscript_add_cpp_test(
-            realscript_phase6_jit_tests
-            realscript.phase6.jit
-            tests/phase6_jit_tests.cpp)
-        add_dependencies(realscript_phase6_jit_tests realscript_jit_support_archive)
+        set_target_properties(
+            realscript_kernel_jit_and_hot_reload_tests PROPERTIES ENABLE_EXPORTS ON)
+        add_dependencies(
+            realscript_kernel_jit_and_hot_reload_tests realscript_jit_support_archive)
         target_compile_definitions(
-            realscript_phase6_jit_tests
+            realscript_kernel_jit_and_hot_reload_tests
             PRIVATE
                 REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
                 REALSCRIPT_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
                 REALSCRIPT_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
                 REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_jit_support_archive>"
-                REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/jit-cache"
-        )
+                REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/kernel-jit-cache")
     endif()
 
-    realscript_add_cpp_test(
-        realscript_phase6_tests realscript.phase6.core tests/phase6_tests.cpp)
+    realscript_add_aot_library(
+        realscript_kernel_aot_fixture
+        PROGRAM_NAME KernelAotSuite
+        CPP_NAMESPACE kernel_aot_ns
+        QUERY_SYMBOL rs_module_query_kernel_aot
+        OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated/kernel_aot_suite"
+        OPT_LEVEL 2
+        SOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/kernel_aot_suite.rscript")
 
-    add_executable(realscript_phase6_aot_tests tests/phase6_aot_tests.cpp)
+    realscript_add_aot_library(
+        realscript_kernel_aot_trusted_fixture
+        PROGRAM_NAME KernelAotTrusted
+        CPP_NAMESPACE kernel_aot_trusted_ns
+        QUERY_SYMBOL rs_module_query_kernel_aot_trusted
+        OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated/kernel_aot_trusted"
+        OPT_LEVEL 2
+        TRUSTED_RELEASE
+        SOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/kernel_aot_trusted.rscript")
+
+    add_executable(realscript_kernel_aot_backend_tests tests/kernel_aot_backend_tests.cpp)
     target_link_libraries(
-        realscript_phase6_aot_tests
-        PRIVATE realscript_phase5_generated RealScript::Full)
-    target_compile_features(realscript_phase6_aot_tests PRIVATE cxx_std_17)
+        realscript_kernel_aot_backend_tests
+        PRIVATE
+            realscript_kernel_aot_fixture
+            realscript_kernel_aot_trusted_fixture
+            RealScript::Kernel)
+    target_compile_features(realscript_kernel_aot_backend_tests PRIVATE cxx_std_17)
     target_compile_definitions(
-        realscript_phase6_aot_tests
+        realscript_kernel_aot_backend_tests
         PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    add_test(NAME realscript.phase6.aot COMMAND realscript_phase6_aot_tests)
+    realscript_enable_cxx_warnings(realscript_kernel_aot_backend_tests)
+    add_test(NAME realscript.kernel.aot-backend COMMAND realscript_kernel_aot_backend_tests)
 
-    realscript_add_cpp_test(
-        realscript_phase7_tests
-        realscript.phase7.game-sdk
-        tests/phase7_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_productization_tests
-        realscript.productization
-        tests/productization_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_phase8_gameplay_primitives_tests
-        realscript.phase8.gameplay-primitives
-        tests/phase8_gameplay_primitives_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_phase9_gameplay_scripting_tests
-        realscript.phase9.gameplay-scripting
-        tests/phase9_gameplay_scripting_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_phase10_gameplay_state_tests
-        realscript.phase10.gameplay-state
-        tests/phase10_gameplay_state_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_phase11_18_native_language_tests
-        realscript.phase11-18.native-language
-        tests/phase11_18_native_language_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_phase18_native_control_flow_tests
-        realscript.phase18.native-control-flow
-        tests/phase18_native_control_flow_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_phase19_runtime_polymorphism_tests
-        realscript.phase19.runtime-polymorphism
-        tests/phase19_runtime_polymorphism_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_phase20_delegate_tests
-        realscript.phase20.delegates
-        tests/phase20_delegate_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_phase21_generics_collections_tests
-        realscript.phase21.generics-collections
-        tests/phase21_generics_collections_tests.cpp)
-    target_compile_definitions(
-        realscript_phase21_generics_collections_tests
-        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    realscript_add_cpp_test(
-        realscript_phase22_coroutine_tests
-        realscript.phase22.coroutines
-        tests/phase22_coroutine_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_phase23_value_semantics_tests
-        realscript.phase23.value-semantics
-        tests/phase23_value_semantics_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_phase24_language_completeness_tests
-        realscript.phase24.language-completeness
-        tests/phase24_language_completeness_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_fiber_scheduler_tests
-        realscript.fiber-scheduler
-        tests/fiber_scheduler_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_engine_integration_evolution_tests
-        realscript.engine-integration-evolution
-        tests/engine_integration_evolution_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_pool_refactor_verification_tests
-        realscript.pool-refactor-verification
-        tests/pool_refactor_verification.cpp)
-    realscript_add_cpp_test(
-        realscript_dap_socket_attach_tests
-        realscript.dap-socket-attach
-        tests/dap_socket_attach_test.cpp)
-    realscript_add_cpp_test(
-        realscript_game_math_flat_opcode_tests
-        realscript.game-math-flat-opcode
-        tests/game_math_flat_opcode_benchmark.cpp)
-    realscript_add_cpp_test(
-        realscript_phase25_async_primitives_tests
-        realscript.phase25.async-primitives
-        tests/phase25_async_primitives_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_phase26_async_coroutines_tests
-        realscript.phase26.async-coroutines
-        tests/phase26_async_coroutines_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_phase27_scene_async_lifecycle_tests
-        realscript.phase27.scene-async-lifecycle
-        tests/phase27_scene_async_lifecycle_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_sprint1_evolution_tests
-        realscript.sprint1-evolution
-        tests/sprint1_evolution_tests.cpp)
-    target_compile_definitions(
-        realscript_sprint1_evolution_tests
-        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    realscript_add_cpp_test(
-        realscript_sprint2_gc_budget_and_pool_tests
-        realscript.sprint2.gc-budget-and-pool
-        tests/sprint2_gc_budget_and_pool_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_sprint2_scene_hotreload_guid_tests
-        realscript.sprint2.scene-hotreload-guid
-        tests/sprint2_scene_hotreload_guid_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_p0_packed_heap_and_trusted_vm_tests
-        realscript.p0.packed-heap-and-trusted-vm
-        tests/p0_packed_heap_and_trusted_vm_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_p0_dual_math_and_packed_struct_tests
-        realscript.p0.dual-math-and-packed-struct
-        tests/p0_dual_math_and_packed_struct_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_p1_dap_eval_and_lsp_scene_tests
-        realscript.p1.dap-eval-and-lsp-scene
-        tests/p1_dap_eval_and_lsp_scene_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_p2_stage1_structural_hot_reload_tests
-        realscript.p2.stage1-structural-hot-reload
-        tests/p2_stage1_structural_hot_reload_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_p2_stage2_parallel_job_and_aot_simd_tests
-        realscript.p2.stage2-parallel-job-and-aot-simd
-        tests/p2_stage2_parallel_job_and_aot_simd_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_p2_stage3_fiber_debug_and_telemetry_tests
-        realscript.p2.stage3-fiber-debug-and-telemetry
-        tests/p2_stage3_fiber_debug_and_telemetry_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_p3_stage1_modular_build_and_abi_governance_tests
-        realscript.p3.stage1-modular-build-and-abi-governance
-        tests/p3_stage1_modular_build_and_abi_governance_tests.cpp)
-    target_compile_definitions(
-        realscript_p3_stage1_modular_build_and_abi_governance_tests
-        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    realscript_add_cpp_test(
-        realscript_p3_stage2_formatter_linter_and_fuzzer_tests
-        realscript.p3.stage2-formatter-linter-and-fuzzer
-        tests/p3_stage2_formatter_linter_and_fuzzer_tests.cpp)
-    target_compile_definitions(
-        realscript_p3_stage2_formatter_linter_and_fuzzer_tests
-        PRIVATE REALSCRIPT_RSC_PATH="$<TARGET_FILE:rsc>")
-    realscript_add_cpp_test(
-        realscript_p3_stage3_language_extensibility_tests
-        realscript.p3.stage3-language-extensibility
-        tests/p3_stage3_language_extensibility_tests.cpp)
-    if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
-        add_dependencies(
-            realscript_p3_stage3_language_extensibility_tests
-            realscript_jit_support_archive)
-        target_compile_definitions(
-            realscript_p3_stage3_language_extensibility_tests
-            PRIVATE
-                REALSCRIPT_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
-                REALSCRIPT_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
-                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_jit_support_archive>"
-                REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/p3-stage3-jit-cache")
-    endif()
-    realscript_add_cpp_test(
-        realscript_p3_stage4_reflection_and_mod_sandbox_tests
-        realscript.p3.stage4-reflection-and-mod-sandbox
-        tests/p3_stage4_reflection_and_mod_sandbox_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_p2_stage4_stencil_jit_tests
-        realscript.p2.stage4-stencil-jit
-        tests/p2_stage4_stencil_jit_tests.cpp)
-    if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
-        add_dependencies(realscript_p2_stage4_stencil_jit_tests realscript_jit_support_archive)
-        target_compile_definitions(
-            realscript_p2_stage4_stencil_jit_tests
-            PRIVATE
-                REALSCRIPT_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
-                REALSCRIPT_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
-                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_jit_support_archive>"
-                REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/p2-stage4-jit-cache")
-    endif()
-    if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
+    # Tier-1 L1 Orthogonal Application Suites
+    if(REALSCRIPT_ENABLE_DEBUG_SERVICES)
         realscript_add_cpp_test(
-            realscript_sprint2_generics_using_resource_tests
-            realscript.sprint2.generics-using-resource
-            tests/sprint2_generics_using_resource_tests.cpp)
-        add_dependencies(
-            realscript_sprint2_generics_using_resource_tests
-            realscript_jit_support_archive)
-        target_compile_definitions(
-            realscript_sprint2_generics_using_resource_tests
-            PRIVATE
-                REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
-                REALSCRIPT_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
-                REALSCRIPT_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
-                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_jit_support_archive>"
-                REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/sprint2-jit-cache")
-    endif()
-    realscript_add_cpp_test(
-        realscript_flat_struct_and_inline_hotreload_tests
-        realscript.flat-struct-and-inline-hotreload
-        tests/flat_struct_and_inline_hotreload_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_phase2_stackref_lvalue_jit_aot_tests
-        realscript.phase2.stackref-lvalue-jit-aot
-        tests/phase2_stackref_lvalue_jit_aot_tests.cpp)
-    if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
-        add_dependencies(
-            realscript_phase2_stackref_lvalue_jit_aot_tests
-            realscript_jit_support_archive)
-        target_compile_definitions(
-            realscript_phase2_stackref_lvalue_jit_aot_tests
-            PRIVATE
-                REALSCRIPT_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
-                REALSCRIPT_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
-                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_jit_support_archive>"
-                REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/phase2-stackref-jit-cache")
-        set_target_properties(realscript_phase2_stackref_lvalue_jit_aot_tests PROPERTIES ENABLE_EXPORTS ON)
-    endif()
-    realscript_add_cpp_test(
-        realscript_phase3_jit_aot_large_flatstruct_fastpath_tests
-        realscript.phase3.jit-aot-large-flatstruct-fastpath
-        tests/phase3_jit_aot_large_flatstruct_fastpath_tests.cpp)
-    if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
-        add_dependencies(
-            realscript_phase3_jit_aot_large_flatstruct_fastpath_tests
-            realscript_jit_support_archive)
-        target_compile_definitions(
-            realscript_phase3_jit_aot_large_flatstruct_fastpath_tests
-            PRIVATE
-                REALSCRIPT_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
-                REALSCRIPT_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
-                REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_jit_support_archive>"
-                REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/phase3-flatstruct-jit-cache")
-        set_target_properties(realscript_phase3_jit_aot_large_flatstruct_fastpath_tests PROPERTIES ENABLE_EXPORTS ON)
-    endif()
-    realscript_add_cpp_test(
-        realscript_phase4_stencil_jit_arm64_tests
-        realscript.phase4.stencil-jit-arm64
-        tests/phase4_stencil_jit_arm64_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_v2_audit_regression_tests
-        realscript.v2.audit-regressions
-        tests/v2_audit_regression_tests.cpp)
-    target_compile_definitions(
-        realscript_v2_audit_regression_tests
-        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    realscript_add_cpp_test(
-        realscript_p1_audit_boundary_regression_tests
-        realscript.p1.audit-boundary-regressions
-        tests/p1_audit_boundary_regression_tests.cpp)
-    realscript_add_cpp_test(
-        realscript_sprint2_module_build_cache_tests
-        realscript.sprint2.module-build-cache
-        tests/sprint2_module_build_cache_tests.cpp)
-    target_compile_definitions(
-        realscript_sprint2_module_build_cache_tests
-        PRIVATE
-            REALSCRIPT_RSC_BIN="$<TARGET_FILE:rsc>"
-            REALSCRIPT_RSAOT_BIN="$<TARGET_FILE:rsaot>")
-    set(REALSCRIPT_PHASE20_GENERATED_DIR
-        "${CMAKE_CURRENT_BINARY_DIR}/generated/phase20")
-    realscript_add_aot_library(
-        realscript_phase20_generated
-        PROGRAM_NAME Phase20Aot
-        OUTPUT_DIRECTORY "${REALSCRIPT_PHASE20_GENERATED_DIR}"
-        OPT_LEVEL 2
-        SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase20_aot.rscript"
-    )
-    add_executable(
-        realscript_phase20_aot_tests tests/phase20_aot_tests.cpp)
-    target_link_libraries(
-        realscript_phase20_aot_tests
-        PRIVATE realscript_phase20_generated RealScript::Full)
-    target_compile_features(
-        realscript_phase20_aot_tests PRIVATE cxx_std_17)
-    target_compile_definitions(
-        realscript_phase20_aot_tests
-        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    add_test(
-        NAME realscript.phase20.aot
-        COMMAND realscript_phase20_aot_tests)
-    set(REALSCRIPT_PHASE21_GENERATED_DIR
-        "${CMAKE_CURRENT_BINARY_DIR}/generated/phase21")
-    realscript_add_aot_library(
-        realscript_phase21_generated
-        PROGRAM_NAME Phase21Aot
-        OUTPUT_DIRECTORY "${REALSCRIPT_PHASE21_GENERATED_DIR}"
-        OPT_LEVEL 2
-        SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase21_aot.rscript"
-    )
-    add_executable(
-        realscript_phase21_aot_tests tests/phase21_aot_tests.cpp)
-    target_link_libraries(
-        realscript_phase21_aot_tests
-        PRIVATE realscript_phase21_generated RealScript::Full)
-    target_compile_features(
-        realscript_phase21_aot_tests PRIVATE cxx_std_17)
-    target_compile_definitions(
-        realscript_phase21_aot_tests
-        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    add_test(
-        NAME realscript.phase21.aot
-        COMMAND realscript_phase21_aot_tests)
-    set(REALSCRIPT_PHASE22_GENERATED_DIR
-        "${CMAKE_CURRENT_BINARY_DIR}/generated/phase22")
-    realscript_add_aot_library(
-        realscript_phase22_generated
-        PROGRAM_NAME Phase22Aot
-        OUTPUT_DIRECTORY "${REALSCRIPT_PHASE22_GENERATED_DIR}"
-        OPT_LEVEL 2
-        SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase22_aot.rscript"
-    )
-    add_executable(
-        realscript_phase22_aot_tests tests/phase22_aot_tests.cpp)
-    target_link_libraries(
-        realscript_phase22_aot_tests
-        PRIVATE realscript_phase22_generated RealScript::Full)
-    target_compile_features(
-        realscript_phase22_aot_tests PRIVATE cxx_std_17)
-    target_compile_definitions(
-        realscript_phase22_aot_tests
-        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    add_test(
-        NAME realscript.phase22.aot
-        COMMAND realscript_phase22_aot_tests)
-    set(REALSCRIPT_PHASE23_GENERATED_DIR
-        "${CMAKE_CURRENT_BINARY_DIR}/generated/phase23")
-    realscript_add_aot_library(
-        realscript_phase23_generated
-        PROGRAM_NAME Phase23Aot
-        OUTPUT_DIRECTORY "${REALSCRIPT_PHASE23_GENERATED_DIR}"
-        OPT_LEVEL 2
-        SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase23_aot.rscript"
-    )
-    add_executable(
-        realscript_phase23_aot_tests tests/phase23_aot_tests.cpp)
-    target_link_libraries(
-        realscript_phase23_aot_tests
-        PRIVATE realscript_phase23_generated RealScript::Full)
-    target_compile_features(
-        realscript_phase23_aot_tests PRIVATE cxx_std_17)
-    target_compile_definitions(
-        realscript_phase23_aot_tests
-        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    add_test(
-        NAME realscript.phase23.aot
-        COMMAND realscript_phase23_aot_tests)
-    set(REALSCRIPT_PHASE24_GENERATED_DIR
-        "${CMAKE_CURRENT_BINARY_DIR}/generated/phase24")
-    realscript_add_aot_library(
-        realscript_phase24_generated
-        PROGRAM_NAME Phase24Aot
-        OUTPUT_DIRECTORY "${REALSCRIPT_PHASE24_GENERATED_DIR}"
-        OPT_LEVEL 2
-        SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase24_aot.rscript"
-    )
-    add_executable(
-        realscript_phase24_aot_tests tests/phase24_aot_tests.cpp)
-    target_link_libraries(
-        realscript_phase24_aot_tests
-        PRIVATE realscript_phase24_generated RealScript::Full)
-    target_compile_features(
-        realscript_phase24_aot_tests PRIVATE cxx_std_17)
-    target_compile_definitions(
-        realscript_phase24_aot_tests
-        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    add_test(
-        NAME realscript.phase24.aot
-        COMMAND realscript_phase24_aot_tests)
-    set(REALSCRIPT_PHASE26_GENERATED_DIR
-        "${CMAKE_CURRENT_BINARY_DIR}/generated/phase26")
-    realscript_add_aot_library(
-        realscript_phase26_generated
-        PROGRAM_NAME Phase26Aot
-        OUTPUT_DIRECTORY "${REALSCRIPT_PHASE26_GENERATED_DIR}"
-        OPT_LEVEL 2
-        SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase26_aot.rscript"
-    )
-    add_executable(
-        realscript_phase26_aot_tests tests/phase26_aot_tests.cpp)
-    target_link_libraries(
-        realscript_phase26_aot_tests
-        PRIVATE realscript_phase26_generated RealScript::Full)
-    target_compile_features(
-        realscript_phase26_aot_tests PRIVATE cxx_std_17)
-    target_compile_definitions(
-        realscript_phase26_aot_tests
-        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    add_test(
-        NAME realscript.phase26.aot
-        COMMAND realscript_phase26_aot_tests)
-    set(REALSCRIPT_PHASE19_GENERATED_DIR
-        "${CMAKE_CURRENT_BINARY_DIR}/generated/phase19")
-    realscript_add_aot_library(
-        realscript_phase19_generated
-        PROGRAM_NAME Phase19Aot
-        OUTPUT_DIRECTORY "${REALSCRIPT_PHASE19_GENERATED_DIR}"
-        OPT_LEVEL 2
-        SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase19_aot.rscript"
-    )
-    add_executable(
-        realscript_phase19_aot_tests tests/phase19_aot_tests.cpp)
-    target_link_libraries(
-        realscript_phase19_aot_tests
-        PRIVATE realscript_phase19_generated RealScript::Full)
-    target_compile_features(
-        realscript_phase19_aot_tests PRIVATE cxx_std_17)
-    target_compile_definitions(
-        realscript_phase19_aot_tests
-        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    add_test(
-        NAME realscript.phase19.aot
-        COMMAND realscript_phase19_aot_tests)
-
-    set(REALSCRIPT_AOT_MATH_BENCH_GENERATED_DIR
-        "${CMAKE_CURRENT_BINARY_DIR}/generated/aot_math_bench")
-    realscript_add_aot_library(
-        realscript_aot_math_bench_generated
-        PROGRAM_NAME BenchProgram_math
-        CPP_NAMESPACE bench_ns_math
-        QUERY_SYMBOL rs_module_query_math
-        OUTPUT_DIRECTORY "${REALSCRIPT_AOT_MATH_BENCH_GENERATED_DIR}"
-        OPT_LEVEL 2
-        SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/aot_trusted_math_bench.rscript"
-    )
-    set(REALSCRIPT_AOT_ECS_BENCH_GENERATED_DIR
-        "${CMAKE_CURRENT_BINARY_DIR}/generated/aot_ecs_bench")
-    realscript_add_aot_library(
-        realscript_aot_ecs_bench_generated
-        PROGRAM_NAME BenchProgram_ecs
-        CPP_NAMESPACE bench_ns_ecs
-        QUERY_SYMBOL rs_module_query_ecs
-        OUTPUT_DIRECTORY "${REALSCRIPT_AOT_ECS_BENCH_GENERATED_DIR}"
-        OPT_LEVEL 2
-        TRUSTED_RELEASE
-        SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/aot_trusted_ecs_bench.rscript"
-    )
-    add_executable(
-        realscript_aot_trusted_and_zero_copy_ecs_tests
-        tests/aot_trusted_and_zero_copy_ecs_test.cpp)
-    target_link_libraries(
-        realscript_aot_trusted_and_zero_copy_ecs_tests
-        PRIVATE
-            realscript_aot_math_bench_generated
-            realscript_aot_ecs_bench_generated
-            RealScript::Full)
-    target_compile_features(
-        realscript_aot_trusted_and_zero_copy_ecs_tests PRIVATE cxx_std_17)
-    target_compile_definitions(
-        realscript_aot_trusted_and_zero_copy_ecs_tests
-        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    add_test(
-        NAME realscript.aot-trusted-and-zero-copy-ecs
-        COMMAND realscript_aot_trusted_and_zero_copy_ecs_tests)
-
-    set(REALSCRIPT_PHASE28_STD_GENERATED_DIR
-        "${CMAKE_CURRENT_BINARY_DIR}/generated/phase28_std")
-    realscript_add_aot_library(
-        realscript_phase28_std_generated
-        PROGRAM_NAME Phase28Std
-        CPP_NAMESPACE phase28_ns_std
-        QUERY_SYMBOL rs_module_query_phase28_std
-        OUTPUT_DIRECTORY "${REALSCRIPT_PHASE28_STD_GENERATED_DIR}"
-        OPT_LEVEL 2
-        SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase28_trusted_async_aot.rscript"
-    )
-    set(REALSCRIPT_PHASE28_TRUSTED_GENERATED_DIR
-        "${CMAKE_CURRENT_BINARY_DIR}/generated/phase28_trusted")
-    realscript_add_aot_library(
-        realscript_phase28_trusted_generated
-        PROGRAM_NAME Phase28Trusted
-        CPP_NAMESPACE phase28_ns_trusted
-        QUERY_SYMBOL rs_module_query_phase28_trusted
-        OUTPUT_DIRECTORY "${REALSCRIPT_PHASE28_TRUSTED_GENERATED_DIR}"
-        OPT_LEVEL 2
-        TRUSTED_RELEASE
-        SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase28_trusted_async_aot.rscript"
-    )
-    add_executable(
-        realscript_phase28_net_async_and_trusted_aot_tests
-        tests/phase28_net_async_and_trusted_aot_tests.cpp)
-    target_link_libraries(
-        realscript_phase28_net_async_and_trusted_aot_tests
-        PRIVATE
-            realscript_phase28_std_generated
-            realscript_phase28_trusted_generated
-            RealScript::Full)
-    target_compile_features(
-        realscript_phase28_net_async_and_trusted_aot_tests PRIVATE cxx_std_17)
-    target_compile_definitions(
-        realscript_phase28_net_async_and_trusted_aot_tests
-        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-    add_test(
-        NAME realscript.phase28.net-async-and-trusted-aot
-        COMMAND realscript_phase28_net_async_and_trusted_aot_tests)
-    if(REALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS)
-        add_dependencies(
-            realscript_phase19_runtime_polymorphism_tests
-            realscript_jit_support_archive)
-        target_compile_definitions(
-            realscript_phase19_runtime_polymorphism_tests
-            PRIVATE
-                REALSCRIPT_PHASE19_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
-                REALSCRIPT_PHASE19_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
-                REALSCRIPT_PHASE19_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_jit_support_archive>"
-                REALSCRIPT_PHASE19_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/phase19-jit-cache"
-        )
+            realscript_app_debug_and_dap_tests
+            realscript.app.debug-and-dap
+            RealScript::Debug
+            tests/app_debug_and_dap_tests.cpp)
     endif()
 
+    if(REALSCRIPT_ENABLE_TOOLING)
+        realscript_add_cpp_test(
+            realscript_app_tooling_and_lsp_tests
+            realscript.app.tooling-and-lsp
+            RealScript::Tooling
+            tests/app_tooling_and_lsp_tests.cpp)
+        target_compile_definitions(
+            realscript_app_tooling_and_lsp_tests
+            PRIVATE REALSCRIPT_RSC_PATH="$<TARGET_FILE:rsc>")
+    endif()
+
+    if(REALSCRIPT_ENABLE_EXTENSIBILITY)
+        realscript_add_cpp_test(
+            realscript_app_reflection_and_mod_host_tests
+            realscript.app.reflection-and-mod-host
+            RealScript::Extensibility
+            tests/app_reflection_and_mod_host_tests.cpp)
+    endif()
+
+    if(REALSCRIPT_ENABLE_GAME_SDK)
+        realscript_add_cpp_test(
+            realscript_app_game_sdk_and_scene_tests
+            realscript.app.game-sdk-and-scene
+            RealScript::GameSdk
+            tests/app_game_sdk_and_scene_tests.cpp)
+    endif()
+
+    # CLI & SDK Consumer Verification
     add_test(
-        NAME realscript.phase6.cli-smoke
-        COMMAND rsc
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_model.rscript"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_app.rscript"
-            --run Phase5.App::main
-            --opt-level 2
+        NAME realscript.kernel.cli-smoke
+        COMMAND
+            rsc
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/kernel_multimodule_model.rscript"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/kernel_multimodule_app.rscript"
+            --run
+            Kernel.App::main
+            --opt-level
+            2
             --deterministic
             --digest
-            --profile
-    )
+            --profile)
+
     add_test(
-        NAME realscript.phase6.benchmark-smoke
-        COMMAND rsbench
-            --entry Phase5.App::main
-            --iterations 3
-            --warmup 1
-            --opt-level 2
+        NAME realscript.kernel.benchmark-smoke
+        COMMAND
+            rsbench
+            --entry
+            Kernel.App::main
+            --iterations
+            3
+            --warmup
+            1
+            --opt-level
+            2
             --json
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_model.rscript"
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_app.rscript"
-    )
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/kernel_multimodule_model.rscript"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/kernel_multimodule_app.rscript")
+
     add_test(
-        NAME realscript.phase6.cli-multimodule-package
-        COMMAND ${CMAKE_COMMAND}
+        NAME realscript.kernel.cli-multimodule
+        COMMAND
+            ${CMAKE_COMMAND}
             -DREALSCRIPT_RSC=$<TARGET_FILE:rsc>
-            -DREALSCRIPT_SOURCE_A=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_model.rscript
-            -DREALSCRIPT_SOURCE_B=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/phase5_app.rscript
+            -DREALSCRIPT_SOURCE_A=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/kernel_multimodule_model.rscript
+            -DREALSCRIPT_SOURCE_B=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/kernel_multimodule_app.rscript
             -DREALSCRIPT_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/cli-multimodule/$<CONFIG>
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/multimodule_cli_test.cmake
-    )
+            -P
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/multimodule_cli_test.cmake)
 
-    foreach(realscript_aot_test IN ITEMS
-            realscript_phase5_aot_tests
-            realscript_phase6_aot_tests
-            realscript_phase19_aot_tests
-            realscript_phase20_aot_tests
-            realscript_phase21_aot_tests
-            realscript_phase22_aot_tests
-            realscript_phase23_aot_tests
-            realscript_phase24_aot_tests
-            realscript_phase26_aot_tests
-            realscript_aot_trusted_and_zero_copy_ecs_tests)
-        realscript_enable_cxx_warnings(${realscript_aot_test})
-    endforeach()
-
-    add_test(
-        NAME realscript.productization.install-consumer
-        COMMAND ${CMAKE_COMMAND}
-            -DREALSCRIPT_BUILD_DIR=${CMAKE_BINARY_DIR}
-            -DREALSCRIPT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
-            -DREALSCRIPT_INSTALL_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/install-consumer/$<CONFIG>/sdk
-            -DREALSCRIPT_INSTALL_LIBDIR=${CMAKE_INSTALL_LIBDIR}
-            -DREALSCRIPT_CONSUMER_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}/install-consumer/$<CONFIG>/build
-            -DREALSCRIPT_CONFIG=$<CONFIG>
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/install_consumer_test.cmake
-    )
-
-    realscript_add_cpp_test(
-        realscript_p2_audit_architecture_regression_tests
-        realscript.p2.audit_architecture_regression
-        tests/p2_audit_architecture_regression_tests.cpp)
-    add_dependencies(
-        realscript_p2_audit_architecture_regression_tests
-        realscript_jit_support_archive)
-    target_compile_definitions(
-        realscript_p2_audit_architecture_regression_tests
-        PRIVATE
-            REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
-            REALSCRIPT_JIT_COMPILER="${CMAKE_CXX_COMPILER}"
-            REALSCRIPT_JIT_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/include"
-            REALSCRIPT_JIT_SUPPORT_LIBRARY="$<TARGET_FILE:realscript_jit_support_archive>"
-            REALSCRIPT_JIT_CACHE_DIR="${CMAKE_CURRENT_BINARY_DIR}/p2-jit-cache"
-    )
-
-    realscript_add_cpp_test(
-        realscript_p3_audit_maintainability_regression_tests
-        realscript.p3.audit_maintainability_regression
-        tests/p3_audit_maintainability_regression_tests.cpp)
-    target_compile_definitions(
-        realscript_p3_audit_maintainability_regression_tests
-        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    if(REALSCRIPT_INSTALL_SDK)
+        add_test(
+            NAME realscript.sdk.install-consumer
+            COMMAND
+                ${CMAKE_COMMAND}
+                -DREALSCRIPT_BUILD_DIR=${CMAKE_BINARY_DIR}
+                -DREALSCRIPT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+                -DREALSCRIPT_INSTALL_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/install-consumer/$<CONFIG>/sdk
+                -DREALSCRIPT_INSTALL_LIBDIR=${CMAKE_INSTALL_LIBDIR}
+                -DREALSCRIPT_CONSUMER_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}/install-consumer/$<CONFIG>/build
+                -DREALSCRIPT_CONFIG=$<CONFIG>
+                -P
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/install_consumer_test.cmake)
+    endif()
 endif()
 
 if(REALSCRIPT_INSTALL_SDK)
