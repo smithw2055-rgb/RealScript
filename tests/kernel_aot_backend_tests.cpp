@@ -2,6 +2,7 @@
 #include "realscript/aot_cpp/AotRuntime.h"
 #include "realscript/bytecode/Bytecode.h"
 #include "realscript/compiler/Compilation.h"
+#include "realscript/hot_reload/HotReload.h"
 #include "realscript/optimization/Optimizer.h"
 #include "realscript/runtime/Runtime.h"
 
@@ -934,6 +935,255 @@ public class HudModel {
     }
 }
 
+namespace {
+
+bool hpCalcV1Body(
+    aot::ExecutionContext&,
+    const runtime::Value* args,
+    std::size_t argc,
+    runtime::Value& out) {
+    if (argc != 1u || !std::holds_alternative<std::int64_t>(args[0])) return false;
+    out = runtime::Value{std::get<std::int64_t>(args[0]) * 2};
+    return true;
+}
+
+bool hpCalcV2Body(
+    aot::ExecutionContext&,
+    const runtime::Value* args,
+    std::size_t argc,
+    runtime::Value& out) {
+    if (argc != 1u || !std::holds_alternative<std::int64_t>(args[0])) return false;
+    out = runtime::Value{std::get<std::int64_t>(args[0]) * 10 + 5};
+    return true;
+}
+
+bool hpCallerBody(
+    aot::ExecutionContext& ctx,
+    const runtime::Value* args,
+    std::size_t argc,
+    runtime::Value& out);
+
+aot::HotPatchSlot kHpSlots[] = {
+    {semantic::stableTypeId("Kernel.AotHp::Calc"), "Kernel.AotHp::Calc", &hpCalcV1Body, &hpCalcV1Body, 0u},
+    {semantic::stableTypeId("Kernel.AotHp::Caller"), "Kernel.AotHp::Caller", &hpCallerBody, &hpCallerBody, 0u},
+};
+
+bool hpCalcThunk(
+    aot::ExecutionContext& ctx,
+    const runtime::Value* args,
+    std::size_t argc,
+    runtime::Value& out) {
+    if (const auto over = ctx.resolveHotPatchImplementation(kHpSlots[0].symbolId)) {
+        return over(ctx, args, argc, out);
+    }
+    const auto slotImpl = kHpSlots[0].patchedImplementation;
+    if (slotImpl && slotImpl != &hpCalcV1Body) {
+        return slotImpl(ctx, args, argc, out);
+    }
+    return hpCalcV1Body(ctx, args, argc, out);
+}
+
+bool hpCallerBody(
+    aot::ExecutionContext& ctx,
+    const runtime::Value* args,
+    std::size_t argc,
+    runtime::Value& out) {
+    if (argc != 1u) return false;
+    runtime::Value inner{};
+    if (!hpCalcThunk(ctx, args, argc, inner)) return false;
+    out = runtime::Value{std::get<std::int64_t>(inner) + 1};
+    return true;
+}
+
+bool hpCallerThunk(
+    aot::ExecutionContext& ctx,
+    const runtime::Value* args,
+    std::size_t argc,
+    runtime::Value& out) {
+    if (const auto over = ctx.resolveHotPatchImplementation(kHpSlots[1].symbolId)) {
+        return over(ctx, args, argc, out);
+    }
+    return hpCallerBody(ctx, args, argc, out);
+}
+
+} // namespace
+
+void testAotHotPatchThunksAndApplyMethodBodyHotPatch() {
+    // 1. Verify AotCpp GenerationOptions::emitHotPatchThunks emits slot dispatch table + thunks
+    {
+        const std::string src = R"RS(
+module Kernel.AotEmitHp;
+public int Helper(int x) { return x * 3; }
+public int Entry(int x) { return Helper(x) + 1; }
+)RS";
+        compiler::Compilation comp({{"emit_hp.rscript", src}});
+        auto build = comp.build();
+        require(!build.diagnostics.hasErrors(), "AOT emit hot-patch compile failed");
+        diagnostics::DiagnosticBag optDiag;
+        auto opt = optimization::Optimizer{}.optimize(std::move(build.modules), optDiag);
+        require(!optDiag.hasErrors(), "AOT emit hot-patch opt failed");
+
+        aot::GenerationOptions opts;
+        opts.programName = "AotEmitHp";
+        opts.cppNamespace = "aot_emit_hp_ns";
+        opts.emitHotPatchThunks = true;
+        diagnostics::DiagnosticBag aotDiag;
+        const auto gen = aot::CppGenerator{}.generate(opt.modules, aotDiag, opts);
+        require(!aotDiag.hasErrors(), "AotCpp emitHotPatchThunks generation failed");
+        require(gen.source.find("programHotPatchSlots") != std::string::npos &&
+                gen.source.find("_body(") != std::string::npos &&
+                gen.source.find("resolveHotPatchImplementation") != std::string::npos &&
+                gen.source.find("patchedImplementation") != std::string::npos,
+            "Generated AOT C++ source missing emitHotPatchThunks slot/thunk dispatch");
+    }
+
+    // 2. Verify AotRuntime applyMethodBodyHotPatch end-to-end with HotReload ReloadPlan
+    const std::string rV1 = R"RS(
+module Kernel.AotHp;
+public struct Pair { public int a; public int b; }
+public int Calc(int x) { return x * 2; }
+public int Caller(int x) { return Calc(x) + 1; }
+)RS";
+    const std::string rV2MethodOnly = R"RS(
+module Kernel.AotHp;
+public struct Pair { public int a; public int b; }
+public int Calc(int x) { return x * 10 + 5; }
+public int Caller(int x) { return Calc(x) + 1; }
+)RS";
+    const std::string rV3LayoutChanged = R"RS(
+module Kernel.AotHp;
+public struct Pair { public int a; public int b; public int c; }
+public int Calc(int x) { return x * 10 + 5; }
+public int Caller(int x) { return Calc(x) + 1; }
+)RS";
+
+    auto compileMods = [](const std::string& code) {
+        compiler::Compilation c({{"hp.rscript", code}});
+        auto b = c.build();
+        require(!b.diagnostics.hasErrors(), "Compile hp failed");
+        bytecode::Lowerer lowerer;
+        std::vector<bytecode::Module> bc;
+        for (const auto& m : b.modules) bc.push_back(lowerer.lower(m));
+        runtime::RuntimeError le;
+        auto linked = runtime::ProgramImage::link(bc, le);
+        require(linked.has_value(), "Link hp failed");
+        return std::make_pair(
+            std::make_shared<const runtime::ProgramImage>(std::move(*linked)),
+            std::move(bc));
+    };
+
+    const auto [imgV1, bcV1] = compileMods(rV1);
+    const auto [imgV2, bcV2] = compileMods(rV2MethodOnly);
+    const auto [imgV3, bcV3] = compileMods(rV3LayoutChanged);
+    (void)bcV1;
+    (void)imgV2;
+    (void)imgV3;
+
+    const auto optCalcId = imgV1->findFunction("Kernel.AotHp::Calc");
+    const auto optCallerId = imgV1->findFunction("Kernel.AotHp::Caller");
+    require(optCalcId.has_value() && optCallerId.has_value(),
+        "Expected compiled symbolIds for Kernel.AotHp::Calc and Caller");
+    const semantic::SymbolId kPairId = semantic::stableTypeId("Kernel.AotHp::Pair");
+    const semantic::SymbolId kCalcId = *optCalcId;
+    const semantic::SymbolId kCallerId = *optCallerId;
+    kHpSlots[0].symbolId = kCalcId;
+    kHpSlots[0].originalImplementation = &hpCalcV1Body;
+    kHpSlots[0].patchedImplementation = &hpCalcV1Body;
+    kHpSlots[0].revision = 0u;
+    kHpSlots[1].symbolId = kCallerId;
+    kHpSlots[1].originalImplementation = &hpCallerBody;
+    kHpSlots[1].patchedImplementation = &hpCallerBody;
+    kHpSlots[1].revision = 0u;
+
+    const aot::FieldDescriptor kPairFieldsV1[] = {
+        {"a", semantic::PrimitiveType::Int, 0u, 0u, false, false, false},
+        {"b", semantic::PrimitiveType::Int, 0u, 1u, false, false, false},
+    };
+    const aot::TypeDescriptor kTypesV1[] = {
+        {kPairId, semantic::TypeKind::Struct, 0u, "Kernel.AotHp", "Pair",
+         kPairFieldsV1, 2u, nullptr, 0u, nullptr, 0u, false, nullptr, 0u, false, false, false},
+    };
+    const semantic::PrimitiveType kOneInt[] = {semantic::PrimitiveType::Int};
+    const semantic::SymbolId kOneZeroId[] = {0u};
+    const aot::FunctionDescriptor kFnsV1[] = {
+        {kCalcId, "Kernel.AotHp::Calc", semantic::PrimitiveType::Int, 0u, kOneInt, kOneZeroId, 1u, &hpCalcThunk, nullptr},
+        {kCallerId, "Kernel.AotHp::Caller", semantic::PrimitiveType::Int, 0u, kOneInt, kOneZeroId, 1u, &hpCallerThunk, nullptr},
+    };
+    const aot::FunctionDescriptor kFnsV2[] = {
+        {kCalcId, "Kernel.AotHp::Calc", semantic::PrimitiveType::Int, 0u, kOneInt, kOneZeroId, 1u, &hpCalcV2Body, nullptr},
+        {kCallerId, "Kernel.AotHp::Caller", semantic::PrimitiveType::Int, 0u, kOneInt, kOneZeroId, 1u, &hpCallerThunk, nullptr},
+    };
+    static const char* const kMods[] = {"Kernel.AotHp"};
+
+    const aot::ProgramDescriptor descV1{
+        aot::RuntimeAbiMajor, aot::RuntimeAbiMinor, "AotHpV1", 0x1111u,
+        kMods, 1u, kTypesV1, 1u, kFnsV1, 2u, nullptr, 0u, nullptr, 0u,
+        kHpSlots, 2u,
+    };
+    const aot::ProgramDescriptor descV2{
+        aot::RuntimeAbiMajor, aot::RuntimeAbiMinor, "AotHpV2", 0x2222u,
+        kMods, 1u, kTypesV1, 1u, kFnsV2, 2u, nullptr, 0u, nullptr, 0u,
+        nullptr, 0u,
+    };
+
+    aot::Program aotProg(descV1);
+
+    // Before patch: Calc(7) == 14, Caller(7) == 15 + verify AOT ProfileCollector steady_clock span recording
+    auto aotProfiler = std::make_shared<runtime::ProfileCollector>();
+    runtime::ExecutionOptions profOpts;
+    profOpts.profile = aotProfiler;
+    const auto preRes = aotProg.invoke(kCallerId, {runtime::Value{std::int64_t{7}}}, profOpts);
+    require(preRes.succeeded && std::get<std::int64_t>(preRes.value) == 15,
+        "Pre-patch Caller(7) expected 15");
+    require(!aotProfiler->snapshot().traceEvents.empty(),
+        "AOT invoke with ProfileCollector must record steady_clock traceEvents");
+
+    // Prepare real ReloadPlan for method-body-only edit and apply patch
+    const hot_reload::ReloadPlan methodBodyPlan = hot_reload::prepare(*imgV1, bcV2);
+    require(methodBodyPlan.compatible && !methodBodyPlan.structuralMigrationRequired &&
+            methodBodyPlan.layoutChangedTypes.empty(),
+        "Expected method-body-only ReloadPlan to be compatible without structural migration");
+
+    const auto patchOk = aotProg.applyMethodBodyHotPatch(methodBodyPlan, descV2);
+    require(patchOk.applied && patchOk.revision == 1u && patchOk.patchedMethodCount >= 1u &&
+            kHpSlots[0].patchedImplementation == &hpCalcV2Body && kHpSlots[0].revision == 1u,
+        "applyMethodBodyHotPatch failed for method-body-only edit: " + patchOk.message);
+
+    // After patch: both direct invoke AND thunked caller see v2 implementation (7 * 10 + 5 = 75; +1 = 76)
+    const auto postCalc = aotProg.invoke(kCalcId, {runtime::Value{std::int64_t{7}}});
+    const auto postCaller = aotProg.invoke(kCallerId, {runtime::Value{std::int64_t{7}}});
+    require(postCalc.succeeded && std::get<std::int64_t>(postCalc.value) == 75 &&
+            postCaller.succeeded && std::get<std::int64_t>(postCaller.value) == 76,
+        "Post-patch AOT execution expected 75 and 76");
+
+    // 3. STRICT rejection when structuralMigrationRequired is true
+    {
+        hot_reload::ReloadOptions structOpts;
+        structOpts.allowStructuralChanges = true;
+        const hot_reload::ReloadPlan structuralPlan = hot_reload::prepare(*imgV1, bcV3, structOpts);
+        require(structuralPlan.structuralMigrationRequired && !structuralPlan.layoutChangedTypes.empty(),
+            "Expected structural ReloadPlan from layout change");
+
+        const auto rejStruct = aotProg.applyMethodBodyHotPatch(structuralPlan, descV2);
+        require(!rejStruct.applied && aotProg.hotPatchRevision() == 1u,
+            "applyMethodBodyHotPatch MUST reject structuralMigrationRequired=true");
+    }
+
+    // 4. STRICT rejection when layoutChangedTypes is non-empty even if structuralMigrationRequired flag is false
+    {
+        hot_reload::ReloadPlan layoutOnlyPlan;
+        layoutOnlyPlan.compatible = true;
+        layoutOnlyPlan.structuralMigrationRequired = false;
+        layoutOnlyPlan.changedFunctions = {kCalcId};
+        layoutOnlyPlan.layoutChangedTypes = {kPairId};
+        const auto rejLayout = aotProg.applyMethodBodyHotPatch(
+            layoutOnlyPlan, {{kCalcId, &hpCalcV1Body}});
+        require(!rejLayout.applied && aotProg.hotPatchRevision() == 1u &&
+                kHpSlots[0].patchedImplementation == &hpCalcV2Body,
+            "applyMethodBodyHotPatch MUST reject non-empty layoutChangedTypes");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -944,6 +1194,7 @@ int main() {
             {"CppGenerator #line directive emission control", testAotCppLineDirectivesGeneration},
             {"Pillar 2 & 4: AotRuntime IAwaitScheduler, [ValueLifecycle] sweep & Span SIMD", testAotAwaitSchedulerValueLifecycleAndSpanSimd},
             {"L0 AttributeDescriptor emission, IExecutionPolicy & AOT weak delegate default return", testAotAttributeDescriptorsPolicyAndWeakDelegates},
+            {"AotCpp emitHotPatchThunks & AotRuntime applyMethodBodyHotPatch", testAotHotPatchThunksAndApplyMethodBodyHotPatch},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

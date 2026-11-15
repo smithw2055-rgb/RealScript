@@ -3946,6 +3946,33 @@ bool executeBlockVmFunction(
     ++state.statistics.functionCalls;
     state.statistics.maximumCallDepth = std::max(state.statistics.maximumCallDepth, state.stack.size());
     emitTrace(state, TraceEventKind::FunctionEnter);
+    const std::uint64_t traceStartNs = state.profile
+        ? state.profile->nowSteadyNs()
+        : 0ULL;
+    const std::size_t traceCallDepth = state.stack.size();
+    struct ProfileSpanGuard {
+        ProfileCollector* collector;
+        semantic::SymbolId functionId;
+        std::string_view functionName;
+        std::uint64_t startNs;
+        std::size_t callDepth;
+        ~ProfileSpanGuard() noexcept {
+            if (collector) {
+                const std::uint64_t endNs = collector->nowSteadyNs();
+                collector->recordTraceSpan(
+                    functionId,
+                    functionName,
+                    startNs,
+                    endNs >= startNs ? (endNs - startNs) : 0ULL,
+                    callDepth);
+            }
+        }
+    } profileSpanGuard{
+        state.profile,
+        function.symbolId,
+        location.qualifiedName,
+        traceStartNs,
+        traceCallDepth};
     ArenaFrameScope frame(state);
     const std::size_t blockArgCount = activeCoroutineFrame
         ? activeCoroutineFrame->savedArguments.size()

@@ -6,6 +6,7 @@
 #include "realscript/runtime/ParallelJob.h"
 #include "realscript/runtime/Runtime.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -848,6 +849,255 @@ public async NativeTaskInt RunDelayedOrFault(int mult, int[] cleanupFlag) {
     }
 }
 
+void testParallelJobRawColumnsAndNativeBatchKernel() {
+    const std::string src = R"RS(
+module Kernel.ParRaw;
+
+public class ColStore {
+    public static int[] Factors;
+}
+
+int PureHostBump(int x);
+
+public void InitFactors(int[] factors) {
+    ColStore.Factors = factors;
+}
+
+public void RawSaxpy(int idx, int[] input, int[] output, int scale) {
+    output[idx] = input[idx] * scale + 3;
+}
+
+public void StaticColScale(int idx, int[] output) {
+    output[idx] = ColStore.Factors[idx] * 5;
+}
+
+public void ExternalFallbackKernel(int idx, int[] input, int[] output) {
+    output[idx] = PureHostBump(input[idx]);
+}
+)RS";
+
+    auto bundle = compileAndLink({{"par_raw_batch.rscript", src}}, {}, optimization::Level::Basic);
+    const auto heap = std::make_shared<runtime::ManagedHeap>();
+
+    constexpr std::size_t kCount = 128u;
+    std::vector<std::int32_t> hostIn(kCount);
+    std::vector<std::int32_t> hostOut(kCount, 0);
+    for (std::size_t i = 0; i < kCount; ++i) {
+        hostIn[i] = static_cast<std::int32_t>(i + 1u);
+    }
+
+    const auto intArrTid = semantic::stableTypeId("int[]");
+    runtime::NativeRawColumnView inView{};
+    inView.basePtr = hostIn.data();
+    inView.count = kCount;
+    inView.strideBytes = sizeof(std::int32_t);
+    inView.readOnly = true;
+    inView.mode = runtime::RawColumnMode::ScalarPacked;
+    inView.elementType = semantic::PrimitiveType::Int;
+    inView.packedEncoding = runtime::PackedElemEncoding::Int32;
+
+    runtime::NativeRawColumnView outView{};
+    outView.basePtr = hostOut.data();
+    outView.count = kCount;
+    outView.strideBytes = sizeof(std::int32_t);
+    outView.readOnly = false;
+    outView.mode = runtime::RawColumnMode::ScalarPacked;
+    outView.elementType = semantic::PrimitiveType::Int;
+    outView.packedEncoding = runtime::PackedElemEncoding::Int32;
+
+    runtime::RuntimeError rawErr;
+    const auto rawInRef = heap->allocateRawColumnArray(intArrTid, 0u, inView, &rawErr);
+    const auto rawOutRef = heap->allocateRawColumnArray(intArrTid, 0u, outView, &rawErr);
+    const auto aliasOutRef = heap->allocateRawColumnArray(intArrTid, 0u, outView, &rawErr);
+    require(rawInRef.has_value() && rawOutRef.has_value() && aliasOutRef.has_value(),
+        "allocateRawColumnArray failed: " + rawErr.message);
+    auto pinIn = heap->retain(runtime::Value{*rawInRef});
+    auto pinOut = heap->retain(runtime::Value{*rawOutRef});
+    auto pinAlias = heap->retain(runtime::Value{*aliasOutRef});
+
+    runtime::ParallelJobScheduler sched(4);
+
+    // 1. Disallowing allowRawColumnArrays rejects raw column arguments safely
+    {
+        runtime::ParallelJobConfig disallowed;
+        disallowed.workerCount = 4;
+        disallowed.allowRawColumnArrays = false;
+        const auto failRes = sched.dispatchFor(
+            bundle.program,
+            heap,
+            "Kernel.ParRaw::RawSaxpy",
+            kCount,
+            {runtime::Value{*rawInRef}, runtime::Value{*rawOutRef}, runtime::Value{std::int64_t{4}}},
+            disallowed);
+        require(!failRes.succeeded && failRes.error.code == runtime::ErrorCode::CapabilityDenied,
+            "Expected CapabilityDenied for RawColumnArray when allowRawColumnArrays is false");
+    }
+
+    // 2. Writing into a readOnly RawColumnArray must be rejected
+    {
+        runtime::ParallelJobConfig roCfg;
+        roCfg.workerCount = 4;
+        roCfg.allowRawColumnArrays = true;
+        const auto roFail = sched.dispatchFor(
+            bundle.program,
+            heap,
+            "Kernel.ParRaw::RawSaxpy",
+            kCount,
+            {runtime::Value{*rawOutRef}, runtime::Value{*rawInRef}, runtime::Value{std::int64_t{2}}},
+            roCfg);
+        require(!roFail.succeeded && roFail.error.code == runtime::ErrorCode::CapabilityDenied,
+            "Expected CapabilityDenied when writing to a readOnly RawColumnArray");
+    }
+
+    // 3. Two distinct ObjectRefs overlapping the same host buffer while written must fail aliasing check
+    {
+        runtime::ParallelJobConfig aliasCfg;
+        aliasCfg.workerCount = 4;
+        aliasCfg.allowRawColumnArrays = true;
+        const auto aliasFail = sched.dispatchFor(
+            bundle.program,
+            heap,
+            "Kernel.ParRaw::RawSaxpy",
+            kCount,
+            {runtime::Value{*aliasOutRef}, runtime::Value{*rawOutRef}, runtime::Value{std::int64_t{2}}},
+            aliasCfg);
+        require(!aliasFail.succeeded && aliasFail.error.code == runtime::ErrorCode::InvalidArguments,
+            "Expected InvalidArguments for overlapping host RawColumn buffers");
+    }
+
+    // 4. Zero-copy POD auto native batch kernel executes over RawColumn buffers without constructing workerInterpreters
+    {
+        runtime::ParallelJobConfig cfg;
+        cfg.workerCount = 4;
+        cfg.batchSize = 32;
+        cfg.allowRawColumnArrays = true;
+        cfg.executionOptions.determinism.mode = runtime::DeterminismMode::Strict;
+        const auto okRes = sched.dispatchFor(
+            bundle.program,
+            heap,
+            "Kernel.ParRaw::RawSaxpy",
+            kCount,
+            {runtime::Value{*rawInRef}, runtime::Value{*rawOutRef}, runtime::Value{std::int64_t{7}}},
+            cfg);
+        require(okRes.succeeded, "Auto ParallelNativeBatchKernel failed: " + okRes.error.message);
+        require(okRes.usedNativeBatchKernel && okRes.workerInterpretersConstructed == 0u,
+            "Expected usedNativeBatchKernel=true and workerInterpretersConstructed=0 on POD/RawColumn batch");
+        for (std::size_t i = 0; i < kCount; ++i) {
+            require(hostOut[i] == hostIn[i] * 7 + 3,
+                "Zero-copy RawSaxpy output mismatch at index " + std::to_string(i));
+        }
+    }
+
+    // 5. allowReadOnlyStaticColumnLoads verifier gating + read-only static column native execution
+    {
+        runtime::Interpreter initVm(bundle.program, heap);
+        const auto initRes = initVm.invoke("Kernel.ParRaw::InitFactors", {runtime::Value{*rawInRef}});
+        require(initRes.succeeded, "InitFactors failed: " + initRes.error.message);
+
+        runtime::ParallelJobVerifyOptions noStaticOpts;
+        noStaticOpts.allowRawColumnArrays = true;
+        noStaticOpts.allowReadOnlyStaticColumnLoads = false;
+        const auto vDeny = runtime::verifyParallelJobFunction(
+            *bundle.program, "Kernel.ParRaw::StaticColScale", noStaticOpts);
+        require(!vDeny.valid,
+            "StaticColScale must fail verification when allowReadOnlyStaticColumnLoads is false");
+
+        runtime::ParallelJobVerifyOptions allowStaticOpts;
+        allowStaticOpts.allowRawColumnArrays = true;
+        allowStaticOpts.allowReadOnlyStaticColumnLoads = true;
+        const auto vAllow = runtime::verifyParallelJobFunction(
+            *bundle.program, "Kernel.ParRaw::StaticColScale", allowStaticOpts);
+        require(vAllow.valid && vAllow.usesReadOnlyStaticColumnLoads,
+            "StaticColScale must pass verification with allowReadOnlyStaticColumnLoads=true");
+
+        std::fill(hostOut.begin(), hostOut.end(), 0);
+        runtime::ParallelJobConfig sCfg;
+        sCfg.workerCount = 4;
+        sCfg.batchSize = 32;
+        sCfg.allowRawColumnArrays = true;
+        sCfg.allowReadOnlyStaticColumnLoads = true;
+        const auto sRes = sched.dispatchFor(
+            bundle.program,
+            heap,
+            "Kernel.ParRaw::StaticColScale",
+            kCount,
+            {runtime::Value{*rawOutRef}},
+            sCfg);
+        require(sRes.succeeded && sRes.usedNativeBatchKernel && sRes.workerInterpretersConstructed == 0u,
+            "Expected native zero-copy execution for read-only static column load: " + sRes.error.message);
+        for (std::size_t i = 0; i < kCount; ++i) {
+            require(hostOut[i] == hostIn[i] * 5,
+                "StaticColScale output mismatch at index " + std::to_string(i));
+        }
+    }
+
+    // 6. Explicit ParallelNativeBatchKernel callback receives column bindings & processes raw buffers directly
+    {
+        std::fill(hostOut.begin(), hostOut.end(), 0);
+        std::atomic<std::size_t> seenBatches{0u};
+        runtime::ParallelJobConfig cbCfg;
+        cbCfg.workerCount = 4;
+        cbCfg.batchSize = 32;
+        cbCfg.allowRawColumnArrays = true;
+        cbCfg.nativeBatchKernel = [&](runtime::ParallelNativeBatchContext& ctx) -> bool {
+            if (!ctx.columns || ctx.columns->size() < 2u) return false;
+            const auto* inPtr = static_cast<const std::int32_t*>((*ctx.columns)[0].basePtr);
+            auto* outPtr = static_cast<std::int32_t*>((*ctx.columns)[1].basePtr);
+            for (std::size_t k = 0; k < ctx.count; ++k) {
+                const std::size_t idx = ctx.start + k;
+                outPtr[idx] = inPtr[idx] * 11;
+            }
+            seenBatches.fetch_add(1u, std::memory_order_relaxed);
+            return true;
+        };
+        const auto cbRes = sched.dispatchFor(
+            bundle.program,
+            heap,
+            "Kernel.ParRaw::RawSaxpy",
+            kCount,
+            {runtime::Value{*rawInRef}, runtime::Value{*rawOutRef}, runtime::Value{std::int64_t{1}}},
+            cbCfg);
+        require(cbRes.succeeded && cbRes.usedNativeBatchKernel &&
+                cbRes.workerInterpretersConstructed == 0u && seenBatches.load() == cbRes.numBatches,
+            "Explicit ParallelNativeBatchKernel failed");
+        for (std::size_t i = 0; i < kCount; ++i) {
+            require(hostOut[i] == hostIn[i] * 11, "Explicit nativeBatchKernel output mismatch");
+        }
+    }
+
+    // 7. Safe fallback to workerInterpreters for unsupported kernels (e.g. calling allowed host extern)
+    {
+        std::fill(hostOut.begin(), hostOut.end(), 0);
+        auto reg = std::make_shared<runtime::BindingRegistry>();
+        reg->bind(
+            "Kernel.ParRaw::PureHostBump",
+            [](const bytecode::FunctionReference&,
+               runtime::ValueSpan args,
+               runtime::RuntimeError&) -> std::optional<runtime::Value> {
+                return runtime::Value{std::get<std::int64_t>(args[0]) + 100};
+            });
+        runtime::ParallelJobConfig fbCfg;
+        fbCfg.workerCount = 2;
+        fbCfg.batchSize = 32;
+        fbCfg.allowRawColumnArrays = true;
+        fbCfg.pureExternalNames.insert("Kernel.ParRaw::PureHostBump");
+        const auto fbRes = sched.dispatchFor(
+            bundle.program,
+            heap,
+            "Kernel.ParRaw::ExternalFallbackKernel",
+            kCount,
+            {runtime::Value{*rawInRef}, runtime::Value{*rawOutRef}},
+            fbCfg,
+            reg);
+        require(fbRes.succeeded && !fbRes.usedNativeBatchKernel &&
+                fbRes.workerInterpretersConstructed == 2u,
+            "Expected safe fallback constructing workerInterpreters for host-extern kernel: " + fbRes.error.message);
+        for (std::size_t i = 0; i < kCount; ++i) {
+            require(hostOut[i] == hostIn[i] + 100, "Fallback kernel output mismatch");
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -859,6 +1109,7 @@ int main() {
             {"AwaitableCorePool ABA safety, GC roots & CancellationTokenSource", testAwaitablePoolAbaAndCancellation},
             {"IAwaitScheduler fast path & true suspension/resumption", testDuckTypedAwaitSchedulerFastAndSuspendedPaths},
             {"Pillar 2: IAwaitScheduler immediate & resumed faults + finally cleanup", testAwaitSchedulerFaultAndDelayedResumePaths},
+            {"ParallelJob RawColumnArray zero-copy, allowReadOnlyStaticColumnLoads & ParallelNativeBatchKernel", testParallelJobRawColumnsAndNativeBatchKernel},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

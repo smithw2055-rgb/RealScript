@@ -39,7 +39,8 @@ void emitTypedPrimitiveFunction(
     std::vector<SourceMapRecord>& sourceMap,
     const std::unordered_map<semantic::SymbolId, const FunctionView*>& typedFunctions,
     const std::map<semantic::SymbolId, TypeView>& allTypes,
-    const std::unordered_map<const mir::Instruction*, std::size_t>& callIds) {
+    const std::unordered_map<const mir::Instruction*, std::size_t>& callIds,
+    const std::unordered_map<semantic::SymbolId, std::size_t>& hotPatchSlots) {
     const auto& module = *view.module;
     const auto& function = *view.function;
     const auto types = valueSlotTypes(function);
@@ -1615,6 +1616,18 @@ void emitTypedPrimitiveFunction(
                         source.line("            switch (polyActualTid_" + suffix + ") {");
                         for (const auto& [candTid, calleeView] : polyTargets) {
                             source.line("            case 0x" + hexId(candTid) + "ULL: {");
+                            if (options.emitHotPatchThunks) {
+                                const auto hpIt = hotPatchSlots.find(calleeView->function->symbolId);
+                                if (hpIt != hotPatchSlots.end()) {
+                                    source.line("                if (RS_AOT_UNLIKELY(context.hasHotPatchOverride(0x" +
+                                        hexId(calleeView->function->symbolId) + "ULL) || "
+                                        "programHotPatchSlots[" + std::to_string(hpIt->second) +
+                                        "u].patchedImplementation != programHotPatchSlots[" +
+                                        std::to_string(hpIt->second) + "u].originalImplementation)) {");
+                                    source.line("                    break;");
+                                    source.line("                }");
+                                }
+                            }
                             source.line("                polyDispatched_" + suffix + " = true;");
                             source.line("                semantic::SymbolId prevFn_" + suffix + " = 0;");
                             source.line("                (void)prevFn_" + suffix + ";");
@@ -1728,10 +1741,60 @@ void emitTypedPrimitiveFunction(
                             " directCallRes_" + suffix + "{};");
                         callArgs += ", directCallRes_" + suffix;
                     }
-                    source.line("            const bool directCallOk_" + suffix +
-                        " = " + calleeView->cppName +
-                        "_scalar<FastAccounting, DeterminismAccounting, TrustedRelease>(" +
-                        callArgs + ");");
+                    const auto hpIt = options.emitHotPatchThunks
+                        ? hotPatchSlots.find(calleeView->function->symbolId)
+                        : hotPatchSlots.end();
+                    if (options.emitHotPatchThunks && hpIt != hotPatchSlots.end()) {
+                        source.line("            bool directCallOk_" + suffix + " = false;");
+                        source.line("            if (RS_AOT_UNLIKELY(context.hasHotPatchOverride(0x" +
+                            hexId(calleeView->function->symbolId) + "ULL) || "
+                            "programHotPatchSlots[" + std::to_string(hpIt->second) +
+                            "u].patchedImplementation != programHotPatchSlots[" +
+                            std::to_string(hpIt->second) + "u].originalImplementation)) {");
+                        std::string hpArgPtr = "nullptr";
+                        if (!instruction.operands.empty()) {
+                            source.line("                std::array<runtime::Value, " +
+                                std::to_string(instruction.operands.size()) +
+                                "> hpArgs_" + suffix + "{{");
+                            for (std::size_t argIndex = 0; argIndex < instruction.operands.size(); ++argIndex) {
+                                const auto argSlot = operandSlot(argIndex);
+                                const auto boxPrim = (argIndex < instruction.parameterTypes.size() &&
+                                                      argSlot.primitive == semantic::PrimitiveType::Null)
+                                    ? instruction.parameterTypes[argIndex]
+                                    : argSlot.primitive;
+                                source.line("                    aot::typedBoxScalar(" +
+                                    primitiveExpression(boxPrim) + ", " +
+                                    callOperandExpr(argIndex) + "),");
+                            }
+                            source.line("                }};");
+                            hpArgPtr = "hpArgs_" + suffix + ".data()";
+                        }
+                        source.line("                runtime::Value hpRet_" + suffix + "{};");
+                        source.line("                directCallOk_" + suffix + " = " + calleeView->cppName +
+                            "(context, " + hpArgPtr + ", " +
+                            std::to_string(instruction.operands.size()) + "u, hpRet_" + suffix + ");");
+                        if (instruction.resultType != semantic::PrimitiveType::Void) {
+                            source.line("                if (directCallOk_" + suffix +
+                                " && !aot::typedUnboxScalar(" +
+                                primitiveExpression(instruction.resultType) +
+                                ", hpRet_" + suffix + ", directCallRes_" + suffix + ")) {");
+                            source.line("                    directCallOk_" + suffix +
+                                " = context.fail(runtime::ErrorCode::TypeMismatch, "
+                                "\"AOT hot-patch call return type mismatch\");");
+                            source.line("                }");
+                        }
+                        source.line("            } else {");
+                        source.line("                directCallOk_" + suffix +
+                            " = " + calleeView->cppName +
+                            "_scalar<FastAccounting, DeterminismAccounting, TrustedRelease>(" +
+                            callArgs + ");");
+                        source.line("            }");
+                    } else {
+                        source.line("            const bool directCallOk_" + suffix +
+                            " = " + calleeView->cppName +
+                            "_scalar<FastAccounting, DeterminismAccounting, TrustedRelease>(" +
+                            callArgs + ");");
+                    }
                     if (instruction.resultType != semantic::PrimitiveType::Void) {
                         source.line("            context.exitTypedDirectCall<FastAccounting, DeterminismAccounting, TrustedRelease>(prevFn_" +
                             suffix + ", directCallOk_" + suffix +
@@ -2096,6 +2159,18 @@ void emitTypedPrimitiveFunction(
                     source.line("                switch (leaf.targetSymbolId) {");
                     for (const auto& cand : delCandidates) {
                         source.line("                case 0x" + hexId(cand.symbolId) + "ULL: {");
+                        if (options.emitHotPatchThunks) {
+                            const auto hpIt = hotPatchSlots.find(cand.symbolId);
+                            if (hpIt != hotPatchSlots.end()) {
+                                source.line("                    if (RS_AOT_UNLIKELY(context.hasHotPatchOverride(0x" +
+                                    hexId(cand.symbolId) + "ULL) || "
+                                    "programHotPatchSlots[" + std::to_string(hpIt->second) +
+                                    "u].patchedImplementation != programHotPatchSlots[" +
+                                    std::to_string(hpIt->second) + "u].originalImplementation)) {");
+                                source.line("                        break;");
+                                source.line("                    }");
+                            }
+                        }
                         std::string recvGuard = cand.expectsReceiver ? "leaf.hasReceiver" : "!leaf.hasReceiver";
                         if (cand.expectsReceiver && cand.recvTypeId != 0) {
                             const auto rHex = "0x" + hexId(cand.recvTypeId) + "ULL";
@@ -2552,7 +2627,10 @@ void emitTypedPrimitiveFunction(
     }
     source.line("}");
     source.line();
-    source.line("static bool " + view.cppName + "(");
+    const std::string entryBodyName = options.emitHotPatchThunks
+        ? (view.cppName + "_body")
+        : view.cppName;
+    source.line("static bool " + entryBodyName + "(");
     source.line("    ExecutionContext& context,");
     source.line("    const runtime::Value* arguments,");
     source.line("    std::size_t argumentCount,");

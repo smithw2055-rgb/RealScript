@@ -275,6 +275,11 @@ void emitVectorizedPackedArrayLoop(
     const mir::Function& function,
     const mir::Instruction& allocInst,
     const std::map<semantic::SymbolId, TypeView>& allTypes) noexcept;
+void emitHotPatchThunks(
+    Emitter& source,
+    const std::vector<FunctionView>& functions,
+    const GenerationOptions& options);
+
 void emitTypedPrimitiveFunction(
     Emitter& source,
     const FunctionView& view,
@@ -282,6 +287,7 @@ void emitTypedPrimitiveFunction(
     std::vector<SourceMapRecord>& sourceMap,
     const std::unordered_map<semantic::SymbolId, const FunctionView*>& typedFunctions,
     const std::map<semantic::SymbolId, TypeView>& allTypes,
-    const std::unordered_map<const mir::Instruction*, std::size_t>& callIds);
+    const std::unordered_map<const mir::Instruction*, std::size_t>& callIds,
+    const std::unordered_map<semantic::SymbolId, std::size_t>& hotPatchSlots);
 
 } // namespace realscript::aot::detail

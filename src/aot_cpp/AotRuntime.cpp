@@ -918,7 +918,11 @@ bool ExecutionContext::invoke(
     runtime::ScopedValuePoolDomain domainScope(
         heap_ ? heap_->valuePoolDomain().get() : nullptr);
     const auto* function = findFunction(symbolId);
-    if (!function || !function->implementation) {
+    const FunctionImplementation overrideImpl =
+        function ? resolveHotPatchImplementation(function->symbolId) : nullptr;
+    const FunctionImplementation targetImpl =
+        overrideImpl ? overrideImpl : (function ? function->implementation : nullptr);
+    if (!function || !targetImpl) {
         return fail(
             runtime::ErrorCode::FunctionNotFound,
             "AOT entry function was not found");
@@ -1006,7 +1010,7 @@ bool ExecutionContext::invoke(
         if (statistics_.maximumCallDepth == 0) {
             statistics_.maximumCallDepth = 1;
         }
-        const bool ok = function->implementation(
+        const bool ok = targetImpl(
             *this,
             arguments,
             argumentCount,
@@ -1025,12 +1029,38 @@ bool ExecutionContext::invoke(
     statistics_.maximumCallDepth = std::max(
         statistics_.maximumCallDepth,
         stack_.size());
+    struct AotInvokeProfileGuard {
+        runtime::ProfileCollector* collector = nullptr;
+        semantic::SymbolId functionId = 0;
+        const char* functionName = nullptr;
+        std::size_t depth = 0;
+        std::uint64_t startNs = 0;
+        ~AotInvokeProfileGuard() noexcept {
+            if (collector) {
+                const std::uint64_t endNs = collector->nowSteadyNs();
+                const std::uint64_t durationNs =
+                    endNs >= startNs ? (endNs - startNs) : 0ULL;
+                collector->recordTraceSpan(
+                    functionId,
+                    functionName ? std::string_view(functionName)
+                                 : std::string_view("<aot-function>"),
+                    startNs,
+                    durationNs,
+                    depth);
+            }
+        }
+    } profileGuard{
+        options_.profile.get(),
+        function->symbolId,
+        function->name,
+        stack_.size(),
+        options_.profile ? options_.profile->nowSteadyNs() : 0ULL};
     emitTrace(runtime::TraceEventKind::FunctionEnter);
 
     bool succeeded = false;
 #if defined(__cpp_exceptions) || defined(_CPPUNWIND)
     try {
-        succeeded = function->implementation(
+        succeeded = targetImpl(
             *this,
             arguments,
             argumentCount,
@@ -1046,7 +1076,7 @@ bool ExecutionContext::invoke(
             "AOT execution threw an unknown exception");
     }
 #else
-    succeeded = function->implementation(
+    succeeded = targetImpl(
         *this,
         arguments,
         argumentCount,
@@ -4011,6 +4041,13 @@ Program::Program(const ProgramDescriptor& descriptor)
 }
 
 Program::~Program() {
+    for (const auto& record : modifiedHotPatchSlots_) {
+        if (record.slot) {
+            record.slot->patchedImplementation = record.originalImplementation;
+            record.slot->revision = 0;
+        }
+    }
+    modifiedHotPatchSlots_.clear();
     if (lifecycleTarget_) {
         std::lock_guard<std::mutex> lock(lifecycleTarget_->mutex);
         lifecycleTarget_->program = nullptr;
@@ -4029,6 +4066,7 @@ struct AotResumeEnv {
     std::weak_ptr<runtime::AsyncRuntimeContext> asyncRuntimeWeak;
     std::unordered_map<semantic::SymbolId, const TypeDescriptor*> ownedTypes;
     std::unordered_map<semantic::SymbolId, const FunctionDescriptor*> ownedFunctions;
+    std::unordered_map<semantic::SymbolId, FunctionImplementation> hotPatchedBodies;
 };
 
 namespace {
@@ -4282,6 +4320,7 @@ void ExecutionContext::resumeCoroutineThunk(
         std::move(opts),
         &env->ownedTypes,
         &env->ownedFunctions);
+    freshCtx.setHotPatchedBodies(&env->hotPatchedBodies);
     std::shared_ptr<runtime::AsyncRuntimeContext> borrowedAsync(
         std::shared_ptr<runtime::AsyncRuntimeContext>{}, &asyncContext);
     freshCtx.setAsyncRuntime(
@@ -5328,6 +5367,335 @@ const ProgramDescriptor& Program::descriptor() const noexcept {
     return *descriptor_;
 }
 
+namespace {
+
+bool validateMethodBodyHotPatchPlan(
+    const hot_reload::ReloadPlan& plan,
+    std::string& outError) {
+    if (plan.structuralMigrationRequired) {
+        outError =
+            "AOT method-body hot-patch rejected: structuralMigrationRequired is true";
+        return false;
+    }
+    if (!plan.layoutChangedTypes.empty()) {
+        outError =
+            "AOT method-body hot-patch rejected: layoutChangedTypes is non-empty";
+        return false;
+    }
+    if (!plan.typeMigrations.empty()) {
+        outError =
+            "AOT method-body hot-patch rejected: typeMigrations is non-empty";
+        return false;
+    }
+    if (!plan.addedTypes.empty() || !plan.removedTypes.empty()) {
+        outError =
+            "AOT method-body hot-patch rejected: type additions/removals are not supported";
+        return false;
+    }
+    if (!plan.issues.empty()) {
+        outError =
+            "AOT method-body hot-patch rejected: " + plan.issues.front().message;
+        return false;
+    }
+    if (!plan.compatible) {
+        outError =
+            "AOT method-body hot-patch rejected: ReloadPlan is marked incompatible";
+        return false;
+    }
+    return true;
+}
+
+bool cstringsEqual(const char* a, const char* b) noexcept {
+    if (a == b) return true;
+    if (!a || !b) return false;
+    return std::strcmp(a, b) == 0;
+}
+
+bool typeDescriptorsLayoutEquivalent(
+    const TypeDescriptor& existing,
+    const TypeDescriptor& replacement) noexcept {
+    if (existing.id != replacement.id ||
+        existing.kind != replacement.kind ||
+        existing.baseTypeId != replacement.baseTypeId ||
+        existing.fieldCount != replacement.fieldCount ||
+        existing.virtualSlotCount != replacement.virtualSlotCount ||
+        existing.interfaceType != replacement.interfaceType ||
+        existing.delegateType != replacement.delegateType ||
+        existing.hasValueLifecycle != replacement.hasValueLifecycle) {
+        return false;
+    }
+    if (existing.fieldCount > 0 && (!existing.fields || !replacement.fields)) {
+        return false;
+    }
+    for (std::uint32_t i = 0; i < existing.fieldCount; ++i) {
+        const auto& ef = existing.fields[i];
+        const auto& rf = replacement.fields[i];
+        if (ef.type != rf.type ||
+            ef.typeId != rf.typeId ||
+            ef.index != rf.index ||
+            ef.staticField != rf.staticField ||
+            ef.constField != rf.constField ||
+            !cstringsEqual(ef.name, rf.name)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool functionSignaturesEquivalent(
+    const FunctionDescriptor& existing,
+    const FunctionDescriptor& replacement) noexcept {
+    if (existing.symbolId != replacement.symbolId ||
+        existing.returnType != replacement.returnType ||
+        existing.returnTypeId != replacement.returnTypeId ||
+        existing.parameterCount != replacement.parameterCount) {
+        return false;
+    }
+    if (existing.parameterCount > 0 &&
+        (!existing.parameterTypes || !existing.parameterTypeIds ||
+         !replacement.parameterTypes || !replacement.parameterTypeIds)) {
+        return false;
+    }
+    for (std::uint32_t p = 0; p < existing.parameterCount; ++p) {
+        if (existing.parameterTypes[p] != replacement.parameterTypes[p] ||
+            existing.parameterTypeIds[p] != replacement.parameterTypeIds[p]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+HotPatchResult Program::applyMethodBodyHotPatch(
+    const hot_reload::ReloadPlan& plan,
+    const std::unordered_map<semantic::SymbolId, FunctionImplementation>& patchedBodies) {
+    HotPatchResult result{};
+    result.revision = hotPatchRevision_;
+    if (!descriptor_) {
+        result.message = "AOT program descriptor is null";
+        return result;
+    }
+    if (!validateMethodBodyHotPatchPlan(plan, result.message)) {
+        return result;
+    }
+
+    // Build validated list of (symbolId, targetImplementation) atomically before mutating anything.
+    std::vector<std::pair<semantic::SymbolId, FunctionImplementation>> pendingUpdates;
+    std::unordered_set<semantic::SymbolId> queuedIds;
+
+    auto enqueueChecked = [&](semantic::SymbolId symId, FunctionImplementation impl) -> bool {
+        if (symId == 0 || !impl) {
+            result.message = "AOT method-body hot-patch rejected: null function implementation";
+            return false;
+        }
+        if (functions_.find(symId) == functions_.end()) {
+            result.message =
+                "AOT method-body hot-patch rejected: target symbol is not present in loaded Program";
+            return false;
+        }
+        if (queuedIds.insert(symId).second) {
+            pendingUpdates.emplace_back(symId, impl);
+        }
+        return true;
+    };
+
+    if (!plan.changedFunctions.empty()) {
+        for (const semantic::SymbolId symId : plan.changedFunctions) {
+            const auto found = patchedBodies.find(symId);
+            if (found == patchedBodies.end()) {
+                result.message =
+                    "AOT method-body hot-patch rejected: missing replacement body for changed function";
+                return result;
+            }
+            if (!enqueueChecked(symId, found->second)) {
+                return result;
+            }
+        }
+        for (const auto& [symId, impl] : patchedBodies) {
+            if (!enqueueChecked(symId, impl)) {
+                return result;
+            }
+        }
+    } else {
+        for (const auto& [symId, impl] : patchedBodies) {
+            if (!enqueueChecked(symId, impl)) {
+                return result;
+            }
+        }
+    }
+
+    std::unordered_map<semantic::SymbolId, HotPatchSlot*> slotMap;
+    if (descriptor_->hotPatchSlots != nullptr && descriptor_->hotPatchSlotCount > 0) {
+        slotMap.reserve(descriptor_->hotPatchSlotCount);
+        for (std::uint32_t i = 0; i < descriptor_->hotPatchSlotCount; ++i) {
+            HotPatchSlot* slot = &descriptor_->hotPatchSlots[i];
+            if (slot->symbolId != 0) {
+                slotMap[slot->symbolId] = slot;
+            }
+        }
+        for (const auto& [symId, impl] : pendingUpdates) {
+            (void)impl;
+            if (slotMap.find(symId) == slotMap.end()) {
+                result.message =
+                    "AOT method-body hot-patch rejected: target function has no emitted hot-patch slot";
+                return result;
+            }
+        }
+    }
+
+    const std::uint32_t nextRevision = hotPatchRevision_ + 1u;
+    for (const auto& [symId, impl] : pendingUpdates) {
+        hotPatchedBodies_[symId] = impl;
+        if (!slotMap.empty()) {
+            HotPatchSlot* slot = slotMap.at(symId);
+            bool alreadyTracked = false;
+            for (const auto& rec : modifiedHotPatchSlots_) {
+                if (rec.slot == slot) {
+                    alreadyTracked = true;
+                    break;
+                }
+            }
+            if (!alreadyTracked) {
+                modifiedHotPatchSlots_.push_back(ModifiedHotPatchSlotRecord{
+                    slot,
+                    slot->originalImplementation});
+            }
+            slot->patchedImplementation = impl;
+            slot->revision = nextRevision;
+        }
+        result.patchedSymbolIds.push_back(symId);
+    }
+
+    hotPatchRevision_ = nextRevision;
+    if (resumeEnv_) {
+        static_cast<AotResumeEnv*>(resumeEnv_.get())->hotPatchedBodies = hotPatchedBodies_;
+    }
+
+    result.applied = true;
+    result.revision = hotPatchRevision_;
+    result.patchedMethodCount = result.patchedSymbolIds.size();
+    result.message = "AOT method-body hot-patch applied";
+    return result;
+}
+
+HotPatchResult Program::applyMethodBodyHotPatch(
+    const hot_reload::ReloadPlan& plan,
+    const ProgramDescriptor& replacementProgram) {
+    HotPatchResult result{};
+    result.revision = hotPatchRevision_;
+    if (!descriptor_) {
+        result.message = "AOT program descriptor is null";
+        return result;
+    }
+    if (!validateMethodBodyHotPatchPlan(plan, result.message)) {
+        return result;
+    }
+    if (replacementProgram.abiMajor != RuntimeAbiMajor) {
+        result.message =
+            "AOT method-body hot-patch rejected: incompatible replacement ABI major version";
+        return result;
+    }
+    if (replacementProgram.typeCount > 0) {
+        if (!replacementProgram.types) {
+            result.message =
+                "AOT method-body hot-patch rejected: replacement descriptor has null types array";
+            return result;
+        }
+        if (replacementProgram.typeCount != types_.size()) {
+            result.message =
+                "AOT method-body hot-patch rejected: type table count differs from loaded Program";
+            return result;
+        }
+        for (std::uint32_t i = 0; i < replacementProgram.typeCount; ++i) {
+            const auto& repType = replacementProgram.types[i];
+            const auto found = types_.find(repType.id);
+            if (found == types_.end() ||
+                !typeDescriptorsLayoutEquivalent(*found->second, repType)) {
+                result.message =
+                    "AOT method-body hot-patch rejected: struct or class type layout changed";
+                return result;
+            }
+        }
+    }
+    if (replacementProgram.functionCount > 0 && !replacementProgram.functions) {
+        result.message =
+            "AOT method-body hot-patch rejected: replacement descriptor has null functions array";
+        return result;
+    }
+
+    std::unordered_map<semantic::SymbolId, const FunctionDescriptor*> repFunctions;
+    repFunctions.reserve(replacementProgram.functionCount);
+    for (std::uint32_t i = 0; i < replacementProgram.functionCount; ++i) {
+        const auto& fn = replacementProgram.functions[i];
+        if (fn.symbolId != 0) {
+            repFunctions[fn.symbolId] = &fn;
+        }
+    }
+
+    // Prefer raw `_body` entry pointer (`originalImplementation`) from replacement's hotPatchSlots
+    // so patching never indirectly bounces back through an identically named thunk!
+    std::unordered_map<semantic::SymbolId, FunctionImplementation> repRawBodies;
+    if (replacementProgram.hotPatchSlots != nullptr &&
+        replacementProgram.hotPatchSlotCount > 0) {
+        repRawBodies.reserve(replacementProgram.hotPatchSlotCount);
+        for (std::uint32_t i = 0; i < replacementProgram.hotPatchSlotCount; ++i) {
+            const auto& slot = replacementProgram.hotPatchSlots[i];
+            if (slot.symbolId != 0 && slot.originalImplementation != nullptr) {
+                repRawBodies[slot.symbolId] = slot.originalImplementation;
+            }
+        }
+    }
+
+    std::unordered_map<semantic::SymbolId, FunctionImplementation> patchedBodies;
+    auto collectTarget = [&](semantic::SymbolId symId) -> bool {
+        const auto origIt = functions_.find(symId);
+        const auto repIt = repFunctions.find(symId);
+        if (origIt == functions_.end() || repIt == repFunctions.end()) {
+            result.message =
+                "AOT method-body hot-patch rejected: target symbol missing in replacement descriptor";
+            return false;
+        }
+        if (!functionSignaturesEquivalent(*origIt->second, *repIt->second)) {
+            result.message =
+                "AOT method-body hot-patch rejected: function signature changed";
+            return false;
+        }
+        const auto rawIt = repRawBodies.find(symId);
+        const FunctionImplementation impl = (rawIt != repRawBodies.end())
+            ? rawIt->second
+            : repIt->second->implementation;
+        if (!impl) {
+            result.message =
+                "AOT method-body hot-patch rejected: null replacement implementation";
+            return false;
+        }
+        patchedBodies[symId] = impl;
+        return true;
+    };
+
+    if (!plan.changedFunctions.empty()) {
+        for (const semantic::SymbolId symId : plan.changedFunctions) {
+            if (!collectTarget(symId)) return result;
+        }
+        for (const semantic::SymbolId symId : plan.inlineInvalidatedFunctions) {
+            if (repFunctions.find(symId) != repFunctions.end() &&
+                functions_.find(symId) != functions_.end()) {
+                if (!collectTarget(symId)) return result;
+            }
+        }
+    } else {
+        for (const auto& [symId, repFn] : repFunctions) {
+            (void)repFn;
+            if (functions_.find(symId) != functions_.end()) {
+                if (!collectTarget(symId)) return result;
+            }
+        }
+    }
+
+    return applyMethodBodyHotPatch(plan, patchedBodies);
+}
+
 runtime::ExecutionResult Program::invoke(
     semantic::SymbolId symbolId,
     const std::vector<runtime::Value>& arguments,
@@ -5358,12 +5726,15 @@ runtime::ExecutionResult Program::invoke(
         env->asyncRuntimeWeak = asyncRuntime_;
         env->ownedTypes = types_;
         env->ownedFunctions = functions_;
+        env->hotPatchedBodies = hotPatchedBodies_;
         resumeEnv_ = std::move(env);
     } else {
         auto* existingEnv = static_cast<AotResumeEnv*>(resumeEnv_.get());
         existingEnv->options = invokeOptionsCopy;
         existingEnv->asyncRuntimeWeak = asyncRuntime_;
+        existingEnv->hotPatchedBodies = hotPatchedBodies_;
     }
+    context.setHotPatchedBodies(&hotPatchedBodies_);
     context.setAsyncRuntime(asyncRuntime_, resumeEnv_);
     void* const prevBridge = asyncRuntime_
         ? asyncRuntime_->activeAotContext()
