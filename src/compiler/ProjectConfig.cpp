@@ -1177,16 +1177,29 @@ public:
 
             const auto visitRecord = [&](const auto& decls) {
                 for (const auto& rec : decls) {
-                    emitAttrMacros(unit, rec.attributes, rec.identifierToken.text, rec.span());
+                    const std::string& typeName = rec.identifierToken.text;
+                    emitAttrMacros(unit, rec.attributes, typeName, rec.span());
                     for (const auto& fld : rec.fields) {
-                        emitAttrMacros(unit, fld.attributes, fld.identifierToken.text, fld.span());
+                        emitAttrMacros(
+                            unit,
+                            fld.attributes,
+                            typeName + "." + fld.identifierToken.text,
+                            fld.span());
                         visitExpr(fld.initializer.get(), fld.identifierToken.text);
                     }
                     for (const auto& ev : rec.events) {
-                        emitAttrMacros(unit, ev.attributes, ev.identifierToken.text, ev.span());
+                        emitAttrMacros(
+                            unit,
+                            ev.attributes,
+                            typeName + "." + ev.identifierToken.text,
+                            ev.span());
                     }
                     for (const auto& prop : rec.properties) {
-                        emitAttrMacros(unit, prop.attributes, prop.identifierToken.text, prop.span());
+                        emitAttrMacros(
+                            unit,
+                            prop.attributes,
+                            typeName + "." + prop.identifierToken.text,
+                            prop.span());
                         if (prop.getter && prop.getter->body) {
                             visitStmt(prop.getter->body.get(), prop.identifierToken.text);
                         }
@@ -1207,7 +1220,11 @@ public:
                         visitStmt(&ctor.body, ctor.identifierToken.text);
                     }
                     for (const auto& m : rec.methods) {
-                        emitAttrMacros(unit, m.attributes, m.identifierToken.text, m.span());
+                        emitAttrMacros(
+                            unit,
+                            m.attributes,
+                            typeName + "." + m.identifierToken.text,
+                            m.span());
                         for (const auto& p : m.parameters) {
                             emitAttrMacros(unit, p.attributes, p.identifierToken.text, p.span());
                             visitExpr(p.defaultValue.get(), p.identifierToken.text);

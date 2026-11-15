@@ -1,7 +1,7 @@
 #pragma once
 
 #include "realscript/bytecode/Bytecode.h"
-#include "realscript/compiler/Compilation.h"
+#include "realscript/compiler/LanguageMetadata.h"
 #include "realscript/bindgen/DeterministicMath.h"
 #include "realscript/runtime/AsyncRuntime.h"
 #include "realscript/runtime/Runtime.h"

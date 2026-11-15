@@ -1,4 +1,4 @@
-#include "realscript/bindgen/RsBindParser.h"
+#include "realscript/bindgen/HostApi.h"
 #include "realscript/Version.h"
 
 #include "realscript/diagnostics/Diagnostic.h"
@@ -351,16 +351,6 @@ std::shared_ptr<runtime::ManagedHeap> HostApi::heap() const noexcept {
 }
 std::shared_ptr<runtime::NativeHandleRegistry> HostApi::nativeHandles() const noexcept {
     return state_->nativeHandles;
-}
-
-HostApi::HeaderBindingGenerationResult HostApi::generateBindingsFromCppHeader(
-    std::string_view headerContent,
-    const std::string& defaultModuleName,
-    const std::unordered_map<std::string, std::string>& predefinedMacros) {
-    return rsbind_detail::generateFromParsedHeader(
-        headerContent,
-        defaultModuleName,
-        predefinedMacros);
 }
 
 } // namespace realscript::bindgen

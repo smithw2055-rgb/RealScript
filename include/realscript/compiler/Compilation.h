@@ -21,11 +21,6 @@ namespace realscript::syntax { struct CompilationUnitSyntax; }
 
 namespace realscript::compiler {
 
-struct SourceFile {
-    std::string path;
-    std::string content;
-};
-
 struct ModuleBuildInfo {
     std::string name;
     std::uint64_t sourceFingerprint = 0;

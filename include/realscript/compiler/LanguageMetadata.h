@@ -7,6 +7,11 @@
 
 namespace realscript::compiler {
 
+struct SourceFile {
+    std::string path;
+    std::string content;
+};
+
 struct LanguageAttributeArgument {
     std::string name;
     std::string value;

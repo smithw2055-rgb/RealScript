@@ -3,7 +3,7 @@
 #if defined(_WIN32)
 #define NOMINMAX
 #include <windows.h>
-#else
+#elif !defined(__EMSCRIPTEN__)
 #include <sys/mman.h>
 #include <unistd.h>
 #if defined(__APPLE__)
@@ -66,7 +66,10 @@ void fillArchTrapPadding(std::uint8_t* dst, std::size_t byteLen) noexcept {
 [[nodiscard]] std::uint8_t* osAllocateCodePages(std::size_t byteSize, bool& outMapJit) noexcept {
     outMapJit = false;
     if (byteSize == 0) return nullptr;
-#if defined(_WIN32)
+#if defined(__EMSCRIPTEN__)
+    (void)byteSize;
+    return nullptr;
+#elif defined(_WIN32)
     void* mem = VirtualAlloc(nullptr, byteSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     return static_cast<std::uint8_t*>(mem);
 #else
@@ -101,7 +104,12 @@ void fillArchTrapPadding(std::uint8_t* dst, std::size_t byteLen) noexcept {
 
 [[nodiscard]] bool osProtectRxPages(std::uint8_t* base, std::size_t byteSize, bool isMapJit) noexcept {
     if (!base || byteSize == 0) return false;
-#if defined(_WIN32)
+#if defined(__EMSCRIPTEN__)
+    (void)base;
+    (void)byteSize;
+    (void)isMapJit;
+    return false;
+#elif defined(_WIN32)
     (void)isMapJit;
     DWORD oldProtect = 0;
     if (VirtualProtect(base, byteSize, PAGE_EXECUTE_READ, &oldProtect) == 0) {
@@ -127,7 +135,10 @@ void fillArchTrapPadding(std::uint8_t* dst, std::size_t byteLen) noexcept {
 
 void osFreePages(std::uint8_t* base, std::size_t byteSize) noexcept {
     if (!base || byteSize == 0) return;
-#if defined(_WIN32)
+#if defined(__EMSCRIPTEN__)
+    (void)base;
+    (void)byteSize;
+#elif defined(_WIN32)
     (void)byteSize;
     VirtualFree(base, 0, MEM_RELEASE);
 #else
@@ -185,7 +196,9 @@ void ExecutableCodeArena::releaseAll() noexcept {
 }
 
 std::size_t ExecutableCodeArena::systemPageSize() noexcept {
-#if defined(_WIN32)
+#if defined(__EMSCRIPTEN__)
+    return 65536u;
+#elif defined(_WIN32)
     SYSTEM_INFO info{};
     GetSystemInfo(&info);
     return info.dwPageSize > 0 ? static_cast<std::size_t>(info.dwPageSize) : 4096u;
@@ -267,7 +280,7 @@ std::size_t ExecutableCodeArena::mappedBytes() const noexcept { return mappedByt
 std::size_t ExecutableCodeArena::blockCount() const noexcept { return blocks_.size(); }
 
 bool ExecutableCodeArena::nativeCodeExecutionSupported() noexcept {
-#if defined(__x86_64__) || defined(_M_X64)
+#if !defined(__EMSCRIPTEN__) && (defined(__x86_64__) || defined(_M_X64))
     static const bool supported = []() noexcept {
         ExecutableCodeArena probe(systemPageSize());
         // mov eax, 0x52534a54; ret
@@ -281,7 +294,7 @@ bool ExecutableCodeArena::nativeCodeExecutionSupported() noexcept {
         return fn() == 0x52534A54u;
     }();
     return supported;
-#elif defined(__aarch64__) || defined(_M_ARM64)
+#elif !defined(__EMSCRIPTEN__) && (defined(__aarch64__) || defined(_M_ARM64))
     static const bool supported = []() noexcept {
         ExecutableCodeArena probe(systemPageSize());
         // movz w0, #0x4a54; movk w0, #0x5253, lsl #16; ret
