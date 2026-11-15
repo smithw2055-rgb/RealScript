@@ -4,6 +4,7 @@
 #include "realscript/aot_cpp/RuntimeAbi.h"
 #include "realscript/hot_reload/HotReload.h"
 #include "realscript/runtime/AsyncHandles.h"
+#include "realscript/runtime/ParallelJob.h"
 #include "realscript/runtime/Runtime.h"
 #if !defined(REALSCRIPT_AOT_NO_ASYNC_INLINES)
 #include "realscript/runtime/AsyncRuntime.h"
@@ -11,6 +12,7 @@
 #include "realscript/semantic/Semantic.h"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -423,6 +425,10 @@ using FunctionImplementation = bool (*)(
     std::size_t,
     runtime::Value&);
 
+using ParallelBatchImplementation = bool (*)(
+    ExecutionContext&,
+    runtime::ParallelNativeBatchContext&);
+
 struct FunctionDescriptor {
     semantic::SymbolId symbolId = 0;
     const char* name = nullptr;
@@ -433,6 +439,7 @@ struct FunctionDescriptor {
     std::uint32_t parameterCount = 0;
     FunctionImplementation implementation = nullptr;
     const debug::FunctionDebugInfo* debugInfo = nullptr;
+    ParallelBatchImplementation parallelBatchKernel = nullptr;
 };
 
 struct SourceMapEntry {
@@ -802,6 +809,10 @@ public:
         const runtime::Value* arguments,
         std::size_t argumentCount,
         runtime::Value& result);
+    [[nodiscard]] bool invokeParallelBatch(
+        semantic::SymbolId symbolId,
+        ParallelBatchImplementation batchKernel,
+        runtime::ParallelNativeBatchContext& batch);
     [[nodiscard]] bool call(
         const CallSignature& signature,
         const runtime::Value* arguments,
@@ -936,6 +947,7 @@ public:
             }
             outPreviousFunctionId = currentFunctionId_;
             currentFunctionId_ = calleeSymbolId;
+            runtime::bindActiveAllocationSite({calleeSymbolId, 0});
             stack_.push_back(calleeName ? calleeName : "<aot-function>");
             stackSites_.push_back({calleeSymbolId, 0});
             ++statistics_.functionCalls;
@@ -957,6 +969,10 @@ public:
                         options_.profile->nowSteadyNs());
                 }
                 emitTrace(runtime::TraceEventKind::FunctionEnter);
+            }
+            if (telemetry_ != nullptr) {
+                telemetryFrames_.push_back({executed_, telemetryChildExecuted_});
+                telemetryChildExecuted_ = 0;
             }
             return true;
         }
@@ -1016,9 +1032,23 @@ public:
                     }
                 }
             }
+            if (telemetry_ != nullptr && !telemetryFrames_.empty()) {
+                const TelemetryCallFrame tf = telemetryFrames_.back();
+                telemetryFrames_.pop_back();
+                const std::uint64_t totalSubtree =
+                    executed_ >= tf.entryExecuted ? (executed_ - tf.entryExecuted) : 0u;
+                const std::uint64_t selfInst = totalSubtree >= telemetryChildExecuted_
+                    ? (totalSubtree - telemetryChildExecuted_)
+                    : 0u;
+                if (selfInst > 0) {
+                    telemetry_->recordFunctionInstructions(currentFunctionId_, selfInst);
+                }
+                telemetryChildExecuted_ = tf.savedParentChildExecuted + totalSubtree;
+            }
             if (!stack_.empty()) stack_.pop_back();
             if (!stackSites_.empty()) stackSites_.pop_back();
             currentFunctionId_ = previousFunctionId;
+            runtime::bindActiveAllocationSite({previousFunctionId, 0});
         }
     }
     [[nodiscard]] bool consumeRawTyped(std::uint64_t count = 1) {
@@ -2413,6 +2443,13 @@ private:
     bool stackRefRootPushed_ = false;
     const std::unordered_map<semantic::SymbolId, FunctionImplementation>* hotPatchedBodiesPtr_ = nullptr;
     std::vector<std::uint64_t> profileSpanStarts_;
+    struct TelemetryCallFrame {
+        std::uint64_t entryExecuted = 0;
+        std::uint64_t savedParentChildExecuted = 0;
+    };
+    runtime::FrameTelemetryCollector* telemetry_ = nullptr;
+    std::uint64_t telemetryChildExecuted_ = 0;
+    std::vector<TelemetryCallFrame> telemetryFrames_;
 };
 
 class Program {
@@ -2463,6 +2500,22 @@ public:
         const std::vector<runtime::Value>& arguments = {},
         runtime::ExecutionOptions options = {}) const;
 
+    [[nodiscard]] runtime::ParallelNativeBatchKernel buildParallelBatchKernel(
+        semantic::SymbolId symbolId,
+        runtime::ParallelKernelKind kernelKind,
+        const std::vector<runtime::ParallelNativeColumnBinding>& paramColumns,
+        const runtime::ParallelJobConfig& config,
+        bool usesParallelPrng = false) const;
+    [[nodiscard]] runtime::ParallelNativeBatchKernel buildParallelBatchKernel(
+        const std::string& qualifiedName,
+        runtime::ParallelKernelKind kernelKind,
+        const std::vector<runtime::ParallelNativeColumnBinding>& paramColumns,
+        const runtime::ParallelJobConfig& config,
+        bool usesParallelPrng = false) const;
+    void attachToProgramImage(const runtime::ProgramImage& program) const;
+    [[nodiscard]] std::size_t parallelBatchExecutionCount() const noexcept;
+    void resetParallelBatchExecutionCount() const noexcept;
+
 private:
     struct LifecycleTarget {
         std::mutex mutex;
@@ -2492,6 +2545,8 @@ private:
     std::uint32_t hotPatchRevision_ = 0;
     std::unordered_map<semantic::SymbolId, FunctionImplementation> hotPatchedBodies_;
     std::vector<ModifiedHotPatchSlotRecord> modifiedHotPatchSlots_;
+    std::shared_ptr<std::atomic<std::size_t>> parallelBatchExecutions_ =
+        std::make_shared<std::atomic<std::size_t>>(0);
 };
 
 // Typed host binding adapters. They keep generated/native call sites on stable

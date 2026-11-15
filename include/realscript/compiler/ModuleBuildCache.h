@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -83,6 +84,7 @@ struct ModuleBuildCacheOptions {
     std::uint64_t flags = kBuildCacheFlagPreserveDebugInfo;
     bool emitDeclarationStubs = true;
     bool retainMirModules = false;
+    std::vector<std::shared_ptr<const ICompilerMacroPlugin>> macroPlugins;
 
     ModuleBuildCacheOptions() noexcept {
         optimizationOptions.level = optimization::Level::None;

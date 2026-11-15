@@ -11,7 +11,7 @@ RealScript 采用 C# 风格语法，但不是 CLR、ECMA C# 或 .NET 标准库�
 | 模块、导入、多文件 | 支持 | 使用显式 `module`/`import`；不是 C# Assembly/Namespace 解析。 |
 | 函数与重载 | 支持 | 前向调用、递归、确定性转换排序、可选/命名/`params` 参数。 |
 | Class 继承 | 支持 | 单继承、基类构造与 `base`、`abstract`/`virtual`/`override`/`sealed`。 |
-| Interface | 支持 | Interface 类型值、实现契约和确定性运行时分派；无默认 Interface 实现。 |
+| Interface | 支持 | Interface 类型值、实现契约、默认 Interface 实现（Default Interface Methods）与确定性运行时分派。 |
 | 访问控制 | 支持 | 已支持声明上的 `public`、`internal`、`protected`、`private`。 |
 | Delegate 与 Closure | 支持 | 一等委托、方法组、堆闭包、共享可变捕获、多播和通用 Event 存储。 |
 | 泛型 | 支持 | 编译期特化、推断、泛型成员、`class`/`struct`/`new()` 与多接口复合 `where` 约束、泛型 Interface/Delegate；无开放运行时泛型和协变/逆变。 |
@@ -20,8 +20,8 @@ RealScript 采用 C# 风格语法，但不是 CLR、ECMA C# 或 .NET 标准库�
 | 精确基础值类型 | 支持 | 精确有符号/无符号整数宽度、binary32 `float`、binary64 `double`、`char`，以及 checked/unchecked 转换。 |
 | Nullable 值类型 | 支持 | 精确 `T?`、空条件提升结果、`HasValue`、`Value`、`GetValueOrDefault`。 |
 | Boxing/Unboxing | 支持 | 保留脚本值类型精确身份，并纳入托管堆与 GC。 |
-| 引用位置 | 部分支持 | ref 参数、局部、返回、字段、Indexer 与 ref `this`；无 unsafe 指针、ref property、ref struct 和完整逃逸分析。 |
-| Attribute | 部分支持 | 原生语法及编译器/Game SDK/产物元数据，自动导入 `ScriptMetadataRegistry` 与 `InspectorTypeSchema`；无可执行 Attribute Class 和完整 `AttributeUsage`。 |
+| 引用位置 | 部分支持 | `[StackOnly]` `Span<T>` / `ReadOnlySpan<T>`（`RS2692..RS2697`）、ref 参数、局部、返回、字段、Indexer 与 ref `this`；无 unsafe 指针、ref property、除 `[StackOnly]` Span 外的任意自定义 ref struct 及完整 CLR 逃逸分析。 |
+| Attribute | 部分支持 | 原生语法、自定义 `[AttributeUsage(...)]`、`[Obsolete]`、`[Signal]`、`[RelayCommand]`、`[Blittable]`、`[FieldTag]`、`[ValueLifecycle]`，以及通过 `RealScript.Reflect`（`ReflectionRegistry`）与 `RealScript-GamePack` `ScriptMetadataRegistry`/`InspectorTypeSchema` 消费的确定性元数据；不支持 CLR 运行时动态 IL 生成。 |
 | 用户运算符/转换 | 支持 | 支持自定义 `operator` 重载（`+`、`-`、`*`、`/`、`%`、`==`、`!=`、`<`、`<=`、`>`、`>=`、一元 `-`、`!`、`~`）、复合赋值（`+=`、`-=`、`*=`、`/=`、`%=`）与自定义隐式/显式类型转换运算符（`public static implicit/explicit operator Target(Source)`）。 |
 | `const`、`readonly`、静态成员与属性初始化器 | 支持 | 支持编译期 `const`、构造函数内赋值的 `readonly` 字段、`static class`、确定性静态构造函数（`static T()`）、`static` 字段及初始化器，以及跨解释器、字节码与 C++17 AOT 的实例/静态自动属性初始化器（`{ get; set; } = expr;`）。 |
 
@@ -33,7 +33,7 @@ RealScript 采用 C# 风格语法，但不是 CLR、ECMA C# 或 .NET 标准库�
 | 推断与便利语法 | 支持 | `var`、`?:`、`??`、`?.`、`$"..."` 字符串插值、对象/Struct/集合初始化器。 |
 | 运行时类型运算 | 支持 | `is`、`as`、`typeof` 和精确运行时可赋值规则。 |
 | Pattern | 支持 | 常量、null、类型、discard、模式变量、`when` guard 和穷尽 Switch Expression。 |
-| 其他模式族 | 部分支持 | 无关系、属性、位置、列表、递归、`and`/`or`/`not` 和 Range Pattern。 |
+| 其他模式族 | 部分支持 | 支持关系模式（`<`、`<=`、`>`、`>=`）、逻辑组合子（`and`/`or`/`not`）与嵌套属性模式；暂不支持位置、列表与递归切片模式。 |
 | 双轨协程：`sequence`（确定性回滚轨） | 支持 | 专司确定性帧模拟与帧级回滚快照（`yield wait_ticks`、`wait_seconds`、`wait_event`、`wait_signal`、`wait_until`），编译为显式字段状态机并完整纳入 `RSGS` 快照/Rollback，配合 `RealScript.Fiber` 协作式调度。 |
 | 双轨协程：`async`/`await`（流式与网络 I/O 轨） | 支持受限模型 | Phase 25–28 引入 `RealScript.Async`（`Awaitable`/`Awaitable<T>`、8B 代际 `AwaitableHandle`、`CancellationToken`/`CancellationTokenSource` 及 `PreTickIo`/`FixedTick`/`Update`/`EndOfFrame` 四阶段主线程恢复队列），专司异步 `OnStart()`、预制体/资产流式加载、存档读写与 HTTP/WebSocket 网络 I/O（随实体销毁自动取消）；不支持裸 OS 线程共享可变状态或 CLR `System.Threading.Tasks.Task`。 |
 
@@ -52,11 +52,12 @@ RealScript 采用 C# 风格语法，但不是 CLR、ECMA C# 或 .NET 标准库�
 
 | 能力 | 状态 | RealScript 语义边界 |
 |---|---|---|
-| Interpreter | 支持 | 验证过的类型化寄存器 Bytecode、统一扁平栈帧布局（Unified Flat Frame）、Computed-goto 解释器派发、增量 GC 步进、预算、确定性 Trace 与结构化错误。 |
-| C++17 AOT | 支持 | 生成代码与解释器共享 MIR 语义，包括委托、值类型、Pattern 和异常，并支持零预算 Trusted Release（`--trusted-release`）、`#line` 源码行号映射指令、结构体栈标量化与 AVX2 向量化 ECS 快循环。 |
-| Toolchain JIT | 平台相关 | 配置后使用外部 C++ 工具链；不是 CLR 风格进程内机器码 JIT。 |
+| Interpreter | 支持 | 验证过的类型化寄存器 Bytecode、16B 紧凑 `Value`、统一扁平栈帧布局（Unified Flat Frame）、Computed-goto 解释器派发、增量与分代 Nursery GC 步进、预算、确定性 Trace 与结构化错误。 |
+| 进程内 `StencilJit` | 支持 | 零外部编译器 W^X `x86_64`（SysV/Win64）与 `ARM64` 原生机器码模板 + Threaded 回退；支持主动增量 GC 安全点、`ProfileCollector`、`StencilModule::functionDiagnostics()` 与原生 `ParallelJobScheduler` 批处理核。 |
+| C++17 AOT | 支持 | 生成代码与解释器共享 MIR 语义，包括委托、值类型、Pattern 和异常，并支持零预算 Trusted Release（`--trusted-release`）、`--opt-remarks` / `--opt-remarks-json`、`#line` 源码行号映射指令、结构体栈标量化、主动 GC 安全点与原生并行批处理核。 |
+| Toolchain JIT | 平台相关 | 可选外部 C++ 工具链 JIT，复用 C++17 AOT 代码生成器并缓存共享模块。 |
 | `.rsbc` | Draft、带版本 | 当前输出 0.9，Decoder 支持 0.6–0.9；格式尚未冻结。 |
-| LSP/DAP/Hot Reload | 支持受限模型 | 仅识别 `.rscript` / `.d.rscript` 后缀；支持原始源码符号与 Sequence Point、`ParseSnapshot` 与语法子图增量重构缓存、成员 `.` 补全、`signatureHelp`、`.d.rscript` 宿主声明导出、标准流及内嵌 TCP（`--dap-port` / `EmbeddedDapServer`）DAP 调试、Watch 面板动态 `variablesReference` 对象/结构体/容器树状展开、C++17 AOT `.natvis`/LLDB 调试视图、纯自研单文件 C++ 声明解析器 `rsbind`（内置 `#define`/`#if` 宏求值），以及带状态结构化热重载。 |
+| LSP/DAP/Hot Reload | 支持受限模型 | 仅识别 `.rscript` / `.d.rscript` 后缀；支持原始源码符号与 Sequence Point、LSP 增量范围同步（`didChange`）、`textDocument/codeLens`（AOT/装箱/GC 状态）、`inlayHint`、`semanticTokens`、`GovernanceLinter`（`RSG001`–`RSG005`）、`rsc --format`/`--lint`、`.d.rscript` 宿主声明导出、标准流及内嵌 TCP（`--dap-port` / `EmbeddedDapServer` / `DapServer`）DAP 调试（含 Fiber 调用栈与 `topAllocations` `GC.Alloc` 遥测）、C++17 AOT `.natvis`/LLDB 调试视图、纯自研单文件 C++ 声明解析器 `rsbind`（内置 `#define`/`#if` 宏求值），以及带状态结构化热重载（`RealScript-GamePack`）。 |
 | Reflection 与 `dynamic` | 不支持 | 有稳定 TypeId，但无 CLR Reflection、`dynamic`、运行时代码生成和运行时泛型构造。 |
 | 标准库 | 专用模型 | 提供确定性游戏/运行时基础能力，不是 .NET BCL。 |
 

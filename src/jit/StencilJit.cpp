@@ -1,4 +1,5 @@
 #include "JitInternal.h"
+#include "realscript/runtime/ParallelJob.h"
 
 #include <chrono>
 
@@ -1052,13 +1053,110 @@ void buildThreadedStream(CompiledFunctionRecord& rec) {
     return true;
 }
 
+void populateJitFrameStructPayloads(
+    const bytecode::Function& bcFunc,
+    const runtime::detail::ExecutionFunction& execFunc,
+    runtime::Value* frameBase,
+    std::uint8_t flatBankId,
+    std::size_t baseFrameOffset,
+    std::size_t argCount) noexcept {
+    if (!execFunc.hasStructPayloads || flatBankId == 0u || !frameBase) {
+        return;
+    }
+    for (std::size_t i = 0; i < argCount; ++i) {
+        const auto pSlot = static_cast<std::uint16_t>(execFunc.paramOffset + i);
+        if (pSlot < execFunc.slotStructSchemaIds.size() && execFunc.slotStructSchemaIds[pSlot] != 0u) {
+            const std::uint16_t sid = execFunc.slotStructSchemaIds[pSlot];
+            const std::uint16_t payOff = execFunc.slotPayloadOffsets[pSlot];
+            const auto* sc = runtime::getFlatStructSchema(sid);
+            if (sc != nullptr && payOff != runtime::detail::InvalidCompactReg) {
+                const runtime::Value incoming = frameBase[pSlot];
+                if (runtime::extractStructLeavesToBuffer(incoming, *sc, frameBase + payOff)) {
+                    frameBase[pSlot] = runtime::StructValue::makeFrameSlice(
+                        sc->structTypeId,
+                        flatBankId,
+                        static_cast<std::uint32_t>(baseFrameOffset + payOff),
+                        sid);
+                } else if (incoming.rawTag() == runtime::ValueTag::Monostate) {
+                    std::memcpy(
+                        static_cast<void*>(frameBase + payOff),
+                        static_cast<const void*>(sc->prototypeLeaves.data()),
+                        static_cast<std::size_t>(sc->flatSlotCount) * sizeof(runtime::Value));
+                    frameBase[pSlot] = runtime::StructValue::makeFrameSlice(
+                        sc->structTypeId,
+                        flatBankId,
+                        static_cast<std::uint32_t>(baseFrameOffset + payOff),
+                        sid);
+                }
+            }
+        }
+    }
+    const std::size_t nLocals = bcFunc.localTypes.size();
+    for (std::size_t l = 0; l < nLocals; ++l) {
+        const auto lSlot = static_cast<std::uint16_t>(execFunc.localOffset + l);
+        if (lSlot < execFunc.slotStructSchemaIds.size() && execFunc.slotStructSchemaIds[lSlot] != 0u) {
+            const std::uint16_t sid = execFunc.slotStructSchemaIds[lSlot];
+            const std::uint16_t payOff = execFunc.slotPayloadOffsets[lSlot];
+            const auto* sc = runtime::getFlatStructSchema(sid);
+            if (sc != nullptr && payOff != runtime::detail::InvalidCompactReg) {
+                std::memcpy(
+                    static_cast<void*>(frameBase + payOff),
+                    static_cast<const void*>(sc->prototypeLeaves.data()),
+                    static_cast<std::size_t>(sc->flatSlotCount) * sizeof(runtime::Value));
+                frameBase[lSlot] = runtime::StructValue::makeFrameSlice(
+                    sc->structTypeId,
+                    flatBankId,
+                    static_cast<std::uint32_t>(baseFrameOffset + payOff),
+                    sid);
+            }
+        }
+    }
+}
+
+void populateJitStatusError(
+    JitRuntimeSession& session,
+    const runtime::ProgramImage::FunctionLocation& fnLoc,
+    const runtime::detail::ExecutionFunction& execFunc,
+    std::uint32_t rawStatus,
+    std::uint32_t errorFlatIndex,
+    const std::string& overrideMessage) {
+    if (session.error.code != runtime::ErrorCode::None) {
+        return;
+    }
+    const auto errCode = static_cast<runtime::ErrorCode>(rawStatus);
+    const char* msg = "runtime error in StencilJit execution";
+    switch (errCode) {
+    case runtime::ErrorCode::InstructionBudgetExceeded:
+        msg = "instruction budget exceeded";
+        break;
+    case runtime::ErrorCode::IntegerOverflow:
+        msg = "integer overflow";
+        break;
+    case runtime::ErrorCode::DivisionByZero:
+        msg = "division by zero";
+        break;
+    case runtime::ErrorCode::TypeMismatch:
+        msg = "expected matching scalar type in StencilJit instruction";
+        break;
+    default:
+        break;
+    }
+    populateJitErrorDiagnostics(
+        session,
+        fnLoc,
+        execFunc,
+        errorFlatIndex,
+        errCode,
+        overrideMessage.empty() ? std::string(msg) : overrideMessage);
+}
+
 } // namespace
 
 // ============================================================================
 // StencilModule & StencilJit Implementation
 // ============================================================================
 
-struct StencilModule::Impl {
+struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
     std::shared_ptr<const runtime::ProgramImage> program;
     std::shared_ptr<runtime::ManagedHeap> heap;
     std::shared_ptr<const runtime::BindingRegistry> bindings;
@@ -1075,6 +1173,8 @@ struct StencilModule::Impl {
     mutable std::atomic<std::size_t> threadedCount{0};
     mutable std::atomic<std::size_t> fallbackCount{0};
     mutable std::atomic<std::size_t> codeBytes{0};
+    mutable std::atomic<std::size_t> interpreterFallbackInvocations{0};
+    mutable std::atomic<std::size_t> parallelBatchExecutions{0};
     bool nativeBackendAvailable = false;
 
     struct LifecycleTarget {
@@ -1305,21 +1405,36 @@ struct StencilModule::Impl {
     bool promoteFunctionToNativeLocked(CompiledFunctionRecord& rec, ExecutableCodeArena* batchArena) const {
 #if !defined(__EMSCRIPTEN__) && (UINTPTR_MAX == 0xffffffffffffffffULL) && \
     (defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__) || defined(_M_ARM64))
-        if (!nativeBackendAvailable || !rec.eligibleForNative) return false;
-        if (rec.tier.load(std::memory_order_relaxed) == StencilTier::NativeMachineCode) return true;
+        if (!nativeBackendAvailable || !rec.eligibleForNative) {
+            if (!nativeBackendAvailable && rec.fallbackReason.empty()) {
+                rec.fallbackReason = "native backend unavailable or W^X restricted";
+            }
+            return false;
+        }
+        if (rec.tier.load(std::memory_order_relaxed) == StencilTier::NativeMachineCode) {
+            rec.fallbackReason.clear();
+            return true;
+        }
 
 #if defined(__aarch64__) || defined(_M_ARM64)
         auto machineBytes = compileFunctionA64(rec);
 #else
         auto machineBytes = compileFunctionX64(rec);
 #endif
-        if (machineBytes.empty()) return false;
+        if (machineBytes.empty()) {
+            rec.fallbackReason = "native machine code emitter returned empty";
+            return false;
+        }
 
         if (batchArena != nullptr) {
             std::uint8_t* dst = batchArena->emit(machineBytes.data(), machineBytes.size(), 16);
-            if (!dst) return false;
+            if (!dst) {
+                rec.fallbackReason = "failed to emit machine code into batch executable arena";
+                return false;
+            }
             rec.rawCodePtr = dst;
             rec.rawCodeSize = machineBytes.size();
+            rec.fallbackReason.clear();
             rec.nativeEntry.store(bitCastFnPtr<NativeJitEntryFn>(dst), std::memory_order_release);
             rec.tier.store(StencilTier::NativeMachineCode, std::memory_order_release);
             return true;
@@ -1327,10 +1442,14 @@ struct StencilModule::Impl {
 
         ExecutableCodeArena singleArena(std::max<std::size_t>(machineBytes.size() + 64u, ExecutableCodeArena::systemPageSize()));
         std::uint8_t* dst = singleArena.emit(machineBytes.data(), machineBytes.size(), 16);
-        if (!dst || !singleArena.seal()) return false;
+        if (!dst || !singleArena.seal()) {
+            rec.fallbackReason = "executable arena allocation or W^X seal failed";
+            return false;
+        }
 
         rec.rawCodePtr = dst;
         rec.rawCodeSize = machineBytes.size();
+        rec.fallbackReason.clear();
         const StencilTier prevTier = rec.tier.load(std::memory_order_relaxed);
         rec.nativeEntry.store(bitCastFnPtr<NativeJitEntryFn>(dst), std::memory_order_release);
         rec.tier.store(StencilTier::NativeMachineCode, std::memory_order_release);
@@ -1345,8 +1464,10 @@ struct StencilModule::Impl {
         codeBytes.fetch_add(machineBytes.size(), std::memory_order_relaxed);
         return true;
 #else
-        (void)rec;
         (void)batchArena;
+        if (rec.fallbackReason.empty()) {
+            rec.fallbackReason = "native codegen unsupported on target host architecture";
+        }
         return false;
 #endif
     }
@@ -1355,6 +1476,7 @@ struct StencilModule::Impl {
         semantic::SymbolId symbolId,
         const std::vector<runtime::Value>& arguments,
         runtime::ExecutionOptions execOptions) const {
+        interpreterFallbackInvocations.fetch_add(1, std::memory_order_relaxed);
         runtime::Interpreter interp(program, heap);
         if (bindings) interp.setBindingRegistry(bindings);
         if (externalResolver) interp.setExternalResolver(externalResolver);
@@ -1385,15 +1507,10 @@ struct StencilModule::Impl {
 
         const bool hasTraceOrDebugOrStrictEvents =
             execOptions.determinism.mode != runtime::DeterminismMode::Off ||
-            execOptions.profile != nullptr ||
             (execOptions.trace && static_cast<bool>(execOptions.trace)) ||
             execOptions.debugger != nullptr;
-        const bool activeGcCycle =
-            execOptions.limits.gcWorkBudget != 0 &&
-            heap != nullptr &&
-            (heap->phase() != runtime::GcPhase::Idle || heap->collectionRequested());
 
-        if (hasTraceOrDebugOrStrictEvents || activeGcCycle) {
+        if (hasTraceOrDebugOrStrictEvents) {
             return invokeFallbackInterpreter(symbolId, arguments, std::move(execOptions));
         }
 
@@ -1516,56 +1633,13 @@ struct StencilModule::Impl {
             }
         } jitBankGuard{session.flatBankId};
 
-        if (execFunc.hasStructPayloads && session.flatBankId != 0u) {
-            for (std::size_t i = 0; i < argCount; ++i) {
-                const auto pSlot = static_cast<std::uint16_t>(execFunc.paramOffset + i);
-                if (pSlot < execFunc.slotStructSchemaIds.size() && execFunc.slotStructSchemaIds[pSlot] != 0u) {
-                    const std::uint16_t sid = execFunc.slotStructSchemaIds[pSlot];
-                    const std::uint16_t payOff = execFunc.slotPayloadOffsets[pSlot];
-                    const auto* sc = runtime::getFlatStructSchema(sid);
-                    if (sc != nullptr && payOff != runtime::detail::InvalidCompactReg) {
-                        const runtime::Value incoming = frameBase[pSlot];
-                        if (runtime::extractStructLeavesToBuffer(incoming, *sc, frameBase + payOff)) {
-                            frameBase[pSlot] = runtime::StructValue::makeFrameSlice(
-                                sc->structTypeId,
-                                session.flatBankId,
-                                static_cast<std::uint32_t>(baseFrameOffset + payOff),
-                                sid);
-                        } else if (incoming.rawTag() == runtime::ValueTag::Monostate) {
-                            std::memcpy(
-                                static_cast<void*>(frameBase + payOff),
-                                static_cast<const void*>(sc->prototypeLeaves.data()),
-                                static_cast<std::size_t>(sc->flatSlotCount) * sizeof(runtime::Value));
-                            frameBase[pSlot] = runtime::StructValue::makeFrameSlice(
-                                sc->structTypeId,
-                                session.flatBankId,
-                                static_cast<std::uint32_t>(baseFrameOffset + payOff),
-                                sid);
-                        }
-                    }
-                }
-            }
-            const std::size_t nLocals = bcFunc.localTypes.size();
-            for (std::size_t l = 0; l < nLocals; ++l) {
-                const auto lSlot = static_cast<std::uint16_t>(execFunc.localOffset + l);
-                if (lSlot < execFunc.slotStructSchemaIds.size() && execFunc.slotStructSchemaIds[lSlot] != 0u) {
-                    const std::uint16_t sid = execFunc.slotStructSchemaIds[lSlot];
-                    const std::uint16_t payOff = execFunc.slotPayloadOffsets[lSlot];
-                    const auto* sc = runtime::getFlatStructSchema(sid);
-                    if (sc != nullptr && payOff != runtime::detail::InvalidCompactReg) {
-                        std::memcpy(
-                            static_cast<void*>(frameBase + payOff),
-                            static_cast<const void*>(sc->prototypeLeaves.data()),
-                            static_cast<std::size_t>(sc->flatSlotCount) * sizeof(runtime::Value));
-                        frameBase[lSlot] = runtime::StructValue::makeFrameSlice(
-                            sc->structTypeId,
-                            session.flatBankId,
-                            static_cast<std::uint32_t>(baseFrameOffset + payOff),
-                            sid);
-                    }
-                }
-            }
-        }
+        populateJitFrameStructPayloads(
+            bcFunc,
+            execFunc,
+            frameBase,
+            session.flatBankId,
+            baseFrameOffset,
+            argCount);
         session.shadowStack.pushFrame(nullptr, nullptr, arenaPtr, &session.valueTop);
 
         runtime::Value retValue{};
@@ -1579,9 +1653,14 @@ struct StencilModule::Impl {
         abi.session = &session;
         abi.compiledFn = &rec;
         invalidateJitArrayCaches(abi);
+        stepJitGcSafepoint(&abi);
+        const std::uint64_t profileBeginNs = execOptions.profile
+            ? execOptions.profile->nowSteadyNs()
+            : 0ULL;
 
         std::uint32_t rawStatus = 0u;
         std::string simDiag;
+        const runtime::ScopedAllocationSite fnAllocSite(rec.symbolId, 0);
         if (forceSimulateArm64) {
 #if !defined(__EMSCRIPTEN__) && UINTPTR_MAX == 0xffffffffffffffffULL
             const auto arm64Code = compileFunctionA64(rec);
@@ -1614,38 +1693,51 @@ struct StencilModule::Impl {
                 : execOptions.limits.instructionBudget;
         session.stats.instructionsExecuted = executed;
         session.stats.branchesTaken = abi.branchesTaken;
+        if (session.telemetry != nullptr && executed > 0) {
+            session.telemetry->recordFunctionInstructions(symbolId, executed);
+        }
 
         bool succeeded = (rawStatus == 0u);
-        if (!succeeded && session.error.code == runtime::ErrorCode::None) {
-            const auto errCode = static_cast<runtime::ErrorCode>(rawStatus);
-            const char* msg = "runtime error in StencilJit execution";
-            switch (errCode) {
-            case runtime::ErrorCode::InstructionBudgetExceeded:
-                msg = "instruction budget exceeded";
-                break;
-            case runtime::ErrorCode::IntegerOverflow:
-                msg = "integer overflow";
-                break;
-            case runtime::ErrorCode::DivisionByZero:
-                msg = "division by zero";
-                break;
-            case runtime::ErrorCode::TypeMismatch:
-                msg = "expected matching scalar type in StencilJit instruction";
-                break;
-            default:
-                break;
-            }
-            populateJitErrorDiagnostics(
+        if (!succeeded) {
+            populateJitStatusError(
                 session,
                 fnLoc,
                 execFunc,
+                rawStatus,
                 abi.errorFlatIndex,
-                errCode,
-                simDiag.empty() ? std::string(msg) : simDiag);
+                simDiag);
         }
 
         runtime::DeterminismSession det(std::move(execOptions.determinism));
         succeeded = det.finish(succeeded, retValue, session.error, session.stats);
+        if (execOptions.profile) {
+            const std::uint64_t profileEndNs = execOptions.profile->nowSteadyNs();
+            const std::uint64_t durationNs = profileEndNs >= profileBeginNs
+                ? (profileEndNs - profileBeginNs)
+                : 0ULL;
+            execOptions.profile->recordTraceSpan(
+                symbolId,
+                fnLoc.qualifiedName,
+                profileBeginNs,
+                durationNs,
+                1u);
+
+            runtime::ExecutionProfile summary;
+            runtime::FunctionProfile fnProfile;
+            fnProfile.function = fnLoc.qualifiedName;
+            fnProfile.calls = session.stats.functionCalls;
+            fnProfile.returns = succeeded ? session.stats.functionCalls : 0u;
+            fnProfile.instructions = executed;
+            fnProfile.branches = session.stats.branchesTaken;
+            fnProfile.gcSteps = session.stats.gcWorkPerformed != 0 ? 1u : 0u;
+            fnProfile.runtimeErrors = succeeded ? 0u : 1u;
+            fnProfile.maximumCallDepth = session.stats.maximumCallDepth;
+            summary.totalEvents = fnProfile.calls + fnProfile.returns +
+                fnProfile.instructions + fnProfile.branches +
+                fnProfile.gcSteps + fnProfile.runtimeErrors;
+            summary.functions.push_back(std::move(fnProfile));
+            execOptions.profile->merge(summary);
+        }
 
         runtime::ExecutionResult out;
         out.succeeded = succeeded;
@@ -1657,10 +1749,439 @@ struct StencilModule::Impl {
         out.replayEntriesConsumed = det.replayEntriesConsumed();
         return out;
     }
+
+    void attachToProgramImage(const runtime::ProgramImage& targetProgram) const {
+        const std::weak_ptr<const Impl> weakSelf = weak_from_this();
+        targetProgram.setParallelBatchKernelFactory(
+            [weakSelf](
+                semantic::SymbolId symId,
+                runtime::ParallelKernelKind kind,
+                const std::vector<runtime::ParallelNativeColumnBinding>& cols,
+                const runtime::ParallelJobConfig& cfg,
+                bool usesPrng) -> runtime::ParallelNativeBatchKernel {
+                if (const auto locked = weakSelf.lock()) {
+                    return locked->buildParallelBatchKernel(symId, kind, cols, cfg, usesPrng);
+                }
+                return {};
+            });
+    }
+
+    [[nodiscard]] runtime::ParallelNativeBatchKernel buildParallelBatchKernel(
+        semantic::SymbolId symbolId,
+        runtime::ParallelKernelKind kernelKind,
+        const std::vector<runtime::ParallelNativeColumnBinding>& paramColumns,
+        const runtime::ParallelJobConfig& config,
+        bool usesParallelPrng) const {
+        if (!program || usesParallelPrng) {
+            return {};
+        }
+        const auto& execOpts = config.executionOptions;
+        if (execOpts.determinism.mode != runtime::DeterminismMode::Off ||
+            execOpts.profile != nullptr ||
+            static_cast<bool>(execOpts.trace) ||
+            execOpts.executionPolicy != nullptr ||
+            execOpts.debugger != nullptr ||
+            execOpts.limits.recursionLimit == 0) {
+            return {};
+        }
+        for (const auto& col : paramColumns) {
+            if (col.rawColumnView != nullptr && col.mode == runtime::RawColumnMode::EcsFields) {
+                return {};
+            }
+        }
+
+        const auto recIt = records.find(symbolId);
+        if (recIt == records.end() || !recIt->second || !recIt->second->location ||
+            !recIt->second->location->function || !recIt->second->execFunc) {
+            return {};
+        }
+        CompiledFunctionRecord& rec = *recIt->second;
+        StencilTier currentTier = rec.tier.load(std::memory_order_acquire);
+        if (currentTier != StencilTier::NativeMachineCode &&
+            rec.eligibleForNative &&
+            nativeBackendAvailable) {
+            std::lock_guard<std::mutex> lock(tierPromotionMutex);
+            (void)promoteFunctionToNativeLocked(rec, nullptr);
+            currentTier = rec.tier.load(std::memory_order_acquire);
+        }
+        if (currentTier == StencilTier::InterpreterFallback) {
+            return {};
+        }
+
+        const bool isRange = (kernelKind == runtime::ParallelKernelKind::Range);
+        const std::size_t prefixParams = isRange ? 2u : 1u;
+        if (rec.location->function->parameterTypes.size() < prefixParams) {
+            return {};
+        }
+        for (std::size_t p = 0; p < prefixParams; ++p) {
+            if (rec.location->function->parameterTypes[p] != semantic::PrimitiveType::Int) {
+                return {};
+            }
+        }
+
+        const std::weak_ptr<const Impl> weakSelf = weak_from_this();
+        const CompiledFunctionRecord* recPtr = &rec;
+        return [weakSelf, recPtr, prefixParams, isRange](runtime::ParallelNativeBatchContext& ctx) -> bool {
+            const auto self = weakSelf.lock();
+            if (!self || !self->program || !recPtr || !recPtr->location ||
+                !recPtr->location->function || !recPtr->execFunc) {
+                ctx.error.code = runtime::ErrorCode::InvalidProgram;
+                ctx.error.message = "StencilJit module is no longer loaded";
+                return false;
+            }
+            const auto& fnLoc = *recPtr->location;
+            const auto& bcFunc = *fnLoc.function;
+            const auto& execFunc = *recPtr->execFunc;
+            const std::size_t userArgCount = ctx.userArguments ? ctx.userArguments->size() : 0u;
+            if (bcFunc.parameterTypes.size() != prefixParams + userArgCount) {
+                ctx.error.code = runtime::ErrorCode::InvalidArguments;
+                ctx.error.message = "argument count does not match function signature";
+                return false;
+            }
+            if (!isRange && ctx.count == 0u) {
+                ctx.hasReducedValue = false;
+                ctx.reducedValue = runtime::Value{std::monostate{}};
+                return true;
+            }
+
+            runtime::ManagedHeap* const activeHeap = ctx.mutableHeap
+                ? ctx.mutableHeap
+                : (ctx.heap ? const_cast<runtime::ManagedHeap*>(ctx.heap) : self->heap.get());
+            runtime::ScopedValuePoolDomain domainScope(
+                activeHeap ? activeHeap->valuePoolDomain().get() : nullptr);
+
+            const auto& batchCfg = ctx.config;
+            const runtime::Limits batchLimits = [&]() {
+                runtime::Limits lim = batchCfg
+                    ? batchCfg->executionOptions.limits
+                    : runtime::Limits{};
+                lim.gcWorkBudget = 0;
+                return lim;
+            }();
+            const runtime::ParallelReduceOp reduceOp = batchCfg
+                ? batchCfg->reduceOp
+                : runtime::ParallelReduceOp::None;
+            const runtime::ParallelCustomReducer& customReducer = batchCfg
+                ? batchCfg->customReducer
+                : runtime::ParallelCustomReducer{};
+            const bool strictDet = batchCfg &&
+                (batchCfg->executionOptions.determinism.mode == runtime::DeterminismMode::Strict);
+
+            bool allIntArgsFit32 =
+                fitsInt32(static_cast<std::int64_t>(ctx.start)) &&
+                (isRange
+                    ? fitsInt32(static_cast<std::int64_t>(ctx.count))
+                    : fitsInt32(static_cast<std::int64_t>(ctx.start + ctx.count - 1u)));
+            if (ctx.userArguments != nullptr) {
+                for (std::size_t u = 0; u < userArgCount; ++u) {
+                    const std::size_t paramIdx = prefixParams + u;
+                    const auto& arg = (*ctx.userArguments)[u];
+                    const auto expectedType = bcFunc.parameterTypes[paramIdx];
+                    const auto expectedTid = paramIdx < bcFunc.parameterTypeIds.size()
+                        ? bcFunc.parameterTypeIds[paramIdx]
+                        : semantic::SymbolId{0};
+                    if (const auto* ref = std::get_if<runtime::ObjectRef>(&arg)) {
+                        if (!activeHeap || !activeHeap->isAlive(*ref)) {
+                            ctx.error.code = runtime::ErrorCode::InvalidObjectReference;
+                            ctx.error.message = "argument contains an invalid managed object reference";
+                            return false;
+                        }
+                    }
+                    if (runtime::valueType(arg) != expectedType) {
+                        ctx.error.code = runtime::ErrorCode::TypeMismatch;
+                        ctx.error.message = "argument type does not match function signature";
+                        return false;
+                    }
+                    if (expectedType == semantic::PrimitiveType::Int) {
+                        if (!fitsInt32(arg.asInt64Unchecked())) {
+                            allIntArgsFit32 = false;
+                        }
+                    } else if (expectedType == semantic::PrimitiveType::Array) {
+                        if (!std::holds_alternative<runtime::NullArray>(arg) && expectedTid != 0) {
+                            const auto* ref = std::get_if<runtime::ObjectRef>(&arg);
+                            const auto actualTid = (ref && activeHeap)
+                                ? activeHeap->arrayTypeId(*ref)
+                                : std::optional<semantic::SymbolId>{};
+                            if (!actualTid || *actualTid != expectedTid) {
+                                ctx.error.code = runtime::ErrorCode::TypeMismatch;
+                                ctx.error.message = "argument has the wrong runtime array type";
+                                return false;
+                            }
+                        }
+                    } else if (expectedType == semantic::PrimitiveType::Struct) {
+                        if (expectedTid != 0 && runtime::structValueTypeId(arg) != expectedTid) {
+                            ctx.error.code = runtime::ErrorCode::TypeMismatch;
+                            ctx.error.message = "argument has the wrong runtime struct type";
+                            return false;
+                        }
+                    } else if (expectedType == semantic::PrimitiveType::Object ||
+                               expectedType == semantic::PrimitiveType::Enum ||
+                               expectedType == semantic::PrimitiveType::Handle) {
+                        if (expectedTid != 0) {
+                            allIntArgsFit32 = false;
+                        }
+                    }
+                }
+            }
+
+            const StencilTier runTier = recPtr->tier.load(std::memory_order_acquire);
+            if (!allIntArgsFit32 || runTier == StencilTier::InterpreterFallback) {
+                self->interpreterFallbackInvocations.fetch_add(1, std::memory_order_relaxed);
+                std::shared_ptr<runtime::ManagedHeap> heapAlias;
+                if (activeHeap != nullptr) {
+                    heapAlias = std::shared_ptr<runtime::ManagedHeap>(
+                        activeHeap,
+                        [](runtime::ManagedHeap*) {});
+                }
+                runtime::Interpreter interp(self->program, heapAlias);
+                if (ctx.bindings != nullptr) {
+                    interp.setBindingRegistry(std::shared_ptr<const runtime::BindingRegistry>(
+                        ctx.bindings,
+                        [](const runtime::BindingRegistry*) {}));
+                } else if (self->bindings) {
+                    interp.setBindingRegistry(self->bindings);
+                }
+                if (self->externalResolver) {
+                    interp.setExternalResolver(self->externalResolver);
+                }
+                runtime::ExecutionOptions opts = batchCfg
+                    ? batchCfg->executionOptions
+                    : runtime::ExecutionOptions{};
+                opts.limits.gcWorkBudget = 0;
+                opts.debugger.reset();
+                std::vector<runtime::Value> callArgs(prefixParams + userArgCount);
+                for (std::size_t u = 0; u < userArgCount; ++u) {
+                    callArgs[prefixParams + u] = (*ctx.userArguments)[u];
+                }
+                if (isRange) {
+                    callArgs[0] = runtime::Value(static_cast<std::int64_t>(ctx.start));
+                    callArgs[1] = runtime::Value(static_cast<std::int64_t>(ctx.count));
+                    auto res = interp.invoke(bcFunc.symbolId, callArgs, std::move(opts));
+                    ctx.statistics = res.statistics;
+                    if (!res.succeeded) {
+                        ctx.error = std::move(res.error);
+                        return false;
+                    }
+                    ctx.reducedValue = std::move(res.value);
+                    ctx.hasReducedValue = true;
+                    return true;
+                }
+                bool hasAcc = false;
+                runtime::Value accValue{std::monostate{}};
+                for (std::size_t off = 0; off < ctx.count; ++off) {
+                    callArgs[0] = runtime::Value(static_cast<std::int64_t>(ctx.start + off));
+                    auto res = interp.invoke(bcFunc.symbolId, callArgs, opts);
+                    ctx.statistics.instructionsExecuted += res.statistics.instructionsExecuted;
+                    ctx.statistics.functionCalls += res.statistics.functionCalls;
+                    ctx.statistics.externalCalls += res.statistics.externalCalls;
+                    ctx.statistics.branchesTaken += res.statistics.branchesTaken;
+                    ctx.statistics.maximumCallDepth = std::max(
+                        ctx.statistics.maximumCallDepth,
+                        res.statistics.maximumCallDepth);
+                    if (!res.succeeded) {
+                        ctx.error = std::move(res.error);
+                        return false;
+                    }
+                    if (!runtime::accumulateParallelReductionValue(
+                            reduceOp,
+                            customReducer,
+                            strictDet,
+                            accValue,
+                            hasAcc,
+                            std::move(res.value),
+                            ctx.error)) {
+                        return false;
+                    }
+                }
+                ctx.hasReducedValue = hasAcc;
+                ctx.reducedValue = (reduceOp == runtime::ParallelReduceOp::None || !hasAcc)
+                    ? runtime::Value{std::monostate{}}
+                    : std::move(accValue);
+                return true;
+            }
+
+            runtime::detail::ActiveMutatorScope activeMutatorScope;
+            self->parallelBatchExecutions.fetch_add(1, std::memory_order_relaxed);
+
+            std::vector<runtime::Value> localFallbackArena;
+            bool usingTls = false;
+            std::vector<runtime::Value>* arenaPtr = &localFallbackArena;
+            if (!g_stencilTlsScratch.inUse) {
+                g_stencilTlsScratch.inUse = true;
+                usingTls = true;
+                arenaPtr = &g_stencilTlsScratch.values;
+            }
+            struct TlsReleaseGuard {
+                bool active = false;
+                ~TlsReleaseGuard() noexcept {
+                    if (active) {
+                        if (g_stencilTlsScratch.values.size() > 4096) {
+                            g_stencilTlsScratch.values.resize(256);
+                        }
+                        g_stencilTlsScratch.inUse = false;
+                    }
+                }
+            } tlsGuard{usingTls};
+
+            const std::size_t frameSlots = execFunc.totalFrameSlots;
+            if (frameSlots > runtime::StructStorageHandle::FrameOffsetMask) {
+                ctx.error.code = runtime::ErrorCode::InvalidProgram;
+                ctx.error.message = "frameSlots exceeds 24-bit FlatStruct slice address space";
+                return false;
+            }
+            if (arenaPtr->size() < frameSlots) {
+                arenaPtr->resize(std::max<std::size_t>(frameSlots, 256));
+            }
+
+            JitRuntimeSession session{};
+            session.program = self->program.get();
+            session.heap = activeHeap;
+            session.limits = batchLimits;
+            session.values = arenaPtr;
+            session.frameOffset = 0;
+            session.valueTop = frameSlots;
+            session.callDepth = 1;
+            session.valuesBase = arenaPtr->data();
+            session.frameOffset32 = 0;
+            session.telemetry = nullptr;
+            session.flatBankId = runtime::detail::acquireFlatStackBank(arenaPtr);
+            struct JitFlatBankGuard {
+                std::uint8_t& bankId;
+                ~JitFlatBankGuard() noexcept {
+                    if (bankId != 0u) {
+                        runtime::detail::releaseFlatStackBank(bankId);
+                        bankId = 0u;
+                    }
+                }
+            } jitBankGuard{session.flatBankId};
+
+            session.shadowStack.pushFrame(nullptr, nullptr, arenaPtr, &session.valueTop);
+            struct ShadowFrameGuard {
+                runtime::ShadowStack& stack;
+                ~ShadowFrameGuard() noexcept { stack.popFrame(); }
+            } shadowGuard{session.shadowStack};
+
+            const NativeJitEntryFn nativeFn = (runTier == StencilTier::NativeMachineCode)
+                ? recPtr->nativeEntry.load(std::memory_order_acquire)
+                : nullptr;
+            const std::size_t totalParams = prefixParams + userArgCount;
+            const std::size_t iterations = isRange ? 1u : ctx.count;
+            bool hasAcc = false;
+            runtime::Value accValue{std::monostate{}};
+
+            for (std::size_t iter = 0; iter < iterations; ++iter) {
+                if (arenaPtr->size() < frameSlots) {
+                    arenaPtr->resize(std::max<std::size_t>(frameSlots, 256));
+                }
+                runtime::Value* frameBase = arenaPtr->data();
+                session.valuesBase = frameBase;
+                session.valueTop = frameSlots;
+                session.callDepth = 1;
+                session.stats = runtime::RuntimeStatistics{};
+                session.stats.functionCalls = 1;
+                session.stats.maximumCallDepth = 1;
+                session.error = runtime::RuntimeError{};
+
+                if (isRange) {
+                    frameBase[0] = runtime::Value(static_cast<std::int64_t>(ctx.start));
+                    frameBase[1] = runtime::Value(static_cast<std::int64_t>(ctx.count));
+                } else {
+                    frameBase[0] = runtime::Value(static_cast<std::int64_t>(ctx.start + iter));
+                }
+                for (std::size_t u = 0; u < userArgCount; ++u) {
+                    frameBase[prefixParams + u] = (*ctx.userArguments)[u];
+                }
+                if (frameSlots > totalParams) {
+                    std::memset(
+                        static_cast<void*>(frameBase + totalParams),
+                        0,
+                        (frameSlots - totalParams) * sizeof(runtime::Value));
+                }
+                populateJitFrameStructPayloads(
+                    bcFunc,
+                    execFunc,
+                    frameBase,
+                    session.flatBankId,
+                    0,
+                    totalParams);
+
+                runtime::Value retValue{};
+                JitAbiContext abi{};
+                abi.frameBase = frameBase;
+                abi.remainingBudget = batchLimits.instructionBudget;
+                abi.branchesTaken = 0;
+                abi.returnSlot = &retValue;
+                abi.errorFlatIndex = 0;
+                abi.errorCodeRaw = 0;
+                abi.session = &session;
+                abi.compiledFn = recPtr;
+                invalidateJitArrayCaches(abi);
+
+                std::uint32_t rawStatus = 0u;
+                const runtime::ScopedAllocationSite fnAllocSite(recPtr->symbolId, 0);
+                if (nativeFn != nullptr) {
+                    rawStatus = nativeFn(&abi);
+                } else {
+                    const ThreadedStencilOp* pc =
+                        recPtr->threadedStream.data() + execFunc.entryStreamOffset;
+                    StencilStepStatus st = StencilStepStatus::Continue;
+                    while ((st = pc->handler(&abi, pc)) == StencilStepStatus::Continue) {}
+                    rawStatus = (st == StencilStepStatus::ReturnOk) ? 0u : abi.errorCodeRaw;
+                }
+                retValue = runtime::detachFrameSliceValue(retValue);
+
+                const std::uint64_t executed =
+                    batchLimits.instructionBudget >= abi.remainingBudget
+                        ? (batchLimits.instructionBudget - abi.remainingBudget)
+                        : batchLimits.instructionBudget;
+                ctx.statistics.instructionsExecuted += executed;
+                ctx.statistics.branchesTaken += abi.branchesTaken;
+                ctx.statistics.functionCalls += session.stats.functionCalls;
+                ctx.statistics.externalCalls += session.stats.externalCalls;
+                ctx.statistics.maximumCallDepth = std::max(
+                    ctx.statistics.maximumCallDepth,
+                    session.stats.maximumCallDepth);
+
+                if (rawStatus != 0u) {
+                    populateJitStatusError(
+                        session,
+                        fnLoc,
+                        execFunc,
+                        rawStatus,
+                        abi.errorFlatIndex,
+                        std::string{});
+                    ctx.error = std::move(session.error);
+                    return false;
+                }
+
+                if (isRange) {
+                    ctx.reducedValue = std::move(retValue);
+                    ctx.hasReducedValue = true;
+                } else if (!runtime::accumulateParallelReductionValue(
+                        reduceOp,
+                        customReducer,
+                        strictDet,
+                        accValue,
+                        hasAcc,
+                        std::move(retValue),
+                        ctx.error)) {
+                    return false;
+                }
+            }
+
+            if (!isRange) {
+                ctx.hasReducedValue = hasAcc;
+                ctx.reducedValue = (reduceOp == runtime::ParallelReduceOp::None || !hasAcc)
+                    ? runtime::Value{std::monostate{}}
+                    : std::move(accValue);
+            }
+            return true;
+        };
+    }
 };
 
 StencilModule::StencilModule() = default;
-StencilModule::StencilModule(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+StencilModule::StencilModule(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {}
 StencilModule::~StencilModule() = default;
 StencilModule::StencilModule(StencilModule&&) noexcept = default;
 StencilModule& StencilModule::operator=(StencilModule&&) noexcept = default;
@@ -1785,6 +2306,56 @@ std::size_t StencilModule::fallbackFunctionCount() const noexcept {
     return impl_ ? impl_->fallbackCount.load(std::memory_order_relaxed) : 0;
 }
 
+std::size_t StencilModule::interpreterFallbackCount() const noexcept {
+    return impl_ ? impl_->interpreterFallbackInvocations.load(std::memory_order_relaxed) : 0;
+}
+
+void StencilModule::resetInterpreterFallbackCount() const noexcept {
+    if (impl_) {
+        impl_->interpreterFallbackInvocations.store(0, std::memory_order_relaxed);
+    }
+}
+
+std::size_t StencilModule::parallelBatchExecutionCount() const noexcept {
+    return impl_ ? impl_->parallelBatchExecutions.load(std::memory_order_relaxed) : 0;
+}
+
+void StencilModule::resetParallelBatchExecutionCount() const noexcept {
+    if (impl_) {
+        impl_->parallelBatchExecutions.store(0, std::memory_order_relaxed);
+    }
+}
+
+runtime::ParallelNativeBatchKernel StencilModule::buildParallelBatchKernel(
+    semantic::SymbolId symbolId,
+    runtime::ParallelKernelKind kernelKind,
+    const std::vector<runtime::ParallelNativeColumnBinding>& paramColumns,
+    const runtime::ParallelJobConfig& config,
+    bool usesParallelPrng) const {
+    return impl_
+        ? impl_->buildParallelBatchKernel(symbolId, kernelKind, paramColumns, config, usesParallelPrng)
+        : runtime::ParallelNativeBatchKernel{};
+}
+
+runtime::ParallelNativeBatchKernel StencilModule::buildParallelBatchKernel(
+    const std::string& qualifiedName,
+    runtime::ParallelKernelKind kernelKind,
+    const std::vector<runtime::ParallelNativeColumnBinding>& paramColumns,
+    const runtime::ParallelJobConfig& config,
+    bool usesParallelPrng) const {
+    if (!valid()) return {};
+    const auto sym = impl_->program->findFunction(qualifiedName);
+    return sym
+        ? buildParallelBatchKernel(*sym, kernelKind, paramColumns, config, usesParallelPrng)
+        : runtime::ParallelNativeBatchKernel{};
+}
+
+void StencilModule::attachToProgramImage(const runtime::ProgramImage& program) const {
+    if (impl_) {
+        impl_->attachToProgramImage(program);
+    }
+}
+
 std::size_t StencilModule::machineCodeBytes() const noexcept {
     return impl_ ? impl_->codeBytes.load(std::memory_order_relaxed) : 0;
 }
@@ -1805,6 +2376,34 @@ StencilTier StencilModule::functionTier(const std::string& qualifiedName) const 
     if (!valid()) return StencilTier::InterpreterFallback;
     const auto sym = impl_->program->findFunction(qualifiedName);
     return sym ? functionTier(*sym) : StencilTier::InterpreterFallback;
+}
+
+std::vector<StencilFunctionDiagnostic> StencilModule::functionDiagnostics() const {
+    if (!impl_) return {};
+    std::lock_guard<std::mutex> lock(impl_->tierPromotionMutex);
+    std::vector<StencilFunctionDiagnostic> diagnostics;
+    diagnostics.reserve(impl_->records.size());
+    for (const auto& [sym, rec] : impl_->records) {
+        if (!rec) continue;
+        StencilFunctionDiagnostic entry;
+        entry.symbolId = sym;
+        entry.qualifiedName = rec->location ? rec->location->qualifiedName : std::string{};
+        entry.tier = rec->tier.load(std::memory_order_acquire);
+        entry.eligibleForThreaded = rec->eligibleForThreaded;
+        entry.eligibleForNative = rec->eligibleForNative;
+        entry.fallbackReason = rec->fallbackReason;
+        diagnostics.push_back(std::move(entry));
+    }
+    std::sort(
+        diagnostics.begin(),
+        diagnostics.end(),
+        [](const StencilFunctionDiagnostic& lhs, const StencilFunctionDiagnostic& rhs) {
+            if (lhs.qualifiedName != rhs.qualifiedName) {
+                return lhs.qualifiedName < rhs.qualifiedName;
+            }
+            return lhs.symbolId < rhs.symbolId;
+        });
+    return diagnostics;
 }
 
 StencilTargetArch StencilModule::hostTargetArch() const noexcept {
@@ -1927,7 +2526,7 @@ StencilCompileResult StencilJit::compile(
         return result;
     }
 
-    auto impl = std::make_unique<StencilModule::Impl>(program, options);
+    auto impl = std::make_shared<StencilModule::Impl>(program, options);
     const bool canEmitNative =
         options.enableNativeCodegen && ExecutableCodeArena::nativeCodeExecutionSupported();
     impl->nativeBackendAvailable = canEmitNative;
@@ -1959,11 +2558,26 @@ StencilCompileResult StencilJit::compile(
                 } else if (options.enableThreadedFallback) {
                     buildThreadedStream(*rec);
                     rec->tier.store(StencilTier::ThreadedStencils, std::memory_order_relaxed);
+                    if (!canEmitNative) {
+                        rec->fallbackReason = "native codegen disabled by options";
+                    } else {
+                        rec->fallbackReason = "awaiting hotness threshold (" +
+                            std::to_string(options.hotnessThreshold) + ") in threaded stencil tier";
+                    }
                 } else {
                     rec->tier.store(StencilTier::InterpreterFallback, std::memory_order_relaxed);
+                    if (!canEmitNative) {
+                        rec->fallbackReason = "native codegen and threaded fallback disabled by options";
+                    } else {
+                        rec->fallbackReason = "awaiting hotness threshold (" +
+                            std::to_string(options.hotnessThreshold) + ") with threaded fallback disabled";
+                    }
                 }
             } else {
                 rec->tier.store(StencilTier::InterpreterFallback, std::memory_order_relaxed);
+                rec->fallbackReason = execFunc == nullptr
+                    ? std::string("missing flat execution lowering")
+                    : explainStencilJitIneligibility(*execFunc);
             }
 
             impl->records.emplace(func.symbolId, std::move(rec));
@@ -1988,6 +2602,7 @@ StencilCompileResult StencilJit::compile(
                 rec->nativeEntry.store(nullptr, std::memory_order_relaxed);
                 rec->rawCodePtr = nullptr;
                 rec->rawCodeSize = 0;
+                rec->fallbackReason = "executable arena W^X seal failed";
                 if (options.enableThreadedFallback) {
                     buildThreadedStream(*rec);
                     rec->tier.store(StencilTier::ThreadedStencils, std::memory_order_relaxed);
@@ -2026,6 +2641,7 @@ StencilCompileResult StencilJit::compile(
     result.fallbackFunctionCount = nFallback;
     result.machineCodeBytes = codeSize;
     impl->registerValueLifecycleHooks();
+    impl->attachToProgramImage(*program);
     result.nativeBackendActive = impl->nativeBackendAvailable;
     result.module = std::shared_ptr<StencilModule>(new StencilModule(std::move(impl)));
     return result;

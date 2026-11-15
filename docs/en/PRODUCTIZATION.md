@@ -11,30 +11,27 @@ The build exports component targets so hosts can declare intent without dependin
 ```cmake
 find_package(RealScript CONFIG REQUIRED)
 
-target_link_libraries(game PRIVATE
+# Minimal runtime-only host (works with -DREALSCRIPT_SLIM_RUNTIME=ON):
+target_link_libraries(host_app PRIVATE
     RealScript::Runtime
-    RealScript::GameRuntime
+    RealScript::BindGenRuntime
 )
+
+# Optional companion L2 GamePack host:
+# find_package(RealScriptGamePack CONFIG REQUIRED)
+# target_link_libraries(game PRIVATE RealScript::GameSdk)
 ```
 
-Available targets are:
+Available `RealScript` L0 / L1 targets are:
 
-- `RealScript::Runtime`
-- `RealScript::Compiler`
-- `RealScript::GameRuntime`
-- `RealScript::GameCompiler`
-- `RealScript::GameSdk`
-- `RealScript::AotSupport`
-- `RealScript::Debug`
-- `RealScript::Tooling`
-- `RealScript::Full`
-- `RealScript::Frontend` for compatibility
-- `RealScript::rsaot` as the installed AOT generator executable
-- `RealScript::rsbind` as the installed auto-binding generator executable
+- **L0 Runtime & Core**: `RealScript::Foundation`, `RealScript::Bytecode`, `RealScript::Runtime`, `RealScript::AotRuntime`, `RealScript::BindGenRuntime`, `RealScript::HotReload`, `RealScript::StencilJit`, `RealScript::SlimRuntime`, `RealScript::Kernel`
+- **L0 Compiler & Native Backends**: `RealScript::Compiler`, `RealScript::NativeBackends`, `RealScript::AotSupport`
+- **L1 Optional Tooling & BindGen**: `RealScript::Debug` (`rsdebug`), `RealScript::Tooling` (`rslsp`), `RealScript::Extensibility`, `RealScript::BindGen`, `RealScript::Full`, `RealScript::Frontend`
+- **Installed CLIs**: `RealScript::rsaot` (`--cache-dir`, `--trusted-release`, `--opt-report`, `--opt-remarks`, `--opt-remarks-json`), `RealScript::rsbind`, `rsc`, `rsdebug`, `rslsp`
 
-The v0.98.0 implementation still uses one internal static archive. The component
-targets are the supported consumer boundary; the implementation can be split
-later without changing downstream CMake files.
+When building headless runtime distributions with `-DREALSCRIPT_SLIM_RUNTIME=ON`, `RealScript` omits compiler, tooling, extensibility, bindgen, JIT, and hot-reload targets while keeping `Foundation`, `Bytecode`, `Runtime`, `AotRuntime`, `BindGenRuntime`, `AotSupport`, and `SlimRuntime`. Offline compilation (`rsc` and `rsaot --cache-dir`) also supports `ModuleBuildCache` with macro-plugin and partial generic invalidation.
+
+Companion **`RealScript-GamePack`** exports the L2 targets (`RealScript::GameRuntime`, `RealScript::GameCompiler`, `RealScript::GameSdk`).
 
 Install and consume the SDK:
 
@@ -60,7 +57,7 @@ unfrozen.
 
 ## Loading verified bytecode modules
 
-`GameProgramLoader` accepts one or more encoded `.rsbc` modules, performs defensive decoding and verification, links a `ProgramImage`, and returns a `GameProgramPackage` containing:
+At the L0 kernel layer, hosts decode and verify `.rsbc` modules via `bytecode::decodeModule` and link a `ProgramImage` via `ProgramImage::link`. In companion **`RealScript-GamePack`** (`RealScript::GameRuntime` / `RealScript::GameSdk`), `GameProgramLoader` wraps that flow and returns a `GameProgramPackage` containing:
 
 - the linked program;
 - host bindings;
@@ -110,7 +107,7 @@ State encoding is little-endian, versioned, bounded, duplicate-field checked, an
 
 ## Human-readable JSON scene and prefab serialization
 
-For editor scene files, prefabs, and Git-friendly diffs, `GameProductization.h` provides `exportScriptObjectJson` and `importScriptObjectJson`:
+For editor scene files, prefabs, and Git-friendly diffs, companion **`RealScript-GamePack`** (`GameProductization.h`) provides `exportScriptObjectJson` and `importScriptObjectJson`:
 
 ```cpp
 auto json = exportScriptObjectJson(runtime, object, error, policy, &scene);

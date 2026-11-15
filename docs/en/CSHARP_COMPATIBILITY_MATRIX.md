@@ -14,7 +14,7 @@ deliberately smaller deterministic profile.
 | Modules, imports, multiple files | Supported | Explicit module/import model; no C# assembly or namespace resolution. |
 | Functions and overloads | Supported | Forward calls, recursion, deterministic conversion ranking, optional/named/`params` arguments. |
 | Class inheritance | Supported | Single inheritance, base constructors/access, `abstract`, `virtual`, `override`, `sealed`. |
-| Interfaces | Supported | Interface values, inheritance contracts, deterministic runtime interface dispatch. No default interface bodies. |
+| Interfaces | Supported | Interface values, inheritance contracts, default interface methods, and deterministic runtime interface dispatch. |
 | Accessibility | Supported | `public`, `internal`, `protected`, and `private` on supported declarations. |
 | Delegates and closures | Supported | First-class exact delegate values, method groups, heap closures, shared mutable captures, multicast, events. |
 | Generics | Supported | Compile-time specialization, inference, generic members, `class`/`struct`/`new()` and multi-interface `where` constraints, generic interfaces/delegates. No open runtime generics or variance. |
@@ -23,8 +23,8 @@ deliberately smaller deterministic profile.
 | Exact primitive identities | Supported | Exact signed/unsigned integer widths, binary32 `float`, binary64 `double`, and `char`; checked/unchecked conversions. |
 | Nullable value types | Supported | Exact `T?`, lifted null-conditional results, `HasValue`, `Value`, `GetValueOrDefault`. |
 | Boxing/unboxing | Supported | Exact script value-type identity with managed-heap/GC support. |
-| Reference locations | Partial | Ref parameters, locals, returns, fields, indexers, and ref `this`. No unsafe pointers, ref properties, ref structs, or full escape analysis. |
-| Attributes | Partial | Native syntax and versioned metadata for compiler/Game SDK/artifacts, auto-ingested into `ScriptMetadataRegistry` and `InspectorTypeSchema`. No executable attribute classes or full `AttributeUsage`. |
+| Reference locations | Partial | `[StackOnly]` `Span<T>` / `ReadOnlySpan<T>`, ref parameters, locals, returns, fields, indexers, and ref `this`. No unsafe pointers, ref properties, arbitrary user-defined ref structs beyond `[StackOnly]` spans, or full CLR escape analysis. |
+| Attributes | Partial | Native syntax, custom `[AttributeUsage(...)]` declarations, `[Obsolete]`, `[Signal]`, `[RelayCommand]`, `[Blittable]`, `[FieldTag]`, `[ValueLifecycle]`, and deterministic reflection/metadata via `RealScript.Reflect` (`ReflectionRegistry`) and `RealScript-GamePack` `ScriptMetadataRegistry` / `InspectorTypeSchema`. No CLR runtime IL emission. |
 | User operators/conversions | Supported | User-defined `operator` overloads (`+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, unary `-`, `!`, `~`), compound assignments (`+=`, `-=`, `*=`, `/=`, `%=`), and user-defined `implicit`/`explicit` conversion operators (`public static implicit/explicit operator Target(Source)`). |
 | `const`, `readonly`, static members, property initializers | Supported | Compile-time `const`, constructor-assigned `readonly` fields, `static class`, deterministic `static` constructors (`static T()`), `static` fields/initializers, and instance/`static` auto-property initializers (`{ get; set; } = expr;`) are supported across interpreter, bytecode, and C++17 AOT. |
 
@@ -36,7 +36,7 @@ deliberately smaller deterministic profile.
 | Inference and convenience | Supported | `var`, `?:`, `??`, `?.`, `$"..."` string interpolation, object/struct/collection initializers. |
 | Runtime type operators | Supported | `is`, `as`, `typeof`, exact runtime assignability. |
 | Patterns | Supported | Constant, null, type, and discard patterns; variables and `when` guards; exhaustive switch expressions. |
-| Pattern families | Partial | No relational, property, positional, list, recursive, `and`/`or`/`not`, or range patterns. |
+| Pattern families | Partial | Type, constant, null, discard, `var`, property, relational (`<`, `<=`, `>`, `>=`), logical combinator (`and`/`or`/`not`), and switch expressions with `when` guards. Positional, list, and recursive slice patterns are not supported. |
 | Dual-track coroutines: `sequence` (rollback track) | Supported | Purpose-built for deterministic tick simulation, `RSGS` binary state snapshots, and frame-level rollback (`yield wait_ticks`, `wait_seconds`, `wait_event`, `wait_signal`, `wait_until`), lowered to explicit object-field state machines alongside `RealScript.Fiber`. |
 | Dual-track coroutines: `async`/`await` (streaming & I/O track) | Supported profile | Phases 25–28 provide `RealScript.Async` (`Awaitable`/`Awaitable<T>`, 8-byte generational `AwaitableHandle`, `CancellationToken`/`CancellationTokenSource`, and 4 main-thread frame queues: `PreTickIo`, `FixedTick`, `Update`, `EndOfFrame`) for async `OnStart()`, prefab/asset streaming, save-game I/O, and HTTP/WebSocket bridges with automatic entity-destroy cancellation. Raw OS threads and CLR `Task` remain excluded. |
 
@@ -56,10 +56,11 @@ deliberately smaller deterministic profile.
 | Area | Status | RealScript contract |
 |---|---|---|
 | Interpreter | Supported | Verified typed-register bytecode with unified flat-frame layout, computed-goto dispatch, incremental GC stepping, budgets, deterministic tracing, and structured errors. |
-| C++17 AOT | Supported | Generated native code executes the same MIR semantics, including delegates, value types, patterns, and exceptions, plus Zero-Budget Trusted Release (`--trusted-release`), `#line` source mapping directives, struct stack scalarization, and vectorized ECS fast-loops. |
-| Toolchain JIT | Platform-dependent | External C++ toolchain JIT where configured; it is not an in-process CLR-style machine-code JIT. |
+| In-process `StencilJit` | Supported | Zero-external-compiler W^X `x86_64` (SysV/Win64) and `ARM64` native stencils with threaded fallback, active incremental GC safepoints, `ProfileCollector`, `StencilModule::functionDiagnostics()`, and native `ParallelJobScheduler` batch kernels. |
+| C++17 AOT | Supported | Generated native code executes the same MIR semantics, including delegates, value types, patterns, and exceptions, plus Zero-Budget Trusted Release (`--trusted-release`), `#line` source mapping directives, struct stack scalarization, active GC safepoints, native parallel batch kernels, and `--opt-remarks`. |
+| Toolchain JIT | Platform-dependent | Optional external C++ compiler JIT reusing C++17 AOT generation. |
 | `.rsbc` artifacts | Draft, versioned | Current output is 0.9; decoder supports 0.6–0.9. Format is not frozen. |
-| LSP/DAP/hot reload | Supported profile | Exclusive `.rscript` / `.d.rscript` file extensions; original-source symbols/sequence points, incremental `ParseSnapshot` and subgraph metadata caching, member `.` completion, `signatureHelp`, `.d.rscript` host stubs, stdio & embedded TCP (`--dap-port` / `EmbeddedDapServer`) DAP debugging, hierarchical Watch `variablesReference` object/struct/collection expansion, C++17 AOT `.natvis` & LLDB formatters, zero-dependency single-file C++ declaration parser in `rsbind` (`-D`/`-U` macro evaluation), and stateful scene hot reload. |
+| LSP/DAP/hot reload | Supported profile | Exclusive `.rscript` / `.d.rscript` file extensions; original-source symbols/sequence points, ranged incremental LSP `didChange` sync, `textDocument/codeLens` (AOT/boxing/GC status), `inlayHint`, `semanticTokens`, `GovernanceLinter` (`RSG001`–`RSG005`), `rsc --format`/`--lint`, stdio & embedded TCP (`--dap-port` / `EmbeddedDapServer`) DAP debugging with fiber & `topAllocations` (`GC.Alloc`) telemetry, `.d.rscript` host stubs (`bindgen::HostApi` / `GameApi`), C++17 AOT `.natvis` & LLDB formatters, zero-dependency C++ declaration parser in `rsbind` (`-D`/`-U` macro evaluation), and stateful scene hot reload (`RealScript-GamePack`). |
 | Reflection and dynamic | Not supported | Stable compile-time/runtime TypeIds exist, but no CLR reflection, `dynamic`, runtime code emission, or runtime generic construction. |
 | Standard library | Purpose-built | Deterministic game/runtime primitives and collections, not the .NET BCL. |
 

@@ -2,7 +2,9 @@
 
 [Documentation Home](README.md) | [Compilation, MIR, and Bytecode](COMPILATION_AND_BYTECODE.md)
 
-RealScript provides two native execution paths built on the same verified Typed MIR semantics: deterministic C++17 AOT generation and an optional external C++ toolchain JIT.
+RealScript provides three native execution paths built on the same verified Typed MIR and `.rsbc` semantics: deterministic C++17 AOT generation (`AotRuntime`), zero-external-compiler in-process W^X `StencilJit` (`x86_64` SysV/Win64 and `ARM64` native stencils with threaded fallback), and an optional external C++ toolchain JIT.
+
+For optimization and tier transparency, `rsaot` exposes `--opt-report`, `--opt-remarks`, and `--opt-remarks-json <file>`, while `StencilModule::functionDiagnostics()` reports per-function tier assignment (`NativeMachineCode`, `ThreadedStencils`, or `InterpreterFallback`) and exact fallback reasons. Both `StencilJit` and `AotRuntime` honor active incremental GC safepoints, `ProfileCollector` instrumentation, and native batch execution kernels for `ParallelJobScheduler::dispatchFor`.
 
 ## C++17 AOT Backend
 
@@ -239,14 +241,13 @@ Tests compare interpreter, AOT, and JIT behavior for:
 
 ## Current Limits
 
-The toolchain JIT is not LLVM ORC and does not provide:
+The toolchain JIT is not LLVM ORC, and neither Toolchain JIT nor `StencilJit` provides:
 
-- direct machine-code emission;
-- speculative optimization;
+- speculative JIT optimizations;
 - deoptimization;
-- on-stack replacement;
-- profile-guided optimization;
-- escape analysis;
+- on-stack replacement (OSR);
+- profile-guided optimization (PGO);
+- full CLR-style global byref escape analysis (beyond stack scalarization, SROA, and `[StackOnly]` spans);
 - advanced bounds-check elimination.
 
 Those capabilities may be added later without changing the verified MIR semantic boundary.

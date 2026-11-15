@@ -1,54 +1,28 @@
-# RealScript English Documentation
+# RealScript Documentation (English)
 
-[Repository README](../../README.md) | [简体中文文档](../zh-CN/README.md)
+[Documentation Home](../README.md) | [中文文档](../zh-CN/README.md) | [Repository README](../../README.md) | [Changelog](../../CHANGELOG.md)
 
-This library describes the RealScript v0.98.0 implementation through Phase 24
-and the Engine Integration Evolution. It is organized by subsystem and user workflow.
+## Start Here
 
-## New Users
+1. [Getting Started](GETTING_STARTED.md) — Build, test, CLI workflows (`rsc`, `rsaot`, `rsbind`, `rsdebug`, `rslsp`), and CMake slice consumption
+2. [Architecture Overview](ARCHITECTURE.md) — L0/L1/L2 repository layering, acyclic physical slices, compiler-runtime boundary, and execution tiers
+3. [Project Status and Roadmap](PROJECT_STATUS_AND_ROADMAP.md) — Verified capabilities in `v0.98.0+`, recent hardening (`AUD-01`–`AUD-05`), and post-baseline roadmap
 
-1. [Getting Started](GETTING_STARTED.md)
-2. [Architecture](ARCHITECTURE.md)
-3. [Language and Type System](LANGUAGE_AND_TYPE_SYSTEM.md)
-4. [C#-Style Compatibility Matrix](CSHARP_COMPATIBILITY_MATRIX.md)
-5. [Phase 11–18 Native Language Profile](NATIVE_LANGUAGE_PHASE_11_18.md)
-6. [Game Scripting SDK](GAME_SCRIPTING_SDK.md)
-7. [Deterministic Gameplay Runtime](GAMEPLAY_RUNTIME.md)
-8. [SDK Productization](PRODUCTIZATION.md)
-9. [Project Status and Roadmap](PROJECT_STATUS_AND_ROADMAP.md)
+## Language and Compatibility
 
-## Compiler and Execution Pipeline
+- [Language and Type System](LANGUAGE_AND_TYPE_SYSTEM.md) — Modules, classes, structs, enums, interfaces (including default interface methods), delegates, generics, pattern matching, deterministic `sequence` coroutines, and `[StackOnly]` spans
+- [C# Compatibility Matrix](CSHARP_COMPATIBILITY_MATRIX.md) — Supported C# constructs, RealScript extensions (`sequence`, `[StackOnly]`, `[Signal]`, `[RelayCommand]`, `[Blittable]`, `fixed`), and deliberate omissions
 
-- [Compilation, MIR, and Bytecode](COMPILATION_AND_BYTECODE.md)
-- [Runtime, GC, and Embedding](RUNTIME_GC_AND_EMBEDDING.md)
-- [Phase 11–18 Native Language Profile](NATIVE_LANGUAGE_PHASE_11_18.md)
-- [Game Scripting SDK](GAME_SCRIPTING_SDK.md)
-- [Deterministic Gameplay Runtime](GAMEPLAY_RUNTIME.md)
-- [SDK Productization](PRODUCTIZATION.md)
-- [AOT, JIT, and Performance](AOT_JIT_AND_PERFORMANCE.md)
-- [Detailed Performance Baseline (Chinese)](../zh-CN/PERFORMANCE_BASELINE.md)
-- [Phase 18–24 Native Roadmap](../roadmap/PHASE_18_24_NATIVE_LANGUAGE_AND_RUNTIME.md)
-- [Phase 24 Language Completeness and Structured Errors](../roadmap/PHASE_24_LANGUAGE_COMPLETENESS_AND_STRUCTURED_ERRORS.md)
+## Compiler, Runtime, and Performance
 
-## Developer Tools
+- [Compilation and Bytecode](COMPILATION_AND_BYTECODE.md) — Frontend, Typed MIR, O2 passes (SROA, LICM, small-function inlining), `ModuleBuildCache`, `.rsbc` (`0.6`–`0.9`), and 16-byte `Value` / 8-byte `Instruction` representation
+- [Runtime, GC, and Embedding](RUNTIME_GC_AND_EMBEDDING.md) — `EngineRuntime`, `ManagedHeap` generational nursery & incremental GC, safepoints, `NativeHandleRegistry`, `ParallelJobScheduler`, and L0 embedding (`RealScript::Runtime`, `RealScript::SlimRuntime`)
+- [AOT, JIT, and Performance](AOT_JIT_AND_PERFORMANCE.md) — Interpreter fast path, in-process W^X `StencilJit` (`x86_64` & `ARM64` native stencils + threaded fallback + `functionDiagnostics()`), C++17 `AotRuntime`, `rsaot --opt-remarks`, and native parallel batch kernels
 
-- [Debugging, Tooling, and Hot Reload](DEBUGGING_TOOLING_AND_HOT_RELOAD.md)
-- [Determinism and Replay](DETERMINISM_AND_REPLAY.md)
+## Tooling, Determinism, and Productization
 
-## Detailed Chinese Specifications
+- [Debugging, Tooling, and Hot Reload](DEBUGGING_TOOLING_AND_HOT_RELOAD.md) — `rslsp` incremental sync / `codeLens` / `inlayHint` / `semanticTokens`, `GovernanceLinter` (`RSG001`–`RSG005`), `rsc --format`/`--lint`, `rsdebug` / `DapServer` fiber & zero-alloc telemetry, `GovernanceFuzzer`, and structural hot reload
+- [Determinism and Replay](DETERMINISM_AND_REPLAY.md) — `DeterminismMode::Strict` / `Record` / `Replay`, cross-backend digest parity, and lockstep simulation boundaries
+- [Productization](PRODUCTIZATION.md) — Versioned contracts (`Version.h`), modular L0/L1 CMake exports, `-DREALSCRIPT_SLIM_RUNTIME=ON`, `ModuleBuildCache`, `.rscache`, and companion L2 `RealScript-GamePack` packaging
 
-The original detailed documents remain useful for implementation history and subsystem-level constraints:
-
-- [Overall engine design](../ENGINE_DESIGN.md)
-- [Game Scripting SDK overview](../zh-CN/GAME_SCRIPTING_SDK.md)
-- [Specification index](../spec/README.md)
-- [Phase 11–17 implementation profile](../roadmap/PHASE_11_17_LANGUAGE_EXPANSION.md)
-- [Implementation roadmap](../roadmap/PHASE_1A.md)
-
-## Versioning
-
-The current documentation describes the v0.98.0 implementation through Phase
-24 and the Engine Integration Evolution. The source language, MIR, bytecode, runtime ABI, metadata, and debug-info
-formats use separate version dimensions. A numbered GitHub release does not
-freeze those compatibility contracts; pin an exact release and rebuild AOT
-artifacts with the matching SDK.
+> **Game / Scene / Gameplay SDK Docs:** `GAME_SCRIPTING_SDK.md` and `GAMEPLAY_RUNTIME.md` now live in the companion **`RealScript-GamePack`** repository (`docs/en/`).

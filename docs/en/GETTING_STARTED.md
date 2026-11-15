@@ -33,6 +33,14 @@ cmake -S . -B build \
   -DREALSCRIPT_ENABLE_TOOLCHAIN_JIT_TESTS=OFF
 ```
 
+To build only the slim headless runtime targets without compiler/tooling/JIT/hot-reload components:
+
+```bash
+cmake -S . -B build-slim -DREALSCRIPT_SLIM_RUNTIME=ON
+```
+
+For L2 game scene/ECS/gameplay bindings (`RealScript::GameRuntime`, `RealScript::GameCompiler`, `RealScript::GameSdk`), use the companion **`RealScript-GamePack`** repository.
+
 ## First Program
 
 Create `hello.rscript`:
@@ -207,7 +215,15 @@ Start the debug adapter with source files:
 build/rsdebug math.rscript app.rscript
 ```
 
-Both processes use standard stdin/stdout protocol framing and are intended to be launched by an editor extension or protocol client.
+Format and lint script sources (`GovernanceLinter` `RSG001`–`RSG005`), or inspect AOT optimization remarks:
+
+```bash
+build/rsc --format --check-format app.rscript
+build/rsc --lint --lint-deny-warnings app.rscript
+build/rsaot --cache-dir build/cache --opt-remarks --output-dir build/generated/demo math.rscript app.rscript
+```
+
+Both `rslsp` and `rsdebug` use standard stdin/stdout protocol framing (and `rsdebug --dap-port` supports TCP attach) and are intended to be launched by an editor extension or protocol client.
 
 ## Where to Go Next
 

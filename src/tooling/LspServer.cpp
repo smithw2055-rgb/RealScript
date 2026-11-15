@@ -325,6 +325,7 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
                     {"commands", Json::Array{"realscript.refreshManifest"}},
                 }},
                 {"inlayHintProvider", true},
+                {"codeLensProvider", Json::Object{{"resolveProvider", false}}},
                 {"semanticTokensProvider", Json::Object{
                     {"full", true},
                     {"legend", Json::Object{
@@ -678,6 +679,9 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
                 {"resources", static_cast<std::int64_t>(manifest.resources.size())},
             });
         }
+        if (cmd == "realscript.codeLens.noop") {
+            return response(message, Json(nullptr));
+        }
         return error(message, -32601, "unknown command: " + cmd);
     }
     if (method == "textDocument/semanticTokens/full") {
@@ -723,6 +727,19 @@ Json LspServer::handle(const Json& message, std::ostream* notifications) {
                 {"position", toLspPosition(activeDocText, hint.position)},
                 {"label", hint.label},
                 {"kind", static_cast<std::int64_t>(hint.kind)},
+            });
+        }
+        return response(message, Json(std::move(items)));
+    }
+    if (method == "textDocument/codeLens") {
+        Json::Array items;
+        for (const auto& lens : service_.codeLenses(path)) {
+            items.emplace_back(Json::Object{
+                {"range", toLspRange(activeDocText, lens.range)},
+                {"command", Json::Object{
+                    {"title", lens.title},
+                    {"command", lens.command},
+                }},
             });
         }
         return response(message, Json(std::move(items)));

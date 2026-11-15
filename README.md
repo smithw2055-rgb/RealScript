@@ -144,9 +144,10 @@ bytecode artifacts, CMake AOT integration, debugging, and editor tooling.
 
 | Backend | Best use | Notes |
 |---|---|---|
-| Bytecode interpreter | Development, debugging, hot reload, and cold or low-frequency scripts | Fast startup and full tooling; slower than native execution for CPU-heavy loops. |
-| C++17 AOT | Shipping gameplay and performance-sensitive deterministic code | Portable generated C++ with the same checked runtime semantics. |
-| Toolchain JIT | Desktop development and native execution without a separate AOT build step | Reuses AOT generation, invokes an external compiler, and caches the shared module. |
+| Bytecode interpreter | Development, debugging, hot reload, and cold or low-frequency scripts | Fast startup, full tooling, and reference semantics; slower than native execution for CPU-heavy loops. |
+| In-process `StencilJit` | Zero-external-compiler fast warm-up in development and live hosts | W^X `x86_64` (SysV/Win64) and `ARM64` native stencils with threaded fallback, active incremental GC safepoints, `ProfileCollector`, `functionDiagnostics()`, and native `ParallelJobScheduler` batch kernels. |
+| C++17 AOT | Shipping gameplay and performance-sensitive deterministic code | Portable generated C++ (`rsaot`) with full-type `_scalar` lowering, active GC safepoints, native parallel batch kernels, and `--opt-remarks`. |
+| Toolchain JIT | Desktop development and native execution without a separate AOT build step | Reuses C++17 AOT generation, invokes a local C++ compiler, and caches the shared module. |
 
 ## Performance snapshot
 
@@ -224,8 +225,11 @@ snapshot, restore, replay, rollback, and C++17 AOT generation.
 - [Runtime, GC, and Embedding](docs/en/RUNTIME_GC_AND_EMBEDDING.md)
 - [AOT, JIT, and Performance](docs/en/AOT_JIT_AND_PERFORMANCE.md)
 - [Determinism and Replay](docs/en/DETERMINISM_AND_REPLAY.md)
-- [Game Scripting SDK](docs/en/GAME_SCRIPTING_SDK.md)
-- [Deterministic Gameplay Runtime](docs/en/GAMEPLAY_RUNTIME.md)
+- [Documentation Home](docs/README.md)
+- [English Documentation Index](docs/en/README.md)
+- [Chinese Integration Guide](docs/zh-CN/integration_guide.md)
+
+Companion **`RealScript-GamePack`** repository (`RealScript::GameRuntime`, `RealScript::GameCompiler`, `RealScript::GameSdk`, `rsbench_product`) hosts the L2 Game Scripting SDK (`GAME_SCRIPTING_SDK.md`) and Deterministic Gameplay Runtime (`GAMEPLAY_RUNTIME.md`).
 - [SDK Productization](docs/en/PRODUCTIZATION.md)
 - [Project Status and Roadmap](docs/en/PROJECT_STATUS_AND_ROADMAP.md)
 - [Changelog](CHANGELOG.md)
@@ -235,10 +239,9 @@ snapshot, restore, replay, rollback, and C++17 AOT generation.
 
 RealScript is not CLR-compatible C#. v0.98.0 deliberately does not provide:
 
-- multiple class inheritance, default interface implementations, open runtime
-  generics, or generic variance;
-- raw OS threads with shared mutable state or CLR `System.Threading.Tasks.Task` (use main-thread-queued `RealScript.Async` `Awaitable<T>` for streaming/network I/O and `sequence` for rollback simulation);
-- unsafe pointers, ref structs, ref properties, or complete escape analysis;
+- multiple class inheritance, open runtime generics, or generic variance;
+- raw OS threads with shared mutable state or CLR `System.Threading.Tasks.Task` (use main-thread-queued `RealScript.Async` `Awaitable<T>` for streaming/network I/O, `ParallelJobScheduler` for verified data-parallel kernels, and `sequence` for rollback simulation);
+- unsafe pointers, arbitrary user-defined ref structs beyond `[StackOnly]` spans (`Span<T>` / `ReadOnlySpan<T>`), ref properties, or complete escape analysis;
 - exception filters, `lock`, native exception interop, or exceptions across a
   coroutine suspension point;
 - LINQ, `dynamic`, reflection code generation, or the .NET base-class library;
@@ -250,12 +253,14 @@ RealScript is not CLR-compatible C#. v0.98.0 deliberately does not provide:
 Pin an exact RealScript release or commit for engine integration and rebuild
 generated AOT artifacts with the matching SDK.
 
+## Architecture Evolution & Hardening Highlights
+
+- **Acyclic L0/L1/L2 Layering & `REALSCRIPT_SLIM_RUNTIME`**: Physical CMake slice exports (`Foundation`, `Bytecode`, `Runtime`, `AotRuntime`, `BindGenRuntime`, `HotReload`, `StencilJit`, `SlimRuntime`, `Compiler`, `NativeBackends`, `Kernel`, plus optional L1 `Debug`, `Tooling`, `Extensibility`, `BindGen`) and headless `-DREALSCRIPT_SLIM_RUNTIME=ON` support, with L2 game/scene SDKs split into companion `RealScript-GamePack`.
+- **Cross-Backend GC/Profile/Diagnostics Parity**: Active incremental GC safepoints and `ProfileCollector` instrumentation across Interpreter, `StencilJit`, and `AotRuntime`; native `ParallelJobScheduler` batch kernels; zero-allocation `GC.Alloc` frame attribution (`FrameTelemetryCollector` / DAP `topAllocations`); `StencilModule::functionDiagnostics()`, `rsaot --opt-remarks`/`--opt-remarks-json`, and LSP `textDocument/codeLens`.
+- **Per-Instance Heap Pools & Nanosecond GC Budgets**: Eliminated cross-instance lock contention across `ManagedHeap` object/array allocations and GC mark/sweep cycles (coordinating brief safe-point sweeps only when shared `ValuePool` pin-reclamation triggers), and added `collectIncrementalWithBudget` nanosecond/microsecond frame-budget APIs.
+- **AST-Hygienic Generics, Shared Ref-Type AOT & `using`**: Span-preserving AST monomorphization with cross-module lexical hygiene, shared C++ bodies for reference-type generics in `AotCpp`, deterministic `using` disposal, default interface methods, relational & `and`/`or`/`not` patterns, and `[StackOnly]` spans.
+- **Modular `publicFingerprint` & Macro-Aware Build Cache**: `rsc`/`rsaot --cache-dir` caches `.rsbc` & AOT shards keyed by upstream `publicFingerprint`, preserving macro-plugin state (`C11MacroPlugin` / `[Signal]` / `[RelayCommand]`) and partial generic dependencies.
+
 ## License
 
 RealScript is licensed under the Apache License 2.0. See [LICENSE](LICENSE).
-
-### Sprint 2 Architecture Evolution Highlights
-- **Per-Instance Heap Pools & Nanosecond GC Budgets**: Eliminated cross-instance lock contention across `ManagedHeap` object/array allocations and GC mark/sweep cycles (coordinating brief safe-point sweeps only when shared `ValuePool` pin-reclamation triggers), and added `collectIncrementalWithBudget` nanosecond/microsecond frame-budget APIs.
-- **Flattened Lifecycle Dispatch & Coroutine-Preserving Hot Reload**: `SceneScriptRuntime` dispatches compact `FlatLifecycleSlot` arrays without per-frame copies and preserves suspended coroutines/sequences whose 64-bit state-machine fingerprint is unchanged across `hotReload`.
-- **AST-Hygienic Generics, Shared Ref-Type AOT & `using` / `Resource`**: Span-preserving AST monomorphization with cross-module lexical hygiene, shared C++ bodies for reference-type generics in `AotCpp`, deterministic `using` disposal, and Godot-style ref-counted `ResourceHandle<T>`.
-- **Modular `publicFingerprint` Build Cache & Git-Friendly `AssetGuid` Scenes**: `rsc`/`rsaot --cache-dir` caches `.rsbc` & AOT shards keyed by upstream `publicFingerprint`, paired with 128-bit `AssetGuid` and line-sorted scene/prefab text serialization.

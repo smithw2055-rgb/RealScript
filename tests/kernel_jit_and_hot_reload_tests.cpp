@@ -4,6 +4,7 @@
 #include "realscript/hot_reload/HotReload.h"
 #include "realscript/jit/Jit.h"
 #include "realscript/optimization/Optimizer.h"
+#include "realscript/runtime/ParallelJob.h"
 #include "realscript/runtime/Runtime.h"
 
 #include <cstdint>
@@ -714,6 +715,337 @@ public int ReadLastToken() {
     }
 }
 
+void testStencilJitActiveIncrementalGcProfileAndTelemetry() {
+    const std::string src = R"RS(
+module Kernel.StencilGcProfile;
+
+public class Box {
+    public int v;
+}
+
+public int RunGcAndAllocLoop(int n) {
+    int[] arr = new int[8];
+    int acc = 0;
+    for (int i = 0; i < n; i = i + 1) {
+        Box b = new Box();
+        b.v = i * 3 + 1;
+        arr[i % 8] = b.v;
+        int[] scratch = new int[4];
+        scratch[0] = arr[i % 8];
+        acc = acc + scratch[0] + b.v;
+    }
+    return acc;
+}
+)RS";
+
+    auto bundle = compileAndLink({{"stencil_gc_prof.rscript", src}}, optimization::Level::Basic);
+    auto vmHeap = std::make_shared<runtime::ManagedHeap>();
+    runtime::Interpreter interp(bundle.program, vmHeap);
+    const auto vmRes = interp.invoke("Kernel.StencilGcProfile::RunGcAndAllocLoop", {std::int64_t{48}});
+    require(vmRes.succeeded, "VM baseline failed: " + vmRes.error.message);
+
+    jit::StencilJit sjit;
+    jit::StencilJitOptions nativeOpts;
+    nativeOpts.enableNativeCodegen = true;
+    auto compiled = sjit.compile(bundle.program, nativeOpts);
+    require(compiled.succeeded(), "StencilJit compile failed: " + compiled.error);
+    auto heap = std::make_shared<runtime::ManagedHeap>();
+    compiled.module->setHeap(heap);
+#if UINTPTR_MAX == 0xffffffffffffffffULL
+    require(compiled.module->functionTier("Kernel.StencilGcProfile::RunGcAndAllocLoop") ==
+            jit::StencilTier::NativeMachineCode,
+        "Expected RunGcAndAllocLoop to be promoted to NativeMachineCode");
+#endif
+
+    // Seed live + garbage objects and initiate an active incremental GC cycle before invoking JIT.
+    std::vector<runtime::PersistentRoot> roots;
+    const auto boxTypeId = semantic::stableTypeId("Kernel.StencilGcProfile::Box");
+    for (int i = 0; i < 64; ++i) {
+        auto obj = heap->allocateObject(boxTypeId, {runtime::Value{std::int64_t{i}}}, {});
+        require(obj.has_value(), "Seed allocateObject failed");
+        if (i % 4 == 0) {
+            roots.push_back(heap->retain(runtime::Value{*obj}));
+        }
+    }
+    heap->requestCollection();
+    runtime::ShadowStack emptyRoots;
+    (void)heap->step(emptyRoots, 1);
+
+    auto profile = std::make_shared<runtime::ProfileCollector>();
+    runtime::FrameTelemetryCollector telemetry;
+    runtime::ActiveFrameTelemetryScope telemetryScope(&telemetry);
+    telemetry.beginFrame(1u);
+
+    runtime::ExecutionOptions opts;
+    opts.profile = profile;
+    opts.limits.gcWorkBudget = 8;
+
+    compiled.module->resetInterpreterFallbackCount();
+    const auto jitRes = compiled.module->invoke(
+        "Kernel.StencilGcProfile::RunGcAndAllocLoop", {std::int64_t{48}}, opts);
+    assertParity("StencilJit active incremental GC + Profile", jitRes, vmRes);
+    require(compiled.module->interpreterFallbackCount() == 0u,
+        "StencilJit fell back to Interpreter under active incremental GC or ProfileCollector");
+    require(jitRes.statistics.gcWorkPerformed > 0u,
+        "Expected StencilJit to step incremental GC safepoints under active GC");
+
+    const auto snap = profile->snapshot();
+    require(!snap.traceEvents.empty(), "Expected ProfileCollector traceEvents from StencilJit");
+    require(!snap.functions.empty(), "Expected ProfileCollector function summary from StencilJit");
+    bool sawFn = false;
+    for (const auto& fp : snap.functions) {
+        if (fp.function == "Kernel.StencilGcProfile::RunGcAndAllocLoop") {
+            require(fp.calls >= 1u && fp.instructions > 0u,
+                "Expected ProfileCollector calls >= 1 and instructions > 0 for StencilJit");
+            sawFn = true;
+        }
+    }
+    require(sawFn, "Missing StencilJit function entry in ProfileCollector snapshot");
+
+    const auto frameSample = telemetry.endFrame(heap.get());
+    require(frameSample.totalInstructions > 0u && frameSample.hotFunctionCount >= 1u,
+        "Expected FrameTelemetryCollector to record StencilJit instructions");
+    require(frameSample.boxedHeapLiveBytes > 0u,
+        "Expected live heap bytes in FrameTelemetryCollector after StencilJit run");
+}
+
+void testStencilJitParallelBatchExecution() {
+    auto bundle = compileAndLink({{"StencilParallel.rscript", R"RS(
+module Kernel.StencilParallel;
+
+public int StepAndScore(int index, int[] dst, int[] src, int scale) {
+    int v = src[index] * scale + 3;
+    dst[index] = v;
+    return v;
+}
+
+public void RangeTransform(int start, int count, int[] dst, int[] src, int bias) {
+    for (int off = 0; off < count; off = off + 1) {
+        int idx = start + off;
+        dst[idx] = src[idx] * 2 + bias;
+    }
+}
+)RS"}});
+
+    constexpr std::size_t kCount = 128;
+    auto makeInputs = [&](runtime::ManagedHeap& h) {
+        const auto arrTypeId = semantic::stableTypeId("int[]");
+        auto src = h.allocateTypedArray(
+            arrTypeId, semantic::PrimitiveType::Int, 0, kCount, runtime::Value{std::int64_t{0}});
+        auto dst = h.allocateTypedArray(
+            arrTypeId, semantic::PrimitiveType::Int, 0, kCount, runtime::Value{std::int64_t{0}});
+        require(src.has_value() && dst.has_value(), "Packed int array allocation failed");
+        for (std::size_t i = 0; i < kCount; ++i) {
+            require(h.arraySet(*src, i, runtime::Value{static_cast<std::int64_t>(i + 1)}),
+                "arraySet failed");
+        }
+        return std::pair<runtime::ObjectRef, runtime::ObjectRef>{*src, *dst};
+    };
+
+    // Baseline VM execution without StencilJit attached
+    auto vmHeap = std::make_shared<runtime::ManagedHeap>();
+    auto [vmSrc, vmDst] = makeInputs(*vmHeap);
+    runtime::ParallelJobScheduler scheduler(4);
+    runtime::ParallelJobConfig elemCfg;
+    elemCfg.workerCount = 4;
+    elemCfg.batchSize = 16;
+    elemCfg.reduceOp = runtime::ParallelReduceOp::Sum;
+
+    const auto vmElemRes = scheduler.dispatchFor(
+        bundle.program,
+        vmHeap,
+        "Kernel.StencilParallel::StepAndScore",
+        kCount,
+        {runtime::Value{vmDst}, runtime::Value{vmSrc}, runtime::Value{std::int64_t{5}}},
+        elemCfg);
+    require(vmElemRes.succeeded && vmElemRes.totalItemsProcessed == kCount,
+        "Baseline VM parallel dispatchFor failed: " + vmElemRes.error.message);
+
+    auto [vmRangeSrc, vmRangeDst] = makeInputs(*vmHeap);
+    runtime::ParallelJobConfig rangeCfg;
+    rangeCfg.workerCount = 4;
+    rangeCfg.batchSize = 32;
+    const auto vmRangeRes = scheduler.dispatchRange(
+        bundle.program,
+        vmHeap,
+        "Kernel.StencilParallel::RangeTransform",
+        kCount,
+        {runtime::Value{vmRangeDst}, runtime::Value{vmRangeSrc}, runtime::Value{std::int64_t{9}}},
+        rangeCfg);
+    require(vmRangeRes.succeeded && vmRangeRes.totalItemsProcessed == kCount,
+        "Baseline VM parallel dispatchRange failed: " + vmRangeRes.error.message);
+
+    // StencilJit native batch execution attached to ProgramImage
+    jit::StencilJit sjit;
+    jit::StencilJitOptions opts;
+    opts.enableNativeCodegen = true;
+    opts.hotnessThreshold = 0;
+    auto compiled = sjit.compile(bundle.program, opts);
+    require(compiled.succeeded() && compiled.module && compiled.module->valid(),
+        "StencilJit compile failed for parallel test: " + compiled.error);
+    compiled.module->resetInterpreterFallbackCount();
+    compiled.module->resetParallelBatchExecutionCount();
+
+    auto jitHeap = std::make_shared<runtime::ManagedHeap>();
+    auto [jitSrc, jitDst] = makeInputs(*jitHeap);
+    const auto jitElemRes = scheduler.dispatchFor(
+        bundle.program,
+        jitHeap,
+        "Kernel.StencilParallel::StepAndScore",
+        kCount,
+        {runtime::Value{jitDst}, runtime::Value{jitSrc}, runtime::Value{std::int64_t{5}}},
+        elemCfg);
+    require(jitElemRes.succeeded && jitElemRes.totalItemsProcessed == kCount,
+        "StencilJit parallel dispatchFor failed: " + jitElemRes.error.message);
+    require(jitElemRes.usedNativeBatchKernel,
+        "Expected StencilJit parallel dispatchFor to use native batch kernel");
+    require(compiled.module->parallelBatchExecutionCount() > 0,
+        "Expected non-zero StencilJit parallelBatchExecutionCount after dispatchFor");
+    require(compiled.module->interpreterFallbackCount() == 0,
+        "Expected zero interpreter fallbacks during StencilJit parallel dispatchFor");
+    require(std::get<std::int64_t>(jitElemRes.value) == std::get<std::int64_t>(vmElemRes.value),
+        "StencilJit parallel reduction mismatch against VM");
+
+    compiled.module->resetParallelBatchExecutionCount();
+    auto [jitRangeSrc, jitRangeDst] = makeInputs(*jitHeap);
+    const auto jitRangeRes = scheduler.dispatchRange(
+        bundle.program,
+        jitHeap,
+        "Kernel.StencilParallel::RangeTransform",
+        kCount,
+        {runtime::Value{jitRangeDst}, runtime::Value{jitRangeSrc}, runtime::Value{std::int64_t{9}}},
+        rangeCfg);
+    require(jitRangeRes.succeeded && jitRangeRes.totalItemsProcessed == kCount,
+        "StencilJit parallel dispatchRange failed: " + jitRangeRes.error.message);
+    require(jitRangeRes.usedNativeBatchKernel,
+        "Expected StencilJit parallel dispatchRange to use native batch kernel");
+    require(compiled.module->parallelBatchExecutionCount() > 0,
+        "Expected non-zero StencilJit parallelBatchExecutionCount after dispatchRange");
+    require(compiled.module->interpreterFallbackCount() == 0,
+        "Expected zero interpreter fallbacks during StencilJit parallel dispatchRange");
+
+    for (std::size_t i = 0; i < kCount; ++i) {
+        const auto a = jitHeap->arrayGet(jitDst, i);
+        const auto b = vmHeap->arrayGet(vmDst, i);
+        require(a && b && std::get<std::int64_t>(*a) == std::get<std::int64_t>(*b),
+            "Element kernel output parity mismatch against VM");
+        const auto ra = jitHeap->arrayGet(jitRangeDst, i);
+        const auto rb = vmHeap->arrayGet(vmRangeDst, i);
+        require(ra && rb && std::get<std::int64_t>(*ra) == std::get<std::int64_t>(*rb),
+            "Range kernel output parity mismatch against VM");
+    }
+}
+
+void testStencilJitAllocAttributionAndFunctionDiagnostics() {
+    const std::string src = R"RS(
+module Kernel.StencilDiag;
+
+public class DiagFault {
+    public string msg;
+    public DiagFault(string m) { msg = m; }
+}
+
+public class Pair {
+    public int a = 0;
+    public int b = 0;
+}
+
+public int FastAdd(int x, int y) {
+    return x * 3 + y;
+}
+
+public int AllocWork(int n) {
+    Pair p = new Pair();
+    p.a = n;
+    int[] arr = new int[4];
+    arr[0] = p.a + 1;
+    return arr[0];
+}
+
+public int TryCatchFallback(int x) {
+    int acc = 0;
+    try {
+        if (x > 0) {
+            throw new DiagFault("err");
+        }
+    } catch (DiagFault ex) {
+        acc = ex.msg.Length;
+    }
+    return acc + x;
+}
+)RS";
+
+    auto bundle = compileAndLink({{"stencil_diag.rscript", src}}, optimization::Level::Basic);
+    jit::StencilJit sjit;
+    jit::StencilJitOptions opts;
+    opts.enableNativeCodegen = true;
+    auto compiled = sjit.compile(bundle.program, opts);
+    require(compiled.succeeded(), "StencilJit compile failed: " + compiled.error);
+
+    auto heap = std::make_shared<runtime::ManagedHeap>();
+    compiled.module->setHeap(heap);
+
+    runtime::FrameTelemetryCollector telemetry;
+    runtime::ActiveFrameTelemetryScope telemetryScope(&telemetry);
+    telemetry.beginFrame(1u);
+
+    const auto allocRes = compiled.module->invoke(
+        "Kernel.StencilDiag::AllocWork", {runtime::Value{std::int64_t{5}}});
+    require(allocRes.succeeded && std::get<std::int64_t>(allocRes.value) == 6,
+        "StencilJit AllocWork execution failed: " + allocRes.error.message);
+
+    const auto sample = telemetry.endFrame(heap.get());
+    require(sample.frameAllocCount >= 2u, "Expected StencilJit frameAllocCount >= 2");
+    require(sample.frameAllocBytes > 0u, "Expected StencilJit frameAllocBytes > 0");
+    require(sample.hotAllocationCount >= 1u, "Expected StencilJit hotAllocationCount >= 1");
+
+    const auto allocSymId = bundle.program->findFunction("Kernel.StencilDiag::AllocWork");
+    require(allocSymId.has_value(), "Missing AllocWork symbolId");
+    bool attributedToAllocWork = false;
+    for (std::uint8_t i = 0; i < sample.hotAllocationCount; ++i) {
+        if (sample.topAllocations[i].symbolId == *allocSymId &&
+            sample.topAllocations[i].allocationCount > 0u) {
+            attributedToAllocWork = true;
+            break;
+        }
+    }
+    require(attributedToAllocWork, "Expected StencilJit allocation attributed to AllocWork");
+
+    const auto fastRes = compiled.module->invoke(
+        "Kernel.StencilDiag::FastAdd",
+        {runtime::Value{std::int64_t{4}}, runtime::Value{std::int64_t{5}}});
+    require(fastRes.succeeded && std::get<std::int64_t>(fastRes.value) == 17,
+        "FastAdd execution failed");
+
+    const auto tryRes = compiled.module->invoke(
+        "Kernel.StencilDiag::TryCatchFallback", {runtime::Value{std::int64_t{2}}});
+    require(tryRes.succeeded && std::get<std::int64_t>(tryRes.value) == 5,
+        "TryCatchFallback execution failed: " + tryRes.error.message);
+
+    const auto diags = compiled.module->functionDiagnostics();
+    bool sawFast = false;
+    bool sawTryFallback = false;
+    for (const auto& d : diags) {
+        if (d.qualifiedName == "Kernel.StencilDiag::FastAdd") {
+            sawFast = true;
+            require(d.eligibleForThreaded, "FastAdd must be eligible for threaded execution");
+#if UINTPTR_MAX == 0xffffffffffffffffULL
+            require(d.eligibleForNative, "FastAdd must be eligible for native StencilJit");
+            require(d.tier == jit::StencilTier::NativeMachineCode,
+                "FastAdd expected NativeMachineCode tier");
+            require(d.fallbackReason.empty(), "FastAdd should have empty fallbackReason");
+#endif
+        } else if (d.qualifiedName == "Kernel.StencilDiag::TryCatchFallback") {
+            sawTryFallback = true;
+            require(!d.eligibleForNative, "TryCatchFallback must not be native-eligible");
+            require(!d.fallbackReason.empty(), "TryCatchFallback must report fallbackReason");
+            require(d.tier == jit::StencilTier::InterpreterFallback,
+                "TryCatchFallback expected InterpreterFallback tier");
+        }
+    }
+    require(sawFast && sawTryFallback, "Missing expected functions in StencilModule::functionDiagnostics");
+}
+
 } // namespace
 
 int main() {
@@ -724,6 +1056,9 @@ int main() {
             {"HotReload -O2 inline invalidation, structural migration & active sequence", testHotReloadInlineStructuralAndSequences},
             {"HotReload Pillar 6: [FieldTag(N)] rename & multi-hop [FormerlySerializedAs]", testHotReloadFieldTagAndMultiHopFormerlySerializedAs},
             {"StencilJit [ValueLifecycle] sweep registration & shared-heap resilience", testStencilJitValueLifecycleAndSharedHeapResilience},
+            {"StencilJit active incremental GC, ProfileCollector & FrameTelemetryCollector (zero fallback)", testStencilJitActiveIncrementalGcProfileAndTelemetry},
+            {"StencilJit native ParallelJobScheduler element reduction & range execution", testStencilJitParallelBatchExecution},
+            {"StencilJit GC.Alloc attribution & per-function diagnostics", testStencilJitAllocAttributionAndFunctionDiagnostics},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

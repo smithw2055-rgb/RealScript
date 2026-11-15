@@ -4101,6 +4101,11 @@ bool executeBlockVmFunction(
             } else if (decodedInstruction.opcode ==
                     detail::QuickOpcode::Generic ||
                     decodedInstruction.opcode >= detail::QuickOpcode::ConstantDouble) {
+                const runtime::ScopedAllocationSite allocSite(
+                    function.symbolId,
+                    runtime::packAllocationSiteOffset(
+                        static_cast<std::uint32_t>(block - execution->blocks.data()),
+                        static_cast<std::uint32_t>(instructionIndex)));
                 executed = executeInstruction(
                     state, *location.module, function, *decodedInstruction.bytecode,
                     argumentWindow, locals, registers);

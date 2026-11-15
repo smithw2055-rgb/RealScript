@@ -1,6 +1,6 @@
 # Project Status and Roadmap
 
-[Documentation Home](README.md) | [Repository README](../../README.md) | [Phase 11–18 Profile](NATIVE_LANGUAGE_PHASE_11_18.md)
+[Documentation Home](README.md) | [Repository README](../../README.md) | [Changelog](../../CHANGELOG.md)
 
 The Phase 1–24 compiler, runtime, Game SDK, deterministic gameplay, and native language/runtime roadmap is complete. Phase 18 replaced the former Phase 11–17 source-expansion profile with native compiler constructs; Phases 19–24 then completed the planned polymorphism, closure, generic/collection, coroutine, value/reference, convenience/pattern, and structured-error slices.
 
@@ -85,7 +85,7 @@ The implementation is suitable for:
 
 - positional and named attribute arguments;
 - module-qualified targets;
-- metadata retained by `Compilation`, `GameCompileResult`, and `GameProgram`.
+- metadata retained by `Compilation` in L0 (and `GameCompileResult` / `GameProgram` in companion `RealScript-GamePack`).
 
 ### Phase 15 — explicit generics and collections
 
@@ -174,7 +174,7 @@ artifacts with the matching SDK, and use the
 Phases 1–24 and the Game Engine Integration Evolution are complete. The next work should be driven by integration, hardening,
 profiling, and explicit RFCs rather than assuming unimplemented CLR semantics:
 
-1. embed `GameApi`, `GameScriptCompiler`, `SceneScriptRuntime`, and `GameplayHost`;
+1. embed companion **`RealScript-GamePack`** (`GameApi`, `GameScriptCompiler`, `SceneScriptRuntime`, and `GameplayHost`) or L0 `bindgen::HostApi` + `EngineRuntime`;
 2. expose a capability-limited host API;
 3. build representative gameplay, AI, ability, quest, and mod scripts;
 4. combine gameplay and script-object state into engine rollback frames;
@@ -185,16 +185,23 @@ profiling, and explicit RFCs rather than assuming unimplemented CLR semantics:
 
 ## Possible Future RFCs
 
+Recent post-`0.98.0` work completed in `RealScript` + `RealScript-GamePack` includes:
+
+- acyclic L0/L1/L2 slice splitting (`RealScript-GamePack` + `-DREALSCRIPT_SLIM_RUNTIME=ON`);
+- default interface methods, relational (`<`, `<=`, `>`, `>=`) and logical (`and`/`or`/`not`) combinator patterns, deterministic `using`, `[StackOnly]` spans (`Span<T>` / `ReadOnlySpan<T>`), `[Signal]`, and `[RelayCommand]`;
+- in-process W^X `StencilJit` (`x86_64` SysV/Win64 and `ARM64` native stencils + threaded fallback + `StencilModule::functionDiagnostics()`);
+- active incremental GC safepoints, `ProfileCollector` instrumentation, native `ParallelJobScheduler` batch kernels in `StencilJit` and `AotRuntime`, and zero-alloc `GC.Alloc` frame attribution (`FrameTelemetryCollector` / DAP `topAllocations`);
+- `ModuleBuildCache` macro-plugin and partial-generic invalidation, `rsaot --opt-remarks` / `--opt-remarks-json`, `GovernanceLinter` (`RSG001`–`RSG005`), `GovernanceFuzzer`, and LSP `textDocument/codeLens`.
+
 Future work may consider:
 
-- open runtime generics, variance, reflection, and `dynamic`;
-- additional relational/property/list/recursive pattern families;
-- ref-struct/Span-style escape analysis, unsafe pointers, and ref properties;
-- catch filters, `using`, native exception interop, and exception-aware
-  coroutine suspension;
-- operators, user-defined conversions, and broader library APIs;
+- open runtime generics, variance, CLR-style dynamic code generation, and `dynamic`;
+- positional, list, and recursive slice pattern families;
+- unsafe pointers, arbitrary user-defined ref structs beyond `[StackOnly]` spans, ref properties, and full CLR-style global byref escape analysis;
+- catch filters, native C++ exception interop, and exception-aware coroutine suspension;
+- user-defined implicit/explicit conversion operators and broader library APIs;
 - rollback networking and replication protocols;
-- direct machine-code JIT, OSR, PGO, and cross-toolchain distribution.
+- OSR, PGO, and cross-toolchain binary distribution.
 
 ## Release Naming
 

@@ -2,6 +2,7 @@
 
 #include "ExecutionMirror.h"
 #include "realscript/diagnostics/Diagnostic.h"
+#include "realscript/runtime/ParallelJob.h"
 
 #include <algorithm>
 #include <array>
@@ -7797,6 +7798,29 @@ const ProgramImage::FunctionLocation* ProgramImage::resolveFunction(
     semantic::SymbolId symbolId) const noexcept {
     const auto found = functions_.find(symbolId);
     return found == functions_.end() ? nullptr : &found->second;
+}
+
+void ProgramImage::setParallelBatchKernelFactory(
+    ParallelBatchKernelFactory factory) const {
+    if (!executionMirror_ || !executionMirror_->parallelBatchFactorySlot) return;
+    std::lock_guard<std::mutex> lock(executionMirror_->parallelBatchFactorySlot->mutex);
+    executionMirror_->parallelBatchFactorySlot->factory = std::move(factory);
+}
+
+ParallelNativeBatchKernel ProgramImage::buildParallelBatchKernel(
+    semantic::SymbolId symbolId,
+    ParallelKernelKind kernelKind,
+    const std::vector<ParallelNativeColumnBinding>& paramColumns,
+    const ParallelJobConfig& config,
+    bool usesParallelPrng) const {
+    if (!executionMirror_ || !executionMirror_->parallelBatchFactorySlot) return {};
+    ParallelBatchKernelFactory factoryCopy;
+    {
+        std::lock_guard<std::mutex> lock(executionMirror_->parallelBatchFactorySlot->mutex);
+        factoryCopy = executionMirror_->parallelBatchFactorySlot->factory;
+    }
+    if (!factoryCopy) return {};
+    return factoryCopy(symbolId, kernelKind, paramColumns, config, usesParallelPrng);
 }
 
 const semantic::TypeSymbol* ProgramImage::resolveType(

@@ -2,12 +2,15 @@
 #include "realscript/aot_cpp/AotRuntime.h"
 #include "realscript/bytecode/Bytecode.h"
 #include "realscript/compiler/Compilation.h"
+#include "realscript/compiler/ModuleBuildCache.h"
 #include "realscript/hot_reload/HotReload.h"
 #include "realscript/optimization/Optimizer.h"
+#include "realscript/runtime/ParallelJob.h"
 #include "realscript/runtime/Runtime.h"
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -1199,6 +1202,384 @@ void testAotPluginMacroDependency() {
             res.error.message);
 }
 
+void testAotActiveGcProfileAndTelemetry() {
+    aot::Program aotProg(kernel_aot_ns::KernelAotSuiteProgram());
+    auto heap = std::make_shared<runtime::ManagedHeap>();
+    auto asyncCtx = std::make_shared<runtime::AsyncRuntimeContext>();
+    aotProg.setHeap(heap);
+    aotProg.setAsyncRuntime(asyncCtx);
+
+    const auto boxArr = heap->allocateTypedArray(
+        semantic::stableTypeId("int[]"), semantic::PrimitiveType::Int, 0, 16, std::int64_t{7});
+    require(boxArr.has_value(), "allocateTypedArray seed failed");
+    auto pinArr = heap->retain(runtime::Value{*boxArr});
+    heap->requestCollection();
+    runtime::ShadowStack emptyRoots;
+    (void)heap->step(emptyRoots, 1);
+
+    auto profile = std::make_shared<runtime::ProfileCollector>();
+    runtime::FrameTelemetryCollector telemetry;
+    runtime::ActiveFrameTelemetryScope telemetryScope(&telemetry);
+    telemetry.beginFrame(1u);
+
+    runtime::ExecutionOptions opts;
+    opts.profile = profile;
+    opts.limits.gcWorkBudget = 8;
+
+    const auto suiteRes = aotProg.invoke(
+        "Kernel.AotSuite::RunOopDelegatesGenericsAndCollections",
+        {runtime::Value{std::int64_t{3}}, runtime::Value{std::int64_t{5}}},
+        opts);
+    require(suiteRes.succeeded, "AOT suite invoke under telemetry failed: " + suiteRes.error.message);
+
+    // Also verify trustedRelease-compiled AOT code honors ActiveFrameTelemetryScope.
+    aot::Program trustedProg(kernel_aot_trusted_ns::KernelAotTrustedProgram());
+    trustedProg.setHeap(std::make_shared<runtime::ManagedHeap>());
+    trustedProg.setAsyncRuntime(std::make_shared<runtime::AsyncRuntimeContext>());
+    runtime::ExecutionOptions trustedOpts;
+    trustedOpts.trustedRelease = true;
+    const auto trustedRes = trustedProg.invoke(
+        "Kernel.AotTrusted::RunSyncScalarBatch",
+        {runtime::Value{std::int64_t{32}}},
+        trustedOpts);
+    require(trustedRes.succeeded, "AOT trusted invoke under telemetry failed: " + trustedRes.error.message);
+
+    const auto snap = profile->snapshot();
+    require(!snap.traceEvents.empty() && !snap.functions.empty(),
+        "Expected ProfileCollector events & function summaries from AOT invoke");
+    bool hasNonZeroAotInst = false;
+    for (const auto& fp : snap.functions) {
+        if (fp.calls > 0u && fp.instructions > 0u) {
+            hasNonZeroAotInst = true;
+            break;
+        }
+    }
+    require(hasNonZeroAotInst, "Expected non-zero AOT ProfileCollector function instructions");
+
+    const auto frameSample = telemetry.endFrame(heap.get());
+    require(frameSample.totalInstructions > 0u && frameSample.hotFunctionCount >= 1u,
+        "Expected FrameTelemetryCollector to record AOT self instructions");
+}
+
+void testAotParallelBatchExecution() {
+    const std::string src = readFixtureFile("tests/fixtures/kernel_aot_suite.rscript");
+    auto program = compileFixtureForVm("tests/fixtures/kernel_aot_suite.rscript", src);
+
+    compiler::Compilation comp({{"tests/fixtures/kernel_aot_suite.rscript", src}});
+    auto build = comp.build();
+    require(!build.diagnostics.hasErrors(), "AotSuite rebuild for parallel batch check failed");
+    diagnostics::DiagnosticBag optDiag;
+    optimization::Options optOpts;
+    optOpts.level = optimization::Level::Aggressive;
+    const auto optResult = optimization::Optimizer{}.optimize(std::move(build.modules), optDiag, optOpts);
+    require(!optDiag.hasErrors(), "AotSuite optimization failed");
+    diagnostics::DiagnosticBag genDiag;
+    const auto generated = aot::CppGenerator{}.generate(optResult.modules, genDiag);
+    require(!genDiag.hasErrors(), "AOT C++ codegen failed");
+    const auto checkEmittedBatch = [&](const char* qualName) {
+        const auto pos = generated.source.find(qualName);
+        require(pos != std::string::npos, std::string("Missing AOT descriptor for ") + qualName);
+        const auto lineEnd = generated.source.find('\n', pos);
+        const auto line = generated.source.substr(
+            pos, lineEnd == std::string::npos ? std::string::npos : (lineEnd - pos));
+        require(line.find("_parallel_batch") != std::string::npos,
+            std::string("Expected AOT descriptor with _parallel_batch for ") + qualName);
+    };
+    checkEmittedBatch("Kernel.AotSuite::ParallelStepElement");
+    checkEmittedBatch("Kernel.AotSuite::ParallelRangeStep");
+
+    auto vmHeap = std::make_shared<runtime::ManagedHeap>();
+    auto aotHeap = std::make_shared<runtime::ManagedHeap>();
+    constexpr std::size_t kCount = 128;
+    auto initArrays = [&](runtime::ManagedHeap& h) {
+        const auto arrTypeId = semantic::stableTypeId("float[]");
+        auto src = h.allocateTypedArray(
+            arrTypeId,
+            semantic::PrimitiveType::Float,
+            0,
+            kCount,
+            runtime::Value{runtime::FloatValue{0.0f}});
+        auto dst = h.allocateTypedArray(
+            arrTypeId,
+            semantic::PrimitiveType::Float,
+            0,
+            kCount,
+            runtime::Value{runtime::FloatValue{0.0f}});
+        require(src.has_value() && dst.has_value(), "Packed float array allocation failed");
+        for (std::size_t i = 0; i < kCount; ++i) {
+            require(h.arraySet(
+                *src, i, runtime::Value{runtime::FloatValue{static_cast<float>(i + 1) * 0.5f}}),
+                "arraySet float failed");
+        }
+        return std::pair<runtime::ObjectRef, runtime::ObjectRef>{*src, *dst};
+    };
+
+    auto [vmSrc, vmDst] = initArrays(*vmHeap);
+    auto [aotSrc, aotDst] = initArrays(*aotHeap);
+
+    runtime::ParallelJobScheduler scheduler(4);
+    runtime::ParallelJobConfig elemCfg;
+    elemCfg.workerCount = 4;
+    elemCfg.batchSize = 16;
+    elemCfg.reduceOp = runtime::ParallelReduceOp::Sum;
+
+    const auto vmElem = scheduler.dispatchFor(
+        program,
+        vmHeap,
+        "Kernel.AotSuite::ParallelStepElement",
+        kCount,
+        {runtime::Value{vmDst}, runtime::Value{vmSrc}, runtime::Value{runtime::FloatValue{2.5f}}},
+        elemCfg);
+    require(vmElem.succeeded && vmElem.totalItemsProcessed == kCount,
+        "VM parallel dispatchFor failed: " + vmElem.error.message);
+
+    auto [vmRangeSrc, vmRangeDst] = initArrays(*vmHeap);
+    auto [aotRangeSrc, aotRangeDst] = initArrays(*aotHeap);
+    runtime::ParallelJobConfig rangeCfg;
+    rangeCfg.workerCount = 4;
+    rangeCfg.batchSize = 32;
+    const auto vmRange = scheduler.dispatchRange(
+        program,
+        vmHeap,
+        "Kernel.AotSuite::ParallelRangeStep",
+        kCount,
+        {runtime::Value{vmRangeDst}, runtime::Value{vmRangeSrc}, runtime::Value{runtime::FloatValue{1.5f}}},
+        rangeCfg);
+    require(vmRange.succeeded && vmRange.totalItemsProcessed == kCount,
+        "VM parallel dispatchRange failed: " + vmRange.error.message);
+
+    aot::Program aotProg(kernel_aot_ns::KernelAotSuiteProgram());
+    aotProg.setHeap(aotHeap);
+    aotProg.attachToProgramImage(*program);
+    aotProg.resetParallelBatchExecutionCount();
+
+    const auto aotElem = scheduler.dispatchFor(
+        program,
+        aotHeap,
+        "Kernel.AotSuite::ParallelStepElement",
+        kCount,
+        {runtime::Value{aotDst}, runtime::Value{aotSrc}, runtime::Value{runtime::FloatValue{2.5f}}},
+        elemCfg);
+    require(aotElem.succeeded && aotElem.totalItemsProcessed == kCount,
+        "AOT parallel dispatchFor failed: " + aotElem.error.message);
+    require(aotElem.usedNativeBatchKernel,
+        "Expected AOT parallel dispatchFor to use native batch kernel");
+    require(aotProg.parallelBatchExecutionCount() > 0,
+        "Expected non-zero AOT parallelBatchExecutionCount after dispatchFor");
+    require(std::fabs(std::get<runtime::FloatValue>(aotElem.value).value -
+                      std::get<runtime::FloatValue>(vmElem.value).value) < 1e-3f,
+        "AOT parallel reduction mismatch against VM");
+
+    aotProg.resetParallelBatchExecutionCount();
+    const auto aotRange = scheduler.dispatchRange(
+        program,
+        aotHeap,
+        "Kernel.AotSuite::ParallelRangeStep",
+        kCount,
+        {runtime::Value{aotRangeDst}, runtime::Value{aotRangeSrc}, runtime::Value{runtime::FloatValue{1.5f}}},
+        rangeCfg);
+    require(aotRange.succeeded && aotRange.totalItemsProcessed == kCount,
+        "AOT parallel dispatchRange failed: " + aotRange.error.message);
+    require(aotRange.usedNativeBatchKernel,
+        "Expected AOT parallel dispatchRange to use native batch kernel");
+    require(aotProg.parallelBatchExecutionCount() > 0,
+        "Expected non-zero AOT parallelBatchExecutionCount after dispatchRange");
+
+    for (std::size_t i = 0; i < kCount; ++i) {
+        const auto ea = aotHeap->arrayGet(aotDst, i);
+        const auto eb = vmHeap->arrayGet(vmDst, i);
+        require(ea && eb && std::fabs(std::get<runtime::FloatValue>(*ea).value -
+                                      std::get<runtime::FloatValue>(*eb).value) < 1e-4f,
+            "AOT parallel element dst parity mismatch against VM");
+        const auto ra = aotHeap->arrayGet(aotRangeDst, i);
+        const auto rb = vmHeap->arrayGet(vmRangeDst, i);
+        require(ra && rb && std::fabs(std::get<runtime::FloatValue>(*ra).value -
+                                      std::get<runtime::FloatValue>(*rb).value) < 1e-4f,
+            "AOT parallel range dst parity mismatch against VM");
+    }
+}
+
+void testAotAllocAttributionRemarksAndCli() {
+    // 1. AotRuntime GC.Alloc attribution into FrameTelemetryCollector
+    {
+        aot::Program aotProg(kernel_aot_ns::KernelAotSuiteProgram());
+        auto heap = std::make_shared<runtime::ManagedHeap>();
+        auto asyncCtx = std::make_shared<runtime::AsyncRuntimeContext>();
+        aotProg.setHeap(heap);
+        aotProg.setAsyncRuntime(asyncCtx);
+
+        runtime::FrameTelemetryCollector telemetry;
+        runtime::ActiveFrameTelemetryScope telemetryScope(&telemetry);
+        telemetry.beginFrame(1u);
+
+        const auto suiteRes = aotProg.invoke(
+            "Kernel.AotSuite::RunOopDelegatesGenericsAndCollections",
+            {runtime::Value{std::int64_t{3}}, runtime::Value{std::int64_t{5}}});
+        require(suiteRes.succeeded, "AOT suite invoke failed: " + suiteRes.error.message);
+
+        const auto sample = telemetry.endFrame(heap.get());
+        require(sample.frameAllocCount > 0u,
+            "Expected AotRuntime FrameTelemetryCollector frameAllocCount > 0");
+        require(sample.frameAllocBytes > 0u,
+            "Expected AotRuntime FrameTelemetryCollector frameAllocBytes > 0");
+        require(sample.hotAllocationCount >= 1u,
+            "Expected AotRuntime FrameTelemetryCollector hotAllocationCount >= 1");
+    }
+
+    // 2. CppGenerator optimization remarks + ModuleBuildCache warm-cache remark bypass + rsaot CLI
+    const std::string src = R"RS(
+module Kernel.AotRemarks;
+
+public class RemarkFault {
+    public string msg;
+    public RemarkFault(string m) { msg = m; }
+}
+
+public class Item {
+    public int val = 0;
+}
+
+public int PureLoop(int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i = i + 1) {
+        sum = sum + i;
+    }
+    return sum;
+}
+
+public Item AllocWork(int x) {
+    Item it = new Item();
+    it.val = x;
+    return it;
+}
+
+public int BoxedTryCatch(int x) {
+    int r = 0;
+    try {
+        if (x > 0) {
+            throw new RemarkFault("fail");
+        }
+    } catch (RemarkFault ex) {
+        r = ex.msg.Length;
+    }
+    return r;
+}
+)RS";
+
+    compiler::Compilation comp({{"aot_remarks.rscript", src}});
+    auto build = comp.build();
+    require(!build.diagnostics.hasErrors(), "AotRemarks compile failed");
+    diagnostics::DiagnosticBag optDiag;
+    optimization::Options optOpts;
+    optOpts.level = optimization::Level::Aggressive;
+    const auto optResult = optimization::Optimizer{}.optimize(std::move(build.modules), optDiag, optOpts);
+    require(!optDiag.hasErrors(), "AotRemarks optimization failed");
+
+    diagnostics::DiagnosticBag genDiag;
+    aot::GenerationOptions aotOpts;
+    aotOpts.programName = "RemarksTest";
+    aotOpts.cppNamespace = "remarks_test_ns";
+    aotOpts.collectOptimizationRemarks = true;
+    const auto generated = aot::CppGenerator{}.generate(optResult.modules, genDiag, aotOpts);
+    require(!genDiag.hasErrors(), "AotRemarks codegen failed");
+    require(!generated.optimizationRemarks.empty(), "Expected non-empty optimizationRemarks");
+
+    bool sawPurePassed = false;
+    bool sawTryMissed = false;
+    bool sawAllocSite = false;
+    for (const auto& remark : generated.optimizationRemarks) {
+        if (remark.kind == aot::OptimizationRemarkKind::Passed &&
+            remark.pass == "aot-lowering" &&
+            remark.functionName.find("PureLoop") != std::string::npos) {
+            sawPurePassed = true;
+        } else if (remark.kind == aot::OptimizationRemarkKind::Missed &&
+                   remark.pass == "aot-lowering" &&
+                   remark.functionName.find("BoxedTryCatch") != std::string::npos &&
+                   !remark.message.empty()) {
+            sawTryMissed = true;
+        } else if (remark.kind == aot::OptimizationRemarkKind::Analysis &&
+                   remark.pass == "gc-alloc" &&
+                   remark.functionName.find("AllocWork") != std::string::npos &&
+                   remark.line > 0u) {
+            sawAllocSite = true;
+        }
+    }
+    require(sawPurePassed, "Missing Passed aot-lowering remark on PureLoop");
+    require(sawTryMissed, "Missing Missed aot-lowering remark on BoxedTryCatch");
+    require(sawAllocSite, "Missing Analysis gc-alloc remark with line > 0 on AllocWork");
+
+    struct LocalTempDirGuard {
+        std::filesystem::path dir;
+        explicit LocalTempDirGuard(const std::string& name) {
+            dir = std::filesystem::temp_directory_path() / name;
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+            std::filesystem::create_directories(dir, ec);
+        }
+        ~LocalTempDirGuard() {
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+        }
+        LocalTempDirGuard(const LocalTempDirGuard&) = delete;
+        LocalTempDirGuard& operator=(const LocalTempDirGuard&) = delete;
+    };
+
+    LocalTempDirGuard guard("rs_aot_remarks_test");
+    compiler::ModuleBuildCache cache(guard.dir / "cache");
+    compiler::ModuleBuildCacheOptions cacheOpts;
+    cacheOpts.cacheDirectory = guard.dir / "cache";
+    cacheOpts.optimizationOptions.level = optimization::Level::Aggressive;
+    const std::vector<compiler::SourceFile> cachedSources = {{"aot_remarks.rscript", src}};
+
+    const auto cold = cache.buildAot(cachedSources, cacheOpts, aotOpts);
+    require(cold.succeeded(), "ModuleBuildCache cold buildAot failed");
+    require(!cold.aotCacheHit, "Expected cold buildAot aotCacheHit == false");
+    require(!cold.program.optimizationRemarks.empty(),
+        "Expected non-empty optimizationRemarks on cold buildAot");
+
+    const auto warm = cache.buildAot(cachedSources, cacheOpts, aotOpts);
+    require(warm.succeeded(), "ModuleBuildCache warm buildAot failed");
+    require(!warm.program.optimizationRemarks.empty(),
+        "Expected warm buildAot to preserve optimizationRemarks when collectOptimizationRemarks is enabled");
+
+#ifdef REALSCRIPT_RSAOT_PATH
+    const auto srcFile = guard.dir / "aot_remarks.rscript";
+    const auto outDir = guard.dir / "out";
+    const auto jsonFile = guard.dir / "remarks.json";
+    const auto cliLog = guard.dir / "cli.log";
+    std::filesystem::create_directories(outDir);
+    {
+        std::ofstream outSrc(srcFile, std::ios::binary | std::ios::trunc);
+        require(outSrc.is_open(), "Failed to write temp aot_remarks.rscript");
+        outSrc << src;
+    }
+
+    const std::string cmdLine =
+        "\"" + std::string(REALSCRIPT_RSAOT_PATH) + "\" \"" + srcFile.string() +
+        "\" --output-dir \"" + outDir.string() +
+        "\" --program-name RemarksCli --opt-remarks --opt-remarks-json \"" +
+        jsonFile.string() + "\" > \"" + cliLog.string() + "\" 2>&1";
+#ifdef _WIN32
+    const std::string wrappedCmd = "\"" + cmdLine + "\"";
+    const int cliRc = std::system(wrappedCmd.c_str());
+#else
+    const int cliRc = std::system(cmdLine.c_str());
+#endif
+    require(cliRc == 0, "rsaot --opt-remarks-json exited non-zero");
+
+    std::ifstream inJson(jsonFile, std::ios::binary);
+    require(inJson.is_open(), "Missing remarks.json output from rsaot");
+    std::ostringstream jsonBuf;
+    jsonBuf << inJson.rdbuf();
+    const std::string jsonText = jsonBuf.str();
+    require(jsonText.find("\"kind\"") != std::string::npos &&
+            jsonText.find("\"pass\"") != std::string::npos &&
+            jsonText.find("\"aot-lowering\"") != std::string::npos &&
+            jsonText.find("\"gc-alloc\"") != std::string::npos,
+        "rsaot remarks.json missing expected remark fields");
+#endif
+}
+
 } // namespace
 
 int main() {
@@ -1211,6 +1592,9 @@ int main() {
             {"L0 AttributeDescriptor emission, IExecutionPolicy & AOT weak delegate default return", testAotAttributeDescriptorsPolicyAndWeakDelegates},
             {"AotCpp emitHotPatchThunks & AotRuntime applyMethodBodyHotPatch", testAotHotPatchThunksAndApplyMethodBodyHotPatch},
             {"realscript_add_aot_library COMPILER_PLUGINS dependency & macro expansion", testAotPluginMacroDependency},
+            {"AotRuntime active GC, ProfileCollector & ActiveFrameTelemetryScope (incl. TrustedRelease)", testAotActiveGcProfileAndTelemetry},
+            {"AotRuntime native ParallelJobScheduler _parallel_batch & SIMD range execution", testAotParallelBatchExecution},
+            {"AotRuntime GC.Alloc attribution, CppGenerator optimization remarks & rsaot CLI", testAotAllocAttributionRemarksAndCli},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

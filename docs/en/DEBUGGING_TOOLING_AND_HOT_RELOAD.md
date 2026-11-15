@@ -112,10 +112,11 @@ Implemented capabilities include:
 - references;
 - rename;
 - document symbols;
-- workspace source tracking, `realscript.project.json` discovery, and `.d.rscript` ambient host declaration loading (`GameApi::exportDeclarationStub()`);
+- workspace source tracking, `realscript.project.json` discovery, `.d.rscript` ambient host declaration loading (`bindgen::HostApi::exportDeclarationStub()` in L0, or `GameApi::exportDeclarationStub()` in `RealScript-GamePack`), and formatting / governance lint diagnostics (`GovernanceLinter`, rules `RSG001`–`RSG005`);
+- `textDocument/codeLens` (showing AOT/boxing tier status, `GC.Alloc`, and managed reference counts), `inlayHint`, `semanticTokens`, and formatting (`rsc --format` / `--check-format`);
 - diagnostic publication.
 
-The initial synchronization model uses full-document updates.
+Text synchronization supports both full-document updates and ranged incremental `textDocument/didChange` edits (`applyContentChanges`, UTF-8 and UTF-16 ranges).
 
 ## Language Service Architecture and VS Code Extension
 
@@ -197,13 +198,17 @@ For structural changes during editor/gameplay iteration, `ScriptRuntime::replace
 
 `exportChromeTraceJson(profile, &gcStats)` serializes `ExecutionProfile` function timing/instruction metrics and `GcStatistics` counters into standard Chrome Tracing / Perfetto JSON (`{"traceEvents":[...]}`) for visual flame-graph inspection in `chrome://tracing` or `ui.perfetto.dev`.
 
+For live frame profiling and CI governance:
+
+- `DapServer::bindFrameTelemetry` and `DapServer::bindFiberScheduler` stream `FrameTelemetryCollector` snapshots (`topAllocations` with `GC.Alloc`, `sourceFile`, and `line`) and active fiber call stacks via DAP / `EmbeddedDapServer`;
+- `rsc --lint [--lint-deny-warnings]` runs `GovernanceLinter` (`RSG001`–`RSG005`), `rsc --format` / `--check-format` formats source canonically, and `GovernanceFuzzer` stress-tests cross-backend parity and corrupted bytecode handling.
+
 ## Current Tooling Limits
 
 The current tooling surface intentionally excludes:
 
 - data (watchpoint) breakpoints;
 - side-effecting function invocations inside watch expressions;
-- partial-document incremental LSP text sync;
-- in-place rewriting of actively executing stack frames.
+- in-place rewriting of actively executing stack frames without safe-point migration.
 
 These limits are explicit protocol and ABI boundaries rather than silent partial behavior.

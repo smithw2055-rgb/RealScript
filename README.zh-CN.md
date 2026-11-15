@@ -135,8 +135,9 @@ realscript::bindgen::HostApi api;
 
 | 后端 | 适合场景 | 说明 |
 |---|---|---|
-| Bytecode Interpreter | 开发、调试、热重载、冷代码和低频脚本 | 启动快、工具完整；CPU 密集循环慢于原生执行。 |
-| C++17 AOT | 发布版 Gameplay 和性能敏感的确定性代码 | 生成可移植 C++，同时保留 checked runtime 语义。 |
+| Bytecode Interpreter | 开发、调试、热重载、冷代码和低频脚本 | 启动快、工具完整、作为参考语义基线；CPU 密集循环慢于原生执行。 |
+| 进程内 `StencilJit` | 开发态与无外部编译器宿主中的低延迟原生热执行 | 基于 W^X 机制即时生成 `x86_64`（SysV/Win64）与 `ARM64` 原生指令模板并支持 Threaded 回退；内置增量 GC 安全点、`ProfileCollector`、`functionDiagnostics()` 与原生 `ParallelJobScheduler` 批处理核。 |
+| C++17 AOT | 发布版 Gameplay 和性能敏感的确定性代码 | 生成可移植 C++（`rsaot`），具备全类型 `_scalar` 下沉、增量 GC 安全点、原生并行批处理核与 `--opt-remarks` 审计。 |
 | Toolchain JIT | 桌面开发，以及不单独执行 AOT 构建时的原生执行 | 复用 AOT 生成器，调用外部编译器并缓存 Shared Module。 |
 
 ## 性能指标
@@ -214,8 +215,11 @@ RealScript 采用**双轨协程分工架构**：
 - [Runtime、GC 与嵌入](docs/en/RUNTIME_GC_AND_EMBEDDING.md)
 - [AOT、JIT 与性能](docs/en/AOT_JIT_AND_PERFORMANCE.md)
 - [确定性与回放](docs/en/DETERMINISM_AND_REPLAY.md)
-- [Game Scripting SDK](docs/zh-CN/GAME_SCRIPTING_SDK.md)
-- [确定性 Gameplay Runtime](docs/zh-CN/GAMEPLAY_RUNTIME.md)
+- [文档首页](docs/README.md)
+- [中文文档索引](docs/zh-CN/README.md)
+- [英文文档索引](docs/en/README.md)
+
+配套 **`RealScript-GamePack`** 仓库（`RealScript::GameRuntime`、`RealScript::GameCompiler`、`RealScript::GameSdk`、`rsbench_product`）提供 L2 游戏脚本 SDK（`GAME_SCRIPTING_SDK.md`）与确定性游戏运行时（`GAMEPLAY_RUNTIME.md`）。
 - [产品状态与路线图](docs/en/PROJECT_STATUS_AND_ROADMAP.md)
 - [版本变更记录](CHANGELOG.md)
 
@@ -223,23 +227,25 @@ RealScript 采用**双轨协程分工架构**：
 
 RealScript 不是 CLR 兼容 C#。v0.98.0 明确不提供：
 
-- 多类继承、默认 Interface 实现、开放运行时泛型或 Generic Variance；
-- 裸操作系统多线程共享可变状态或 CLR `System.Threading.Tasks.Task`（流式加载与网络 I/O 请使用受主线程帧队列约束的 `RealScript.Async` `Awaitable<T>`，帧回滚请使用 `sequence`）；
-- Unsafe Pointer、Ref Struct、Ref Property 或完整 Escape Analysis；
+- 多类继承、开放运行时泛型或 Generic Variance（默认 Interface 实现与关系/`and`/`or`/`not` 组合模式已支持）；
+- 裸操作系统多线程共享可变状态或 CLR `System.Threading.Tasks.Task`（流式加载与网络 I/O 请使用受主线程帧队列约束的 `RealScript.Async` `Awaitable<T>`，确定性并行计算请使用 `ParallelJobScheduler`，帧回滚请使用 `sequence`）；
+- Unsafe Pointer、除 `[StackOnly]` `Span<T>`/`ReadOnlySpan<T>` 外的任意自定义 Ref Struct、Ref Property 或完整 Escape Analysis；
 - Exception Filter、`lock`、Native Exception Interop，或异常跨越协程暂停点；
 - LINQ、`dynamic`、反射代码生成或 .NET BCL；
-- OSR、PGO、非 x86_64 架构进程内机器码 JIT（当前已内置 x86_64 SysV/Win64 `StencilJit`）或 Rollback Networking Protocol；
+- OSR、PGO 或 Rollback Networking Protocol；
 - Source、`.rsbc`、AOT ABI、SDK Metadata 和 Gameplay State 的长期冻结兼容性。
 
 游戏引擎集成应固定到准确的 RealScript Release 或 Commit，并使用匹配 SDK 重新生成
 AOT Artifact。
 
+## 架构演进与工程加固要点
+
+- **L0/L1/L2 无环分层与 `REALSCRIPT_SLIM_RUNTIME`**：`RealScript` 导出严格无环的 L0/L1 CMake 目标集合并支持 `-DREALSCRIPT_SLIM_RUNTIME=ON` 纯运行时裁剪；游戏场景/ECS/Gameplay SDK 独立于配套 **`RealScript-GamePack`** 仓库。
+- **跨后端 GC / 遥测 / 诊断对齐**：`StencilJit` 与 `AotRuntime` 补齐增量 GC 安全点与 `ProfileCollector` 采样归因、原生 `ParallelJobScheduler` 批处理核、零分配 `GC.Alloc` 帧级热点归因（`FrameTelemetryCollector` / DAP `topAllocations`），以及 `StencilModule::functionDiagnostics()`、`rsaot --opt-remarks`/`--opt-remarks-json` 与 LSP `textDocument/codeLens`。
+- **每实例独立堆池与纳秒时间片 GC 预算**：每个 `ManagedHeap` 独立持有槽位/缓冲区对象池与同步状态，常规堆分配与 GC 标记清扫无跨实例锁竞争（仅在进程共享 `ValuePool` 触发滞留回收时执行极短安全点扫描），并新增 `collectIncrementalWithBudget` 帧剩余纳秒/微秒预算控制。
+- **AST 卫生泛型、AOT 共享折叠与 `using`**：泛型特化保留精确源文件行列号与跨模块词法卫生性，引用类型泛型共享底层 AOT 实现；支持块级/声明级 `using` 确定性 `Dispose()`、默认接口方法、关系/逻辑模式匹配与 `[StackOnly]` Span。
+- **分模块增量缓存与宏插件一致性**：`rsc`/`rsaot --cache-dir` 基于 `publicFingerprint` 隔离私有实现变更，并精确追踪宏插件状态（`C11MacroPlugin`、`[Signal]`、`[RelayCommand]`）与局部泛型依赖。
+
 ## License
 
 RealScript 使用 Apache License 2.0，详见 [LICENSE](LICENSE)。
-
-### Sprint 2 全栈架构演进要点
-- **每实例独立堆池与纳秒时间片 GC 预算**：每个 `ManagedHeap` 独立持有槽位/缓冲区对象池与同步状态，常规堆分配与 GC 标记清扫无跨实例锁竞争（仅在进程共享 `ValuePool` 触发滞留回收时执行极短安全点扫描），并新增 `collectIncrementalWithBudget` 帧剩余纳秒/微秒预算控制。
-- **扁平化生命周期与无损协程热重载**：`SceneScriptRuntime` 采用连续 `FlatLifecycleSlot` 热路径直调，热重载基于 64-bit 状态机指纹自动保留未变更的在途协程帧。
-- **AST 卫生泛型、AOT 共享折叠与 `using`/`Resource`**：泛型特化保留精确源文件行列号与跨模块词法卫生性，引用类型泛型共享底层 AOT 实现；支持块级/声明级 `using` 确定性 `Dispose()` 与统一引用计数 `ResourceHandle<T>`。
-- **分模块磁盘增量缓存与 Git 友好场景序列化**：`rsc`/`rsaot --cache-dir` 基于 `publicFingerprint` 隔离私有实现变更；引入 128-bit `AssetGuid` 与单行单属性有序场景/预制体文本格式。

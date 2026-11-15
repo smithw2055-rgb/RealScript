@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -615,6 +616,12 @@ struct ExecutionMirror {
     std::vector<PolymorphicCallSiteDesc> polyCallSites;
     std::vector<NewDelegateSiteDesc> newDelegateSites;
     std::vector<InvokeDelegateSiteDesc> invokeDelegateSites;
+    struct ParallelBatchFactorySlot {
+        std::mutex mutex;
+        ParallelBatchKernelFactory factory;
+    };
+    mutable std::shared_ptr<ParallelBatchFactorySlot> parallelBatchFactorySlot =
+        std::make_shared<ParallelBatchFactorySlot>();
 };
 
 [[nodiscard]] std::shared_ptr<const ExecutionMirror> buildExecutionMirror(

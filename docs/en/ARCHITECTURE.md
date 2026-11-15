@@ -36,6 +36,8 @@ Verified multi-block Typed MIR
     +----> O0/O1/O2 Optimizer ----> MIR Verifier
     |
     +----> Typed register bytecode ----> Bytecode Verifier ----> Interpreter
+    |                                                            |
+    |                                                            +----> In-process StencilJit (W^X x86_64/ARM64 native or threaded stencils)
     |
     +----> Deterministic C++17 source --> Platform compiler ----> AOT module
     |
@@ -111,11 +113,20 @@ The heap is non-moving and uses generation-checked `ObjectRef` handles. Precise 
 
 Heap identity prevents references from crossing unrelated runtimes accidentally.
 
-### Native Execution
+### Native and JIT Execution
 
-The AOT generator emits deterministic C++17 and a native module descriptor. The optional toolchain JIT reuses the same generator, compiles a shared library, loads it, negotiates the module query ABI, validates descriptors, and then invokes native entries.
+The AOT generator emits deterministic C++17 and a native module descriptor (`AotRuntime`). For zero-external-compiler in-process execution, `StencilJit` lowers verified bytecode directly into W^X `x86_64` (SysV/Win64) and `ARM64` native code stencils (with threaded fallback and explicit interpreter fallback diagnostics via `StencilModule::functionDiagnostics()`), while participating in active incremental GC safepoints, `ProfileCollector`, and native `ParallelJobScheduler` batch kernels. The optional external Toolchain JIT reuses the C++17 AOT generator, compiles a shared library, loads it, negotiates the module query ABI, and validates descriptors.
 
 AOT and JIT are same-SDK paths. Cross-toolchain binary distribution is not frozen.
+
+## Modular Repository Layering (L0 / L1 / L2)
+
+`RealScript` is split into strict acyclic CMake slices alongside optional L1 tooling:
+
+- **L0 Runtime & Core (`REALSCRIPT_SLIM_RUNTIME=ON` compatible)**: `Foundation`, `Bytecode`, `Runtime`, `AotRuntime`, `BindGenRuntime`, `HotReload`, `StencilJit`, `SlimRuntime`, `Kernel`
+- **L0 Compiler & Native Backends**: `Compiler`, `NativeBackends`, `AotSupport` (`rsc`, `rsaot`)
+- **L1 Optional Tooling**: `Debug` (`rsdebug`), `Tooling` (`rslsp`), `Extensibility`, `BindGen` (`rsbind`), `Frontend`, `Full`
+- **L2 Game Engine SDK (`RealScript-GamePack`)**: Separate companion repository (`RealScript::GameRuntime`, `RealScript::GameCompiler`, `RealScript::GameSdk`, `rsbench_product`) providing scene components, zero-copy ECS column bindings, `GameplayHost`, `ReflectionRegistry`, `ModHost`, and `RSGS` state serialization.
 
 ### Debugging and Tooling
 

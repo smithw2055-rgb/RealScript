@@ -196,6 +196,27 @@ void emitGeneratedLineReset(Emitter& output, bool enabled);
 [[nodiscard]] bool supportsTypedPrimitiveAot(
     const mir::Function& function,
     const std::unordered_set<semantic::SymbolId>& customStructs);
+[[nodiscard]] std::string explainTypedPrimitiveAotIneligibility(
+    const mir::Function& function,
+    const std::unordered_set<semantic::SymbolId>& customStructs);
+void resolveRemarkLocation(
+    const mir::Module& module,
+    const mir::Function& function,
+    std::optional<mir::BlockId> blockId,
+    std::optional<std::uint32_t> instructionIndex,
+    text::TextSpan span,
+    std::string& outSourceFile,
+    std::uint32_t& outLine,
+    std::uint32_t& outColumn);
+void appendAllocationRemark(
+    std::vector<OptimizationRemark>& remarks,
+    const mir::Module& module,
+    const mir::Function& function,
+    const std::string& qualifiedName,
+    mir::BlockId blockId,
+    std::uint32_t instructionIndex,
+    const mir::Instruction& instruction,
+    bool isNonEscapingObject);
 [[nodiscard]] std::string typedCppType(TypedSlotType slot);
 [[nodiscard]] std::string typedDefaultValue(TypedSlotType slot);
 [[nodiscard]] std::string typedValueExpression(mir::ValueId id);
@@ -280,6 +301,8 @@ void emitHotPatchThunks(
     const std::vector<FunctionView>& functions,
     const GenerationOptions& options);
 
+[[nodiscard]] bool supportsTypedParallelBatchKernel(const FunctionView& view);
+
 void emitTypedPrimitiveFunction(
     Emitter& source,
     const FunctionView& view,
@@ -288,6 +311,7 @@ void emitTypedPrimitiveFunction(
     const std::unordered_map<semantic::SymbolId, const FunctionView*>& typedFunctions,
     const std::map<semantic::SymbolId, TypeView>& allTypes,
     const std::unordered_map<const mir::Instruction*, std::size_t>& callIds,
-    const std::unordered_map<semantic::SymbolId, std::size_t>& hotPatchSlots);
+    const std::unordered_map<semantic::SymbolId, std::size_t>& hotPatchSlots,
+    std::vector<OptimizationRemark>* remarks = nullptr);
 
 } // namespace realscript::aot::detail

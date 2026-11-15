@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
@@ -242,6 +243,7 @@ ExecutionContext::ExecutionContext(
           return std::move(options);
       }()),
       determinism_(options_.determinism) {
+    telemetry_ = runtime::activeFrameTelemetry();
     traceEventsEnabled_ =
         options_.determinism.mode != runtime::DeterminismMode::Off ||
         options_.profile != nullptr || static_cast<bool>(options_.trace);
@@ -252,7 +254,8 @@ ExecutionContext::ExecutionContext(
     determinismOnly_ = determinismEventsEnabled_ &&
         options_.profile == nullptr && !diagnosticEventsEnabled_;
     fastAccounting_ = !determinismEventsEnabled_ &&
-        options_.profile == nullptr && !diagnosticEventsEnabled_ &&
+        options_.profile == nullptr && telemetry_ == nullptr &&
+        !diagnosticEventsEnabled_ &&
         (options_.limits.gcWorkBudget == 0 || options_.trustedRelease);
     if (prebuiltTypes) {
         typesPtr_ = prebuiltTypes;
@@ -638,18 +641,28 @@ bool ExecutionContext::consume(
                 operationId, operation);
         }
     }
-    if (heap_ && options_.limits.gcWorkBudget != 0) {
+    if (heap_ && options_.limits.gcWorkBudget != 0 &&
+        (heap_->phase() != runtime::GcPhase::Idle || heap_->collectionRequested())) {
+        const auto gcSliceStart = telemetry_
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         const auto work = heap_->step(
             shadowStack_,
             options_.limits.gcWorkBudget);
         statistics_.gcWorkPerformed += work;
-        if (work != 0) {
+        if (work != 0 && traceEventsEnabled_) {
             if (diagnosticEventsEnabled_) {
                 const auto workText = std::to_string(work);
                 emitTrace(runtime::TraceEventKind::GcStep, work, workText);
             } else {
                 emitTrace(runtime::TraceEventKind::GcStep, work);
             }
+        }
+        if (telemetry_ != nullptr) {
+            const auto elapsedNs = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - gcSliceStart).count());
+            telemetry_->recordGcSliceNanoseconds(elapsedNs);
         }
     }
     return true;
@@ -1004,6 +1017,7 @@ bool ExecutionContext::invoke(
     if (trustedReleaseEnabled()) {
         const auto previousFunctionId = currentFunctionId_;
         currentFunctionId_ = function->symbolId;
+        const runtime::ScopedAllocationSite fnAllocSite(function->symbolId, 0);
         stack_.push_back(function->name ? function->name : "<aot-function>");
         stackSites_.push_back({function->symbolId, 0});
         ++statistics_.functionCalls;
@@ -1023,6 +1037,7 @@ bool ExecutionContext::invoke(
 
     const auto previousFunctionId = currentFunctionId_;
     currentFunctionId_ = function->symbolId;
+    const runtime::ScopedAllocationSite fnAllocSite(function->symbolId, 0);
     stack_.push_back(function->name ? function->name : "<aot-function>");
     stackSites_.push_back({function->symbolId, 0});
     ++statistics_.functionCalls;
@@ -1055,6 +1070,35 @@ bool ExecutionContext::invoke(
         function->name,
         stack_.size(),
         options_.profile ? options_.profile->nowSteadyNs() : 0ULL};
+    struct AotInvokeTelemetryScope {
+        ExecutionContext& ctx;
+        semantic::SymbolId functionId = 0;
+        std::uint64_t entryExecuted = 0;
+        std::uint64_t savedParentChildExecuted = 0;
+        AotInvokeTelemetryScope(ExecutionContext& context, semantic::SymbolId symId) noexcept
+            : ctx(context),
+              functionId(symId),
+              entryExecuted(context.executed_),
+              savedParentChildExecuted(context.telemetryChildExecuted_) {
+            if (ctx.telemetry_ != nullptr) {
+                ctx.telemetryChildExecuted_ = 0;
+            }
+        }
+        ~AotInvokeTelemetryScope() noexcept {
+            if (ctx.telemetry_ != nullptr) {
+                const std::uint64_t totalSubtree = ctx.executed_ >= entryExecuted
+                    ? (ctx.executed_ - entryExecuted)
+                    : 0u;
+                const std::uint64_t selfInst = totalSubtree >= ctx.telemetryChildExecuted_
+                    ? (totalSubtree - ctx.telemetryChildExecuted_)
+                    : 0u;
+                if (selfInst > 0) {
+                    ctx.telemetry_->recordFunctionInstructions(functionId, selfInst);
+                }
+                ctx.telemetryChildExecuted_ = savedParentChildExecuted + totalSubtree;
+            }
+        }
+    } telemetryScope{*this, function->symbolId};
     emitTrace(runtime::TraceEventKind::FunctionEnter);
 
     bool succeeded = false;
@@ -1115,6 +1159,158 @@ bool ExecutionContext::invoke(
     if (!stack_.empty()) stack_.pop_back();
     if (!stackSites_.empty()) stackSites_.pop_back();
     currentFunctionId_ = previousFunctionId;
+    return true;
+}
+
+bool ExecutionContext::invokeParallelBatch(
+    semantic::SymbolId symbolId,
+    ParallelBatchImplementation batchKernel,
+    runtime::ParallelNativeBatchContext& batch) {
+    runtime::ScopedValuePoolDomain domainScope(
+        heap_ ? heap_->valuePoolDomain().get() : nullptr);
+    const auto* function = findFunction(symbolId);
+    const FunctionImplementation overrideImpl =
+        function ? resolveHotPatchImplementation(function->symbolId) : nullptr;
+    const FunctionImplementation targetImpl =
+        overrideImpl ? overrideImpl : (function ? function->implementation : nullptr);
+    if (!function || (!batchKernel && !targetImpl)) {
+        const bool ok = fail(
+            runtime::ErrorCode::FunctionNotFound,
+            "AOT entry function was not found");
+        batch.error = error_;
+        return ok;
+    }
+    if (stack_.size() >= options_.limits.recursionLimit) {
+        const bool ok = fail(
+            runtime::ErrorCode::RecursionLimitExceeded,
+            "recursion limit exceeded");
+        batch.error = error_;
+        return ok;
+    }
+
+    const bool isRange = (batch.kernelKind == runtime::ParallelKernelKind::Range);
+    const std::size_t prefixParams = isRange ? 2u : 1u;
+    const std::size_t userArgCount = batch.userArguments ? batch.userArguments->size() : 0u;
+    if (function->parameterCount != prefixParams + userArgCount) {
+        const bool ok = fail(
+            runtime::ErrorCode::InvalidArguments,
+            "argument count does not match function signature");
+        batch.error = error_;
+        return ok;
+    }
+    if (!isRange && batch.count == 0u) {
+        batch.hasReducedValue = false;
+        batch.reducedValue = runtime::Value{std::monostate{}};
+        batch.statistics = statistics_;
+        return true;
+    }
+
+    const auto previousFunctionId = currentFunctionId_;
+    currentFunctionId_ = function->symbolId;
+    const runtime::ScopedAllocationSite fnAllocSite(function->symbolId, 0);
+    stack_.push_back(function->name ? function->name : "<aot-function>");
+    stackSites_.push_back({function->symbolId, 0});
+    statistics_.maximumCallDepth = std::max(statistics_.maximumCallDepth, stack_.size());
+
+    auto runBatchBody = [&]() -> bool {
+        if (batchKernel != nullptr && !overrideImpl) {
+            statistics_.functionCalls += isRange ? 1u : batch.count;
+            return batchKernel(*this, batch);
+        }
+        std::vector<runtime::Value> callArgs(prefixParams + userArgCount);
+        for (std::size_t u = 0; u < userArgCount; ++u) {
+            callArgs[prefixParams + u] = (*batch.userArguments)[u];
+        }
+        if (isRange) {
+            callArgs[0] = runtime::Value(static_cast<std::int64_t>(batch.start));
+            callArgs[1] = runtime::Value(static_cast<std::int64_t>(batch.count));
+            ++statistics_.functionCalls;
+            runtime::Value retVal{};
+            if (!targetImpl(*this, callArgs.data(), callArgs.size(), retVal)) {
+                return false;
+            }
+            if (!expectSignatureType(
+                    retVal,
+                    function->returnType,
+                    function->returnTypeId,
+                    "return value")) {
+                return false;
+            }
+            batch.reducedValue = std::move(retVal);
+            batch.hasReducedValue = true;
+            return true;
+        }
+        const runtime::ParallelReduceOp reduceOp = batch.config
+            ? batch.config->reduceOp
+            : runtime::ParallelReduceOp::None;
+        const runtime::ParallelCustomReducer& customReducer = batch.config
+            ? batch.config->customReducer
+            : runtime::ParallelCustomReducer{};
+        const bool strictDet = batch.config &&
+            (batch.config->executionOptions.determinism.mode == runtime::DeterminismMode::Strict);
+        bool hasAcc = false;
+        runtime::Value accValue{std::monostate{}};
+        for (std::size_t batchOff = 0u; batchOff < batch.count; ++batchOff) {
+            callArgs[0] = runtime::Value(static_cast<std::int64_t>(batch.start + batchOff));
+            ++statistics_.functionCalls;
+            runtime::Value elemVal{};
+            if (!targetImpl(*this, callArgs.data(), callArgs.size(), elemVal)) {
+                return false;
+            }
+            if (!expectSignatureType(
+                    elemVal,
+                    function->returnType,
+                    function->returnTypeId,
+                    "return value")) {
+                return false;
+            }
+            if (!runtime::accumulateParallelReductionValue(
+                    reduceOp,
+                    customReducer,
+                    strictDet,
+                    accValue,
+                    hasAcc,
+                    std::move(elemVal),
+                    error_)) {
+                return false;
+            }
+        }
+        batch.hasReducedValue = hasAcc;
+        batch.reducedValue = (reduceOp == runtime::ParallelReduceOp::None || !hasAcc)
+            ? runtime::Value{std::monostate{}}
+            : std::move(accValue);
+        return true;
+    };
+
+    bool succeeded = false;
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+    try {
+        succeeded = runBatchBody();
+    } catch (const std::bad_alloc&) {
+        succeeded = fail(runtime::ErrorCode::OutOfMemory,
+            "AOT execution exhausted native memory");
+    } catch (const std::exception& exception) {
+        succeeded = fail(runtime::ErrorCode::InvalidProgram,
+            std::string("AOT execution threw: ") + exception.what());
+    } catch (...) {
+        succeeded = fail(runtime::ErrorCode::InvalidProgram,
+            "AOT execution threw an unknown exception");
+    }
+#else
+    succeeded = runBatchBody();
+#endif
+
+    if (!succeeded && hasPendingException()) {
+        reportUnhandledScriptException();
+    }
+    if (!stack_.empty()) stack_.pop_back();
+    if (!stackSites_.empty()) stackSites_.pop_back();
+    currentFunctionId_ = previousFunctionId;
+    batch.statistics = statistics_;
+    if (!succeeded) {
+        batch.error = error_;
+        return false;
+    }
     return true;
 }
 
@@ -2639,6 +2835,9 @@ bool ExecutionContext::newArray(
             allocationError.message.empty()
                 ? "managed array allocation failed"
                 : allocationError.message);
+    }
+    if (telemetry_ != nullptr && heap_->isPackedArray(*reference)) {
+        telemetry_->noteCompactHeapObject(*reference);
     }
     result = *reference;
     return true;
@@ -5835,6 +6034,164 @@ runtime::ExecutionResult Program::invoke(
         return missing;
     }
     return invoke(found->second, arguments, std::move(options));
+}
+
+runtime::ParallelNativeBatchKernel Program::buildParallelBatchKernel(
+    semantic::SymbolId symbolId,
+    runtime::ParallelKernelKind kernelKind,
+    const std::vector<runtime::ParallelNativeColumnBinding>& paramColumns,
+    const runtime::ParallelJobConfig& config,
+    bool usesParallelPrng) const {
+    (void)kernelKind;
+    (void)paramColumns;
+    if (!descriptor_ || usesParallelPrng) {
+        return {};
+    }
+    const auto& execOpts = config.executionOptions;
+    if (execOpts.determinism.mode != runtime::DeterminismMode::Off ||
+        execOpts.profile != nullptr ||
+        static_cast<bool>(execOpts.trace) ||
+        execOpts.executionPolicy != nullptr ||
+        executionPolicy_ != nullptr ||
+        execOpts.debugger != nullptr ||
+        execOpts.limits.recursionLimit == 0) {
+        return {};
+    }
+    const auto fnIt = functions_.find(symbolId);
+    if (fnIt == functions_.end() || !fnIt->second || !fnIt->second->implementation) {
+        return {};
+    }
+    const FunctionDescriptor* fnDesc = fnIt->second;
+    const bool hasHotPatch = hotPatchedBodies_.find(symbolId) != hotPatchedBodies_.end();
+    const ParallelBatchImplementation batchKernel = hasHotPatch
+        ? nullptr
+        : fnDesc->parallelBatchKernel;
+
+    struct AotParallelBatchSnapshot {
+        const ProgramDescriptor* descriptor = nullptr;
+        std::unordered_map<semantic::SymbolId, const TypeDescriptor*> types;
+        std::unordered_map<semantic::SymbolId, const FunctionDescriptor*> functions;
+        std::unordered_map<semantic::SymbolId, FunctionImplementation> hotPatchedBodies;
+        std::shared_ptr<const runtime::BindingRegistry> bindings;
+        std::shared_ptr<std::atomic<std::size_t>> batchCounter;
+    };
+    auto snapshot = std::make_shared<AotParallelBatchSnapshot>();
+    snapshot->descriptor = descriptor_;
+    snapshot->types = types_;
+    snapshot->functions = functions_;
+    snapshot->hotPatchedBodies = hotPatchedBodies_;
+    snapshot->bindings = bindings_;
+    snapshot->batchCounter = parallelBatchExecutions_;
+
+    return [snapshot, symbolId, batchKernel](runtime::ParallelNativeBatchContext& ctx) -> bool {
+        if (!snapshot || !snapshot->descriptor) {
+            ctx.error.code = runtime::ErrorCode::InvalidProgram;
+            ctx.error.message = "AOT program descriptor is not available";
+            return false;
+        }
+        std::shared_ptr<runtime::ManagedHeap> batchHeap;
+        if (runtime::ManagedHeap* rawHeap = ctx.mutableHeap
+                ? ctx.mutableHeap
+                : const_cast<runtime::ManagedHeap*>(ctx.heap)) {
+            batchHeap = std::shared_ptr<runtime::ManagedHeap>(
+                rawHeap,
+                [](runtime::ManagedHeap*) {});
+        }
+        std::shared_ptr<const runtime::BindingRegistry> batchBindings = snapshot->bindings;
+        if (ctx.bindings != nullptr) {
+            batchBindings = std::shared_ptr<const runtime::BindingRegistry>(
+                ctx.bindings,
+                [](const runtime::BindingRegistry*) {});
+        }
+        runtime::ExecutionOptions batchOpts = ctx.config
+            ? ctx.config->executionOptions
+            : runtime::ExecutionOptions{};
+        batchOpts.limits.gcWorkBudget = 0;
+        batchOpts.debugger.reset();
+
+        runtime::ScopedValuePoolDomain domainScope(
+            batchHeap ? batchHeap->valuePoolDomain().get() : nullptr);
+        ExecutionContext context(
+            *snapshot->descriptor,
+            std::move(batchHeap),
+            std::move(batchBindings),
+            std::move(batchOpts),
+            &snapshot->types,
+            &snapshot->functions);
+        context.setHotPatchedBodies(&snapshot->hotPatchedBodies);
+        if (snapshot->batchCounter) {
+            snapshot->batchCounter->fetch_add(1, std::memory_order_relaxed);
+        }
+        return context.invokeParallelBatch(symbolId, batchKernel, ctx);
+    };
+}
+
+runtime::ParallelNativeBatchKernel Program::buildParallelBatchKernel(
+    const std::string& qualifiedName,
+    runtime::ParallelKernelKind kernelKind,
+    const std::vector<runtime::ParallelNativeColumnBinding>& paramColumns,
+    const runtime::ParallelJobConfig& config,
+    bool usesParallelPrng) const {
+    const auto found = names_.find(qualifiedName);
+    if (found == names_.end()) {
+        return {};
+    }
+    return buildParallelBatchKernel(
+        found->second,
+        kernelKind,
+        paramColumns,
+        config,
+        usesParallelPrng);
+}
+
+void Program::attachToProgramImage(const runtime::ProgramImage& program) const {
+    if (!lifecycleTarget_) {
+        const Program* selfPtr = this;
+        program.setParallelBatchKernelFactory(
+            [selfPtr](
+                semantic::SymbolId symId,
+                runtime::ParallelKernelKind kind,
+                const std::vector<runtime::ParallelNativeColumnBinding>& cols,
+                const runtime::ParallelJobConfig& cfg,
+                bool usesPrng) -> runtime::ParallelNativeBatchKernel {
+                return selfPtr->buildParallelBatchKernel(symId, kind, cols, cfg, usesPrng);
+            });
+        return;
+    }
+    std::weak_ptr<LifecycleTarget> weakTarget = lifecycleTarget_;
+    program.setParallelBatchKernelFactory(
+        [weakTarget](
+            semantic::SymbolId symId,
+            runtime::ParallelKernelKind kind,
+            const std::vector<runtime::ParallelNativeColumnBinding>& cols,
+            const runtime::ParallelJobConfig& cfg,
+            bool usesPrng) -> runtime::ParallelNativeBatchKernel {
+            const auto locked = weakTarget.lock();
+            if (!locked) {
+                return {};
+            }
+            const Program* prog = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(locked->mutex);
+                if (!locked->alive || !locked->program) {
+                    return {};
+                }
+                prog = locked->program;
+            }
+            return prog->buildParallelBatchKernel(symId, kind, cols, cfg, usesPrng);
+        });
+}
+
+std::size_t Program::parallelBatchExecutionCount() const noexcept {
+    return parallelBatchExecutions_
+        ? parallelBatchExecutions_->load(std::memory_order_relaxed)
+        : 0u;
+}
+
+void Program::resetParallelBatchExecutionCount() const noexcept {
+    if (parallelBatchExecutions_) {
+        parallelBatchExecutions_->store(0u, std::memory_order_relaxed);
+    }
 }
 
 std::optional<runtime::StackTraceLocation> Program::resolveSourceLocation(

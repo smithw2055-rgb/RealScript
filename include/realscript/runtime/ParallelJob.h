@@ -167,6 +167,10 @@ struct ParallelNativeBatchContext {
     std::size_t count = 0;
     std::uint32_t batchSeed = 0;
     const ManagedHeap* heap = nullptr;
+    ManagedHeap* mutableHeap = nullptr;
+    const BindingRegistry* bindings = nullptr;
+    ParallelKernelKind kernelKind = ParallelKernelKind::Element;
+    const ParallelJobConfig* config = nullptr;
     const std::vector<Value>* userArguments = nullptr;
     const std::vector<ParallelNativeColumnBinding>* columns = nullptr;
     Value reducedValue{};
@@ -178,7 +182,14 @@ struct ParallelNativeBatchContext {
 #pragma warning(pop)
 #endif
 
-using ParallelNativeBatchKernel = std::function<bool(ParallelNativeBatchContext&)>;
+[[nodiscard]] bool accumulateParallelReductionValue(
+    ParallelReduceOp reduceOp,
+    const ParallelCustomReducer& customReducer,
+    bool strictDeterminism,
+    Value& ioAccumulated,
+    bool& ioHasValue,
+    Value nextValue,
+    RuntimeError& outError);
 
 struct ParallelJobConfig {
     std::size_t workerCount = 0; // 0 => hardware_concurrency() (clamped >= 1)

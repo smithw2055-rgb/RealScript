@@ -5,6 +5,15 @@ remain versioned but unfrozen until a future 1.0 release.
 
 ## [Unreleased]
 
+### Layering Separation, Audit Hardening & Documentation Sync
+
+- **Acyclic L0/L1/L2 Layer Separation & Slim Runtime Packaging**: Split `RealScript` into acyclic L0/L1 CMake slices (`Foundation`, `Bytecode`, `Runtime`, `AotRuntime`, `BindGenRuntime`, `HotReload`, `StencilJit`, `SlimRuntime`, `Compiler`, `NativeBackends`, `Kernel`, plus optional L1 `Debug`, `Tooling`, `Extensibility`, `BindGen`, `Frontend`, `Full`) with `-DREALSCRIPT_SLIM_RUNTIME=ON` headless runtime packaging, and separated L2 Game/Scene/Gameplay SDKs (`RealScript::GameRuntime`, `RealScript::GameCompiler`, `RealScript::GameSdk`, `rsbench_product`) into companion `RealScript-GamePack`.
+- **`ModuleBuildCache` Macro & Partial Generic Invalidation**: Preserved C11 macro plugin transforms (`C11MacroPlugin`) and expanded macro diagnostics alongside module dependency invalidation when shared or partial generic instantiations change.
+- **Cross-Backend GC Safepoints, Profiling & `GC.Alloc` Frame Attribution**: Added active incremental GC safepoints and `ProfileCollector` instrumentation across `StencilJit` and `AotRuntime`, plus zero-allocation `GC.Alloc` per-frame allocation tracking surfaced via `FrameTelemetryCollector` and DAP `topAllocations` (including `sourceFile` and `line`).
+- **Native `ParallelJobScheduler` Batch Kernels**: Added native batch kernel execution paths (`StencilModule::buildParallelBatchKernel` and `AotRuntime`) for verified element kernels, eliminating per-item interpreter transitions while preserving deterministic chunk reductions.
+- **Optimization & Tier Observability**: Added `StencilModule::functionDiagnostics()`, `rsaot --opt-remarks` / `--opt-remarks-json`, and LSP `textDocument/codeLens` hints surfacing AOT tier status, fallback reasons, and per-function GC allocation pressure.
+- **Documentation Cleanup & Sync**: Removed 46 superseded early design/spec/phase-roadmap files, relocated the L2 Game/Gameplay SDK docs into `RealScript-GamePack/docs/`, and synchronized README/architecture/compatibility/integration docs with verified `16`-byte `Value`, `StencilJit` (`x86_64` & `ARM64`), default interface methods, relational & `and`/`or`/`not` pattern matching, and `[StackOnly]` spans.
+
 ### Sprint 2 Architecture Evolution
 
 - **Per-Instance Heap Pools & Nanosecond Incremental GC Budget (`perf_3`)**: Removed process-wide `poolGcMutex` contention across `ManagedHeap` object/array allocations and GC mark/sweep cycles; each `ManagedHeap` owns cache-line-aligned synchronization and private slot/buffer pools (while process-shared `ValuePool` arenas coordinate brief mutator safe-point sweeps only when pool pin-reclamation triggers), plus `collectIncrementalWithBudget(roots, ns/us)` time-sliced GC APIs.

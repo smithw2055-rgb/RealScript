@@ -162,6 +162,258 @@ std::string jsonEscape(const std::string& value) {
     return output;
 }
 
+void mergeModuleTypes(
+    const mir::Module& module,
+    std::map<semantic::SymbolId, TypeView>& types,
+    diagnostics::DiagnosticBag* diagnostics) {
+    for (const auto& type : module.types) {
+        const auto inserted = types.emplace(
+            type.id,
+            TypeView{nullptr, type, "type_" + hexId(type.id)});
+        inserted.first->second.type = &inserted.first->second.mergedType;
+        if (!inserted.second) {
+            auto& dst = inserted.first->second.mergedType;
+            if (semantic::canonicalTypeName(dst) !=
+                semantic::canonicalTypeName(type)) {
+                if (diagnostics != nullptr) {
+                    diagnostics->report("RS7003", "duplicate AOT TypeId has incompatible names", {});
+                }
+            } else {
+                const bool prevPartial = dst.partialType;
+                const bool prevAbstract = dst.abstractType;
+                const bool prevSealed = dst.sealedType;
+                const bool prevLifecycle = dst.hasValueLifecycle;
+                const auto prevFields = dst.fields;
+                bool swappedToIncoming = false;
+                if (type.fields.size() > dst.fields.size() ||
+                    type.virtualDispatchTable.size() >
+                        dst.virtualDispatchTable.size()) {
+                    dst = type;
+                    swappedToIncoming = true;
+                }
+                dst.partialType = prevPartial || type.partialType;
+                dst.abstractType = prevAbstract || type.abstractType;
+                dst.sealedType = prevSealed || type.sealedType;
+                dst.hasValueLifecycle = prevLifecycle || type.hasValueLifecycle;
+                if (dst.baseTypeId == 0 && type.baseTypeId != 0) {
+                    dst.baseTypeId = type.baseTypeId;
+                    dst.baseTypeName = type.baseTypeName;
+                }
+                const auto& extraFields = swappedToIncoming ? prevFields : type.fields;
+                for (const auto& extra : extraFields) {
+                    const auto foundIt = std::find_if(
+                        dst.fields.begin(),
+                        dst.fields.end(),
+                        [&](const semantic::FieldSymbol& f) {
+                            return f.name == extra.name;
+                        });
+                    if (foundIt == dst.fields.end()) {
+                        auto added = extra;
+                        added.index = dst.fields.size();
+                        dst.fields.push_back(std::move(added));
+                    }
+                }
+                if (type.virtualDispatchTable.size() > dst.virtualDispatchTable.size()) {
+                    dst.virtualDispatchTable = type.virtualDispatchTable;
+                }
+                for (const auto& iface : type.interfaceDispatchMaps) {
+                    const bool hasIface = std::any_of(
+                        dst.interfaceDispatchMaps.begin(),
+                        dst.interfaceDispatchMaps.end(),
+                        [&](const auto& existing) {
+                            return existing.interfaceTypeId == iface.interfaceTypeId;
+                        });
+                    if (!hasIface) {
+                        dst.interfaceDispatchMaps.push_back(iface);
+                    }
+                }
+            }
+        }
+    }
+}
+
+void collectUnboxableCustomStructs(
+    const std::map<semantic::SymbolId, TypeView>& types,
+    std::unordered_set<semantic::SymbolId>& unboxableCustomStructs,
+    std::vector<semantic::SymbolId>* orderedUnboxableStructs) {
+    for (bool progress = true; progress;) {
+        progress = false;
+        for (const auto& [id, view] : types) {
+            if (unboxableCustomStructs.find(id) != unboxableCustomStructs.end()) {
+                continue;
+            }
+            const auto& type = *view.type;
+            if (type.kind != semantic::TypeKind::Struct ||
+                classifyInlineMath(semantic::PrimitiveType::Struct, type.id) !=
+                    InlineMathKind::None ||
+                type.fields.empty() ||
+                type.fields.size() > 256) {
+                continue;
+            }
+            bool allScalarMathOrNested = true;
+            for (const auto& field : type.fields) {
+                const auto fieldTypeId = semantic::isExactType(field.type) && !field.typeName.empty()
+                    ? semantic::stableTypeId(field.typeName)
+                    : 0;
+                if (field.staticField ||
+                    !isTypedAotSlot({field.type, fieldTypeId}, &unboxableCustomStructs)) {
+                    allScalarMathOrNested = false;
+                    break;
+                }
+            }
+            if (allScalarMathOrNested) {
+                unboxableCustomStructs.insert(type.id);
+                if (orderedUnboxableStructs != nullptr) {
+                    orderedUnboxableStructs->push_back(type.id);
+                }
+                progress = true;
+            }
+        }
+    }
+}
+
+struct AttributedFunctionFilter {
+    std::unordered_set<std::string> exactAttrTargets;
+    std::unordered_set<std::string> methodOrFnAttrStems;
+    std::unordered_set<std::string> ctorOwnerAttrStems;
+
+    void populate(const std::vector<mir::Module>& modules) {
+        for (const auto& module : modules) {
+            for (const auto& attr : module.languageMetadata.attributes) {
+                if (attr.target.empty()) continue;
+                exactAttrTargets.insert(attr.target);
+                if (const auto hashPos = attr.target.find('#');
+                    hashPos != std::string::npos) {
+                    methodOrFnAttrStems.insert(attr.target.substr(0, hashPos + 1u));
+                }
+                if (const auto ctorPos = attr.target.find("::ctor:");
+                    ctorPos != std::string::npos) {
+                    ctorOwnerAttrStems.insert(attr.target.substr(0, ctorPos + 7u));
+                }
+            }
+        }
+    }
+
+    [[nodiscard]] bool matches(const mir::Function& fn) const {
+        if (exactAttrTargets.empty()) return false;
+        const std::string& name = fn.name;
+        std::string owner;
+        std::string member;
+        if (name.size() >= 6 && name.compare(name.size() - 6, 6, "..ctor") == 0) {
+            owner = name.substr(0, name.size() - 6);
+            member = ".ctor";
+        } else if (name.size() >= 7 && name.compare(name.size() - 7, 7, "..cctor") == 0) {
+            owner = name.substr(0, name.size() - 7);
+            member = ".cctor";
+        } else {
+            std::size_t angleDepth = 0;
+            std::size_t lastDot = std::string::npos;
+            for (std::size_t i = 0; i < name.size(); ++i) {
+                if (name[i] == '<') ++angleDepth;
+                else if (name[i] == '>' && angleDepth > 0) --angleDepth;
+                else if (name[i] == '.' && angleDepth == 0) lastDot = i;
+            }
+            if (lastDot != std::string::npos) {
+                owner = name.substr(0, lastDot);
+                member = name.substr(lastDot + 1u);
+            }
+        }
+        if (owner.empty()) {
+            return methodOrFnAttrStems.count(
+                fn.moduleName + "::function:" + name + "#") > 0;
+        }
+        const std::string ownerPrefix = fn.moduleName + "::" + owner + "::";
+        if (methodOrFnAttrStems.count(ownerPrefix + "method:" + member + "#") > 0) {
+            return true;
+        }
+        if ((member == ".ctor" || member == owner) &&
+            ctorOwnerAttrStems.count(ownerPrefix + "ctor:") > 0) {
+            return true;
+        }
+        if ((member.rfind("get_", 0) == 0 || member.rfind("set_", 0) == 0) &&
+            exactAttrTargets.count(ownerPrefix + "property:" + member.substr(4u)) > 0) {
+            return true;
+        }
+        return false;
+    }
+};
+
+[[nodiscard]] bool isAsyncMirFunction(const mir::Function& fn) noexcept {
+    return !fn.blocks.empty() &&
+        !fn.blocks.front().instructions.empty() &&
+        fn.blocks.front().instructions.front().opcode == mir::Opcode::AsyncEnter;
+}
+
+[[nodiscard]] bool hasMirLoopBackEdge(const mir::Function& fn) noexcept {
+    for (const auto& block : fn.blocks) {
+        if (block.terminator.kind == mir::TerminatorKind::Jump) {
+            if (block.terminator.target <= block.id) return true;
+        } else if (block.terminator.kind == mir::TerminatorKind::Branch) {
+            if (block.terminator.target <= block.id ||
+                block.terminator.falseTarget <= block.id) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] OptimizationRemark makeFunctionRemark(
+    OptimizationRemarkKind kind,
+    std::string pass,
+    const mir::Module& module,
+    const mir::Function& function,
+    const std::string& qualifiedName,
+    std::string message) {
+    OptimizationRemark remark;
+    remark.kind = kind;
+    remark.pass = std::move(pass);
+    remark.functionSymbolId = function.symbolId;
+    remark.functionName = qualifiedName;
+    remark.message = std::move(message);
+    text::TextSpan fallbackSpan{};
+    std::optional<mir::BlockId> blkId;
+    std::optional<std::uint32_t> instIdx;
+    for (const auto& blk : function.blocks) {
+        if (!blk.instructions.empty()) {
+            blkId = blk.id;
+            instIdx = 0u;
+            fallbackSpan = blk.instructions.front().sourceSpan;
+            break;
+        }
+    }
+    resolveRemarkLocation(
+        module, function, blkId, instIdx, fallbackSpan,
+        remark.sourceFile, remark.line, remark.column);
+    return remark;
+}
+
+void emitBoxedFunctionAllocationRemarks(
+    std::vector<OptimizationRemark>& remarks,
+    const mir::Module& module,
+    const mir::Function& function,
+    const std::string& qualifiedName,
+    const std::map<semantic::SymbolId, TypeView>& types,
+    bool isAsyncFunction) {
+    for (const auto& blk : function.blocks) {
+        for (std::size_t idx = 0; idx < blk.instructions.size(); ++idx) {
+            const auto& inst = blk.instructions[idx];
+            const bool isNonEscaping = !isAsyncFunction &&
+                inst.opcode == mir::Opcode::NewObject &&
+                isNonEscapingMirStackRefAlloc(function, inst, types);
+            appendAllocationRemark(
+                remarks,
+                module,
+                function,
+                qualifiedName,
+                blk.id,
+                static_cast<std::uint32_t>(idx),
+                inst,
+                isNonEscaping);
+        }
+    }
+}
+
 } // namespace
 
 
@@ -254,68 +506,7 @@ GeneratedProgram CppGenerator::generate(
                 lifecycleTargets.insert(attr.target);
             }
         }
-        for (const auto& type : module.types) {
-            const auto inserted = types.emplace(
-                type.id,
-                TypeView{nullptr, type, "type_" + hexId(type.id)});
-            inserted.first->second.type = &inserted.first->second.mergedType;
-            if (!inserted.second) {
-                auto& dst = inserted.first->second.mergedType;
-                if (semantic::canonicalTypeName(dst) !=
-                    semantic::canonicalTypeName(type)) {
-                    diagnostics.report("RS7003", "duplicate AOT TypeId has incompatible names", {});
-                } else {
-                    const bool prevPartial = dst.partialType;
-                    const bool prevAbstract = dst.abstractType;
-                    const bool prevSealed = dst.sealedType;
-                    const bool prevLifecycle = dst.hasValueLifecycle;
-                    const auto prevFields = dst.fields;
-                    bool swappedToIncoming = false;
-                    if (type.fields.size() > dst.fields.size() ||
-                        type.virtualDispatchTable.size() >
-                            dst.virtualDispatchTable.size()) {
-                        dst = type;
-                        swappedToIncoming = true;
-                    }
-                    dst.partialType = prevPartial || type.partialType;
-                    dst.abstractType = prevAbstract || type.abstractType;
-                    dst.sealedType = prevSealed || type.sealedType;
-                    dst.hasValueLifecycle = prevLifecycle || type.hasValueLifecycle;
-                    if (dst.baseTypeId == 0 && type.baseTypeId != 0) {
-                        dst.baseTypeId = type.baseTypeId;
-                        dst.baseTypeName = type.baseTypeName;
-                    }
-                    const auto& extraFields = swappedToIncoming ? prevFields : type.fields;
-                    for (const auto& extra : extraFields) {
-                        const auto foundIt = std::find_if(
-                            dst.fields.begin(),
-                            dst.fields.end(),
-                            [&](const semantic::FieldSymbol& f) {
-                                return f.name == extra.name;
-                            });
-                        if (foundIt == dst.fields.end()) {
-                            auto added = extra;
-                            added.index = dst.fields.size();
-                            dst.fields.push_back(std::move(added));
-                        }
-                    }
-                    if (type.virtualDispatchTable.size() > dst.virtualDispatchTable.size()) {
-                        dst.virtualDispatchTable = type.virtualDispatchTable;
-                    }
-                    for (const auto& iface : type.interfaceDispatchMaps) {
-                        const bool hasIface = std::any_of(
-                            dst.interfaceDispatchMaps.begin(),
-                            dst.interfaceDispatchMaps.end(),
-                            [&](const auto& existing) {
-                                return existing.interfaceTypeId == iface.interfaceTypeId;
-                            });
-                        if (!hasIface) {
-                            dst.interfaceDispatchMaps.push_back(iface);
-                        }
-                    }
-                }
-            }
-        }
+        mergeModuleTypes(module, types, &diagnostics);
         for (const auto& function : module.functions) {
             if (!symbols.insert(function.symbolId).second) {
                 diagnostics.report("RS7004", "duplicate AOT function SymbolId", {});
@@ -531,38 +722,8 @@ GeneratedProgram CppGenerator::generate(
 
     std::unordered_set<semantic::SymbolId> unboxableCustomStructs;
     std::vector<semantic::SymbolId> orderedUnboxableStructs;
-    for (bool progress = true; progress;) {
-        progress = false;
-        for (const auto& [id, view] : types) {
-            if (unboxableCustomStructs.find(id) != unboxableCustomStructs.end()) {
-                continue;
-            }
-            const auto& type = *view.type;
-            if (type.kind != semantic::TypeKind::Struct ||
-                classifyInlineMath(semantic::PrimitiveType::Struct, type.id) !=
-                    InlineMathKind::None ||
-                type.fields.empty() ||
-                type.fields.size() > 256) {
-                continue;
-            }
-            bool allScalarMathOrNested = true;
-            for (const auto& field : type.fields) {
-                const auto fieldTypeId = semantic::isExactType(field.type) && !field.typeName.empty()
-                    ? semantic::stableTypeId(field.typeName)
-                    : 0;
-                if (field.staticField ||
-                    !isTypedAotSlot({field.type, fieldTypeId}, &unboxableCustomStructs)) {
-                    allScalarMathOrNested = false;
-                    break;
-                }
-            }
-            if (allScalarMathOrNested) {
-                unboxableCustomStructs.insert(type.id);
-                orderedUnboxableStructs.push_back(type.id);
-                progress = true;
-            }
-        }
-    }
+    collectUnboxableCustomStructs(
+        types, unboxableCustomStructs, &orderedUnboxableStructs);
 
     std::unordered_map<semantic::SymbolId, std::size_t> structGcSlotCounts;
     for (const auto id : orderedUnboxableStructs) {
@@ -818,65 +979,8 @@ GeneratedProgram CppGenerator::generate(
         std::vector<SharedGenericMemberSpec> members;
     };
 
-    std::unordered_set<std::string> exactAttrTargets;
-    std::unordered_set<std::string> methodOrFnAttrStems;
-    std::unordered_set<std::string> ctorOwnerAttrStems;
-    for (const auto& module : modules) {
-        for (const auto& attr : module.languageMetadata.attributes) {
-            if (attr.target.empty()) continue;
-            exactAttrTargets.insert(attr.target);
-            if (const auto hashPos = attr.target.find('#');
-                hashPos != std::string::npos) {
-                methodOrFnAttrStems.insert(attr.target.substr(0, hashPos + 1u));
-            }
-            if (const auto ctorPos = attr.target.find("::ctor:");
-                ctorPos != std::string::npos) {
-                ctorOwnerAttrStems.insert(attr.target.substr(0, ctorPos + 7u));
-            }
-        }
-    }
-    const auto isAttributedFunction = [&](const mir::Function& fn) -> bool {
-        if (exactAttrTargets.empty()) return false;
-        const std::string& name = fn.name;
-        std::string owner;
-        std::string member;
-        if (name.size() >= 6 && name.compare(name.size() - 6, 6, "..ctor") == 0) {
-            owner = name.substr(0, name.size() - 6);
-            member = ".ctor";
-        } else if (name.size() >= 7 && name.compare(name.size() - 7, 7, "..cctor") == 0) {
-            owner = name.substr(0, name.size() - 7);
-            member = ".cctor";
-        } else {
-            std::size_t angleDepth = 0;
-            std::size_t lastDot = std::string::npos;
-            for (std::size_t i = 0; i < name.size(); ++i) {
-                if (name[i] == '<') ++angleDepth;
-                else if (name[i] == '>' && angleDepth > 0) --angleDepth;
-                else if (name[i] == '.' && angleDepth == 0) lastDot = i;
-            }
-            if (lastDot != std::string::npos) {
-                owner = name.substr(0, lastDot);
-                member = name.substr(lastDot + 1u);
-            }
-        }
-        if (owner.empty()) {
-            return methodOrFnAttrStems.count(
-                fn.moduleName + "::function:" + name + "#") > 0;
-        }
-        const std::string ownerPrefix = fn.moduleName + "::" + owner + "::";
-        if (methodOrFnAttrStems.count(ownerPrefix + "method:" + member + "#") > 0) {
-            return true;
-        }
-        if ((member == ".ctor" || member == owner) &&
-            ctorOwnerAttrStems.count(ownerPrefix + "ctor:") > 0) {
-            return true;
-        }
-        if ((member.rfind("get_", 0) == 0 || member.rfind("set_", 0) == 0) &&
-            exactAttrTargets.count(ownerPrefix + "property:" + member.substr(4u)) > 0) {
-            return true;
-        }
-        return false;
-    };
+    AttributedFunctionFilter attrFilter;
+    attrFilter.populate(modules);
 
     std::unordered_map<semantic::SymbolId, const FunctionView*> typedFunctions;
     for (const auto& view : functions) {
@@ -884,7 +988,7 @@ GeneratedProgram CppGenerator::generate(
             view.function->name.rfind("Async.__", 0) == 0) {
             continue;
         }
-        if (isAttributedFunction(*view.function)) {
+        if (attrFilter.matches(*view.function)) {
             continue;
         }
         if (supportsTypedPrimitiveAot(*view.function, unboxableCustomStructs)) {
@@ -1184,6 +1288,11 @@ GeneratedProgram CppGenerator::generate(
         }
         if (typedFunctions.find(function.symbolId) != typedFunctions.end()) {
             source.line(typedScalarFunctionSignature(view, true));
+            if (supportsTypedParallelBatchKernel(view)) {
+                source.line("static bool " + view.cppName + "_parallel_batch(");
+                source.line("    ExecutionContext& context,");
+                source.line("    runtime::ParallelNativeBatchContext& batch);");
+            }
         }
         if (options.emitHotPatchThunks) {
             source.line("static bool " + view.cppName + "_body(");
@@ -1963,10 +2072,45 @@ GeneratedProgram CppGenerator::generate(
                 view.cppName + "_sharedSpec);");
             source.line("}");
             source.line();
+            if (options.collectOptimizationRemarks) {
+                generated.optimizationRemarks.push_back(makeFunctionRemark(
+                    OptimizationRemarkKind::Passed,
+                    "shared-generics",
+                    module,
+                    function,
+                    view.qualifiedName,
+                    "lowered via reference-erased shared generic body"));
+                emitBoxedFunctionAllocationRemarks(
+                    generated.optimizationRemarks,
+                    module,
+                    function,
+                    view.qualifiedName,
+                    types,
+                    isAsyncMirFunction(function));
+            }
         } else if (typedFunctions.find(function.symbolId) != typedFunctions.end()) {
             emitTypedPrimitiveFunction(
                 source, view, options, sourceMap, typedFunctions, types, callIds,
-                hotPatchSlotsBySymbol);
+                hotPatchSlotsBySymbol,
+                options.collectOptimizationRemarks ? &generated.optimizationRemarks : nullptr);
+            if (options.collectOptimizationRemarks) {
+                generated.optimizationRemarks.push_back(makeFunctionRemark(
+                    OptimizationRemarkKind::Passed,
+                    "aot-lowering",
+                    module,
+                    function,
+                    view.qualifiedName,
+                    "lowered to unboxed typed C++ function"));
+                if (supportsTypedParallelBatchKernel(view)) {
+                    generated.optimizationRemarks.push_back(makeFunctionRemark(
+                        OptimizationRemarkKind::Passed,
+                        "parallel-batch",
+                        module,
+                        function,
+                        view.qualifiedName,
+                        "generated native parallel batch kernel"));
+                }
+            }
         } else {
         const std::string entryBodyName = options.emitHotPatchThunks
             ? (view.cppName + "_body")
@@ -1977,9 +2121,34 @@ GeneratedProgram CppGenerator::generate(
         source.line("    std::size_t argumentCount,");
         source.line("    runtime::Value& result) {");
         source.line("    (void)result;");
-        const bool isAsyncFunction = !function.blocks.empty() &&
-            !function.blocks.front().instructions.empty() &&
-            function.blocks.front().instructions.front().opcode == mir::Opcode::AsyncEnter;
+        const bool isAsyncFunction = isAsyncMirFunction(function);
+        if (options.collectOptimizationRemarks) {
+            std::string reason;
+            if (module.name == "RealScript.Async" &&
+                function.name.rfind("Async.__", 0) == 0) {
+                reason = "async runtime helper";
+            } else if (attrFilter.matches(function)) {
+                reason = "function carries metadata attribute";
+            } else {
+                reason = explainTypedPrimitiveAotIneligibility(
+                    function, unboxableCustomStructs);
+                if (reason.empty()) reason = "generic boxed lowering";
+            }
+            generated.optimizationRemarks.push_back(makeFunctionRemark(
+                OptimizationRemarkKind::Missed,
+                "aot-lowering",
+                module,
+                function,
+                view.qualifiedName,
+                "boxed AOT fallback: " + reason));
+            emitBoxedFunctionAllocationRemarks(
+                generated.optimizationRemarks,
+                module,
+                function,
+                view.qualifiedName,
+                types,
+                isAsyncFunction);
+        }
         if (isAsyncFunction) {
             source.line("    std::vector<runtime::Value> argumentValues;");
             source.line("    if (argumentCount != 0) {");
@@ -2578,6 +2747,11 @@ GeneratedProgram CppGenerator::generate(
     source.line("static constexpr FunctionDescriptor programFunctions[] = {");
     for (const auto& view : functions) {
         const auto& function = *view.function;
+        const std::string parallelBatchExpr =
+            (typedFunctions.find(function.symbolId) != typedFunctions.end() &&
+             supportsTypedParallelBatchKernel(view))
+                ? ("&" + view.cppName + "_parallel_batch")
+                : std::string("nullptr");
         source.line("    {0x" + hexId(function.symbolId) + "ULL, \"" +
             escapeCppString(view.qualifiedName) + "\", " +
             primitiveExpression(function.returnType) + ", 0x" +
@@ -2589,7 +2763,7 @@ GeneratedProgram CppGenerator::generate(
                 ? std::string("nullptr")
                 : view.cppName + "_parameterTypeIds") + ", " +
             std::to_string(function.parameterTypes.size()) + "u, &" +
-            view.cppName + ", nullptr},");
+            view.cppName + ", nullptr, " + parallelBatchExpr + "},");
     }
     source.line("};");
 
@@ -2811,6 +2985,70 @@ GeneratedProgram CppGenerator::generate(
     manifest << "    ]\n  }\n}\n";
     generated.manifest = manifest.str();
     return generated;
+}
+
+std::vector<FunctionLoweringSummary> analyzeFunctionLowering(
+    const std::vector<mir::Module>& modules) {
+    std::vector<FunctionLoweringSummary> summaries;
+    std::map<semantic::SymbolId, TypeView> types;
+    for (const auto& module : modules) {
+        mergeModuleTypes(module, types, nullptr);
+    }
+    std::unordered_set<semantic::SymbolId> unboxableCustomStructs;
+    collectUnboxableCustomStructs(types, unboxableCustomStructs, nullptr);
+
+    AttributedFunctionFilter attrFilter;
+    attrFilter.populate(modules);
+
+    std::unordered_set<semantic::SymbolId> seenSymbols;
+    for (const auto& module : modules) {
+        for (const auto& fn : module.functions) {
+            if (!seenSymbols.insert(fn.symbolId).second) continue;
+            FunctionLoweringSummary summary;
+            summary.symbolId = fn.symbolId;
+            summary.moduleName = module.name;
+            summary.functionName = fn.name;
+            summary.isAsync = isAsyncMirFunction(fn);
+            summary.hasLoops = hasMirLoopBackEdge(fn);
+
+            for (const auto& blk : fn.blocks) {
+                for (const auto& inst : blk.instructions) {
+                    if (inst.opcode == mir::Opcode::NewArray ||
+                        inst.opcode == mir::Opcode::ConstantString ||
+                        inst.opcode == mir::Opcode::NewDelegate ||
+                        inst.opcode == mir::Opcode::CombineDelegate ||
+                        inst.opcode == mir::Opcode::RemoveDelegate) {
+                        ++summary.heapAllocationSites;
+                    } else if (inst.opcode == mir::Opcode::NewObject &&
+                               !(!summary.isAsync &&
+                                 isNonEscapingMirStackRefAlloc(fn, inst, types))) {
+                        ++summary.heapAllocationSites;
+                    }
+                }
+            }
+
+            const bool isAsyncRuntimeHelper =
+                module.name == "RealScript.Async" &&
+                fn.name.rfind("Async.__", 0) == 0;
+            if (isAsyncRuntimeHelper) {
+                summary.boxedFallbackReason = "async runtime helper";
+            } else if (attrFilter.matches(fn)) {
+                summary.boxedFallbackReason = "carries metadata attribute";
+            } else {
+                const std::string reason =
+                    explainTypedPrimitiveAotIneligibility(fn, unboxableCustomStructs);
+                if (reason.empty()) {
+                    summary.typedPrimitiveAot = true;
+                    FunctionView view{&module, &fn, module.name + "::" + fn.name, {}};
+                    summary.parallelBatchKernel = supportsTypedParallelBatchKernel(view);
+                } else {
+                    summary.boxedFallbackReason = reason;
+                }
+            }
+            summaries.push_back(std::move(summary));
+        }
+    }
+    return summaries;
 }
 
 namespace detail {

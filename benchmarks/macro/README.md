@@ -24,9 +24,13 @@ build-perf\Release\rsbench.exe --mode raw --gc-work 8 --samples 9 `
 Report both time per invocation and workload-normalized throughput; do not use
 these local measurements as cross-language rankings.
 
-The opt-in `rsbench_product` target measures a 10,000-coroutine gameplay tick,
-including heap/host snapshot, restore, and deterministic replay:
+The opt-in `rsbench_product` target (now hosted in the companion **`RealScript-GamePack`**
+repository when configured with `-DREALSCRIPT_BUILD_BENCHMARKS=ON`) measures a
+10,000-coroutine gameplay tick, including heap/host snapshot, restore, and
+deterministic replay:
 
 ```powershell
-build-perf\Release\rsbench_product.exe
+cmake -S C:\Projects\RealScript-GamePack -B build-gamepack -DREALSCRIPT_SOURCE_DIR=C:\Projects\RealScript -DREALSCRIPT_BUILD_BENCHMARKS=ON
+cmake --build build-gamepack --config Release --target rsbench_product
+build-gamepack\Release\rsbench_product.exe
 ```

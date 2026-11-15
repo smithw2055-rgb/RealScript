@@ -55,7 +55,7 @@ The runtime `Value` model supports:
 
 Type validation occurs at function boundaries and relevant operations.
 
-`runtime::Value` uses a compact 24-byte representation (`sizeof(runtime::Value) == 24`):
+`runtime::Value` uses a compact 16-byte representation (`sizeof(runtime::Value) == 16`):
 
 - Custom value-type `struct`s with up to 4 scalar, `Enum`, or `RealScript.Math` (`Fixed`, `Fixed16`, `Vec2`, `Vec3`, `Quat`) fields are bit-packed inline inside a 12-byte `InlineStructSlot` with zero heap allocation.
 - Larger structs (>4 fields), dynamic strings, and closures are stored in a thread-local `ValuePoolArena` (`PooledStringValue`, `PooledStructValue`, `PooledClosureValue`) whose unreferenced entries are automatically reclaimed during `ManagedHeap::collect` (`ValuePoolArena::collectGarbage`).
@@ -135,7 +135,7 @@ Struct values are scanned recursively when their descriptors contain managed ref
 
 ## Incremental Mark/Sweep
 
-Collection proceeds through explicit incremental work units. The runtime can request collection and perform bounded work at instruction safepoints.
+Collection proceeds through explicit incremental work units and active incremental GC safepoints across the Interpreter, in-process `StencilJit`, and C++17 `AotRuntime`. The runtime performs bounded work using nanosecond/microsecond frame budgets (`collectIncrementalWithBudget` / `collectYoung`), while allocation attribution is recorded without per-allocation heap noise for `FrameTelemetryCollector` (`GC.Alloc` hotspots). For headless hosts, link `RealScript::SlimRuntime` / `RealScript::Runtime` (compatible with `-DREALSCRIPT_SLIM_RUNTIME=ON`).
 
 Important properties:
 

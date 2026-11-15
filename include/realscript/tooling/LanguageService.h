@@ -91,6 +91,12 @@ struct InlayHint {
     std::uint32_t kind = 1; // 1 = Type, 2 = Parameter
 };
 
+struct CodeLensItem {
+    debug::SourceRange range{};
+    std::string title;
+    std::string command;
+};
+
 struct CodeAction {
     std::string title;
     std::string kind = "quickfix";
@@ -214,6 +220,7 @@ public:
     [[nodiscard]] std::vector<SemanticToken> semanticTokens(const std::string& path);
     [[nodiscard]] std::vector<std::uint32_t> semanticTokensEncoded(const std::string& path);
     [[nodiscard]] std::vector<InlayHint> inlayHints(const std::string& path);
+    [[nodiscard]] std::vector<CodeLensItem> codeLenses(const std::string& path);
     [[nodiscard]] std::vector<TextEdit> formatDocument(const std::string& path, std::size_t tabSize = 4);
     [[nodiscard]] std::vector<TextEdit> formatDocument(const std::string& path, const FormatOptions& options);
     [[nodiscard]] std::vector<DocumentSymbol> workspaceSymbols(const std::string& query = {});

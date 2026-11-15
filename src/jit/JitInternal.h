@@ -193,6 +193,7 @@ struct JitRuntimeSession {
     std::uint32_t frameOffset32 = 0;
     std::uint8_t flatBankId = 0;
     runtime::ShadowStack shadowStack{};
+    runtime::FrameTelemetryCollector* telemetry = runtime::activeFrameTelemetry();
 };
 
 struct StencilTlsScratch {
@@ -245,6 +246,7 @@ struct CompiledFunctionRecord {
     bool eligibleForNative = false;
     bool eligibleForThreaded = false;
     mutable std::atomic<std::uint32_t> callCount{0};
+    std::string fallbackReason;
     std::vector<std::uint8_t> unexecutedAfterOp;
     std::vector<ThreadedStencilOp> threadedStream;
 };
@@ -295,6 +297,7 @@ void populateJitErrorDiagnostics(
     const runtime::Value& arrVal,
     JitArrayCacheEntry& ce) noexcept;
 
+void stepJitGcSafepoint(JitAbiContext* ctx) noexcept;
 std::uint32_t jitNewArrayHelper(JitAbiContext* ctx, std::uint32_t flatIdx) noexcept;
 std::uint32_t jitArrayLengthHelper(JitAbiContext* ctx, std::uint32_t flatIdx) noexcept;
 std::uint32_t jitLoadElementHelper(JitAbiContext* ctx, std::uint32_t flatIdx) noexcept;
@@ -322,6 +325,9 @@ std::uint32_t jitPartialSuperBudgetHelper(JitAbiContext* ctx, std::uint32_t flat
 
 [[nodiscard]] bool isFunctionEligibleForStencilJit(
     const runtime::detail::ExecutionFunction& execFunc) noexcept;
+
+[[nodiscard]] std::string explainStencilJitIneligibility(
+    const runtime::detail::ExecutionFunction& execFunc);
 
 #if !defined(__EMSCRIPTEN__) && UINTPTR_MAX == 0xffffffffffffffffULL
 [[nodiscard]] std::vector<std::uint8_t> compileFunctionX64(

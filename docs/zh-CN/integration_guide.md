@@ -4,17 +4,16 @@
 
 ## 1. 架构分层与 CMake 构建接入
 
-P3 阶段 1 将原先的单体实现拆分为 7 个严格无环的物理构建层（`foundation`、`compiler_core`、`runtime_core`、`native_backends`、`debug`、`tooling`、`game`），同时完整保留 `RealScript::*` 消费端目标契约。你可以根据宿主进程形态按需链接对应组件：
+`RealScript` 现已拆分为严格无环的 **L0/L1 核心仓库** 与独立的 **L2 `RealScript-GamePack` 配套仓库**，你可以根据宿主进程形态按需链接对应组件：
 
-| CMake 导入目标 | 适用进程形态 | 包含的核心能力范围 |
-| :--- | :--- | :--- |
-| `RealScript::Runtime` | 纯运行态轻量宿主 / 独立服务器 | `ManagedHeap`、字节码解释器、`ParallelJobScheduler`、`FiberScheduler`、`AsyncRuntime`、`FrameTelemetryCollector`、`AbiGovernance` |
-| `RealScript::Compiler` | 离线烘焙器 / 热编译服务 | 词法/语法/语义前端（含模式匹配、默认接口、强类型注解、扩展方法）、MIR 优化器、`ModuleBuildCache`、`.rsbc` 编解码与校验 |
-| `RealScript::AotSupport` | 发布态原生 C++17 AOT 客户端 | `AotRuntime` 零预算可信运行库、`__restrict` 紧凑数组 SIMD 算子、C11 `NativeModuleAbi` |
-| `RealScript::GameSdk` | 引擎主工程（场景 + ECS + 绑定） | `GameApi`、`SceneScriptRuntime`、零拷贝 ECS 原生列、`ResourceRegistry`、`GameProductization`、`ReflectionRegistry`、`ModHost` |
-| `RealScript::Debug` | 编辑器调试宿主 / 远程附加进程 | `DebugSession`、`EmbeddedDapServer`（TCP / stdio DAP、无副作用求值、虚拟 Fiber 线程栈、流式帧遥测） |
-| `RealScript::Tooling` | IDE 语言服务 / CI 代码治理工具 | `LanguageService`、`LspServer`、场景/信号/资产 GUID 清单桥接、`Formatter`、`GovernanceLinter`、`GovernanceFuzzer` |
-| `RealScript::Full` | 一体化编辑器 + Play-In-Editor | 上述全部运行态、编译态、JIT、调试与工具链能力 |
+| 仓库 / 层级 | CMake 导入目标 | 适用进程形态 | 包含的核心能力范围 |
+| :--- | :--- | :--- | :--- |
+| L0 核心运行时 | `RealScript::Runtime` / `RealScript::SlimRuntime` | 纯运行态宿主 / 无头服务器 | `ManagedHeap`、字节码解释器、`ParallelJobScheduler`、`FiberScheduler`、`AsyncRuntime`、`FrameTelemetryCollector`、`AbiGovernance`（兼容 `-DREALSCRIPT_SLIM_RUNTIME=ON`） |
+| L0 AOT / JIT | `RealScript::AotRuntime` / `RealScript::StencilJit` / `RealScript::HotReload` | 发布态 AOT 或内存态 JIT 宿主 | `AotRuntime` 零预算可信运行库与 `__restrict` 批处理核、`StencilJit`（`x86_64`/`ARM64`）、原生结构化热重载 |
+| L0 编译器 | `RealScript::Compiler` / `RealScript::NativeBackends` / `RealScript::Kernel` | 离线烘焙器 / 热编译服务 | 词法/语法/语义前端（含模式匹配、默认接口、强类型注解、`[StackOnly]` Span、宏插件）、MIR 优化器、`ModuleBuildCache`、`.rsbc` 编解码与校验、`rsaot` 后端 |
+| L1 可选工具链 | `RealScript::Debug` / `RealScript::Tooling` / `RealScript::BindGen` | 编辑器宿主 / IDE / CI 门禁 | `DebugSession` / `EmbeddedDapServer` / `DapServer`、`LanguageService` / `LspServer`、`Formatter`、`GovernanceLinter`、`rsbind` 自动绑定生成 |
+| L1 聚合包 | `RealScript::Full` | 一体化编辑器 + 开发态宿主 | 组合 `RealScript` L0 + L1 全部核心、原生后端、调试与工具链能力 |
+| L2 配套仓库 (`RealScript-GamePack`) | `RealScript::GameSdk` / `RealScript::GameRuntime` / `RealScript::GameCompiler` | 游戏引擎主工程 / 游戏客户端 | `GameApi`、`SceneScriptRuntime`、零拷贝 ECS 原生列、`ResourceRegistry`、`GameplayHost`、`RSGS` 状态编解码、`ReflectionRegistry`、`ModHost` |
 
 ### 1.1 源码子目录接入与 SDK 安装包接入
 
@@ -31,9 +30,12 @@ add_subdirectory(external/RealScript)
 
 # 方式 B：使用 cmake --install 导出的预编译 SDK
 # find_package(RealScript 0.98 CONFIG REQUIRED)
+# 若需游戏场景 / ECS / Gameplay SDK（L2），同时引入配套 RealScript-GamePack：
+# find_package(RealScriptGamePack 0.98 CONFIG REQUIRED)
 
 add_executable(MyEngineEditor src/editor_main.cpp)
 target_link_libraries(MyEngineEditor PRIVATE RealScript::Full)
+# 若使用 RealScript-GamePack，可链接 RealScript::GameSdk
 target_compile_features(MyEngineEditor PRIVATE cxx_std_17)
 ```
 
@@ -57,10 +59,11 @@ realscript_add_aot_library(
         scripts/ai_director.rscript
 )
 
+# 可按需启用 -DREALSCRIPT_SLIM_RUNTIME=ON 仅构建运行态产物（纯 L0 宿主可仅链接 RealScript::AotRuntime + RealScript::Runtime）
 add_executable(MyGameShippingClient src/shipping_main.cpp)
 target_link_libraries(MyGameShippingClient PRIVATE
     mygame_scripts_aot
-    RealScript::GameRuntime
+    RealScript::GameRuntime # 由配套 RealScriptGamePack 提供；纯 L0 宿主使用 RealScript::Runtime
     RealScript::AotSupport
 )
 ```
@@ -178,7 +181,7 @@ RealScript 在所有执行档位共享统一的 16 字节 `Value`（首偏移载
 
 ### 4.1 零外部依赖内存态 `StencilJit`（开发态 / 热更态 / 无外部编译器客户端）
 
-`StencilJit` 采用 `PROT_READ | PROT_WRITE` 写入后切换 `PROT_READ | PROT_EXEC` 的严格 `W^X` 封页机制，在约 50 微秒内将字节码直接编译为原生 `x86_64` 机器码（非 `x86_64` 架构自动回退至直接线索化模板，不支持原生化的宿主调用/异常函数按函数粒度无缝回退至解释器）：
+`StencilJit` 采用严格 `W^X` 封页机制（写入 `PROT_READ | PROT_WRITE` 后切换为 `PROT_READ | PROT_EXEC` / macOS `MAP_JIT`），直接生成原生 `x86_64`（SysV/Win64）与 `ARM64` 机器码模板（不支持的指令或宿主边界自动回退至直接线索化模板或解释器，并通过 `compiled.module->functionDiagnostics()` 报告精确的回退原因）。`StencilJit` 与 `AotRuntime` 均已接入主动增量 GC 安全点与 `ProfileCollector` 采样归因；离线 AOT 侧亦可通过 `rsaot --opt-remarks` / `--opt-remarks-json <file>` 审计内联、SROA 与向量化决策：
 
 ```cpp
 #include "realscript/jit/Jit.h"
@@ -189,12 +192,17 @@ void runWithInMemoryStencilJit(
     std::shared_ptr<const realscript::runtime::BindingRegistry> bindings) {
     realscript::jit::StencilJit jit;
     realscript::jit::StencilJitOptions jitOpts;
-    jitOpts.enableNativeCodegen = true;   // 启用 x86_64 W^X 原生机器码生成
+    jitOpts.enableNativeCodegen = true;   // 启用 x86_64 / ARM64 W^X 原生机器码模板生成
     jitOpts.enableThreadedFallback = true;
 
     auto compiled = jit.compile(program, jitOpts);
     if (!compiled.succeeded()) {
         return;
+    }
+
+    // 检查各函数分档与回退原因（NativeMachineCode / ThreadedStencils / InterpreterFallback）
+    for (const auto& diag : compiled.module->functionDiagnostics()) {
+        (void)diag;
     }
 
     compiled.module->setHeap(heap);
@@ -209,7 +217,7 @@ void runWithInMemoryStencilJit(
 
 ### 4.2 确定性多核无锁数据并行 `ParallelJobScheduler`
 
-针对寻路代价场、群体避障（Boids）、伤害结算与粒子模拟等数据密集型逻辑，`ParallelJobScheduler` 在分发前静态验证整个调用图无堆分配、无静态写、无动态多态与无跨参数别名，随后进入 `ManagedHeap::ParallelLockFreeScope` 零锁并发执行，并按分片编号 `0 .. numBatches - 1` 固定顺序归约，确保 `1`、`4`、`8` 或任意线程数在 `DeterminismMode::Strict` 下结果与摘要逐位一致：
+针对寻路代价场、群体避障（Boids）、伤害结算与粒子模拟等数据密集型逻辑，`ParallelJobScheduler` 在分发前静态验证整个调用图无堆分配、无静态写、无动态多态与无跨参数别名，随后进入 `ManagedHeap::ParallelLockFreeScope` 零锁并发执行（在 `StencilJit` 与 `AotRuntime` 上还可直接编译/分派原生批处理核 `buildParallelBatchKernel`，避免逐元素回切解释器），并按分片编号 `0 .. numBatches - 1` 固定顺序归约，确保 `1`、`4`、`8` 或任意线程数在 `DeterminismMode::Strict` 下结果与摘要逐位一致：
 
 ```csharp
 // 脚本侧核函数（simulation_jobs.rscript）
@@ -314,7 +322,7 @@ RealScript 严格区分两条异步轨道以避免帧同步回滚污染：
 
 ### 6.1 内嵌 DAP 调试服务器与零分配环形帧遥测（`FrameTelemetryCollector`）
 
-在引擎进程内启动 `EmbeddedDapServer` 并绑定 `FiberScheduler` 与 `FrameTelemetryCollector`，VS Code 插件（`tools/vscode-realscript`）附加后不仅支持无副作用纯 Getter Watch/Hover 求值与条件断点，还能直接查看成百上千个挂起 Fiber 的虚拟线程调用栈与源码行号，并实时接收每帧耗时热点推送：
+在引擎进程内可使用 `EmbeddedDapServer` 启动后台 TCP 调试监听（供 VS Code 插件 `tools/vscode-realscript` 通过 TCP Attach 进行无副作用纯 Getter Watch/Hover 求值与条件断点调试），也可通过 `DapServer` 绑定 `FiberScheduler` 与 `FrameTelemetryCollector`，查看成百上千个挂起 Fiber 的虚拟线程调用栈、每帧耗时热点，以及零堆分配采集的 `topAllocations`（`GC.Alloc` 字节/次数、`sourceFile` 与 `line`）：
 
 ```cpp
 #include "realscript/debug/DapServer.h"
@@ -328,11 +336,16 @@ public:
         std::shared_ptr<realscript::debug::DebugSession> debugSession,
         const realscript::runtime::FiberScheduler* fibers,
         const realscript::runtime::CompiledFiberModule* fiberMod) {
-        dapServer_ = std::make_unique<realscript::debug::EmbeddedDapServer>(
-            program, heap, debugSession);
-        dapServer_->server().bindFiberScheduler(fibers, fiberMod);
-        dapServer_->server().bindFrameTelemetry(&telemetry_);
-        dapServer_->start(/*port=*/4711); // VS Code 可直接通过 TCP 4711 端口 Attach
+        // 方式 1：使用 DapServer 绑定 Fiber 虚线程调度与帧遥测（支持 buildFrameTelemetryReport 或 serveTcp/run）
+        dapServer_ = std::make_unique<realscript::debug::DapServer>(
+            debugSession, program, heap);
+        dapServer_->bindFiberScheduler(fibers, fiberMod);
+        dapServer_->bindFrameTelemetry(&telemetry_);
+
+        // 方式 2：使用后台 TCP EmbeddedDapServer 直接接收 IDE Attach（端口 4711）
+        embeddedDap_ = std::make_unique<realscript::debug::EmbeddedDapServer>(
+            program, heap);
+        embeddedDap_->start(/*port=*/4711);
     }
 
     void runFrame(
@@ -344,18 +357,19 @@ public:
             realscript::runtime::ActiveFrameTelemetryScope scope(&telemetry_);
             (void)engine.invoke("Game.Loop::OnFrameTick");
         }
-        // 零堆分配写入 128 帧 Seqlock 环形槽位，聚合 Top-8 热点函数、紧凑堆/装箱堆字节与 GC 切片耗时
+        // 零堆分配写入 128 帧 Seqlock 环形槽位，聚合 Top-8 耗时热点与 Top GC.Alloc 来源（含源码文件与行号）
         auto sample = telemetry_.endFrame(&engine.heap(), nullptr, fibers);
         (void)sample;
     }
 
 private:
     realscript::runtime::FrameTelemetryCollector telemetry_;
-    std::unique_ptr<realscript::debug::EmbeddedDapServer> dapServer_;
+    std::unique_ptr<realscript::debug::DapServer> dapServer_;
+    std::unique_ptr<realscript::debug::EmbeddedDapServer> embeddedDap_;
 };
 ```
 
-在 VS Code 调试控制台输入 `:telemetry` 可即时拉取最近帧剖析报表，调试流也会输出 `realscript/frameTelemetry` 实时事件。
+在 VS Code 调试控制台输入 `:telemetry`（或通过 `DapServer::buildFrameTelemetryReport()`）可即时拉取含 `topAllocations` 的最近帧剖析报表，调试流也会输出 `realscript/frameTelemetry` 实时事件；同时 `rslsp` 已支持 `textDocument/codeLens`（在源码函数上方直接展示 `"Typed AOT"` / `"Boxed AOT (<reason>) | GC.Alloc: N | K refs"` 内联提示）。
 
 ### 6.2 `realscript.project.json` 场景感知 LSP 与静态治理 Linter 配置
 
@@ -588,6 +602,8 @@ void integrateWorkshopMods(const std::vector<realscript::plugin::ModPackage>& pa
 
 ## 9. 引擎主循环全链路集成参考骨架
 
+> **仓库说明**：下述骨架同时使用了 `RealScript` L0/L1 能力（`AbiGovernance`、`StencilJit`、`EmbeddedDapServer`、`DapServer`、`HotReload`）以及配套 **L2 `RealScript-GamePack`** 提供的 `SceneScriptRuntime` 与 `ModHost`。
+
 下面给出将 **ABI 校验、核心场景运行时、内存态 `StencilJit`、帧遥测、内嵌 DAP 调试器、结构热重载与 `ModHost` 创意工坊沙箱** 串联进同一引擎生命周期的标准骨架：
 
 ```cpp
@@ -644,11 +660,13 @@ public:
             stencilModule_->setBindings(bindings_);
         }
 
-        // 4. 启动内嵌 TCP DAP 调试器并绑定无锁帧遥测
+        // 4. 启动内嵌 TCP DAP 调试器并绑定无锁帧遥测（EmbeddedDapServer + DapServer 报表）
         if (enableLiveDebugger) {
-            debugSession_ = std::make_shared<realscript::debug::DebugSession>(program, heap_);
-            dap_ = std::make_unique<realscript::debug::EmbeddedDapServer>(program, heap_, debugSession_);
-            dap_->server().bindFrameTelemetry(&telemetry_);
+            dap_ = std::make_unique<realscript::debug::EmbeddedDapServer>(program, heap_);
+            debugSession_ = dap_->session();
+            dapReportServer_ = std::make_unique<realscript::debug::DapServer>(
+                debugSession_, program, heap_);
+            dapReportServer_->bindFrameTelemetry(&telemetry_);
             dap_->start(4711);
         }
 
@@ -697,6 +715,7 @@ private:
     std::shared_ptr<realscript::jit::StencilModule> stencilModule_;
     realscript::runtime::FrameTelemetryCollector telemetry_;
     std::shared_ptr<realscript::debug::DebugSession> debugSession_;
+    std::unique_ptr<realscript::debug::DapServer> dapReportServer_;
     std::unique_ptr<realscript::debug::EmbeddedDapServer> dap_;
     std::unique_ptr<realscript::plugin::ModHost> modHost_;
 };

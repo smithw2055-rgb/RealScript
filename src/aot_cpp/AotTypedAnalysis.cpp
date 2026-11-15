@@ -397,11 +397,11 @@ namespace {
 
 } // namespace
 
-bool supportsTypedPrimitiveAot(
+std::string explainTypedPrimitiveAotIneligibility(
     const mir::Function& function,
     const std::unordered_set<semantic::SymbolId>& customStructs) {
     if (!function.exceptionHandlers.empty()) {
-        return false;
+        return "contains try/catch exception handlers";
     }
     const bool isAsyncFunction = !function.blocks.empty() &&
         !function.blocks.front().instructions.empty() &&
@@ -411,12 +411,13 @@ bool supportsTypedPrimitiveAot(
         if (function.returnType != semantic::PrimitiveType::Struct ||
             customStructs.find(function.returnTypeId) == customStructs.end() ||
             !isBuiltinAsyncAwaitableType(enterInst.symbolName, function.returnTypeId)) {
-            return false;
+            return "unsupported async awaitable return type";
         }
     }
     if (function.returnType != semantic::PrimitiveType::Void &&
         !isTypedAotSlot({function.returnType, function.returnTypeId}, &customStructs)) {
-        return false;
+        return "unsupported return type: " +
+            std::string(semantic::primitiveTypeName(function.returnType));
     }
     bool usesReferenceSlots =
         function.returnType == semantic::PrimitiveType::Object ||
@@ -427,7 +428,8 @@ bool supportsTypedPrimitiveAot(
             ? function.parameterTypeIds[index]
             : 0;
         if (!isTypedAotSlot({function.parameterTypes[index], typeId}, &customStructs)) {
-            return false;
+            return "unsupported parameter #" + std::to_string(index) + " type: " +
+                semantic::primitiveTypeName(function.parameterTypes[index]);
         }
         if (function.parameterTypes[index] == semantic::PrimitiveType::Object ||
             function.parameterTypes[index] == semantic::PrimitiveType::Array ||
@@ -440,7 +442,8 @@ bool supportsTypedPrimitiveAot(
             ? function.localTypeIds[index]
             : 0;
         if (!isTypedAotSlot({function.localTypes[index], typeId}, &customStructs)) {
-            return false;
+            return "unsupported local #" + std::to_string(index) + " type: " +
+                semantic::primitiveTypeName(function.localTypes[index]);
         }
         if (function.localTypes[index] == semantic::PrimitiveType::Object ||
             function.localTypes[index] == semantic::PrimitiveType::Array ||
@@ -453,7 +456,8 @@ bool supportsTypedPrimitiveAot(
         if (slot.primitive != semantic::PrimitiveType::Error &&
             slot.primitive != semantic::PrimitiveType::Void &&
             !isTypedAotSlot(slot, &customStructs)) {
-            return false;
+            return "unsupported temporary slot type: " +
+                std::string(semantic::primitiveTypeName(slot.primitive));
         }
         if (slot.primitive == semantic::PrimitiveType::Object ||
             slot.primitive == semantic::PrimitiveType::Array ||
@@ -526,7 +530,7 @@ bool supportsTypedPrimitiveAot(
                 if (instruction.resultType != semantic::PrimitiveType::Object ||
                     objTid == 0 ||
                     !isTypedAotSlot({semantic::PrimitiveType::Object, objTid}, &customStructs)) {
-                    return false;
+                    return "unsupported NewObject type in typed lowering";
                 }
                 break;
             }
@@ -536,57 +540,61 @@ bool supportsTypedPrimitiveAot(
                     instruction.elementType != semantic::PrimitiveType::Object ||
                     instruction.elementTypeId == 0 ||
                     operandSlot(instruction, 0).primitive != semantic::PrimitiveType::Object) {
-                    return false;
+                    return "unsupported IsType/AsType operand";
                 }
                 if (instruction.opcode == mir::Opcode::IsType &&
                     instruction.resultType != semantic::PrimitiveType::Bool) {
-                    return false;
+                    return "unsupported IsType result type";
                 }
                 if (instruction.opcode == mir::Opcode::AsType &&
                     instruction.resultType != semantic::PrimitiveType::Object) {
-                    return false;
+                    return "unsupported AsType result type";
                 }
                 break;
             }
             case mir::Opcode::LoadField:
                 if (!isTypedAotSlot({instruction.resultType, instruction.resultTypeId}, &customStructs)) {
-                    return false;
+                    return "unsupported LoadField type in typed lowering";
                 }
                 break;
             case mir::Opcode::StoreField:
                 if (instruction.operands.size() < 2 ||
                     !isTypedAotSlot(operandSlot(instruction, 1), &customStructs)) {
-                    return false;
+                    return "unsupported StoreField value type in typed lowering";
                 }
                 break;
             case mir::Opcode::NewArray:
                 if (instruction.operands.size() != 1 ||
                     operandSlot(instruction, 0).primitive != semantic::PrimitiveType::Int ||
                     !isTypedAotSlot({instruction.elementType, instruction.elementTypeId}, &customStructs)) {
-                    return false;
+                    return "unsupported NewArray element or length type";
                 }
                 break;
             case mir::Opcode::LoadElement:
                 if (operandSlot(instruction, 1).primitive != semantic::PrimitiveType::Int ||
                     !isTypedAotSlot({instruction.elementType, instruction.elementTypeId}, &customStructs)) {
-                    return false;
+                    return "unsupported LoadElement index or element type";
                 }
                 break;
             case mir::Opcode::StoreElement:
                 if (operandSlot(instruction, 1).primitive != semantic::PrimitiveType::Int ||
                     !isTypedAotSlot({instruction.elementType, instruction.elementTypeId}, &customStructs) ||
                     !isTypedAotSlot(operandSlot(instruction, 2), &customStructs)) {
-                    return false;
+                    return "unsupported StoreElement index or element type";
                 }
                 break;
             case mir::Opcode::LogicalNot:
                 if (operandSlot(instruction, 0).primitive !=
-                    semantic::PrimitiveType::Bool) return false;
+                    semantic::PrimitiveType::Bool) {
+                    return "unsupported LogicalNot operand";
+                }
                 break;
             case mir::Opcode::Equal:
             case mir::Opcode::NotEqual:
                 if (operandSlot(instruction, 0) !=
-                    operandSlot(instruction, 1)) return false;
+                    operandSlot(instruction, 1)) {
+                    return "mismatched equality operand types";
+                }
                 break;
             case mir::Opcode::NewStruct: {
                 const auto typeId = instruction.resultTypeId != 0
@@ -595,7 +603,7 @@ bool supportsTypedPrimitiveAot(
                 if (classifyInlineMath(semantic::PrimitiveType::Struct, typeId) ==
                         InlineMathKind::None &&
                     customStructs.find(typeId) == customStructs.end()) {
-                    return false;
+                    return "unsupported non-unboxable struct in NewStruct";
                 }
                 break;
             }
@@ -605,22 +613,22 @@ bool supportsTypedPrimitiveAot(
                     semantic::PrimitiveType::Struct, instruction.typeId);
                 if (kind != InlineMathKind::None) {
                     if (inlineMathFieldMember(kind, instruction.fieldIndex) == nullptr) {
-                        return false;
+                        return "unsupported inline math struct field index";
                     }
                 } else if (customStructs.find(instruction.typeId) == customStructs.end() ||
                            instruction.fieldIndex >= 256) {
-                    return false;
+                    return "unsupported non-unboxable struct field access";
                 }
                 break;
             }
             case mir::Opcode::AsyncEnter:
-                if (!isAsyncFunction) return false;
+                if (!isAsyncFunction) return "unexpected AsyncEnter instruction";
                 break;
             case mir::Opcode::AwaitSuspend: {
                 if (!isAsyncFunction ||
                     instruction.operands.size() != 1 ||
                     instruction.localIndex >= function.localTypes.size()) {
-                    return false;
+                    return "unsupported AwaitSuspend layout";
                 }
                 const auto opSlot = operandSlot(instruction, 0);
                 const auto locTid = instruction.localIndex < function.localTypeIds.size()
@@ -631,7 +639,7 @@ bool supportsTypedPrimitiveAot(
                     function.localTypes[instruction.localIndex] != semantic::PrimitiveType::Struct ||
                     locTid != opSlot.typeId ||
                     !isBuiltinAsyncAwaitableType(instruction.symbolName, opSlot.typeId)) {
-                    return false;
+                    return "unsupported AwaitSuspend awaitable type";
                 }
                 break;
             }
@@ -639,19 +647,19 @@ bool supportsTypedPrimitiveAot(
                 if (!isAsyncFunction ||
                     instruction.localIndex >= function.localTypes.size() ||
                     function.localTypes[instruction.localIndex] != semantic::PrimitiveType::Struct) {
-                    return false;
+                    return "unsupported AwaitResume state slot";
                 }
                 const auto locTid = instruction.localIndex < function.localTypeIds.size()
                     ? function.localTypeIds[instruction.localIndex]
                     : 0;
                 if (customStructs.find(locTid) == customStructs.end() ||
                     !isBuiltinAsyncAwaitableType(instruction.symbolName, locTid)) {
-                    return false;
+                    return "unsupported AwaitResume awaitable type";
                 }
                 if (instruction.result >= 0 &&
                     instruction.elementType != semantic::PrimitiveType::Void &&
                     !isTypedAotSlot({instruction.elementType, instruction.elementTypeId}, &customStructs)) {
-                    return false;
+                    return "unsupported AwaitResume result type";
                 }
                 break;
             }
@@ -662,17 +670,17 @@ bool supportsTypedPrimitiveAot(
                     customStructs.find(instruction.typeId) == customStructs.end() ||
                     !isBuiltinAsyncAwaitableType(instruction.symbolName, instruction.typeId) ||
                     instruction.operands.size() > 1) {
-                    return false;
+                    return "unsupported AsyncResolve return layout";
                 }
                 if (instruction.operands.size() == 1 &&
                     !isTypedAotSlot(operandSlot(instruction, 0), &customStructs)) {
-                    return false;
+                    return "unsupported AsyncResolve payload type";
                 }
                 break;
             }
             case mir::Opcode::Call: {
                 if (instruction.virtualDispatch && instruction.interfaceDispatch) {
-                    return false;
+                    return "ambiguous virtual and interface call dispatch";
                 }
                 const std::string_view symName(instruction.symbolName);
                 const bool isEcsIntrinsic =
@@ -705,7 +713,7 @@ bool supportsTypedPrimitiveAot(
                         if (hasPolyOrLoopInFn) break;
                     }
                     if (!hasPolyOrLoopInFn) {
-                        return false;
+                        return "single-block reference call uses boxed bridge";
                     }
                 }
                 if (!symName.empty() &&
@@ -713,14 +721,14 @@ bool supportsTypedPrimitiveAot(
                     !isEcsIntrinsic &&
                     !isAsyncIntrinsic &&
                     !isStringOrCoreIntrinsic) {
-                    return false;
+                    return "unsupported runtime intrinsic call: " + instruction.symbolName;
                 }
                 if (instruction.resultType != semantic::PrimitiveType::Void &&
                     !isTypedAotSlot({instruction.resultType, instruction.resultTypeId}, &customStructs)) {
-                    return false;
+                    return "unsupported call return type in typed lowering";
                 }
                 if (instruction.operands.size() != instruction.parameterTypes.size()) {
-                    return false;
+                    return "call arity mismatch";
                 }
                 for (std::size_t index = 0; index < instruction.operands.size(); ++index) {
                     const auto paramTypeId = index < instruction.parameterTypeIds.size()
@@ -731,7 +739,7 @@ bool supportsTypedPrimitiveAot(
                         paramTypeId,
                     };
                     if (!isTypedAotSlot(expectedSlot, &customStructs)) {
-                        return false;
+                        return "unsupported call parameter type in typed lowering";
                     }
                     const auto actualOpSlot = operandSlot(instruction, index);
                     if (expectedSlot.primitive == semantic::PrimitiveType::Object ||
@@ -739,10 +747,10 @@ bool supportsTypedPrimitiveAot(
                         expectedSlot.primitive == semantic::PrimitiveType::String) {
                         if (actualOpSlot.primitive != expectedSlot.primitive &&
                             actualOpSlot.primitive != semantic::PrimitiveType::Null) {
-                            return false;
+                            return "call reference argument type mismatch";
                         }
                     } else if (actualOpSlot != expectedSlot) {
-                        return false;
+                        return "call value argument type mismatch";
                     }
                 }
                 break;
@@ -752,16 +760,16 @@ bool supportsTypedPrimitiveAot(
                     instruction.typeId == 0 ||
                     instruction.operands.size() > 1 ||
                     (instruction.virtualDispatch && instruction.interfaceDispatch)) {
-                    return false;
+                    return "unsupported NewDelegate signature";
                 }
                 if (instruction.operands.size() == 1) {
                     const auto recvSlot = operandSlot(instruction, 0);
                     if (recvSlot.primitive != semantic::PrimitiveType::Object &&
                         recvSlot.primitive != semantic::PrimitiveType::Null) {
-                        return false;
+                        return "unsupported NewDelegate receiver type";
                     }
                 } else if (instruction.virtualDispatch || instruction.interfaceDispatch) {
-                    return false;
+                    return "virtual static NewDelegate unsupported";
                 }
                 break;
             }
@@ -770,7 +778,7 @@ bool supportsTypedPrimitiveAot(
                 if (instruction.resultType != semantic::PrimitiveType::Object ||
                     instruction.typeId == 0 ||
                     instruction.operands.size() != 2) {
-                    return false;
+                    return "unsupported delegate combine/remove signature";
                 }
                 const auto lSlot = operandSlot(instruction, 0);
                 const auto rSlot = operandSlot(instruction, 1);
@@ -778,32 +786,33 @@ bool supportsTypedPrimitiveAot(
                      lSlot.primitive != semantic::PrimitiveType::Null) ||
                     (rSlot.primitive != semantic::PrimitiveType::Object &&
                      rSlot.primitive != semantic::PrimitiveType::Null)) {
-                    return false;
+                    return "unsupported delegate combine/remove operand";
                 }
                 break;
             }
             case mir::Opcode::InvokeDelegate: {
                 if (instruction.typeId == 0 || instruction.operands.empty()) {
-                    return false;
+                    return "unsupported InvokeDelegate target";
                 }
                 const auto delSlot = operandSlot(instruction, 0);
                 if (delSlot.primitive != semantic::PrimitiveType::Object &&
                     delSlot.primitive != semantic::PrimitiveType::Null) {
-                    return false;
+                    return "unsupported InvokeDelegate operand";
                 }
                 if (instruction.resultType != semantic::PrimitiveType::Void &&
                     !isTypedAotSlot({instruction.resultType, instruction.resultTypeId}, &customStructs)) {
-                    return false;
+                    return "unsupported InvokeDelegate return type";
                 }
                 for (std::size_t idx = 1; idx < instruction.operands.size(); ++idx) {
                     if (!isTypedAotSlot(operandSlot(instruction, idx), &customStructs)) {
-                        return false;
+                        return "unsupported InvokeDelegate argument type";
                     }
                 }
                 break;
             }
             default:
-                return false;
+                return std::string("unsupported MIR opcode: ") +
+                    mir::opcodeName(instruction.opcode);
             }
         }
         switch (block.terminator.kind) {
@@ -814,10 +823,116 @@ bool supportsTypedPrimitiveAot(
             break;
         case mir::TerminatorKind::Throw:
         case mir::TerminatorKind::None:
-            return false;
+            return "uses throw or unterminated block terminator";
         }
     }
-    return true;
+    return {};
+}
+
+bool supportsTypedPrimitiveAot(
+    const mir::Function& function,
+    const std::unordered_set<semantic::SymbolId>& customStructs) {
+    return explainTypedPrimitiveAotIneligibility(function, customStructs).empty();
+}
+
+void resolveRemarkLocation(
+    const mir::Module& module,
+    const mir::Function& function,
+    std::optional<mir::BlockId> blockId,
+    std::optional<std::uint32_t> instructionIndex,
+    text::TextSpan span,
+    std::string& outSourceFile,
+    std::uint32_t& outLine,
+    std::uint32_t& outColumn) {
+    outSourceFile.clear();
+    outLine = 0;
+    outColumn = 0;
+    if (blockId.has_value() && instructionIndex.has_value()) {
+        if (const auto pt = resolveSequencePoint(
+                module, function, *blockId, *instructionIndex, false, span)) {
+            if (const auto* sf = findSource(module, pt->range.fileId)) {
+                outSourceFile = sf->path;
+                outLine = static_cast<std::uint32_t>(pt->range.start.line) + 1u;
+                outColumn = static_cast<std::uint32_t>(pt->range.start.column) + 1u;
+                return;
+            }
+        }
+    }
+    if (!span.empty()) {
+        if (const auto* sf = findFunctionSource(module, function)) {
+            const auto pos = debug::linePosition(*sf, span.start);
+            outSourceFile = sf->path;
+            outLine = static_cast<std::uint32_t>(pos.line) + 1u;
+            outColumn = static_cast<std::uint32_t>(pos.column) + 1u;
+            return;
+        }
+    }
+    if (function.debugInfo.declaration.valid()) {
+        if (const auto* sf = findSource(module, function.debugInfo.declaration.fileId)) {
+            outSourceFile = sf->path;
+            outLine = static_cast<std::uint32_t>(function.debugInfo.declaration.start.line) + 1u;
+            outColumn = static_cast<std::uint32_t>(function.debugInfo.declaration.start.column) + 1u;
+        }
+    }
+}
+
+void appendAllocationRemark(
+    std::vector<OptimizationRemark>& remarks,
+    const mir::Module& module,
+    const mir::Function& function,
+    const std::string& qualifiedName,
+    mir::BlockId blockId,
+    std::uint32_t instructionIndex,
+    const mir::Instruction& instruction,
+    bool isNonEscapingObject) {
+    OptimizationRemarkKind kind = OptimizationRemarkKind::Analysis;
+    const char* pass = "gc-alloc";
+    const char* message = nullptr;
+    switch (instruction.opcode) {
+    case mir::Opcode::NewObject:
+        if (isNonEscapingObject) {
+            kind = OptimizationRemarkKind::Passed;
+            pass = "escape-analysis";
+            message = "stack-allocated non-escaping object";
+        } else {
+            message = "managed heap object allocation";
+        }
+        break;
+    case mir::Opcode::NewArray:
+        message = "managed heap array allocation";
+        break;
+    case mir::Opcode::ConstantString:
+        message = "managed string literal allocation";
+        break;
+    case mir::Opcode::NewDelegate:
+        message = "managed delegate allocation";
+        break;
+    case mir::Opcode::CombineDelegate:
+        message = "managed delegate combine allocation";
+        break;
+    case mir::Opcode::RemoveDelegate:
+        message = "managed delegate remove allocation";
+        break;
+    default:
+        return;
+    }
+
+    OptimizationRemark remark;
+    remark.kind = kind;
+    remark.pass = pass;
+    remark.functionSymbolId = function.symbolId;
+    remark.functionName = qualifiedName;
+    remark.message = message;
+    resolveRemarkLocation(
+        module,
+        function,
+        blockId,
+        instructionIndex,
+        instruction.sourceSpan,
+        remark.sourceFile,
+        remark.line,
+        remark.column);
+    remarks.push_back(std::move(remark));
 }
 
 std::string typedCppType(TypedSlotType slot) {

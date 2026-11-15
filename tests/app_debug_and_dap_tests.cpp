@@ -709,15 +709,16 @@ void testFiberIntrospectionAndZeroAllocTelemetry() {
     g_heapAllocCount.store(0, std::memory_order_relaxed);
     g_countHeapAllocs.store(true, std::memory_order_release);
     for (std::uint64_t frame = 1; frame <= 8; ++frame) {
-        runtime::FrameTelemetrySample sample{};
-        sample.frameNumber = frame;
-        sample.totalInstructions = frame * 100u;
-        sample.hotFunctionCount = 1;
-        sample.topFunctions[0] = runtime::HotFunctionTelemetry{1u, frame * 100u, 1.0};
-        telemetry.commitSample(sample);
+        telemetry.beginFrame(frame);
+        telemetry.recordFunctionInstructions(1u, frame * 100u);
+        telemetry.recordAllocation(1u, 12u, runtime::ObjectKind::Record, 64u);
+        (void)telemetry.endFrame(nullptr);
         runtime::FrameTelemetrySample latest{};
         RS_CHECK(telemetry.latestSample(latest));
         RS_CHECK(latest.frameNumber == frame);
+        RS_CHECK(latest.frameAllocCount == 1u);
+        RS_CHECK(latest.frameAllocBytes == 64u);
+        RS_CHECK(latest.hotAllocationCount == 1u);
     }
     g_countHeapAllocs.store(false, std::memory_order_release);
     RS_CHECK(g_heapAllocCount.load(std::memory_order_relaxed) == 0);
@@ -859,6 +860,101 @@ public int makeAndCompute()
     std::cout << "[PASS] EmbeddedDapServer TCP attach, loopback bind & live rebindProgram\n";
 }
 
+void testGcAllocAttributionAndDapTelemetry() {
+    const auto built = compileProgram({{
+        "alloc_attr.rscript",
+        R"(module Debug.AllocAttr;
+
+public class Node {
+    public int value = 0;
+    public Node(int v) {
+        value = v;
+    }
+}
+
+public int makeAndSum(string prefix, int count) {
+    Node n = new Node(count);
+    int[] arr = new int[4];
+    arr[0] = n.value;
+    string label = prefix + ":item";
+    return arr[0] + label.Length;
+}
+)",
+    }});
+
+    built.heap->setAllocationProfilingEnabled(true);
+    built.heap->clearAllocationProfile();
+
+    runtime::FrameTelemetryCollector telemetry;
+    runtime::ActiveFrameTelemetryScope telemetryScope(&telemetry);
+    telemetry.beginFrame(1u);
+
+    runtime::Interpreter interp(built.program, built.heap);
+    const auto strObj = built.heap->allocateString("hero");
+    RS_CHECK(strObj.has_value());
+    const auto res = interp.invoke(
+        "Debug.AllocAttr::makeAndSum",
+        {runtime::Value{*strObj}, runtime::Value{std::int64_t{7}}});
+    RS_CHECK(res.succeeded);
+    RS_CHECK(std::get<std::int64_t>(res.value) == 16);
+
+    const auto sample = telemetry.endFrame(built.heap.get());
+    RS_CHECK(sample.frameAllocCount >= 3u);
+    RS_CHECK(sample.frameAllocBytes > 0u);
+    RS_CHECK(sample.hotAllocationCount >= 1u);
+
+    const auto profileSnap = built.heap->allocationProfileSnapshot();
+    RS_CHECK(!profileSnap.empty());
+    const auto fnSymId = built.program->findFunction("Debug.AllocAttr::makeAndSum");
+    RS_CHECK(fnSymId.has_value());
+    bool sawFnRecord = false;
+    bool sawArrayOrObject = false;
+    for (const auto& rec : profileSnap) {
+        if (rec.functionId == *fnSymId && rec.allocationCount > 0u && rec.allocatedBytes > 0u) {
+            sawFnRecord = true;
+            if (rec.kind == runtime::ObjectKind::Record ||
+                rec.kind == runtime::ObjectKind::Array) {
+                sawArrayOrObject = true;
+            }
+        }
+    }
+    RS_CHECK(sawFnRecord && sawArrayOrObject);
+
+    debug::DapServer dap(built.program, built.heap);
+    dap.bindFrameTelemetry(&telemetry);
+    std::ostringstream out;
+    dap.emitFrameTelemetry(out);
+    const std::string emitted = out.str();
+    RS_CHECK(emitted.find("\"frameAllocCount\"") != std::string::npos);
+    RS_CHECK(emitted.find("\"frameAllocBytes\"") != std::string::npos);
+    RS_CHECK(emitted.find("\"topAllocations\"") != std::string::npos);
+    RS_CHECK(emitted.find("alloc_attr.rscript") != std::string::npos);
+
+    const auto report = dap.buildFrameTelemetryReport(4);
+    const auto* frames = report.find("frames");
+    RS_CHECK(frames && frames->isArray() && !frames->arrayValue().empty());
+    const auto* topAllocs = frames->arrayValue().back().find("topAllocations");
+    RS_CHECK(topAllocs && topAllocs->isArray() && !topAllocs->arrayValue().empty());
+    bool sawResolvedLine = false;
+    for (const auto& entry : topAllocs->arrayValue()) {
+        const auto* sf = entry.find("sourceFile");
+        const auto* ln = entry.find("line");
+        const auto* cnt = entry.find("count");
+        const auto* bytes = entry.find("bytes");
+        const auto* kind = entry.find("kind");
+        RS_CHECK(cnt && cnt->integerValue(0) > 0);
+        RS_CHECK(bytes && bytes->integerValue(0) > 0);
+        RS_CHECK(kind && !kind->stringValue().empty());
+        if (sf && sf->stringValue().find("alloc_attr.rscript") != std::string::npos &&
+            ln && ln->integerValue(0) > 0) {
+            sawResolvedLine = true;
+        }
+    }
+    RS_CHECK(sawResolvedLine);
+
+    std::cout << "[PASS] GC.Alloc per-site attribution & DAP topAllocations telemetry\n";
+}
+
 } // namespace
 
 int main() {
@@ -869,6 +965,7 @@ int main() {
     testConditionalBreakpointsEvalSandboxAndExceptions();
     testFiberIntrospectionAndZeroAllocTelemetry();
     testEmbeddedDapSocketAttachAndHotReloadRebind();
+    testGcAllocAttributionAndDapTelemetry();
     std::cout << "All app_debug_and_dap_tests passed!\n";
     return 0;
 }

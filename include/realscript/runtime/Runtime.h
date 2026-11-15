@@ -3025,6 +3025,18 @@ public:
         const ShadowStack* shadowStack = nullptr) const;
     [[nodiscard]] std::string leakSummary() const;
 
+    struct AllocationSiteRecord {
+        semantic::SymbolId functionId = 0;
+        std::uint32_t instructionOffset = 0;
+        ObjectKind kind = ObjectKind::Record;
+        std::uint64_t allocationCount = 0;
+        std::uint64_t allocatedBytes = 0;
+    };
+    void setAllocationProfilingEnabled(bool enabled) noexcept;
+    [[nodiscard]] bool allocationProfilingEnabled() const noexcept;
+    void clearAllocationProfile() noexcept;
+    [[nodiscard]] std::vector<AllocationSiteRecord> allocationProfileSnapshot() const;
+
     // P2-C: Lock-free parallel read & disjoint PackedArray shard epoch
     void enterParallelLockFreeRegion() noexcept;
     void leaveParallelLockFreeRegion() noexcept;
@@ -3429,20 +3441,90 @@ class ProgramImage;
 class AsyncRuntimeContext;
 class FiberScheduler;
 
+[[nodiscard]] constexpr const char* objectKindName(ObjectKind kind) noexcept {
+    switch (kind) {
+    case ObjectKind::String: return "String";
+    case ObjectKind::Array: return "Array";
+    case ObjectKind::Record: return "Record";
+    }
+    return "Unknown";
+}
+
+struct ScriptAllocationSite {
+    semantic::SymbolId functionId = 0;
+    std::uint32_t instructionOffset = 0;
+};
+
+[[nodiscard]] constexpr std::uint32_t packAllocationSiteOffset(
+    std::uint32_t blockIndex,
+    std::uint32_t instructionIndexInBlock) noexcept {
+    return ((blockIndex + 1u) << 16u) | (instructionIndexInBlock & 0xFFFFu);
+}
+
+[[nodiscard]] constexpr bool unpackAllocationSiteOffset(
+    std::uint32_t encoded,
+    std::uint32_t& outBlockIndex,
+    std::uint32_t& outInstructionIndexInBlock) noexcept {
+    if ((encoded >> 16u) == 0u) {
+        outBlockIndex = 0u;
+        outInstructionIndexInBlock = encoded;
+        return false;
+    }
+    outBlockIndex = (encoded >> 16u) - 1u;
+    outInstructionIndexInBlock = encoded & 0xFFFFu;
+    return true;
+}
+
+void bindActiveAllocationSite(ScriptAllocationSite site) noexcept;
+[[nodiscard]] ScriptAllocationSite activeAllocationSite() noexcept;
+
+class ScopedAllocationSite {
+public:
+    explicit ScopedAllocationSite(ScriptAllocationSite site) noexcept
+        : previous_(activeAllocationSite()) {
+        bindActiveAllocationSite(site);
+    }
+    ScopedAllocationSite(
+        semantic::SymbolId functionId,
+        std::uint32_t instructionOffset = 0) noexcept
+        : ScopedAllocationSite(ScriptAllocationSite{functionId, instructionOffset}) {}
+    ~ScopedAllocationSite() noexcept {
+        bindActiveAllocationSite(previous_);
+    }
+    ScopedAllocationSite(const ScopedAllocationSite&) = delete;
+    ScopedAllocationSite& operator=(const ScopedAllocationSite&) = delete;
+
+private:
+    ScriptAllocationSite previous_{};
+};
+
 struct HotFunctionTelemetry {
     semantic::SymbolId symbolId = 0;
     std::uint64_t instructions = 0;
     double instructionShare = 0.0;
 };
 
+struct HotAllocationTelemetry {
+    semantic::SymbolId symbolId = 0;
+    std::uint32_t instructionOffset = 0;
+    ObjectKind kind = ObjectKind::String;
+    std::uint32_t allocationCount = 0;
+    std::uint64_t allocatedBytes = 0;
+};
+
 struct FrameTelemetrySample {
     static constexpr std::size_t kMaxHotFunctions = 8;
+    static constexpr std::size_t kMaxHotAllocations = 8;
 
     std::uint64_t frameNumber = 0;
     std::uint64_t totalInstructions = 0;
     std::uint64_t fiberInstructions = 0;
     std::uint8_t hotFunctionCount = 0;
     std::array<HotFunctionTelemetry, kMaxHotFunctions> topFunctions{};
+    std::uint64_t frameAllocCount = 0;
+    std::uint64_t frameAllocBytes = 0;
+    std::uint8_t hotAllocationCount = 0;
+    std::array<HotAllocationTelemetry, kMaxHotAllocations> topAllocations{};
     std::size_t compactHeapLiveBytes = 0;
     std::size_t boxedHeapLiveBytes = 0;
     std::uint64_t gcSliceNanoseconds = 0;
@@ -3471,6 +3553,11 @@ public:
     void recordFunctionInstructions(
         semantic::SymbolId symbolId,
         std::uint64_t instructions) noexcept;
+    void recordAllocation(
+        semantic::SymbolId symbolId,
+        std::uint32_t instructionOffset,
+        ObjectKind kind,
+        std::size_t sizeBytes) noexcept;
     void recordFiberStep(
         std::uint64_t fiberInstructions,
         std::uint32_t activeFibers) noexcept;
@@ -3508,6 +3595,15 @@ private:
         std::uint64_t instructions = 0;
     };
 
+    struct AllocBucket {
+        semantic::SymbolId symbolId = 0;
+        std::uint32_t instructionOffset = 0;
+        ObjectKind kind = ObjectKind::String;
+        std::uint32_t allocationCount = 0;
+        std::uint64_t allocatedBytes = 0;
+        bool occupied = false;
+    };
+
     struct alignas(64) RingSlot {
         std::atomic<std::uint64_t> version{0};
         FrameTelemetrySample sample{};
@@ -3525,6 +3621,8 @@ private:
     std::uint64_t currentTotalInstructions_ = 0;
     std::uint64_t currentFiberInstructions_ = 0;
     std::uint64_t currentGcSliceNs_ = 0;
+    std::uint64_t currentAllocCount_ = 0;
+    std::uint64_t currentAllocBytes_ = 0;
     std::size_t explicitCompactBytes_ = 0;
     std::size_t explicitBoxedBytes_ = 0;
     bool hasExplicitHeapBytes_ = false;
@@ -3534,6 +3632,10 @@ private:
     std::array<FuncBucket, kAccumulatorBuckets> activeBuckets_{};
     std::array<std::uint8_t, kAccumulatorBuckets> touchedBuckets_{};
     std::size_t touchedCount_ = 0;
+
+    std::array<AllocBucket, kAccumulatorBuckets> activeAllocBuckets_{};
+    std::array<std::uint8_t, kAccumulatorBuckets> touchedAllocBuckets_{};
+    std::size_t touchedAllocCount_ = 0;
 
     std::array<ObjectRef, kTrackedCompactCapacity> trackedCompactRefs_{};
     std::size_t trackedCompactCount_ = 0;
@@ -3694,6 +3796,18 @@ class ProgramImage;
 class AsyncRuntimeContext;
 class FiberScheduler;
 
+enum class ParallelKernelKind : std::uint8_t;
+struct ParallelNativeColumnBinding;
+struct ParallelNativeBatchContext;
+struct ParallelJobConfig;
+using ParallelNativeBatchKernel = std::function<bool(ParallelNativeBatchContext&)>;
+using ParallelBatchKernelFactory = std::function<ParallelNativeBatchKernel(
+    semantic::SymbolId symbolId,
+    ParallelKernelKind kernelKind,
+    const std::vector<ParallelNativeColumnBinding>& paramColumns,
+    const ParallelJobConfig& config,
+    bool usesParallelPrng)>;
+
 namespace detail {
 struct ExecutionMirror;
 [[nodiscard]] const ExecutionMirror& executionMirror(
@@ -3737,6 +3851,14 @@ public:
         semantic::SymbolId typeId) const noexcept;
     [[nodiscard]] std::optional<FrameStructAllocationStats> functionStructFrameStats(
         const std::string& qualifiedName) const;
+
+    void setParallelBatchKernelFactory(ParallelBatchKernelFactory factory) const;
+    [[nodiscard]] ParallelNativeBatchKernel buildParallelBatchKernel(
+        semantic::SymbolId symbolId,
+        ParallelKernelKind kernelKind,
+        const std::vector<ParallelNativeColumnBinding>& paramColumns,
+        const ParallelJobConfig& config,
+        bool usesParallelPrng) const;
 
 private:
     friend class ManagedHeap;

@@ -218,6 +218,28 @@ void mixCompilationOptions(
         sources, std::nullopt, false, outOpts, &diagnostics);
 }
 
+void mergeMacroPlugins(
+    CompilationOptions& projectCompOpts,
+    const std::vector<std::shared_ptr<const ICompilerMacroPlugin>>& extraPlugins) {
+    for (const auto& plugin : extraPlugins) {
+        if (!plugin) continue;
+        const std::string pluginName = plugin->name();
+        const std::uint64_t pluginFp = plugin->fingerprint();
+        bool alreadyPresent = false;
+        for (const auto& existing : projectCompOpts.macroPlugins) {
+            if (!existing) continue;
+            if (existing == plugin ||
+                (existing->name() == pluginName && existing->fingerprint() == pluginFp)) {
+                alreadyPresent = true;
+                break;
+            }
+        }
+        if (!alreadyPresent) {
+            projectCompOpts.macroPlugins.push_back(plugin);
+        }
+    }
+}
+
 [[nodiscard]] bool expandProjectSources(
     const std::vector<SourceFile>& sources,
     const CompilationOptions& opts,
@@ -2277,13 +2299,18 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
         group.units.push_back(std::move(unit));
     }
 
-    // Sort units inside each module deterministically by path
+    // Sort units inside each module deterministically by path (keeping user sources before $-prefixed generated/pack sources)
     for (auto& [modName, group] : groups) {
         (void)modName;
         std::sort(
             group.units.begin(),
             group.units.end(),
             [](const ParsedSourceUnit& a, const ParsedSourceUnit& b) {
+                const bool aSynthetic = !a.rawSource.path.empty() && a.rawSource.path[0] == '$';
+                const bool bSynthetic = !b.rawSource.path.empty() && b.rawSource.path[0] == '$';
+                if (aSynthetic != bSynthetic) {
+                    return !aSynthetic;
+                }
                 return a.rawSource.path < b.rawSource.path;
             });
     }
@@ -3578,6 +3605,7 @@ CachedBuildResult ModuleBuildCache::build(
     if (!resolveEffectiveProjectOptions(sources, options.flags, projectCompOpts, out.diagnostics)) {
         return out;
     }
+    mergeMacroPlugins(projectCompOpts, options.macroPlugins);
     std::vector<SourceFile> effectiveSources;
     if (!expandProjectSources(sources, projectCompOpts, effectiveSources, out.diagnostics)) {
         return out;
@@ -4459,6 +4487,7 @@ CachedAotBuildResult ModuleBuildCache::buildAotWithGenerator(
     if (!resolveEffectiveProjectOptions(sources, cacheOptions.flags, projectCompOpts, out.diagnostics)) {
         return out;
     }
+    mergeMacroPlugins(projectCompOpts, cacheOptions.macroPlugins);
     std::vector<SourceFile> effectiveSources;
     if (!expandProjectSources(sources, projectCompOpts, effectiveSources, out.diagnostics)) {
         return out;
@@ -4484,7 +4513,7 @@ CachedAotBuildResult ModuleBuildCache::buildAotWithGenerator(
     };
 
     // Fast-path check: extract module graph & verify module cache entries + AOT bundle on disk
-    if (useDiskCache) {
+    if (useDiskCache && !aotOptions.collectOptimizationRemarks) {
         auto graph = extractModuleGraph(
             effectiveSources, cacheOptions.optimizationOptions, cacheOptions.flags);
         if (!graph.diagnostics.hasErrors()) {

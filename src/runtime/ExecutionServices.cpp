@@ -18,6 +18,7 @@ constexpr std::uint64_t FnvOffset = 1469598103934665603ULL;
 constexpr std::uint64_t FnvPrime = 1099511628211ULL;
 
 thread_local FrameTelemetryCollector* gActiveFrameTelemetry = nullptr;
+thread_local ScriptAllocationSite gActiveAllocationSite{};
 
 void hashBytes(std::uint64_t& hash, const void* data, std::size_t size) noexcept {
     const auto* bytes = static_cast<const unsigned char*>(data);
@@ -591,6 +592,14 @@ void ProfileCollector::reset() {
 // Zero-Allocation Lock-Free Per-Frame Ring Telemetry (`FrameTelemetryCollector`)
 // ============================================================================
 
+void bindActiveAllocationSite(ScriptAllocationSite site) noexcept {
+    gActiveAllocationSite = site;
+}
+
+ScriptAllocationSite activeAllocationSite() noexcept {
+    return gActiveAllocationSite;
+}
+
 void bindActiveFrameTelemetry(FrameTelemetryCollector* collector) noexcept {
     gActiveFrameTelemetry = collector;
 }
@@ -606,9 +615,16 @@ void FrameTelemetryCollector::resetCurrentFrameAccumulators() noexcept {
         activeBuckets_[idx].instructions = 0;
     }
     touchedCount_ = 0;
+    for (std::size_t i = 0; i < touchedAllocCount_; ++i) {
+        const std::uint8_t idx = touchedAllocBuckets_[i];
+        activeAllocBuckets_[idx] = AllocBucket{};
+    }
+    touchedAllocCount_ = 0;
     currentTotalInstructions_ = 0;
     currentFiberInstructions_ = 0;
     currentGcSliceNs_ = 0;
+    currentAllocCount_ = 0;
+    currentAllocBytes_ = 0;
     explicitCompactBytes_ = 0;
     explicitBoxedBytes_ = 0;
     hasExplicitHeapBytes_ = false;
@@ -658,6 +674,69 @@ void FrameTelemetryCollector::recordFunctionInstructions(
     if (instructions > minCount) {
         activeBuckets_[minSlot].symbolId = symbolId;
         activeBuckets_[minSlot].instructions = instructions;
+    }
+}
+
+void FrameTelemetryCollector::recordAllocation(
+    semantic::SymbolId symbolId,
+    std::uint32_t instructionOffset,
+    ObjectKind kind,
+    std::size_t sizeBytes) noexcept {
+    ++currentAllocCount_;
+    const auto bytes64 = static_cast<std::uint64_t>(sizeBytes);
+    currentAllocBytes_ += bytes64;
+
+    constexpr std::size_t kMask = kAccumulatorBuckets - 1u;
+    const std::uint64_t mixed =
+        (symbolId * 0x9E3779B97F4A7C15ULL) ^
+        (static_cast<std::uint64_t>(instructionOffset) * 0xBF58476D1CE4E5B9ULL) ^
+        (static_cast<std::uint64_t>(static_cast<std::uint8_t>(kind)) * 0x94D049BB133111EBULL);
+    std::size_t idx = static_cast<std::size_t>((mixed ^ (mixed >> 32u)) >> 56u) & kMask;
+    std::size_t minSlot = idx;
+    std::uint64_t minBytes = std::numeric_limits<std::uint64_t>::max();
+    std::uint32_t minCount = std::numeric_limits<std::uint32_t>::max();
+
+    for (std::size_t probe = 0; probe < kAccumulatorBuckets; ++probe) {
+        auto& bucket = activeAllocBuckets_[idx];
+        if (bucket.occupied &&
+            bucket.symbolId == symbolId &&
+            bucket.instructionOffset == instructionOffset &&
+            bucket.kind == kind) {
+            if (bucket.allocationCount < std::numeric_limits<std::uint32_t>::max()) {
+                ++bucket.allocationCount;
+            }
+            bucket.allocatedBytes += bytes64;
+            return;
+        }
+        if (!bucket.occupied) {
+            bucket.occupied = true;
+            bucket.symbolId = symbolId;
+            bucket.instructionOffset = instructionOffset;
+            bucket.kind = kind;
+            bucket.allocationCount = 1u;
+            bucket.allocatedBytes = bytes64;
+            if (touchedAllocCount_ < touchedAllocBuckets_.size()) {
+                touchedAllocBuckets_[touchedAllocCount_++] = static_cast<std::uint8_t>(idx);
+            }
+            return;
+        }
+        if (bucket.allocatedBytes < minBytes ||
+            (bucket.allocatedBytes == minBytes && bucket.allocationCount < minCount)) {
+            minBytes = bucket.allocatedBytes;
+            minCount = bucket.allocationCount;
+            minSlot = idx;
+        }
+        idx = (idx + 1u) & kMask;
+    }
+
+    if (bytes64 > minBytes || (bytes64 == minBytes && 1u > minCount)) {
+        auto& victim = activeAllocBuckets_[minSlot];
+        victim.symbolId = symbolId;
+        victim.instructionOffset = instructionOffset;
+        victim.kind = kind;
+        victim.allocationCount = 1u;
+        victim.allocatedBytes = bytes64;
+        victim.occupied = true;
     }
 }
 
@@ -740,6 +819,50 @@ FrameTelemetrySample FrameTelemetryCollector::endFrame(
             }
         }
     }
+    // Extract Top-8 allocation sites by (allocatedBytes DESC, allocationCount DESC, symbolId ASC, offset ASC) with zero heap allocation
+    const auto allocBetter = [](const HotAllocationTelemetry& a,
+                                const HotAllocationTelemetry& b) noexcept -> bool {
+        if (a.allocatedBytes != b.allocatedBytes) return a.allocatedBytes > b.allocatedBytes;
+        if (a.allocationCount != b.allocationCount) return a.allocationCount > b.allocationCount;
+        if (a.symbolId != b.symbolId) return a.symbolId < b.symbolId;
+        if (a.instructionOffset != b.instructionOffset) {
+            return a.instructionOffset < b.instructionOffset;
+        }
+        return static_cast<std::uint8_t>(a.kind) < static_cast<std::uint8_t>(b.kind);
+    };
+    sample.frameAllocCount = currentAllocCount_;
+    sample.frameAllocBytes = currentAllocBytes_;
+    std::uint8_t topAllocCount = 0;
+    for (std::size_t i = 0; i < touchedAllocCount_; ++i) {
+        const auto& b = activeAllocBuckets_[touchedAllocBuckets_[i]];
+        if (!b.occupied || b.allocationCount == 0) continue;
+
+        HotAllocationTelemetry candidate{};
+        candidate.symbolId = b.symbolId;
+        candidate.instructionOffset = b.instructionOffset;
+        candidate.kind = b.kind;
+        candidate.allocationCount = b.allocationCount;
+        candidate.allocatedBytes = b.allocatedBytes;
+
+        if (topAllocCount < FrameTelemetrySample::kMaxHotAllocations) {
+            sample.topAllocations[topAllocCount++] = candidate;
+        } else {
+            const auto& tail =
+                sample.topAllocations[FrameTelemetrySample::kMaxHotAllocations - 1u];
+            if (!allocBetter(candidate, tail)) continue;
+            sample.topAllocations[FrameTelemetrySample::kMaxHotAllocations - 1u] = candidate;
+        }
+
+        for (std::size_t k = static_cast<std::size_t>(topAllocCount - 1u); k > 0; --k) {
+            if (allocBetter(sample.topAllocations[k], sample.topAllocations[k - 1u])) {
+                std::swap(sample.topAllocations[k - 1u], sample.topAllocations[k]);
+            } else {
+                break;
+            }
+        }
+    }
+    sample.hotAllocationCount = topAllocCount;
+
     sample.hotFunctionCount = topCount;
 
     if (hasExplicitHeapBytes_) {
@@ -889,6 +1012,7 @@ std::string FrameTelemetryCollector::formatSummary(
             << " (fiber=" << f.fiberInstructions << ")"
             << " compactHeap=" << f.compactHeapLiveBytes << "B"
             << " boxedHeap=" << f.boxedHeapLiveBytes << "B"
+            << " gcAlloc=" << f.frameAllocCount << "(" << f.frameAllocBytes << "B)"
             << " gcSlice=" << f.gcSliceNanoseconds << "ns"
             << " coros=" << f.activeCoroutines
             << " fibers=" << f.activeFibers;
@@ -905,6 +1029,23 @@ std::string FrameTelemetryCollector::formatSummary(
                 }
                 out << ":" << hf.instructions << "("
                     << std::fixed << std::setprecision(1) << (hf.instructionShare * 100.0) << "%)";
+            }
+            out << "]";
+        }
+        if (f.hotAllocationCount > 0) {
+            out << " allocs=[";
+            for (std::uint8_t a = 0; a < f.hotAllocationCount; ++a) {
+                if (a != 0) out << ", ";
+                const auto& ha = f.topAllocations[a];
+                const auto* fnLoc = program ? program->resolveFunction(ha.symbolId) : nullptr;
+                if (fnLoc) {
+                    out << fnLoc->qualifiedName;
+                } else {
+                    out << "sym#" << ha.symbolId;
+                }
+                out << "@" << ha.instructionOffset
+                    << ":" << objectKindName(ha.kind)
+                    << ":" << ha.allocationCount << "(" << ha.allocatedBytes << "B)";
             }
             out << "]";
         }
@@ -931,6 +1072,8 @@ std::string FrameTelemetryCollector::toJson(
             << ",\"fiberInstructions\":" << f.fiberInstructions
             << ",\"compactHeapLiveBytes\":" << f.compactHeapLiveBytes
             << ",\"boxedHeapLiveBytes\":" << f.boxedHeapLiveBytes
+            << ",\"frameAllocCount\":" << f.frameAllocCount
+            << ",\"frameAllocBytes\":" << f.frameAllocBytes
             << ",\"gcSliceNanoseconds\":" << f.gcSliceNanoseconds
             << ",\"activeCoroutines\":" << f.activeCoroutines
             << ",\"activeFibers\":" << f.activeFibers
@@ -943,6 +1086,19 @@ std::string FrameTelemetryCollector::toJson(
                 << ",\"name\":\"" << (fnLoc ? escapeJson(fnLoc->qualifiedName) : std::string{}) << "\""
                 << ",\"instructions\":" << hf.instructions
                 << ",\"share\":" << std::fixed << std::setprecision(6) << hf.instructionShare
+                << '}';
+        }
+        out << "],\"topAllocations\":[";
+        for (std::uint8_t a = 0; a < f.hotAllocationCount; ++a) {
+            if (a != 0) out << ',';
+            const auto& ha = f.topAllocations[a];
+            const auto* fnLoc = program ? program->resolveFunction(ha.symbolId) : nullptr;
+            out << "{\"symbolId\":" << ha.symbolId
+                << ",\"name\":\"" << (fnLoc ? escapeJson(fnLoc->qualifiedName) : std::string{}) << "\""
+                << ",\"instructionOffset\":" << ha.instructionOffset
+                << ",\"kind\":\"" << objectKindName(ha.kind) << "\""
+                << ",\"count\":" << ha.allocationCount
+                << ",\"bytes\":" << ha.allocatedBytes
                 << '}';
         }
         out << "]}";

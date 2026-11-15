@@ -102,11 +102,65 @@ void usage() {
         << "  --query-symbol <identifier>\n"
         << "  --opt-level <0|1|2>\n"
         << "  --opt-report\n"
+        << "  --opt-remarks\n"
+        << "  --opt-remarks-json <file>\n"
         << "  --no-line-directives\n"
         << "  --no-shared-generics\n"
         << "  --trusted-release\n"
         << "  --help\n"
         << "  --version\n";
+}
+
+const char* remarkKindLabel(realscript::aot::OptimizationRemarkKind kind) noexcept {
+    switch (kind) {
+    case realscript::aot::OptimizationRemarkKind::Passed: return "passed";
+    case realscript::aot::OptimizationRemarkKind::Missed: return "missed";
+    case realscript::aot::OptimizationRemarkKind::Analysis: return "analysis";
+    }
+    return "analysis";
+}
+
+void emitOptimizationRemarks(
+    const std::vector<realscript::aot::OptimizationRemark>& remarks,
+    bool printToStderr,
+    const std::filesystem::path& jsonPath) {
+    if (printToStderr) {
+        for (const auto& remark : remarks) {
+            std::cerr << '[' << remarkKindLabel(remark.kind) << "] ["
+                << remark.pass << "] ";
+            if (!remark.sourceFile.empty()) {
+                std::cerr << remark.sourceFile << ':' << remark.line << ':'
+                    << remark.column << ' ';
+            }
+            if (!remark.functionName.empty()) {
+                std::cerr << '(' << remark.functionName << ") ";
+            }
+            std::cerr << remark.message << '\n';
+        }
+    }
+    if (!jsonPath.empty()) {
+        std::error_code ec;
+        const auto parent = jsonPath.parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent, ec);
+        }
+        std::ostringstream json;
+        json << "[\n";
+        for (std::size_t i = 0; i < remarks.size(); ++i) {
+            const auto& r = remarks[i];
+            if (i != 0) json << ",\n";
+            json << "  {\"kind\": \"" << remarkKindLabel(r.kind)
+                << "\", \"pass\": \"" << realscript::aot::escapeCppString(r.pass)
+                << "\", \"symbolId\": " << r.functionSymbolId
+                << ", \"functionName\": \"" << realscript::aot::escapeCppString(r.functionName)
+                << "\", \"sourceFile\": \"" << realscript::aot::escapeCppString(r.sourceFile)
+                << "\", \"line\": " << r.line
+                << ", \"column\": " << r.column
+                << ", \"message\": \"" << realscript::aot::escapeCppString(r.message) << "\"}";
+        }
+        json << "\n]\n";
+        (void)writeFileIfChanged(jsonPath, json.str());
+    }
 }
 
 void collectPackInputs(
@@ -183,6 +237,8 @@ int main(int argc, char** argv) {
         realscript::optimization::Options optimizationOptions;
         optimizationOptions.level = realscript::optimization::Level::Aggressive;
         bool optimizationReport = false;
+        bool optimizationRemarks = false;
+        std::filesystem::path optimizationRemarksJsonPath;
         std::vector<std::string> sources;
         std::vector<std::string> cliPacks;
         std::vector<std::string> cliPlugins;
@@ -256,6 +312,18 @@ int main(int argc, char** argv) {
                 else throw std::runtime_error("--opt-level must be 0, 1, or 2");
             } else if (argument == "--opt-report") {
                 optimizationReport = true;
+            } else if (argument == "--opt-remarks") {
+                optimizationRemarks = true;
+            } else if (argument == "--opt-remarks-json") {
+                optimizationRemarksJsonPath = requireValue("--opt-remarks-json");
+                if (optimizationRemarksJsonPath.empty()) {
+                    throw std::runtime_error("--opt-remarks-json requires a value");
+                }
+            } else if (argument.rfind("--opt-remarks-json=", 0) == 0) {
+                optimizationRemarksJsonPath = argument.substr(19);
+                if (optimizationRemarksJsonPath.empty()) {
+                    throw std::runtime_error("--opt-remarks-json requires a value");
+                }
             } else if (argument == "--no-line-directives") {
                 options.emitLineDirectives = false;
             } else if (argument == "--no-shared-generics") {
@@ -319,6 +387,9 @@ int main(int argc, char** argv) {
         }
         printDiagnostics(projectDiagnostics);
 
+        options.collectOptimizationRemarks =
+            optimizationRemarks || !optimizationRemarksJsonPath.empty();
+
         if (!cacheDirectory.empty() || printCacheStats) {
             realscript::compiler::ModuleBuildCacheOptions cacheOptions;
             cacheOptions.cacheDirectory = cacheDirectory;
@@ -342,6 +413,12 @@ int main(int argc, char** argv) {
                 std::cerr << realscript::optimization::levelName(optimizationOptions.level)
                     << ' ' << realscript::optimization::formatStatistics(
                         cached.optimizationStatistics) << '\n';
+            }
+            if (options.collectOptimizationRemarks) {
+                emitOptimizationRemarks(
+                    cached.program.optimizationRemarks,
+                    optimizationRemarks,
+                    optimizationRemarksJsonPath);
             }
 
             std::filesystem::create_directories(outputDirectory);
@@ -386,6 +463,12 @@ int main(int argc, char** argv) {
         if (build.diagnostics.hasErrors()) {
             printDiagnostics(build.diagnostics);
             return 1;
+        }
+        if (options.collectOptimizationRemarks) {
+            emitOptimizationRemarks(
+                generated.optimizationRemarks,
+                optimizationRemarks,
+                optimizationRemarksJsonPath);
         }
 
         std::filesystem::create_directories(outputDirectory);

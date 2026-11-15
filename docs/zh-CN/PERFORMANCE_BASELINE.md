@@ -133,7 +133,7 @@ AOT raw 比 Interpreter raw 快约 4 倍，但仍远离 native。生成源码保
 - `context.binary()`、`context.branch()` 等运行时抽象；
 - 每次 `Program::invoke()` 新建 ExecutionContext 及 function/type map。
 
-因此当前 JIT 的运行性能与 AOT 基本一致是预期行为：它缓存并加载同一类生成 C++，不是另一套优化执行后端。
+因此当前 **Toolchain JIT** 的运行性能与 AOT 基本一致是预期行为：它缓存并加载同一类生成 C++，不是另一套优化执行后端（若需零外部编译器开销，请直接使用进程内 `StencilJit` 原生机器码模板后端）。
 
 JIT cold 编译为 3,617 ms，紧随其后的 cache hit 为 2.61 ms。JIT 性能工作应分别看编译/缓存和运行时，不应把两者混成一个数。
 
@@ -378,8 +378,8 @@ function-call 变慢，均已撤销；当前 vector 所有权与递归语义下�
 
 ### 产品级 macrobench 与 GC
 
-新增 AI tick、ability tick、event fanout、allocation tick 四个稳定脚本 workload，以及
-`rsbench_product` 的 10,000 协程 resume + heap/host snapshot/restore + deterministic replay。
+新增 AI tick、ability tick、event fanout、allocation tick 四个稳定脚本 workload（均保留在本仓库 `benchmarks/micro|macro` 中），以及
+`rsbench_product`（已随 L2 游戏 SDK 迁入配套 `RealScript-GamePack` 仓库）的 10,000 协程 resume + heap/host snapshot/restore + deterministic replay。
 
 | Workload | 最终中位数 | 归一化信息 |
 |---|---:|---:|
@@ -426,3 +426,11 @@ collection。新增持续 sweep-allocation 回归，验证 collection 有界完�
 
 ### 4. 多线程确定性 Fiber 调度器（`FiberScheduler::stepTickParallel`）
 - 按优先级队列分组收集当前 Tick 就绪的 Fiber，在每个优先级内使用多线程工作池并行执行各 Fiber 的时间片，并在优先级边界同步合并指令计数与状态，保证多线程执行与单线程 `stepTick` 产生完全一致的 `computeLockstepDigest()`。
+
+---
+
+## P5 后工程加固与跨后端对齐
+
+- **`StencilJit` 与 `AotRuntime` GC / Profiling / 并行批处理对齐**：`StencilJit`（支持 `x86_64` 与 `ARM64` W^X 原生模板）与 `AotRuntime` 均接入主动增量 GC 安全点与 `ProfileCollector` 函数归因，并为 `ParallelJobScheduler::dispatchFor` 提供原生批处理核执行路径，免去逐元素回切解释器的过渡开销。
+- **零分配 `GC.Alloc` 帧级热点归因与诊断可观测性**：`FrameTelemetryCollector` 现零堆分配记录每帧托管分配热度（`topAllocations` 含 `sourceFile` 与行号）并在 DAP 报表展示；同时提供 `StencilModule::functionDiagnostics()`、`rsaot --opt-remarks` / `--opt-remarks-json` 与 LSP `textDocument/codeLens` AOT 分档提示。
+- **构建缓存与 L0/L2 裁剪解耦**：`ModuleBuildCache` 在增量缓存中保留 C11 宏插件变换与局部泛型依赖失效判定；`RealScript` 支持 `-DREALSCRIPT_SLIM_RUNTIME=ON` 纯运行时裁剪，L2 游戏 SDK 及 `rsbench_product` 已拆分为独立 `RealScript-GamePack` 仓库。

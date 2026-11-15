@@ -269,11 +269,15 @@ the native `GetEnumerator`/`MoveNext`/`Current` protocol used by `foreach`.
 
 ## Expressions and Patterns
 
-Phase 24 includes `var`, lazy `?:` and `??`, null-conditional `?.`, `is`, `as`,
-`typeof`, object/struct/collection initializers, and optional/named/`params`
-arguments with source-order evaluation. Constant, null, type, and discard
-patterns support variables and `when` guards in switch statements and exhaustive
-switch expressions.
+Phase 24+ includes `var`, lazy `?:` and `??`, null-conditional `?.`, `is`, `as`,
+`typeof`, deterministic `using` disposal, object/struct/collection initializers,
+and optional/named/`params` arguments with source-order evaluation. Constant,
+null, type, property, relational (`<`, `<=`, `>`, `>=`), logical combinator
+(`and`/`or`/`not`), and discard patterns support variables and `when` guards in
+switch statements and exhaustive switch expressions, alongside default interface
+methods, extension methods (`ref this` / generics), `[StackOnly]`
+`Span<T>`/`ReadOnlySpan<T>`, and custom C11 macro plugins / reactive attributes
+(`[Signal]`, `[RelayCommand]`).
 
 ## Deterministic Sequences
 
@@ -292,16 +296,14 @@ errors rather than catchable script objects.
 
 ## Unsupported Language Features
 
-The Phase 24 implementation deliberately does not provide:
+The language deliberately does not provide:
 
-- multiple class inheritance or default interface implementations;
-- open runtime generics, variance, reflection, or `dynamic`;
-- relational/property/list/recursive pattern families;
-- `Task`, threads, or general `async`/`await`;
-- unsafe pointers, ref structs, ref properties, or full byref escape analysis;
-- exception filters, `using`, native exception interop, or exception unwinding
-  serialized across sequence suspension;
-- user-defined implicit/explicit conversions, LINQ, or the .NET base-class
-  library.
+- multiple class inheritance;
+- open runtime generics, generic variance, CLR dynamic dispatch (`dynamic`), or runtime code emission;
+- positional, list, or recursive slice pattern families;
+- `Task`, threads with shared mutable state, or arbitrary `async`/`await` (use main-thread `RealScript.Async` `Awaitable<T>`, `ParallelJobScheduler`, and `sequence`);
+- unsafe pointers, arbitrary user-defined `ref struct` types beyond `[StackOnly]` `Span<T>`/`ReadOnlySpan<T>`, ref properties, or full CLR-style global byref escape analysis;
+- exception filters, native C++ exception interop, or exception unwinding serialized across sequence suspension;
+- user-defined implicit/explicit conversions, LINQ, or the .NET base-class library.
 
 Unsupported syntax or semantics receive explicit diagnostics.

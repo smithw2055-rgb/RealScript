@@ -2606,11 +2606,70 @@ struct PodSlot {
         std::vector<std::int32_t> paramToCombinedCol;
         std::unordered_map<semantic::SymbolId, PodStructDesc> structDescs;
         std::vector<CompiledBlock> blocks;
+        std::vector<PodSlot> defaultLocals;
         ParallelReduceOp reduceOp = ParallelReduceOp::None;
         ParallelCustomReducer customReducer;
         bool strictDet = false;
         std::uint64_t instructionBudget = 0;
     };
+    std::vector<PodSlot> precomputedDefaultLocals(fn.localTypes.size());
+    for (std::size_t l = 0; l < fn.localTypes.size(); ++l) {
+        switch (fn.localTypes[l]) {
+        case semantic::PrimitiveType::Bool:
+            precomputedDefaultLocals[l].kind = PodValKind::Bool;
+            precomputedDefaultLocals[l].b = false;
+            break;
+        case semantic::PrimitiveType::Int:
+            precomputedDefaultLocals[l].kind = PodValKind::Int32;
+            precomputedDefaultLocals[l].i64 = 0;
+            break;
+        case semantic::PrimitiveType::Long:
+            precomputedDefaultLocals[l].kind = PodValKind::Int64;
+            precomputedDefaultLocals[l].i64 = 0;
+            break;
+        case semantic::PrimitiveType::Float:
+            precomputedDefaultLocals[l].kind = PodValKind::Float32;
+            precomputedDefaultLocals[l].f32 = 0.0f;
+            break;
+        case semantic::PrimitiveType::Double:
+            precomputedDefaultLocals[l].kind = PodValKind::Float64;
+            precomputedDefaultLocals[l].f64 = 0.0;
+            break;
+        case semantic::PrimitiveType::Enum:
+            precomputedDefaultLocals[l].kind = PodValKind::Enum64;
+            precomputedDefaultLocals[l].i64 = 0;
+            precomputedDefaultLocals[l].typeId = l < fn.localTypeIds.size() ? fn.localTypeIds[l] : 0;
+            break;
+        case semantic::PrimitiveType::Array:
+            precomputedDefaultLocals[l].kind = PodValKind::ColumnRef;
+            precomputedDefaultLocals[l].colIndex = -1;
+            break;
+        case semantic::PrimitiveType::Struct: {
+            const auto ltid = l < fn.localTypeIds.size() ? fn.localTypeIds[l] : 0;
+            const auto dIt = structDescs.find(ltid);
+            if (dIt == structDescs.end()) {
+                return {};
+            }
+            const auto& desc = dIt->second;
+            precomputedDefaultLocals[l].kind = PodValKind::PodStruct;
+            precomputedDefaultLocals[l].typeId = ltid;
+            precomputedDefaultLocals[l].structFieldCount = desc.fieldCount;
+            for (std::size_t f = 0; f < desc.fieldCount; ++f) {
+                const auto ft = desc.fieldTypes[f];
+                if (ft == semantic::PrimitiveType::Bool) precomputedDefaultLocals[l].fieldKinds[f] = PodValKind::Bool;
+                else if (ft == semantic::PrimitiveType::Long) precomputedDefaultLocals[l].fieldKinds[f] = PodValKind::Int64;
+                else if (ft == semantic::PrimitiveType::Float) precomputedDefaultLocals[l].fieldKinds[f] = PodValKind::Float32;
+                else if (ft == semantic::PrimitiveType::Double) precomputedDefaultLocals[l].fieldKinds[f] = PodValKind::Float64;
+                else if (ft == semantic::PrimitiveType::Enum) precomputedDefaultLocals[l].fieldKinds[f] = PodValKind::Enum64;
+                else precomputedDefaultLocals[l].fieldKinds[f] = PodValKind::Int32;
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
     auto plan = std::make_shared<SharedNativePlan>();
     plan->fn = &fn;
     plan->mod = &mod;
@@ -2619,6 +2678,7 @@ struct PodSlot {
     plan->paramToCombinedCol = std::move(paramToCombinedCol);
     plan->structDescs = std::move(structDescs);
     plan->blocks = std::move(compiledBlocks);
+    plan->defaultLocals = std::move(precomputedDefaultLocals);
     plan->reduceOp = config.reduceOp;
     plan->customReducer = config.customReducer;
     plan->strictDet = (config.executionOptions.determinism.mode == DeterminismMode::Strict);
@@ -2631,8 +2691,28 @@ struct PodSlot {
         const std::size_t nRegs = fnRef.registerTypes.size();
         const std::size_t nLocals = fnRef.localTypes.size();
 
-        std::vector<PodSlot> params(fnRef.parameterTypes.size());
+        struct TlsNativeBatchScratch {
+            std::vector<PodSlot> params;
+            std::vector<PodSlot> regs;
+            std::vector<PodSlot> locals;
+            std::vector<PodSlot> edgeArgs;
+        };
+        thread_local TlsNativeBatchScratch tlsScratch;
+        auto& params = tlsScratch.params;
+        auto& regs = tlsScratch.regs;
+        auto& locals = tlsScratch.locals;
+        auto& edgeArgs = tlsScratch.edgeArgs;
+        params.resize(fnRef.parameterTypes.size());
+        regs.resize(nRegs);
+        std::fill(regs.begin(), regs.end(), PodSlot{});
+        locals.resize(nLocals);
+        edgeArgs.clear();
+        if (edgeArgs.capacity() < 16u) {
+            edgeArgs.reserve(16u);
+        }
+
         for (std::size_t p = 0; p < fnRef.parameterTypes.size(); ++p) {
+            params[p] = PodSlot{};
             if (fnRef.parameterTypes[p] == semantic::PrimitiveType::Array) {
                 params[p].kind = PodValKind::ColumnRef;
                 params[p].colIndex = plan->paramToCombinedCol[p];
@@ -2645,71 +2725,6 @@ struct PodSlot {
                 }
             }
         }
-
-        std::vector<PodSlot> defaultLocals(nLocals);
-        for (std::size_t l = 0; l < nLocals; ++l) {
-            switch (fnRef.localTypes[l]) {
-            case semantic::PrimitiveType::Bool:
-                defaultLocals[l].kind = PodValKind::Bool;
-                defaultLocals[l].b = false;
-                break;
-            case semantic::PrimitiveType::Int:
-                defaultLocals[l].kind = PodValKind::Int32;
-                defaultLocals[l].i64 = 0;
-                break;
-            case semantic::PrimitiveType::Long:
-                defaultLocals[l].kind = PodValKind::Int64;
-                defaultLocals[l].i64 = 0;
-                break;
-            case semantic::PrimitiveType::Float:
-                defaultLocals[l].kind = PodValKind::Float32;
-                defaultLocals[l].f32 = 0.0f;
-                break;
-            case semantic::PrimitiveType::Double:
-                defaultLocals[l].kind = PodValKind::Float64;
-                defaultLocals[l].f64 = 0.0;
-                break;
-            case semantic::PrimitiveType::Enum:
-                defaultLocals[l].kind = PodValKind::Enum64;
-                defaultLocals[l].i64 = 0;
-                defaultLocals[l].typeId = l < fnRef.localTypeIds.size() ? fnRef.localTypeIds[l] : 0;
-                break;
-            case semantic::PrimitiveType::Array:
-                defaultLocals[l].kind = PodValKind::ColumnRef;
-                defaultLocals[l].colIndex = -1;
-                break;
-            case semantic::PrimitiveType::Struct: {
-                const auto ltid = l < fnRef.localTypeIds.size() ? fnRef.localTypeIds[l] : 0;
-                const auto dIt = plan->structDescs.find(ltid);
-                if (dIt == plan->structDescs.end()) {
-                    ctx.error.code = ErrorCode::InvalidProgram;
-                    ctx.error.message = "missing native POD struct layout";
-                    return false;
-                }
-                const auto& desc = dIt->second;
-                defaultLocals[l].kind = PodValKind::PodStruct;
-                defaultLocals[l].typeId = ltid;
-                defaultLocals[l].structFieldCount = desc.fieldCount;
-                for (std::size_t f = 0; f < desc.fieldCount; ++f) {
-                    const auto ft = desc.fieldTypes[f];
-                    if (ft == semantic::PrimitiveType::Bool) defaultLocals[l].fieldKinds[f] = PodValKind::Bool;
-                    else if (ft == semantic::PrimitiveType::Long) defaultLocals[l].fieldKinds[f] = PodValKind::Int64;
-                    else if (ft == semantic::PrimitiveType::Float) defaultLocals[l].fieldKinds[f] = PodValKind::Float32;
-                    else if (ft == semantic::PrimitiveType::Double) defaultLocals[l].fieldKinds[f] = PodValKind::Float64;
-                    else if (ft == semantic::PrimitiveType::Enum) defaultLocals[l].fieldKinds[f] = PodValKind::Enum64;
-                    else defaultLocals[l].fieldKinds[f] = PodValKind::Int32;
-                }
-                break;
-            }
-            default:
-                break;
-            }
-        }
-
-        std::vector<PodSlot> regs(nRegs);
-        std::vector<PodSlot> locals(nLocals);
-        std::vector<PodSlot> edgeArgs;
-        edgeArgs.reserve(16u);
 
         auto failNative = [&](ErrorCode code, std::string msg) -> bool {
             ctx.error.code = code;
@@ -2735,7 +2750,7 @@ struct PodSlot {
         };
 
         auto executeSingleInvocation = [&](Value& outReturnValue) -> bool {
-            locals = defaultLocals;
+            std::copy(plan->defaultLocals.begin(), plan->defaultLocals.end(), locals.begin());
             std::size_t denseBlockIdx = 0u;
             std::uint64_t executed = 0u;
             const std::uint64_t budget = plan->instructionBudget;
@@ -3258,24 +3273,15 @@ struct PodSlot {
             if (!executeSingleInvocation(elemVal)) return false;
             ctx.statistics.functionCalls += 1u;
             ctx.statistics.maximumCallDepth = 1u;
-            if (plan->reduceOp != ParallelReduceOp::None) {
-                if (!hasAcc) {
-                    accValue = std::move(elemVal);
-                    hasAcc = true;
-                } else {
-                    Value nextAcc{};
-                    if (!reduceTwoValues(
-                            plan->reduceOp,
-                            plan->customReducer,
-                            plan->strictDet,
-                            accValue,
-                            elemVal,
-                            nextAcc,
-                            ctx.error)) {
-                        return false;
-                    }
-                    accValue = std::move(nextAcc);
-                }
+            if (!accumulateParallelReductionValue(
+                    plan->reduceOp,
+                    plan->customReducer,
+                    plan->strictDet,
+                    accValue,
+                    hasAcc,
+                    std::move(elemVal),
+                    ctx.error)) {
+                return false;
             }
         }
         ctx.hasReducedValue = hasAcc;
@@ -3287,6 +3293,37 @@ struct PodSlot {
 }
 
 } // namespace
+
+bool accumulateParallelReductionValue(
+    ParallelReduceOp reduceOp,
+    const ParallelCustomReducer& customReducer,
+    bool strictDeterminism,
+    Value& ioAccumulated,
+    bool& ioHasValue,
+    Value nextValue,
+    RuntimeError& outError) {
+    if (reduceOp == ParallelReduceOp::None) {
+        return true;
+    }
+    if (!ioHasValue) {
+        ioAccumulated = std::move(nextValue);
+        ioHasValue = true;
+        return true;
+    }
+    Value nextAcc{};
+    if (!reduceTwoValues(
+            reduceOp,
+            customReducer,
+            strictDeterminism,
+            ioAccumulated,
+            nextValue,
+            nextAcc,
+            outError)) {
+        return false;
+    }
+    ioAccumulated = std::move(nextAcc);
+    return true;
+}
 
 struct ParallelJobScheduler::Impl {
     std::size_t defaultWorkers = 0;
@@ -3983,15 +4020,28 @@ struct ParallelJobScheduler::Impl {
             } else {
                 const auto* entryLoc = program->resolveFunction(symbolId);
                 if (entryLoc != nullptr) {
-                    activeNativeKernel = tryBuildAutoNativeBatchKernel(
-                        *program,
-                        *entryLoc,
+                    nativeColumns = paramColumns;
+                    for (const auto& [sid, scb] : staticColumnBindings) {
+                        (void)sid;
+                        nativeColumns.push_back(scb);
+                    }
+                    activeNativeKernel = program->buildParallelBatchKernel(
+                        symbolId,
                         kernelKind,
-                        prefixParamCount,
-                        paramColumns,
-                        staticColumnBindings,
+                        nativeColumns,
                         config,
-                        nativeColumns);
+                        report.usesParallelPrng);
+                    if (!activeNativeKernel) {
+                        activeNativeKernel = tryBuildAutoNativeBatchKernel(
+                            *program,
+                            *entryLoc,
+                            kernelKind,
+                            prefixParamCount,
+                            paramColumns,
+                            staticColumnBindings,
+                            config,
+                            nativeColumns);
+                    }
                 }
             }
         }
@@ -4022,6 +4072,10 @@ struct ParallelJobScheduler::Impl {
                     ctx.count = batchCount;
                     ctx.batchSeed = config.baseSeed ^ static_cast<std::uint32_t>(chunkIndex);
                     ctx.heap = heap.get();
+                    ctx.mutableHeap = heap.get();
+                    ctx.bindings = bindings.get();
+                    ctx.kernelKind = kernelKind;
+                    ctx.config = &config;
                     ctx.userArguments = &normalizedUserArguments;
                     ctx.columns = &nativeColumns;
 
@@ -4135,25 +4189,16 @@ struct ParallelJobScheduler::Impl {
                                 break;
                             }
 
-                            if (config.reduceOp != ParallelReduceOp::None) {
-                                if (!hasAcc) {
-                                    accValue = std::move(elemRes.value);
-                                    hasAcc = true;
-                                } else {
-                                    Value nextAcc{};
-                                    if (!reduceTwoValues(
-                                            config.reduceOp,
-                                            config.customReducer,
-                                            strictDet,
-                                            accValue,
-                                            elemRes.value,
-                                            nextAcc,
-                                            batchErr)) {
-                                        batchOk = false;
-                                        break;
-                                    }
-                                    accValue = std::move(nextAcc);
-                                }
+                            if (!accumulateParallelReductionValue(
+                                    config.reduceOp,
+                                    config.customReducer,
+                                    strictDet,
+                                    accValue,
+                                    hasAcc,
+                                    std::move(elemRes.value),
+                                    batchErr)) {
+                                batchOk = false;
+                                break;
                             }
                         }
 

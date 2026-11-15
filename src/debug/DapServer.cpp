@@ -355,16 +355,65 @@ tooling::Json DapServer::serializeFrameTelemetrySample(
             {"share", hf.instructionShare},
         });
     }
+    tooling::Json::Array allocArr;
+    for (std::uint8_t i = 0; i < sample.hotAllocationCount; ++i) {
+        const auto& ha = sample.topAllocations[i];
+        const auto* fnLoc = prog ? prog->resolveFunction(ha.symbolId) : nullptr;
+        std::string sourceFile;
+        std::int64_t line = 0;
+        if (fnLoc && fnLoc->module && fnLoc->function) {
+            std::uint32_t blkIdx = 0;
+            std::uint32_t instIdx = 0;
+            const bool hasBlk = runtime::unpackAllocationSiteOffset(
+                ha.instructionOffset, blkIdx, instIdx);
+            const auto& dbg = fnLoc->function->debugInfo;
+            const debug::SequencePoint* bestSp = nullptr;
+            if (hasBlk && blkIdx < fnLoc->function->blocks.size()) {
+                const auto blockId = fnLoc->function->blocks[blkIdx].id;
+                const debug::SequencePoint* firstInBlock = nullptr;
+                for (const auto& sp : dbg.sequencePoints) {
+                    if (sp.blockId != blockId) continue;
+                    if (!firstInBlock) firstInBlock = &sp;
+                    if (sp.instructionIndex <= instIdx) {
+                        if (!bestSp || sp.instructionIndex >= bestSp->instructionIndex) {
+                            bestSp = &sp;
+                        }
+                    }
+                }
+                if (!bestSp) bestSp = firstInBlock;
+            }
+            if (bestSp && bestSp->range.fileId < fnLoc->module->sourceFiles.size()) {
+                sourceFile = fnLoc->module->sourceFiles[bestSp->range.fileId].path;
+                line = static_cast<std::int64_t>(bestSp->range.start.line) + 1;
+            } else if (dbg.declaration.valid() &&
+                       dbg.declaration.fileId < fnLoc->module->sourceFiles.size()) {
+                sourceFile = fnLoc->module->sourceFiles[dbg.declaration.fileId].path;
+                line = static_cast<std::int64_t>(dbg.declaration.start.line) + 1;
+            }
+        }
+        allocArr.emplace_back(tooling::Json::Object{
+            {"symbolId", static_cast<std::int64_t>(ha.symbolId)},
+            {"name", fnLoc ? fnLoc->qualifiedName : std::string{}},
+            {"sourceFile", sourceFile},
+            {"line", line},
+            {"kind", std::string(runtime::objectKindName(ha.kind))},
+            {"count", static_cast<std::int64_t>(ha.allocationCount)},
+            {"bytes", static_cast<std::int64_t>(ha.allocatedBytes)},
+        });
+    }
     return tooling::Json::Object{
         {"frameNumber", static_cast<std::int64_t>(sample.frameNumber)},
         {"totalInstructions", static_cast<std::int64_t>(sample.totalInstructions)},
         {"fiberInstructions", static_cast<std::int64_t>(sample.fiberInstructions)},
+        {"frameAllocCount", static_cast<std::int64_t>(sample.frameAllocCount)},
+        {"frameAllocBytes", static_cast<std::int64_t>(sample.frameAllocBytes)},
         {"compactHeapLiveBytes", static_cast<std::int64_t>(sample.compactHeapLiveBytes)},
         {"boxedHeapLiveBytes", static_cast<std::int64_t>(sample.boxedHeapLiveBytes)},
         {"gcSliceNanoseconds", static_cast<std::int64_t>(sample.gcSliceNanoseconds)},
         {"activeCoroutines", static_cast<std::int64_t>(sample.activeCoroutines)},
         {"activeFibers", static_cast<std::int64_t>(sample.activeFibers)},
         {"topFunctions", tooling::Json(std::move(hotArr))},
+        {"topAllocations", tooling::Json(std::move(allocArr))},
     };
 }
 

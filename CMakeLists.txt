@@ -655,9 +655,12 @@ if(REALSCRIPT_BUILD_TESTS)
             realscript_kernel_aot_plugin_fixture
             RealScript::Kernel)
     target_compile_features(realscript_kernel_aot_backend_tests PRIVATE cxx_std_17)
+    add_dependencies(realscript_kernel_aot_backend_tests rsaot)
     target_compile_definitions(
         realscript_kernel_aot_backend_tests
-        PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        PRIVATE
+            REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+            REALSCRIPT_RSAOT_PATH="$<TARGET_FILE:rsaot>")
     realscript_enable_cxx_warnings(realscript_kernel_aot_backend_tests)
     add_test(NAME realscript.kernel.aot-backend COMMAND realscript_kernel_aot_backend_tests)
 

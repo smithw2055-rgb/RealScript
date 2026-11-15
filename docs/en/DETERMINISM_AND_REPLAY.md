@@ -110,7 +110,7 @@ Interpreter and AOT execution emit the same semantic event sequence for:
 - host calls;
 - errors.
 
-The toolchain JIT executes generated AOT semantics and participates in the same differential tests.
+In-process `StencilJit` (including native `ParallelJobScheduler` batch kernels) and Toolchain JIT preserve the same verified MIR / AOT deterministic semantics and participate in the cross-backend differential test suite.
 
 ## Profiles and Digests
 

@@ -772,6 +772,141 @@ void testProjectConfigMacroPluginsAndSkeletonFastpath() {
     std::cout << "[PASS] Pillar 5: LanguageService project config, C11 macros & declaration-skeleton fastpath\n";
 }
 
+void testCodeLensLoweringAndLspRoundTrip() {
+    const std::string src =
+        "module Tooling.CodeLens;\n"
+        "public class LensFault {\n"
+        "    public string msg;\n"
+        "    public LensFault(string m) { msg = m; }\n"
+        "}\n"
+        "public class Box {\n"
+        "    public int v = 0;\n"
+        "}\n"
+        "public int PureHelper(int x) {\n"
+        "    return x * 2 + 1;\n"
+        "}\n"
+        "public int AllocAndCall(int x) {\n"
+        "    Box b = new Box();\n"
+        "    b.v = PureHelper(x);\n"
+        "    return b.v + PureHelper(x + 1);\n"
+        "}\n"
+        "public int TryFallback(int x) {\n"
+        "    try {\n"
+        "        if (x > 0) { throw new LensFault(\"bad\"); }\n"
+        "    } catch (LensFault ex) {\n"
+        "        return ex.msg.Length;\n"
+        "    }\n"
+        "    return 0;\n"
+        "}\n";
+
+    tooling::LanguageService svc;
+    svc.open("codelens.rscript", src, 1);
+    RS_CHECK(svc.diagnostics("codelens.rscript").empty());
+    const auto lenses = svc.codeLenses("codelens.rscript");
+    RS_CHECK(lenses.size() >= 3u);
+
+    bool sawPureHelper = false;
+    bool sawAllocAndCall = false;
+    bool sawTryFallback = false;
+    for (const auto& lens : lenses) {
+        if (lens.range.start.line == 8u) {
+            RS_CHECK(lens.title.find("Typed AOT") != std::string::npos);
+            RS_CHECK(lens.title.find("GC.Alloc: 0") != std::string::npos);
+            RS_CHECK(lens.title.find("2 refs") != std::string::npos);
+            RS_CHECK(lens.command == "realscript.codeLens.noop");
+            sawPureHelper = true;
+        } else if (lens.range.start.line == 11u) {
+            RS_CHECK(lens.title.find("GC.Alloc: 1") != std::string::npos);
+            sawAllocAndCall = true;
+        } else if (lens.range.start.line == 16u) {
+            RS_CHECK(lens.title.find("Boxed AOT") != std::string::npos);
+            sawTryFallback = true;
+        }
+    }
+    RS_CHECK(sawPureHelper && sawAllocAndCall && sawTryFallback);
+
+    const std::string uri = "file:///codelens.rscript";
+    std::string inputStream;
+    inputStream += buildLspMessage(tooling::Json::Object{
+        {"jsonrpc", "2.0"},
+        {"id", std::int64_t{1}},
+        {"method", "initialize"},
+        {"params", tooling::Json::Object{}},
+    });
+    inputStream += buildLspMessage(tooling::Json::Object{
+        {"jsonrpc", "2.0"},
+        {"method", "textDocument/didOpen"},
+        {"params", tooling::Json::Object{
+            {"textDocument", tooling::Json::Object{
+                {"uri", uri},
+                {"languageId", "realscript"},
+                {"version", std::int64_t{1}},
+                {"text", src},
+            }},
+        }},
+    });
+    inputStream += buildLspMessage(tooling::Json::Object{
+        {"jsonrpc", "2.0"},
+        {"id", std::int64_t{2}},
+        {"method", "textDocument/codeLens"},
+        {"params", tooling::Json::Object{
+            {"textDocument", tooling::Json::Object{{"uri", uri}}},
+        }},
+    });
+    inputStream += buildLspMessage(tooling::Json::Object{
+        {"jsonrpc", "2.0"},
+        {"id", std::int64_t{3}},
+        {"method", "workspace/executeCommand"},
+        {"params", tooling::Json::Object{
+            {"command", "realscript.codeLens.noop"},
+        }},
+    });
+    inputStream += buildLspMessage(tooling::Json::Object{
+        {"jsonrpc", "2.0"},
+        {"id", std::int64_t{4}},
+        {"method", "shutdown"},
+        {"params", tooling::Json::Object{}},
+    });
+    inputStream += buildLspMessage(tooling::Json::Object{
+        {"jsonrpc", "2.0"},
+        {"method", "exit"},
+    });
+
+    std::istringstream in(inputStream);
+    std::ostringstream out;
+    tooling::LspServer server;
+    RS_CHECK(server.run(in, out) == 0);
+
+    const auto responses = parseLspMessages(out.str());
+    bool checkedInit = false;
+    bool checkedLens = false;
+    bool checkedNoop = false;
+    for (const auto& msg : responses) {
+        const auto* idNode = msg.find("id");
+        if (!idNode) continue;
+        const auto id = idNode->integerValue(0);
+        if (id == 1) {
+            const auto* caps = msg.find("result")->find("capabilities");
+            RS_CHECK(caps && caps->find("codeLensProvider") != nullptr);
+            checkedInit = true;
+        } else if (id == 2) {
+            const auto* res = msg.find("result");
+            RS_CHECK(res && res->isArray() && res->arrayValue().size() >= 3u);
+            const std::string dumped = res->dump();
+            RS_CHECK(dumped.find("Typed AOT | GC.Alloc: 0 | 2 refs") != std::string::npos);
+            RS_CHECK(dumped.find("Boxed AOT") != std::string::npos);
+            RS_CHECK(dumped.find("realscript.codeLens.noop") != std::string::npos);
+            checkedLens = true;
+        } else if (id == 3) {
+            RS_CHECK(msg.find("error") == nullptr);
+            checkedNoop = true;
+        }
+    }
+    RS_CHECK(checkedInit && checkedLens && checkedNoop);
+
+    std::cout << "[PASS] LanguageService & LspServer textDocument/codeLens lowering hints\n";
+}
+
 } // namespace
 
 int main() {
@@ -782,6 +917,7 @@ int main() {
     testGovernanceFuzzerDifferentialAndMutation();
     testRscCliFormatAndLintSmoke();
     testProjectConfigMacroPluginsAndSkeletonFastpath();
+    testCodeLensLoweringAndLspRoundTrip();
     std::cout << "All app_tooling_and_lsp_tests passed!\n";
     return 0;
 }

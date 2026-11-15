@@ -1,5 +1,7 @@
 #include "JitInternal.h"
 
+#include <chrono>
+
 #if defined(_WIN32)
 #define NOMINMAX
 #include <windows.h>
@@ -521,6 +523,50 @@ void populateJitErrorDiagnostics(
     return false;
 }
 
+void stepJitGcSafepoint(JitAbiContext* ctx) noexcept {
+    if (!ctx || !ctx->session) return;
+    auto& session = *ctx->session;
+    if (!session.heap || session.limits.gcWorkBudget == 0) return;
+    if (session.heap->phase() == runtime::GcPhase::Idle &&
+        !session.heap->collectionRequested()) {
+        return;
+    }
+    const bool recordGcNs = (session.telemetry != nullptr);
+    const auto gcSliceStart = recordGcNs
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+    const auto work = session.heap->step(session.shadowStack, session.limits.gcWorkBudget);
+    session.stats.gcWorkPerformed += work;
+    invalidateJitArrayCaches(*ctx);
+    if (recordGcNs) {
+        const auto elapsedNs = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - gcSliceStart).count());
+        session.telemetry->recordGcSliceNanoseconds(elapsedNs);
+    }
+}
+
+namespace {
+runtime::ScriptAllocationSite makeJitAllocSite(
+    const JitAbiContext& ctx,
+    std::uint32_t flatIdx) noexcept {
+    if (!ctx.compiledFn) return {};
+    const auto fallbackSym = ctx.compiledFn->symbolId;
+    if (!ctx.compiledFn->execFunc) return {fallbackSym, 0};
+    const auto& execFunc = *ctx.compiledFn->execFunc;
+    if (flatIdx >= execFunc.flatCold.size()) return {fallbackSym, 0};
+    const auto& cold = execFunc.flatCold[flatIdx];
+    const semantic::SymbolId sym =
+        (cold.inlinedCallee && cold.inlinedCallee->function)
+            ? cold.inlinedCallee->function->symbolId
+            : fallbackSym;
+    return {
+        sym,
+        runtime::packAllocationSiteOffset(cold.blockIndex, cold.instructionIndexInBlock),
+    };
+}
+} // namespace
+
 // Slow-path C++ helper for NewArrayFast
 std::uint32_t jitNewArrayHelper(JitAbiContext* ctx, std::uint32_t flatIdx) noexcept {
     const auto& execFunc = *ctx->compiledFn->execFunc;
@@ -617,6 +663,7 @@ std::uint32_t jitNewArrayHelper(JitAbiContext* ctx, std::uint32_t flatIdx) noexc
         }
     }
 
+    const runtime::ScopedAllocationSite allocSite(makeJitAllocSite(*ctx, flatIdx));
     bool slotsMoved = false;
     runtime::RuntimeError allocErr;
     const auto ref = session.heap->allocateTypedArray(
@@ -643,13 +690,11 @@ std::uint32_t jitNewArrayHelper(JitAbiContext* ctx, std::uint32_t flatIdx) noexc
     if (slotsMoved) {
         invalidateJitArrayCaches(*ctx);
     }
-    if (session.limits.gcWorkBudget != 0 &&
-        (session.heap->phase() != runtime::GcPhase::Idle || session.heap->collectionRequested())) {
-        const auto work = session.heap->step(session.shadowStack, session.limits.gcWorkBudget);
-        session.stats.gcWorkPerformed += work;
-        invalidateJitArrayCaches(*ctx);
-    }
     ctx->frameBase[fi.dstSlot] = *ref;
+    if (session.telemetry != nullptr && session.heap->isPackedArray(*ref)) {
+        session.telemetry->noteCompactHeapObject(*ref);
+    }
+    stepJitGcSafepoint(ctx);
     (void)bindJitArrayCacheSlot(
         session.heap,
         ctx->frameBase[fi.dstSlot],
@@ -1433,6 +1478,7 @@ std::uint32_t jitFlatStructAndStackRefHelper(JitAbiContext* ctx, std::uint32_t f
             return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "invalid object template");
         }
         const auto& tmpl = mirror.objectTemplates[fi.aux0Slot];
+        const runtime::ScopedAllocationSite allocSite(makeJitAllocSite(*ctx, flatIdx));
         runtime::RuntimeError allocErr;
         const auto allocated = session.heap->allocateObjectFromTemplate(
             tmpl.typeId,
@@ -1450,6 +1496,7 @@ std::uint32_t jitFlatStructAndStackRefHelper(JitAbiContext* ctx, std::uint32_t f
         ctx->remainingBudget -= fi.span;
         ctx->frameBase[fi.dstSlot] = *allocated;
         invalidateJitArrayCaches(*ctx);
+        stepJitGcSafepoint(ctx);
         return 0u;
     }
     if (fi.flatOpcode == FO::LoadFieldExactFast || fi.flatOpcode == FO::LoadFieldFast) {
@@ -1612,6 +1659,7 @@ std::uint32_t jitFlatStructAndStackRefHelper(JitAbiContext* ctx, std::uint32_t f
             if (!session.heap) {
                 return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "ConstantString requires heap");
             }
+            const runtime::ScopedAllocationSite allocSite(makeJitAllocSite(*ctx, flatIdx));
             runtime::RuntimeError strErr;
             const auto interned = session.heap->internString(bc.stringImmediate, &strErr);
             if (!interned) {
@@ -1620,6 +1668,7 @@ std::uint32_t jitFlatStructAndStackRefHelper(JitAbiContext* ctx, std::uint32_t f
             ctx->frameBase[regOff + bc.result] = *interned;
             ctx->remainingBudget -= fi.span;
             invalidateJitArrayCaches(*ctx);
+            stepJitGcSafepoint(ctx);
             return 0u;
         }
         case bytecode::Opcode::Equal:
@@ -2604,6 +2653,54 @@ std::uint32_t jitPartialSuperBudgetHelper(JitAbiContext* ctx, std::uint32_t flat
         }
     }
     return true;
+}
+
+[[nodiscard]] std::string explainStencilJitIneligibility(
+    const runtime::detail::ExecutionFunction& execFunc) {
+    if (!execFunc.bytecode) {
+        return "missing bytecode body";
+    }
+    if (execFunc.hasExceptionHandlers || !execFunc.bytecode->exceptionHandlers.empty()) {
+        return "function contains try/catch exception handlers";
+    }
+    if (execFunc.isAsyncFunction) {
+        return "async state-machine function runs via interpreter";
+    }
+    if (execFunc.directNativeReference != nullptr) {
+        return "direct host-native reference";
+    }
+    if (!execFunc.canUseFlatFastPath) {
+        return "flat fast-path disabled for function";
+    }
+    if (execFunc.flatStream.empty()) {
+        return "empty flat instruction stream";
+    }
+    if (execFunc.entryStreamOffset >= execFunc.flatStream.size()) {
+        return "invalid entry stream offset";
+    }
+    if (execFunc.totalFrameSlots == 0 || execFunc.totalFrameSlots > 4096) {
+        return "frame slot count outside StencilJit range (1..4096)";
+    }
+    for (std::size_t i = 0; i < execFunc.flatStream.size(); ++i) {
+        const auto& fi = execFunc.flatStream[i];
+        if (isStencilSupportedFlatOp(execFunc, fi)) {
+            continue;
+        }
+        if (fi.flatOpcode == runtime::detail::FlatOpcode::GenericBytecode &&
+            i < execFunc.flatCold.size()) {
+            const auto& cold = execFunc.flatCold[i];
+            if (cold.inlinedCallee != nullptr) {
+                return "unsupported inlined call inside GenericBytecode";
+            }
+            if (cold.bytecode != nullptr) {
+                return std::string("unsupported generic bytecode opcode: ") +
+                    bytecode::opcodeName(cold.bytecode->opcode);
+            }
+        }
+        return "unsupported flat opcode #" +
+            std::to_string(static_cast<unsigned>(fi.flatOpcode));
+    }
+    return {};
 }
 
 // ============================================================================

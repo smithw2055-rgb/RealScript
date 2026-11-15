@@ -1,5 +1,6 @@
 #include "realscript/tooling/LanguageService.h"
 
+#include "realscript/aot_cpp/AotCpp.h"
 #include "realscript/syntax/Syntax.h"
 #include "realscript/text/AssetGuid.h"
 #include "realscript/text/Text.h"
@@ -4466,6 +4467,61 @@ std::vector<InlayHint> LanguageService::inlayHints(const std::string& rawPath) {
     }
 
     return hints;
+}
+
+std::vector<CodeLensItem> LanguageService::codeLenses(const std::string& rawPath) {
+    const std::string path = normalizeDocPath(rawPath);
+    const auto& built = build();
+    if (!document(path)) return {};
+
+    const auto& defs = allDefinitionsRef();
+    const auto summaries = aot::analyzeFunctionLowering(built.modules);
+    std::unordered_map<semantic::SymbolId, const aot::FunctionLoweringSummary*> summaryById;
+    summaryById.reserve(summaries.size());
+    for (const auto& summary : summaries) {
+        if (summary.symbolId != 0) {
+            summaryById[summary.symbolId] = &summary;
+        }
+    }
+
+    std::unordered_map<semantic::SymbolId, std::size_t> refCounts;
+    for (const auto& occ : built.symbols) {
+        if (!occ.definition && occ.id != 0) {
+            ++refCounts[occ.id];
+        }
+    }
+
+    std::vector<CodeLensItem> lenses;
+    for (const auto& symbol : defs) {
+        if (symbol.location.path != path || symbol.kind != semantic::SymbolKind::Function) {
+            continue;
+        }
+        const auto sumIt = summaryById.find(symbol.id);
+        if (sumIt == summaryById.end()) {
+            continue;
+        }
+        const auto& summary = *sumIt->second;
+        const auto refIt = refCounts.find(symbol.id);
+        const std::size_t refCount = (refIt != refCounts.end()) ? refIt->second : 0u;
+
+        std::string title = summary.typedPrimitiveAot
+            ? std::string("Typed AOT")
+            : ("Boxed AOT" + (summary.boxedFallbackReason.empty()
+                ? std::string{}
+                : " (" + summary.boxedFallbackReason + ")"));
+        title += " | GC.Alloc: " + std::to_string(summary.heapAllocationSites);
+        title += " | " + std::to_string(refCount) + (refCount == 1 ? " ref" : " refs");
+        if (summary.parallelBatchKernel) title += " | parallel-batch";
+        if (summary.isAsync) title += " | async";
+        if (summary.hasLoops) title += " | loop";
+
+        lenses.push_back(CodeLensItem{
+            symbol.location.range,
+            std::move(title),
+            "realscript.codeLens.noop",
+        });
+    }
+    return lenses;
 }
 
 std::vector<TextEdit> LanguageService::formatDocument(const std::string& rawPath, std::size_t tabSize) {

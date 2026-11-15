@@ -40,7 +40,8 @@ void emitTypedPrimitiveFunction(
     const std::unordered_map<semantic::SymbolId, const FunctionView*>& typedFunctions,
     const std::map<semantic::SymbolId, TypeView>& allTypes,
     const std::unordered_map<const mir::Instruction*, std::size_t>& callIds,
-    const std::unordered_map<semantic::SymbolId, std::size_t>& hotPatchSlots) {
+    const std::unordered_map<semantic::SymbolId, std::size_t>& hotPatchSlots,
+    std::vector<OptimizationRemark>* remarks) {
     const auto& module = *view.module;
     const auto& function = *view.function;
     const auto types = valueSlotTypes(function);
@@ -660,11 +661,41 @@ void emitTypedPrimitiveFunction(
         if (vecLoopIt != vectorizedEcsLoops.end()) {
             emitVectorizedEcsLoop(
                 source, module, function, types, vecLoopIt->second, options.emitLineDirectives);
+            if (remarks != nullptr) {
+                OptimizationRemark r;
+                r.kind = OptimizationRemarkKind::Passed;
+                r.pass = "simd-vectorizer";
+                r.functionSymbolId = function.symbolId;
+                r.functionName = view.qualifiedName;
+                r.message = "vectorized ECS dense column loop";
+                const text::TextSpan span = !block.instructions.empty()
+                    ? block.instructions.front().sourceSpan
+                    : block.terminator.sourceSpan;
+                resolveRemarkLocation(
+                    module, function, block.id, 0u, span,
+                    r.sourceFile, r.line, r.column);
+                remarks->push_back(std::move(r));
+            }
         } else {
             const auto vecPackedIt = vectorizedPackedLoops.find(block.id);
             if (vecPackedIt != vectorizedPackedLoops.end()) {
                 emitVectorizedPackedArrayLoop(
                     source, function, types, vecPackedIt->second);
+                if (remarks != nullptr) {
+                    OptimizationRemark r;
+                    r.kind = OptimizationRemarkKind::Passed;
+                    r.pass = "simd-vectorizer";
+                    r.functionSymbolId = function.symbolId;
+                    r.functionName = view.qualifiedName;
+                    r.message = "vectorized packed array loop";
+                    const text::TextSpan span = !block.instructions.empty()
+                        ? block.instructions.front().sourceSpan
+                        : block.terminator.sourceSpan;
+                    resolveRemarkLocation(
+                        module, function, block.id, 0u, span,
+                        r.sourceFile, r.line, r.column);
+                    remarks->push_back(std::move(r));
+                }
             }
         }
         const auto rawConsumeBatches =
@@ -765,6 +796,12 @@ void emitTypedPrimitiveFunction(
                 source.line("            if (!context.constantString(\"" +
                     escapeCppString(instruction.stringImmediate) + "\", " +
                     result + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                if (remarks != nullptr) {
+                    appendAllocationRemark(
+                        *remarks, module, function, view.qualifiedName,
+                        block.id, static_cast<std::uint32_t>(instructionIndex),
+                        instruction, false);
+                }
                 emitRetainRegResult();
                 break;
             case mir::Opcode::ConstantNull:
@@ -795,13 +832,20 @@ void emitTypedPrimitiveFunction(
                 const auto objTid = instruction.resultTypeId != 0
                     ? instruction.resultTypeId
                     : instruction.typeId;
-                const char* allocFn = (!isAsyncFunction &&
-                    isNonEscapingMirStackRefAlloc(function, instruction, allTypes))
+                const bool isNonEscaping = !isAsyncFunction &&
+                    isNonEscapingMirStackRefAlloc(function, instruction, allTypes);
+                const char* allocFn = isNonEscaping
                     ? "context.newStackRefObject(0x"
                     : "context.newObject(0x";
                 source.line("            if (!" + std::string(allocFn) +
                     hexId(objTid) + "ULL, " + result +
                     ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                if (remarks != nullptr) {
+                    appendAllocationRemark(
+                        *remarks, module, function, view.qualifiedName,
+                        block.id, static_cast<std::uint32_t>(instructionIndex),
+                        instruction, isNonEscaping);
+                }
                 emitRetainRegResult();
                 break;
             }
@@ -877,6 +921,12 @@ void emitTypedPrimitiveFunction(
                     hexId(instruction.elementTypeId) + "ULL, runtime::Value{" +
                     operand(0) + "}, " + result +
                     ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                if (remarks != nullptr) {
+                    appendAllocationRemark(
+                        *remarks, module, function, view.qualifiedName,
+                        block.id, static_cast<std::uint32_t>(instructionIndex),
+                        instruction, false);
+                }
                 emitRetainRegResult();
                 break;
             }
@@ -2010,6 +2060,12 @@ void emitTypedPrimitiveFunction(
                         ", 1u, " + result +
                         ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
                 }
+                if (remarks != nullptr) {
+                    appendAllocationRemark(
+                        *remarks, module, function, view.qualifiedName,
+                        block.id, static_cast<std::uint32_t>(instructionIndex),
+                        instruction, false);
+                }
                 emitRetainRegResult();
                 break;
             }
@@ -2027,6 +2083,12 @@ void emitTypedPrimitiveFunction(
                     (instruction.opcode == mir::Opcode::RemoveDelegate ? "true" : "false") +
                     ", " + result +
                     ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                if (remarks != nullptr) {
+                    appendAllocationRemark(
+                        *remarks, module, function, view.qualifiedName,
+                        block.id, static_cast<std::uint32_t>(instructionIndex),
+                        instruction, false);
+                }
                 emitRetainRegResult();
                 break;
             }
@@ -2658,6 +2720,161 @@ void emitTypedPrimitiveFunction(
         "_typed<false, false, false>(context, arguments, argumentCount, result);");
     source.line("}");
     source.line();
+    if (supportsTypedParallelBatchKernel(view)) {
+        const bool supportsRangeKernel =
+            function.parameterTypes.size() >= 2 &&
+            function.parameterTypes[1] == semantic::PrimitiveType::Int;
+        source.line("template <bool FastAccounting, bool DeterminismAccounting, bool TrustedRelease = false>");
+        source.line("static bool " + view.cppName + "_parallel_batch_impl(");
+        source.line("    ExecutionContext& context,");
+        source.line("    runtime::ParallelNativeBatchContext& batch) {");
+        source.line("    const bool isRange = (batch.kernelKind == runtime::ParallelKernelKind::Range);");
+        source.line("    const std::size_t userArgCount = batch.userArguments ? batch.userArguments->size() : 0u;");
+        for (std::size_t index = 0; index < function.parameterTypes.size(); ++index) {
+            const auto typeId = index < function.parameterTypeIds.size()
+                ? function.parameterTypeIds[index]
+                : 0;
+            const TypedSlotType paramSlot{function.parameterTypes[index], typeId};
+            source.line("    " + typedCppType(paramSlot) + " unboxedArg_" +
+                std::to_string(index) + "{};");
+        }
+        std::string batchScalarCallArgs = "context";
+        for (std::size_t index = 0; index < function.parameterTypes.size(); ++index) {
+            batchScalarCallArgs += ", unboxedArg_" + std::to_string(index);
+        }
+        const bool hasReturn = (function.returnType != semantic::PrimitiveType::Void);
+        const std::string retBoxedExpr = hasReturn
+            ? ("aot::typedBoxScalar(" + primitiveExpression(function.returnType) + ", typedOutResult)")
+            : std::string{};
+        const std::string retDecl = hasReturn
+            ? (typedCppType(TypedSlotType{function.returnType, function.returnTypeId}) + " typedOutResult{};")
+            : std::string{};
+        const std::string scalarCallWithRet = hasReturn
+            ? (batchScalarCallArgs + ", typedOutResult")
+            : batchScalarCallArgs;
+
+        source.line("    if (isRange) {");
+        if (supportsRangeKernel) {
+            source.line("        if (2u + userArgCount != " +
+                std::to_string(function.parameterTypes.size()) + "u) {");
+            source.line("            return context.fail(runtime::ErrorCode::InvalidArguments, \"AOT parallel range argument count mismatch\");");
+            source.line("        }");
+            for (std::size_t index = 2; index < function.parameterTypes.size(); ++index) {
+                const auto paramPrim = function.parameterTypes[index];
+                source.line("        if (!aot::typedUnboxScalar(" +
+                    primitiveExpression(paramPrim) + ", (*batch.userArguments)[" +
+                    std::to_string(index - 2) + "], unboxedArg_" +
+                    std::to_string(index) + ")) {");
+                source.line("            return context.fail(runtime::ErrorCode::TypeMismatch, \"AOT parallel parameter type mismatch\");");
+                source.line("        }");
+            }
+            source.line("        unboxedArg_0 = static_cast<std::int64_t>(batch.start);");
+            source.line("        unboxedArg_1 = static_cast<std::int64_t>(batch.count);");
+            if (hasReturn) {
+                source.line("        " + retDecl);
+            }
+            source.line("        if (!" + view.cppName +
+                "_scalar<FastAccounting, DeterminismAccounting, TrustedRelease>(" +
+                scalarCallWithRet + ")) return false;");
+            if (hasReturn) {
+                source.line("        batch.reducedValue = " + retBoxedExpr + ";");
+            } else {
+                source.line("        batch.reducedValue = runtime::Value{std::monostate{}};");
+            }
+            source.line("        batch.hasReducedValue = true;");
+            source.line("        return true;");
+        } else {
+            source.line("        return context.fail(runtime::ErrorCode::InvalidArguments, \"AOT parallel range kernel requires two leading int parameters\");");
+        }
+        source.line("    }");
+        source.line("    if (1u + userArgCount != " +
+            std::to_string(function.parameterTypes.size()) + "u) {");
+        source.line("        return context.fail(runtime::ErrorCode::InvalidArguments, \"AOT parallel element argument count mismatch\");");
+        source.line("    }");
+        for (std::size_t index = 1; index < function.parameterTypes.size(); ++index) {
+            const auto paramPrim = function.parameterTypes[index];
+            source.line("    if (!aot::typedUnboxScalar(" +
+                primitiveExpression(paramPrim) + ", (*batch.userArguments)[" +
+                std::to_string(index - 1) + "], unboxedArg_" +
+                std::to_string(index) + ")) {");
+            source.line("        return context.fail(runtime::ErrorCode::TypeMismatch, \"AOT parallel parameter type mismatch\");");
+            source.line("    }");
+        }
+        if (hasReturn) {
+            source.line("    const runtime::ParallelReduceOp reduceOp = batch.config ? batch.config->reduceOp : runtime::ParallelReduceOp::None;");
+            source.line("    const runtime::ParallelCustomReducer& customReducer = batch.config ? batch.config->customReducer : runtime::ParallelCustomReducer{};");
+            source.line("    const bool strictDet = batch.config && (batch.config->executionOptions.determinism.mode == runtime::DeterminismMode::Strict);");
+            source.line("    bool hasAcc = false;");
+            source.line("    runtime::Value accValue{std::monostate{}};");
+            source.line("    for (std::size_t batchOff = 0u; batchOff < batch.count; ++batchOff) {");
+            source.line("        unboxedArg_0 = static_cast<std::int64_t>(batch.start + batchOff);");
+            source.line("        " + retDecl);
+            source.line("        if (!" + view.cppName +
+                "_scalar<FastAccounting, DeterminismAccounting, TrustedRelease>(" +
+                scalarCallWithRet + ")) return false;");
+            source.line("        if (reduceOp != runtime::ParallelReduceOp::None) {");
+            source.line("            runtime::RuntimeError reduceErr{};");
+            source.line("            if (!runtime::accumulateParallelReductionValue(reduceOp, customReducer, strictDet, accValue, hasAcc, " +
+                retBoxedExpr + ", reduceErr)) {");
+            source.line("                return context.fail(reduceErr.code, reduceErr.message);");
+            source.line("            }");
+            source.line("        }");
+            source.line("    }");
+            source.line("    batch.hasReducedValue = hasAcc;");
+            source.line("    batch.reducedValue = (reduceOp == runtime::ParallelReduceOp::None || !hasAcc)");
+            source.line("        ? runtime::Value{std::monostate{}}");
+            source.line("        : std::move(accValue);");
+        } else {
+            source.line("    for (std::size_t batchOff = 0u; batchOff < batch.count; ++batchOff) {");
+            source.line("        unboxedArg_0 = static_cast<std::int64_t>(batch.start + batchOff);");
+            source.line("        if (!" + view.cppName +
+                "_scalar<FastAccounting, DeterminismAccounting, TrustedRelease>(" +
+                scalarCallWithRet + ")) return false;");
+            source.line("    }");
+            source.line("    batch.hasReducedValue = false;");
+            source.line("    batch.reducedValue = runtime::Value{std::monostate{}};");
+        }
+        source.line("    return true;");
+        source.line("}");
+        source.line();
+        source.line("static bool " + view.cppName + "_parallel_batch(");
+        source.line("    ExecutionContext& context,");
+        source.line("    runtime::ParallelNativeBatchContext& batch) {");
+        if (options.trustedRelease) {
+            source.line("    if (context.trustedReleaseEnabled() || context.fastAccountingEnabled()) {");
+            source.line("        return " + view.cppName +
+                "_parallel_batch_impl<false, false, true>(context, batch);");
+            source.line("    }");
+        } else {
+            source.line("    if (context.trustedReleaseEnabled()) {");
+            source.line("        return " + view.cppName +
+                "_parallel_batch_impl<false, false, true>(context, batch);");
+            source.line("    }");
+            source.line("    if (context.fastAccountingEnabled()) {");
+            source.line("        return " + view.cppName +
+                "_parallel_batch_impl<true, false, false>(context, batch);");
+            source.line("    }");
+        }
+        source.line("    if (context.typedDeterminismAccountingEnabled()) {");
+        source.line("        return " + view.cppName +
+            "_parallel_batch_impl<false, true, false>(context, batch);");
+        source.line("    }");
+        source.line("    return " + view.cppName +
+            "_parallel_batch_impl<false, false, false>(context, batch);");
+        source.line("}");
+        source.line();
+    }
+}
+
+bool supportsTypedParallelBatchKernel(const FunctionView& view) {
+    if (!view.function) return false;
+    const auto& fn = *view.function;
+    const bool isAsyncFunction = !fn.blocks.empty() &&
+        !fn.blocks.front().instructions.empty() &&
+        fn.blocks.front().instructions.front().opcode == mir::Opcode::AsyncEnter;
+    if (isAsyncFunction) return false;
+    return !fn.parameterTypes.empty() &&
+        fn.parameterTypes[0] == semantic::PrimitiveType::Int;
 }
 
 } // namespace realscript::aot::detail

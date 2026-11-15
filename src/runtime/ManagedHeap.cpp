@@ -71,7 +71,7 @@ std::vector<NativeHandleRegistry*>& nativeHandleRegistries() noexcept {
     return registries;
 }
 
-const char* objectKindName(ObjectKind kind) noexcept {
+const char* snapshotObjectKindName(ObjectKind kind) noexcept {
     switch (kind) {
     case ObjectKind::String: return "string";
     case ObjectKind::Array: return "array";
@@ -3465,6 +3465,31 @@ struct ManagedHeap::Impl {
     std::vector<const ShadowStack*> activeShadowStacks;
     std::unordered_map<semantic::SymbolId, Value> staticFields;
     std::unordered_map<std::string, NativeEcsColumnTable> nativeEcsTables;
+    struct AllocationSiteKey {
+        semantic::SymbolId functionId = 0;
+        std::uint32_t instructionOffset = 0;
+        ObjectKind kind = ObjectKind::Record;
+
+        [[nodiscard]] bool operator==(const AllocationSiteKey& other) const noexcept {
+            return functionId == other.functionId &&
+                instructionOffset == other.instructionOffset &&
+                kind == other.kind;
+        }
+    };
+    struct AllocationSiteKeyHash {
+        [[nodiscard]] std::size_t operator()(const AllocationSiteKey& key) const noexcept {
+            std::size_t h = static_cast<std::size_t>(key.functionId) * 0x9E3779B97F4A7C15ULL;
+            h ^= static_cast<std::size_t>(key.instructionOffset) * 0xBF58476D1CE4E5B9ULL + (h << 6u) + (h >> 2u);
+            h ^= static_cast<std::size_t>(static_cast<std::uint8_t>(key.kind)) + (h << 6u) + (h >> 2u);
+            return h;
+        }
+    };
+    struct AllocationSiteCounters {
+        std::uint64_t allocationCount = 0;
+        std::uint64_t allocatedBytes = 0;
+    };
+    std::atomic<bool> allocationProfilingEnabled{false};
+    std::unordered_map<AllocationSiteKey, AllocationSiteCounters, AllocationSiteKeyHash> allocationProfile;
     std::unordered_map<std::string, ObjectRef> internedStrings;
     bool hasDirtyTrackingTypes = false;
     std::unordered_map<semantic::SymbolId, std::vector<std::uint8_t>> typeDirtyBitMaps;
@@ -3864,6 +3889,16 @@ struct ManagedHeap::Impl {
         ++statistics.liveObjects;
         statistics.liveBytes += sizeBytes;
         statistics.peakLiveBytes = std::max(statistics.peakLiveBytes, statistics.liveBytes);
+        const ScriptAllocationSite site = activeAllocationSite();
+        if (auto* telemetry = activeFrameTelemetry(); telemetry != nullptr) {
+            telemetry->recordAllocation(site.functionId, site.instructionOffset, kind, sizeBytes);
+        }
+        if (allocationProfilingEnabled.load(std::memory_order_relaxed)) {
+            const AllocationSiteKey key{site.functionId, site.instructionOffset, kind};
+            auto& entry = allocationProfile[key];
+            ++entry.allocationCount;
+            entry.allocatedBytes += static_cast<std::uint64_t>(sizeBytes);
+        }
         if (statistics.liveBytes >= nextCollectionThreshold) requested = true;
         if (phase != GcPhase::Idle) {
             markStack.push_back(reference);
@@ -9416,6 +9451,53 @@ std::size_t ManagedHeap::liveBytes() const noexcept {
     return impl_->statistics.liveBytes;
 }
 
+void ManagedHeap::setAllocationProfilingEnabled(bool enabled) noexcept {
+    impl_->allocationProfilingEnabled.store(enabled, std::memory_order_release);
+}
+
+bool ManagedHeap::allocationProfilingEnabled() const noexcept {
+    return impl_->allocationProfilingEnabled.load(std::memory_order_acquire);
+}
+
+void ManagedHeap::clearAllocationProfile() noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    impl_->allocationProfile.clear();
+}
+
+std::vector<ManagedHeap::AllocationSiteRecord> ManagedHeap::allocationProfileSnapshot() const {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    std::vector<AllocationSiteRecord> result;
+    result.reserve(impl_->allocationProfile.size());
+    for (const auto& [key, counters] : impl_->allocationProfile) {
+        result.push_back(AllocationSiteRecord{
+            key.functionId,
+            key.instructionOffset,
+            key.kind,
+            counters.allocationCount,
+            counters.allocatedBytes,
+        });
+    }
+    std::sort(
+        result.begin(),
+        result.end(),
+        [](const AllocationSiteRecord& lhs, const AllocationSiteRecord& rhs) {
+            if (lhs.allocatedBytes != rhs.allocatedBytes) {
+                return lhs.allocatedBytes > rhs.allocatedBytes;
+            }
+            if (lhs.allocationCount != rhs.allocationCount) {
+                return lhs.allocationCount > rhs.allocationCount;
+            }
+            if (lhs.functionId != rhs.functionId) {
+                return lhs.functionId < rhs.functionId;
+            }
+            if (lhs.instructionOffset != rhs.instructionOffset) {
+                return lhs.instructionOffset < rhs.instructionOffset;
+            }
+            return static_cast<std::uint8_t>(lhs.kind) < static_cast<std::uint8_t>(rhs.kind);
+        });
+    return result;
+}
+
 std::uint64_t ManagedHeap::heapId() const noexcept { return impl_->heapId; }
 
 HeapSnapshot ManagedHeap::Impl::snapshotUnlocked(const ShadowStack* shadowStack) const {
@@ -10024,7 +10106,7 @@ std::string HeapSnapshot::toText() const {
     }
     for (const auto& object : objects) {
         out << 'o' << object.reference.slot << ':' << object.reference.generation
-            << ' ' << objectKindName(object.kind) << " bytes=" << object.sizeBytes;
+            << ' ' << snapshotObjectKindName(object.kind) << " bytes=" << object.sizeBytes;
         if (object.typeId != 0) out << " type=0x" << std::hex << object.typeId << std::dec;
         if (object.kind == ObjectKind::Array) {
             out << " element=" << semantic::primitiveTypeName(object.elementType)

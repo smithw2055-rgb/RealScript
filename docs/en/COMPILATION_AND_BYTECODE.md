@@ -16,8 +16,8 @@ SourceText
   -> Flow Analysis
   -> Typed MIR Lowering
   -> MIR Verification
-  -> Optional MIR Optimization
-  -> Bytecode / C++17 AOT / Toolchain JIT
+  -> Optional MIR Optimization (O0/O1/O2: SROA, LICM, small-function inlining)
+  -> Bytecode / In-process StencilJit / C++17 AOT / Toolchain JIT
 ```
 
 Diagnostics accumulate across stages so users can receive multiple useful errors from one compilation.
@@ -59,8 +59,7 @@ Each module records:
 
 If an implementation changes without changing public signatures, dependent module MIR may be reused from the previous `BuildSnapshot`. If a public signature changes, direct dependents are rebound.
 
-The v0.98.0 baseline reuses semantic and MIR results with per-file `ParseSnapshot`
-caching in the language server. Persistent parser disk caches are future work.
+In the language server, semantic and MIR results are cached per file via `ParseSnapshot` alongside incremental subgraph metadata caching. For offline builds (`rsc` and `rsaot`), `ModuleBuildCache` (`--cache-dir`, `--cache-stats`) persists compiled module shards keyed by upstream `publicFingerprint` vs `implementationFingerprint`, tracking imported generic/partial-generic specializations and C11 macro-plugin state (`C11MacroPlugin`, `[Signal]`, `[RelayCommand]`) for deterministic invalidation.
 
 ## Typed MIR
 
@@ -146,7 +145,7 @@ In v0.98.0, the runtime bytecode engine features:
 - **Unified Flat-Frame Layout**: contiguous memory allocation for locals, arguments, and evaluation registers;
 - **Computed-Goto Threaded Dispatch**: direct label addressing for instruction decoding in performance-critical loops;
 - **Widened 32-bit `BytecodeString`**: backed by lock-free paged string pools and register slice pools;
-- **Compacted Representations**: 24-byte `Value` and 8-byte `Instruction` layouts with quickened integer superinstructions (`AddIntLocalConst`, `SubIntLocalConst`, `LessIntLocalConstBranch`).
+- **Compacted Representations**: 16-byte `Value` (`sizeof(runtime::Value) == 16`) and 8-byte `Instruction` layouts with quickened integer superinstructions (`AddIntLocalConst`, `SubIntLocalConst`, `LessIntLocalConstBranch`).
 
 Bytecode functions retain:
 
@@ -234,7 +233,6 @@ rsc program.rsbc --disassemble
 
 `--emit-bytecode` retains the single-module file workflow. For a compilation
 that produces multiple modules, `--emit-bytecode-dir` writes one canonically
-named `.rsbc` artifact per module so the files can be passed directly to
-`GameProgramLoader::loadBytecodeModules`.
+named `.rsbc` artifact per module for loading via `bytecode::decodeModule` and `ProgramImage::link` (or `GameProgramLoader::loadBytecodeModules` in companion `RealScript-GamePack`).
 
 For backend details, continue with [AOT, JIT, and Performance](AOT_JIT_AND_PERFORMANCE.md).

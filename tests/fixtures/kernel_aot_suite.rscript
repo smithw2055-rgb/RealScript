@@ -407,3 +407,16 @@ public float ScaleFloatSpan(Span<float> dst, float scale, ReadOnlySpan<float> sr
     }
     return acc;
 }
+
+public float ParallelStepElement(int index, float[] dst, float[] src, float scale) {
+    float val = src[index] * scale + 1.25f;
+    dst[index] = val;
+    return val;
+}
+
+public void ParallelRangeStep(int start, int count, float[] dst, float[] src, float scale) {
+    for (int off = 0; off < count; off = off + 1) {
+        int idx = start + off;
+        dst[idx] = src[idx] * scale + 2.0f;
+    }
+}

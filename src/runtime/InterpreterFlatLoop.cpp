@@ -37,6 +37,7 @@ bool executeFunction(
             }
         }
     } telemetryScope{state, function.symbolId};
+    const runtime::ScopedAllocationSite fnAllocSite(function.symbolId, 0);
     const auto* execution = cachedExecution
         ? cachedExecution
         : detail::findExecutionFunction(
@@ -2455,6 +2456,12 @@ bool executeFunction(
                         initVal = defaultValue(*location.module, elemType, elemTid);
                     }
 
+                    const auto& allocCold = flatColdBase[ip - streamBase];
+                    const runtime::ScopedAllocationSite allocSite(
+                        (allocCold.inlinedCallee && allocCold.inlinedCallee->function)
+                            ? allocCold.inlinedCallee->function->symbolId
+                            : function.symbolId,
+                        runtime::packAllocationSiteOffset(allocCold.blockIndex, allocCold.instructionIndexInBlock));
                     bool slotsMoved = false;
                     RuntimeError allocErr;
                     const auto ref = state.heap->allocateTypedArray(
@@ -5048,6 +5055,12 @@ bool executeFunction(
                 else gcAccounted = localExecuted;
 
                 const auto& tmpl = detail::executionMirror(*state.program).objectTemplates[ip->aux0Slot];
+                const auto& allocCold = flatColdBase[ip - streamBase];
+                const runtime::ScopedAllocationSite allocSite(
+                    (allocCold.inlinedCallee && allocCold.inlinedCallee->function)
+                        ? allocCold.inlinedCallee->function->symbolId
+                        : function.symbolId,
+                    runtime::packAllocationSiteOffset(allocCold.blockIndex, allocCold.instructionIndexInBlock));
                 bool slotsMoved = false;
                 RuntimeError allocErr;
                 const auto ref = state.heap->allocateObjectFromTemplate(
@@ -5292,6 +5305,12 @@ bool executeFunction(
                 if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                 else gcAccounted = localExecuted;
 
+                const auto& allocCold = flatColdBase[ip - streamBase];
+                const runtime::ScopedAllocationSite allocSite(
+                    (allocCold.inlinedCallee && allocCold.inlinedCallee->function)
+                        ? allocCold.inlinedCallee->function->symbolId
+                        : function.symbolId,
+                    runtime::packAllocationSiteOffset(allocCold.blockIndex, allocCold.instructionIndexInBlock));
                 bool slotsMoved = false;
                 RuntimeError allocErr;
                 const auto ref = state.heap->allocateObjectFromTemplate(
@@ -5346,6 +5365,12 @@ bool executeFunction(
                 else gcAccounted = localExecuted;
                 state.executed = localExecuted;
 
+                const auto& allocCold = flatColdBase[ip - streamBase];
+                const runtime::ScopedAllocationSite allocSite(
+                    (allocCold.inlinedCallee && allocCold.inlinedCallee->function)
+                        ? allocCold.inlinedCallee->function->symbolId
+                        : function.symbolId,
+                    runtime::packAllocationSiteOffset(allocCold.blockIndex, allocCold.instructionIndexInBlock));
                 bool slotsMoved = false;
                 Value combinedOut;
                 if (RS_FLAT_UNLIKELY(!combineOrRemoveDelegateFastImpl(
@@ -6614,6 +6639,9 @@ bool executeFunction(
                     const ValueWindow locWin{&state.values, subOff + cExec.localOffset, cFunc.localTypes.size()};
                     const ValueWindow regWin{&state.values, subOff + cExec.registerOffset, cFunc.registerTypes.size()};
                     state.stack.push_back(&cLoc.qualifiedName);
+                    const runtime::ScopedAllocationSite allocSite(
+                        cFunc.symbolId,
+                        runtime::packAllocationSiteOffset(cold.blockIndex, cold.instructionIndexInBlock));
                     const bool ok = executeInstruction(
                         state, *cLoc.module, cFunc, *cold.bytecode, argWin, locWin, regWin);
                     frameBase = state.values.data() + frameOffset;
@@ -6648,6 +6676,9 @@ bool executeFunction(
                 const ValueWindow argWin{&state.values, frameOffset + execution->paramOffset, argCount};
                 const ValueWindow locWin{&state.values, frameOffset + execution->localOffset, function.localTypes.size()};
                 const ValueWindow regWin{&state.values, frameOffset + execution->registerOffset, function.registerTypes.size()};
+                const runtime::ScopedAllocationSite allocSite(
+                    function.symbolId,
+                    runtime::packAllocationSiteOffset(cold.blockIndex, cold.instructionIndexInBlock));
                 const bool ok = executeInstruction(
                     state, *location.module, function, *cold.bytecode, argWin, locWin, regWin);
                 frameBase = state.values.data() + frameOffset;
@@ -6910,6 +6941,7 @@ L_FlatSuperFallback: {
             state.stack.push_back(&activeLoc.qualifiedName);
         }
         std::size_t executedSubK = 0;
+        const runtime::ScopedAllocationSite superAllocSite(activeFunc.symbolId, 0);
         for (std::size_t k = 0; k < instSpan; ++k) {
             executedSubK = k;
             const auto& singleDec = blk.instructions[startIdx + k];

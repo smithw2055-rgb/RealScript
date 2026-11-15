@@ -69,6 +69,15 @@ enum class StencilTargetArch : std::uint8_t {
     Arm64 = 2,
 };
 
+struct StencilFunctionDiagnostic {
+    semantic::SymbolId symbolId = 0;
+    std::string qualifiedName;
+    StencilTier tier = StencilTier::InterpreterFallback;
+    bool eligibleForThreaded = false;
+    bool eligibleForNative = false;
+    std::string fallbackReason;
+};
+
 struct StencilJitOptions {
     bool enableNativeCodegen = true;
     bool enableThreadedFallback = true;
@@ -118,10 +127,28 @@ public:
     [[nodiscard]] std::size_t nativeFunctionCount() const noexcept;
     [[nodiscard]] std::size_t threadedFunctionCount() const noexcept;
     [[nodiscard]] std::size_t fallbackFunctionCount() const noexcept;
+    [[nodiscard]] std::size_t interpreterFallbackCount() const noexcept;
+    void resetInterpreterFallbackCount() const noexcept;
+    [[nodiscard]] std::size_t parallelBatchExecutionCount() const noexcept;
+    void resetParallelBatchExecutionCount() const noexcept;
+    [[nodiscard]] runtime::ParallelNativeBatchKernel buildParallelBatchKernel(
+        semantic::SymbolId symbolId,
+        runtime::ParallelKernelKind kernelKind,
+        const std::vector<runtime::ParallelNativeColumnBinding>& paramColumns,
+        const runtime::ParallelJobConfig& config,
+        bool usesParallelPrng = false) const;
+    [[nodiscard]] runtime::ParallelNativeBatchKernel buildParallelBatchKernel(
+        const std::string& qualifiedName,
+        runtime::ParallelKernelKind kernelKind,
+        const std::vector<runtime::ParallelNativeColumnBinding>& paramColumns,
+        const runtime::ParallelJobConfig& config,
+        bool usesParallelPrng = false) const;
+    void attachToProgramImage(const runtime::ProgramImage& program) const;
     [[nodiscard]] std::size_t machineCodeBytes() const noexcept;
     [[nodiscard]] bool nativeBackendActive() const noexcept;
     [[nodiscard]] StencilTier functionTier(semantic::SymbolId symbolId) const noexcept;
     [[nodiscard]] StencilTier functionTier(const std::string& qualifiedName) const noexcept;
+    [[nodiscard]] std::vector<StencilFunctionDiagnostic> functionDiagnostics() const;
     [[nodiscard]] StencilTargetArch hostTargetArch() const noexcept;
     [[nodiscard]] std::vector<std::uint8_t> inspectMachineCode(
         const std::string& qualifiedName) const;
@@ -143,8 +170,8 @@ public:
 private:
     friend class StencilJit;
     struct Impl;
-    explicit StencilModule(std::unique_ptr<Impl> impl);
-    std::unique_ptr<Impl> impl_;
+    explicit StencilModule(std::shared_ptr<Impl> impl);
+    std::shared_ptr<Impl> impl_;
 };
 
 struct StencilCompileResult {

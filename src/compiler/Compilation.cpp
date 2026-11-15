@@ -672,6 +672,19 @@ void mergePartialTypesInModule(ModuleWork& module, BuildResult& result) {
 
     detail::mergePartialRecordDeclarations(
         partialUnits, result.diagnostics, module.invalid);
+
+    bool anyGenericSyntax = false;
+    for (const auto* u : module.units) {
+        if (u && u->hasGenericSyntax) {
+            anyGenericSyntax = true;
+            break;
+        }
+    }
+    if (anyGenericSyntax) {
+        for (auto* u : module.units) {
+            if (u) u->hasGenericSyntax = true;
+        }
+    }
 }
 
 } // namespace
