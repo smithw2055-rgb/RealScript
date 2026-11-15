@@ -42,3 +42,15 @@ if(TARGET RealScript::Runtime)
         COMMAND realscript_install_runtime_c_consumer
     )
 endif()
+
+foreach(_rs_expected_target IN ITEMS
+        RealScript::SlimRuntime
+        RealScript::BindGenRuntime
+        RealScript::StencilJit
+        RealScript::HotReload
+        RealScript::Frontend
+        RealScript::Full)
+    if(NOT TARGET ${_rs_expected_target})
+        message(FATAL_ERROR "Missing exported RealScript target: ${_rs_expected_target}")
+    endif()
+endforeach()

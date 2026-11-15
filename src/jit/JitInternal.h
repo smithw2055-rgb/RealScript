@@ -1,6 +1,6 @@
 #pragma once
 
-#include "realscript/jit/Jit.h"
+#include "realscript/jit/StencilJit.h"
 
 #include "../runtime/ExecutionMirror.h"
 #include "realscript/runtime/AsyncRuntime.h"
@@ -323,7 +323,7 @@ std::uint32_t jitPartialSuperBudgetHelper(JitAbiContext* ctx, std::uint32_t flat
 [[nodiscard]] bool isFunctionEligibleForStencilJit(
     const runtime::detail::ExecutionFunction& execFunc) noexcept;
 
-#if UINTPTR_MAX == 0xffffffffffffffffULL
+#if !defined(__EMSCRIPTEN__) && UINTPTR_MAX == 0xffffffffffffffffULL
 [[nodiscard]] std::vector<std::uint8_t> compileFunctionX64(
     const CompiledFunctionRecord& record);
 

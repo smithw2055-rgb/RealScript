@@ -1049,7 +1049,8 @@ struct StencilModule::Impl {
           primaryArena(opts.arenaBlockBytes) {}
 
     bool promoteFunctionToNativeLocked(CompiledFunctionRecord& rec, ExecutableCodeArena* batchArena) const {
-#if defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__) || defined(_M_ARM64)
+#if !defined(__EMSCRIPTEN__) && (UINTPTR_MAX == 0xffffffffffffffffULL) && \
+    (defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__) || defined(_M_ARM64))
         if (!nativeBackendAvailable || !rec.eligibleForNative) return false;
         if (rec.tier.load(std::memory_order_relaxed) == StencilTier::NativeMachineCode) return true;
 
@@ -1328,7 +1329,7 @@ struct StencilModule::Impl {
         std::uint32_t rawStatus = 0u;
         std::string simDiag;
         if (forceSimulateArm64) {
-#if UINTPTR_MAX == 0xffffffffffffffffULL
+#if !defined(__EMSCRIPTEN__) && UINTPTR_MAX == 0xffffffffffffffffULL
             const auto arm64Code = compileFunctionA64(rec);
             if (arm64Code.empty()) {
                 simDiag = "compileFunctionA64 returned empty machine code";
@@ -1549,9 +1550,9 @@ StencilTier StencilModule::functionTier(const std::string& qualifiedName) const 
 }
 
 StencilTargetArch StencilModule::hostTargetArch() const noexcept {
-#if defined(__aarch64__) || defined(_M_ARM64)
+#if !defined(__EMSCRIPTEN__) && (defined(__aarch64__) || defined(_M_ARM64))
     return StencilTargetArch::Arm64;
-#elif defined(__x86_64__) || defined(_M_X64)
+#elif !defined(__EMSCRIPTEN__) && (defined(__x86_64__) || defined(_M_X64))
     return StencilTargetArch::X86_64;
 #else
     return StencilTargetArch::Host;
@@ -1579,7 +1580,7 @@ std::vector<std::uint8_t> StencilModule::inspectMachineCode(
             return std::vector<std::uint8_t>(rec.rawCodePtr, rec.rawCodePtr + rec.rawCodeSize);
         }
     }
-#if UINTPTR_MAX == 0xffffffffffffffffULL
+#if !defined(__EMSCRIPTEN__) && UINTPTR_MAX == 0xffffffffffffffffULL
     if (!rec.eligibleForNative || rec.execFunc == nullptr) {
         return {};
     }

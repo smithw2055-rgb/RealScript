@@ -3691,3 +3691,17 @@ HostApi::HeaderBindingGenerationResult generateFromParsedHeader(
 }
 
 } // namespace realscript::bindgen::rsbind_detail
+
+namespace realscript::bindgen {
+
+HostApi::HeaderBindingGenerationResult HostApi::generateBindingsFromCppHeader(
+    std::string_view headerContent,
+    const std::string& defaultModuleName,
+    const std::unordered_map<std::string, std::string>& predefinedMacros) {
+    return rsbind_detail::generateFromParsedHeader(
+        headerContent,
+        defaultModuleName,
+        predefinedMacros);
+}
+
+} // namespace realscript::bindgen

@@ -154,6 +154,7 @@ realscript_add_layer_library(realscript_layer_compiler_core
     src/compiler/Compilation.cpp
     src/compiler/ModuleBuildCache.cpp
     src/compiler/ProjectConfig.cpp
+    src/compiler/StandardMacros.cpp
 )
 realscript_add_slice_library(realscript_slice_compiler_core Compiler
     $<TARGET_OBJECTS:realscript_layer_compiler_core>
@@ -208,7 +209,37 @@ target_link_libraries(realscript_slim_runtime INTERFACE
 set_target_properties(realscript_slim_runtime PROPERTIES EXPORT_NAME SlimRuntime)
 add_library(RealScript::SlimRuntime ALIAS realscript_slim_runtime)
 
-# 5. Native Backends & Hot Reload (aot_cpp codegen, jit, hot_reload)
+# 4c. BindGen Host Runtime (host API marshaling ONLY; zero Parser/CompilerCore)
+realscript_add_layer_library(realscript_layer_bindgen_runtime
+    src/bindgen/HostApi.cpp
+)
+realscript_add_slice_library(realscript_slice_bindgen_runtime BindGenRuntime
+    $<TARGET_OBJECTS:realscript_layer_bindgen_runtime>
+)
+target_link_libraries(realscript_slice_bindgen_runtime PUBLIC realscript_slice_runtime_core)
+
+# 4d. StencilJit Engine (W^X copy-and-patch & threaded stencils; zero ToolchainJit/CompilerCore)
+realscript_add_layer_library(realscript_layer_stencil_jit
+    src/jit/StencilJitRuntime.cpp
+    src/jit/StencilJitX64.cpp
+    src/jit/StencilJitArm64.cpp
+    src/jit/StencilJit.cpp
+)
+realscript_add_slice_library(realscript_slice_stencil_jit StencilJit
+    $<TARGET_OBJECTS:realscript_layer_stencil_jit>
+)
+target_link_libraries(realscript_slice_stencil_jit PUBLIC realscript_slice_runtime_core)
+
+# 4e. Hot Reload Engine (runtime image diff & state migration; zero CompilerCore)
+realscript_add_layer_library(realscript_layer_hot_reload
+    src/hot_reload/HotReload.cpp
+)
+realscript_add_slice_library(realscript_slice_hot_reload HotReload
+    $<TARGET_OBJECTS:realscript_layer_hot_reload>
+)
+target_link_libraries(realscript_slice_hot_reload PUBLIC realscript_slice_runtime_core)
+
+# 5. Native Backends (aot_cpp codegen, ToolchainJit)
 if(NOT REALSCRIPT_SLIM_RUNTIME)
 realscript_add_layer_library(realscript_layer_native_backends
     src/aot_cpp/AotRangeAnalysis.cpp
@@ -217,16 +248,13 @@ realscript_add_layer_library(realscript_layer_native_backends
     src/aot_cpp/AotTypedEmitter.cpp
     src/aot_cpp/AotCpp.cpp
     src/jit/ToolchainJit.cpp
-    src/jit/StencilJitRuntime.cpp
-    src/jit/StencilJitX64.cpp
-    src/jit/StencilJitArm64.cpp
-    src/jit/StencilJit.cpp
-    src/hot_reload/HotReload.cpp
 )
 realscript_add_slice_library(realscript_slice_native_backends NativeBackends
     $<TARGET_OBJECTS:realscript_layer_native_backends>
 )
 target_link_libraries(realscript_slice_native_backends PUBLIC
+    realscript_slice_stencil_jit
+    realscript_slice_hot_reload
     realscript_slice_runtime_core
     realscript_slice_compiler_core
     realscript_slice_aot_runtime
@@ -236,6 +264,8 @@ target_link_libraries(realscript_slice_native_backends PUBLIC
 add_library(realscript_kernel INTERFACE)
 target_link_libraries(realscript_kernel INTERFACE
     realscript_slice_native_backends
+    realscript_slice_stencil_jit
+    realscript_slice_hot_reload
     realscript_slice_aot_runtime
     realscript_slice_compiler_core
     realscript_slice_runtime_core
@@ -249,6 +279,8 @@ if(REALSCRIPT_BUILD_TESTS OR REALSCRIPT_BUILD_BENCHMARKS)
         $<TARGET_OBJECTS:realscript_layer_bytecode_format>
         $<TARGET_OBJECTS:realscript_layer_runtime_core>
         $<TARGET_OBJECTS:realscript_layer_aot_runtime>
+        $<TARGET_OBJECTS:realscript_layer_stencil_jit>
+        $<TARGET_OBJECTS:realscript_layer_hot_reload>
         $<TARGET_OBJECTS:realscript_layer_native_backends>
     )
     set_target_properties(realscript_jit_support_archive PROPERTIES
@@ -327,13 +359,13 @@ endif()
 
 if(REALSCRIPT_ENABLE_BINDGEN)
     realscript_add_layer_library(realscript_layer_bindgen
-        src/bindgen/HostApi.cpp
         src/bindgen/RsBindParser.cpp
     )
     realscript_add_slice_library(realscript_app_bindgen BindGen
         $<TARGET_OBJECTS:realscript_layer_bindgen>
     )
     target_link_libraries(realscript_app_bindgen PUBLIC
+        realscript_slice_bindgen_runtime
         realscript_slice_runtime_core
         realscript_slice_compiler_core
     )
@@ -470,6 +502,12 @@ if(REALSCRIPT_BUILD_TESTS)
     target_compile_definitions(
         realscript_kernel_architecture_and_abi_tests
         PRIVATE REALSCRIPT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+
+    realscript_add_cpp_test(
+        realscript_kernel_slice_isolation_tests
+        realscript.kernel.slice-isolation
+        "RealScript::BindGenRuntime;RealScript::StencilJit;RealScript::HotReload;RealScript::AotSupport;RealScript::SlimRuntime"
+        tests/kernel_slice_isolation_tests.cpp)
 
     add_executable(realscript_kernel_host_abi_c_tests tests/kernel_host_abi_c_tests.c)
     target_link_libraries(realscript_kernel_host_abi_c_tests PRIVATE RealScript::Runtime)
@@ -710,6 +748,9 @@ if(REALSCRIPT_INSTALL_SDK AND NOT REALSCRIPT_SLIM_RUNTIME)
         realscript_slice_compiler_core
         realscript_slice_runtime_core
         realscript_slice_aot_runtime
+        realscript_slice_bindgen_runtime
+        realscript_slice_stencil_jit
+        realscript_slice_hot_reload
         realscript_slice_native_backends
         realscript_aot_support
         realscript_slim_runtime

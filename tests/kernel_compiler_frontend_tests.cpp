@@ -2,6 +2,7 @@
 #include "realscript/compiler/Compilation.h"
 #include "realscript/compiler/ModuleBuildCache.h"
 #include "realscript/compiler/ProjectConfig.h"
+#include "realscript/compiler/StandardMacros.h"
 #include "realscript/debug/DebugInfo.h"
 #include "realscript/diagnostics/Diagnostic.h"
 #include "realscript/optimization/Optimizer.h"
@@ -1056,13 +1057,36 @@ public int TouchPacked() {
     const std::string heroV1 = R"RS(
 module Test.ProjMacro;
 
+public delegate void HeroDamageHandler(int amount);
+
 [AutoGetter("hp")]
+[QualifiedProbe("HeroType")]
 public partial class Hero {
+    [QualifiedProbe("HeroField")]
     public int hp = 88;
+    [QualifiedProbe("HeroEvent")]
+    public event HeroDamageHandler Damaged;
+    [QualifiedProbe("HeroProp")]
+    public int Armor { get { return 7; } }
+    [QualifiedProbe("HeroMethod")]
+    public void Heal(int v) { hp = hp + v; }
+}
+
+[QualifiedProbe("StructType")]
+public struct StatVec {
+    [QualifiedProbe("StructField")]
+    public int x;
 }
 
 public int Run() {
     var h = new Hero();
+    if (probe_HeroType() != "Hero") return -1;
+    if (probe_HeroField() != "Hero.hp") return -2;
+    if (probe_HeroEvent() != "Hero.Damaged") return -3;
+    if (probe_HeroProp() != "Hero.Armor") return -4;
+    if (probe_HeroMethod() != "Hero.Heal") return -5;
+    if (probe_StructType() != "StatVec") return -6;
+    if (probe_StructField() != "StatVec.x") return -7;
     return h.GetHp() + plugin_magic(12);
 }
 )RS";
@@ -1313,6 +1337,252 @@ public class Bad<T> where T : class, struct { public T v; }
     }
 }
 
+// ---------------------------------------------------------------------------
+// 10. Built-in Standard Reactive Macros ([Signal] & [RelayCommand], 3-Way Partial)
+// ---------------------------------------------------------------------------
+void testStandardReactiveMacros() {
+    // A. 3-way partial class: View.g.rs (XAML) + ViewModel.rs + StandardReactiveMacroPlugin
+    //    coexisting alongside ReactiveMacroPlugin ([Observable]) with zero collision.
+    {
+        compiler::CompilationOptions opts;
+        opts.macroPlugins.push_back(std::make_shared<ReactiveMacroPlugin>());
+        opts.macroPlugins.push_back(compiler::createStandardReactiveMacroPlugin());
+
+        auto prog = buildAndLink({
+            {"SaveDialogViewModel.g.rs", R"RS(
+module Demo.ReactiveVm;
+
+public partial class SaveDialogViewModel {
+    public int uiObservedScore = 0;
+    public int uiHealthEvents = 0;
+    public int uiDamageTotal = 0;
+    public string uiLastStatus = "";
+    public int uiCanExecNotifyCount = 0;
+
+    public void BindGeneratedUi() {
+        this.SubscribeHealthChanged((int hp, string status) => {
+            this.uiHealthEvents = this.uiHealthEvents + hp;
+            this.uiLastStatus = status;
+        });
+        this.HealthChangedEvent += (int hp, string status) => {
+            this.uiHealthEvents = this.uiHealthEvents + 1;
+        };
+        this.SubscribeOnDamage((int dmg) => {
+            this.uiDamageTotal = this.uiDamageTotal + dmg;
+        });
+        this.AttackCommand.SubscribeCanExecuteChanged(() => {
+            this.uiCanExecNotifyCount = this.uiCanExecNotifyCount + 1;
+        });
+    }
+
+    public void TriggerUiCommands(int power) {
+        this.AttackCommand.Execute(power);
+        this.ResetCommand.Execute();
+        this.PingCommand.Execute();
+    }
+}
+)RS"},
+            {"SaveDialogViewModel.rs", R"RS(
+module Demo.ReactiveVm;
+
+public partial class SaveDialogViewModel {
+    [Observable]
+    private int _score = 10;
+
+    public bool attackEnabled = false;
+    public bool readyFlag = false;
+    public int attackTotal = 0;
+    public int resetCount = 0;
+    public int pingCount = 0;
+
+    public bool IsReady {
+        get { return this.readyFlag; }
+    }
+
+    [Signal]
+    public partial void HealthChanged(int hp, string status);
+
+    [Signal]
+    partial void OnDamage(int dmg);
+
+    public void ApplyHit(int dmg) {
+        this.OnDamage(dmg);
+    }
+
+    [RelayCommand(CanExecute = "CanAttack")]
+    public void Attack(int power) {
+        this.attackTotal = this.attackTotal + power;
+    }
+
+    private bool CanAttack(int power) {
+        return this.attackEnabled && power > 0;
+    }
+
+    [RelayCommand(CanExecute = "IsReady")]
+    public void Reset() {
+        this.resetCount = this.resetCount + 1;
+    }
+
+    [RelayCommand]
+    public void Ping() {
+        this.pingCount = this.pingCount + 1;
+    }
+}
+
+public int RunThreeWayPartial() {
+    var vm = new SaveDialogViewModel();
+    vm.BindGeneratedUi();
+
+    // [Observable] coexists cleanly
+    vm.Score = vm.Score + 5;
+    if (vm.Score != 15) return -1;
+
+    // CanExecute false blocks Attack and Reset, while Ping (unconditional) executes
+    vm.TriggerUiCommands(25);
+    if (vm.AttackCommand.CanExecute(25) || vm.ResetCommand.CanExecute()) return -2;
+    if (!vm.PingCommand.CanExecute()) return -3;
+    if (vm.attackTotal != 0 || vm.resetCount != 0 || vm.pingCount != 1) return -4;
+
+    // Flip CanExecute conditions & raise CanExecuteChanged notification
+    vm.attackEnabled = true;
+    vm.readyFlag = true;
+    vm.NotifyAttackCanExecuteChanged();
+    if (vm.uiCanExecNotifyCount != 1) return -5;
+    if (!vm.AttackCommand.CanExecute(25) || vm.AttackCommand.CanExecute(0)) return -6;
+
+    // Trigger via command object and direct ViewModel hook
+    vm.TriggerUiCommands(25);
+    vm.ExecuteAttack(5);
+    if (vm.attackTotal != 30 || vm.resetCount != 1 || vm.pingCount != 2) return -7;
+
+    // Fire [Signal] public & private signals, then verify Unsubscribe
+    SaveDialogViewModel__HealthChangedSignalHandler extraListener = (int hp, string status) => {
+        vm.uiObservedScore = vm.uiObservedScore + hp;
+    };
+    vm.SubscribeHealthChanged(extraListener);
+    vm.HealthChanged(50, "ok");
+    if (vm.uiHealthEvents != 51 || vm.uiObservedScore != 50 || vm.uiLastStatus != "ok") return -8;
+
+    vm.UnsubscribeHealthChanged(extraListener);
+    vm.HealthChanged(10, "fine");
+    if (vm.uiObservedScore != 50 || vm.uiHealthEvents != 62 || vm.uiLastStatus != "fine") return -9;
+
+    vm.ApplyHit(17);
+    if (vm.uiDamageTotal != 17) return -10;
+
+    return vm.Score + vm.attackTotal + vm.uiHealthEvents + vm.uiDamageTotal;
+}
+)RS"}
+        }, std::move(opts));
+
+        runtime::Interpreter interp(prog);
+        const auto res = interp.invoke("Demo.ReactiveVm::RunThreeWayPartial");
+        // Expected: 15 (Score) + 30 (attackTotal) + 62 (uiHealthEvents) + 17 (uiDamageTotal) = 124
+        require(
+            res.succeeded && std::holds_alternative<std::int64_t>(res.value) &&
+                std::get<std::int64_t>(res.value) == 124,
+            "RunThreeWayPartial failed (val=" +
+                (res.succeeded && std::holds_alternative<std::int64_t>(res.value)
+                    ? std::to_string(std::get<std::int64_t>(res.value))
+                    : res.error.message) +
+                ")");
+    }
+
+    // B. partial struct with [Signal] (delegate-backed, avoiding RS8315) & [RelayCommand]
+    {
+        compiler::CompilationOptions opts;
+        opts.macroPlugins.push_back(compiler::createStandardReactiveMacroPlugin());
+        auto prog = buildAndLink({
+            {"CounterStruct.rscript", R"RS(
+module Demo.ReactiveStruct;
+
+public class StructLog {
+    public int sum = 0;
+}
+
+public partial struct StepCounter {
+    public int count;
+    public bool allowStep;
+
+    [Signal]
+    public partial void Stepped(int stepCount);
+
+    [RelayCommand(CanExecute = "CanStep")]
+    public void Step() {
+        this.count = this.count + 1;
+        this.Stepped(this.count);
+    }
+
+    private bool CanStep() {
+        return this.allowStep;
+    }
+}
+
+public int RunStructReactive() {
+    var log = new StructLog();
+    StepCounter s = new StepCounter();
+    s.count = 0;
+    s.allowStep = false;
+    s.SubscribeStepped((int c) => {
+        log.sum = log.sum + c;
+    });
+    s.ExecuteStep();
+    if (s.count != 0 || log.sum != 0) return -1;
+    s.allowStep = true;
+    s.ExecuteStep();
+    s.ExecuteStep();
+    return s.count * 10 + log.sum;
+}
+)RS"}
+        }, std::move(opts));
+
+        runtime::Interpreter interp(prog);
+        const auto res = interp.invoke("Demo.ReactiveStruct::RunStructReactive");
+        require(
+            res.succeeded && std::holds_alternative<std::int64_t>(res.value) &&
+                std::get<std::int64_t>(res.value) == 23,
+            "RunStructReactive failed: " + res.error.message);
+    }
+
+    // C. Error diagnostics for invalid [Signal] & [RelayCommand] usage
+    {
+        compiler::CompilationOptions opts;
+        opts.macroPlugins.push_back(compiler::createStandardReactiveMacroPlugin());
+
+        compiler::Compilation badSignal({{"BadSignal.rscript", R"RS(
+module Demo.BadSignal;
+public class NotPartial {
+    [Signal]
+    public partial void Ping();
+}
+public partial class NonPartialMethod {
+    [Signal]
+    public void Ping() {}
+    [Signal]
+    public partial int BadRet();
+    [Signal]
+    public partial void HasBody() {}
+}
+)RS"}}, opts);
+        const auto dSig = badSignal.build().diagnostics;
+        require(hasDiagnosticCode(dSig, "RS9502"), "expected RS9502 on non-partial class");
+        require(hasDiagnosticCode(dSig, "RS9503"), "expected RS9503 on non-partial method");
+        require(hasDiagnosticCode(dSig, "RS9504"), "expected RS9504 on non-void [Signal]");
+        require(hasDiagnosticCode(dSig, "RS9505"), "expected RS9505 on [Signal] with body");
+
+        compiler::Compilation badCmd({{"BadCmd.rscript", R"RS(
+module Demo.BadCmd;
+public partial class BadVm {
+    [RelayCommand]
+    public void TooMany(int a, int b) {}
+}
+)RS"}}, opts);
+        require(
+            hasDiagnosticCode(badCmd.build().diagnostics, "RS9513"),
+            "expected RS9513 on 2-arg [RelayCommand]");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1336,6 +1606,7 @@ int main() {
     run("ModulePackRegistry, CompilerSession, ICompilerMacroPlugin & partial diagnostics", testPacksSessionMacrosAndPartials);
     run("[Blittable] layout, [FieldTag]/[FormerlySerializedAs] .rsbc, ProjectConfig & C11 macro cache", testBlittableSchemaEvolutionProjectConfigAndMacroCache);
     run("C# base syntax primitives (verbatim, =>, :this, iface:iface, arity generics, lambdas)", testCSharpBaseSyntaxPrimitives);
+    run("Standard Reactive Macros ([Signal] & [RelayCommand] 3-way partial)", testStandardReactiveMacros);
 
     return failures == 0 ? 0 : 1;
 }

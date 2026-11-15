@@ -1,6 +1,6 @@
 #include "JitInternal.h"
 
-#if UINTPTR_MAX == 0xffffffffffffffffULL
+#if !defined(__EMSCRIPTEN__) && UINTPTR_MAX == 0xffffffffffffffffULL
 
 namespace realscript::jit::jit_detail {
 namespace {

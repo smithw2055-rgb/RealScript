@@ -168,8 +168,63 @@ void testCMakeSliceTopology() {
     const std::string nativeLink = findSection("target_link_libraries(realscript_slice_native_backends");
     require(
         nativeLink.find("realscript_slice_runtime_core") != std::string::npos &&
-            nativeLink.find("realscript_slice_compiler_core") != std::string::npos,
-        "native backends slice must depend on runtime and compiler slices");
+            nativeLink.find("realscript_slice_compiler_core") != std::string::npos &&
+            nativeLink.find("realscript_slice_stencil_jit") != std::string::npos &&
+            nativeLink.find("realscript_slice_hot_reload") != std::string::npos,
+        "native backends slice must depend on runtime, compiler, stencil_jit, and hot_reload slices");
+
+    // 5. Verify decoupled L0/runtime-only slices (BindGenRuntime, StencilJit, HotReload)
+    for (const char* sliceTarget : {
+             "realscript_slice_bindgen_runtime",
+             "realscript_slice_stencil_jit",
+             "realscript_slice_hot_reload"}) {
+        const std::string sliceLink =
+            findSection(std::string("target_link_libraries(") + sliceTarget);
+        require(
+            sliceLink.find("realscript_slice_runtime_core") != std::string::npos &&
+                sliceLink.find("realscript_slice_compiler_core") == std::string::npos,
+            std::string(sliceTarget) + " must depend on runtime_core and NOT compiler_core");
+    }
+    const auto slimRuntimePos = cmake.find("add_library(realscript_slim_runtime");
+    const auto compilerSliceLinkPos = cmake.find("target_link_libraries(realscript_slice_compiler_core");
+    const auto compilerSlimGuardEndPos =
+        compilerSliceLinkPos != std::string::npos ? cmake.find("endif()", compilerSliceLinkPos) : std::string::npos;
+    const auto l1SlimGuardPos =
+        slimRuntimePos != std::string::npos ? cmake.find("if(NOT REALSCRIPT_SLIM_RUNTIME)", slimRuntimePos) : std::string::npos;
+    require(
+        slimRuntimePos != std::string::npos &&
+            compilerSlimGuardEndPos != std::string::npos &&
+            l1SlimGuardPos != std::string::npos &&
+            compilerSlimGuardEndPos < slimRuntimePos,
+        "missing REALSCRIPT_SLIM_RUNTIME guard around compiler/L1 slices");
+    for (const char* alwaysExposedAlias : {
+             "BindGenRuntime",
+             "StencilJit",
+             "HotReload"}) {
+        const auto slicePos = cmake.find(alwaysExposedAlias, slimRuntimePos);
+        require(
+            slicePos != std::string::npos && slicePos < l1SlimGuardPos,
+            std::string(alwaysExposedAlias) + " slice must be defined outside REALSCRIPT_SLIM_RUNTIME guard");
+    }
+
+    // 6. Verify header & symbol decoupling invariants
+    const std::string bindingTypesH = readTextFile(root / "include/realscript/bindgen/BindingTypes.h");
+    require(
+        bindingTypesH.find("realscript/compiler/Compilation.h") == std::string::npos &&
+            bindingTypesH.find("realscript/compiler/LanguageMetadata.h") != std::string::npos,
+        "BindingTypes.h must include LanguageMetadata.h instead of Compilation.h");
+
+    const std::string hostApiCpp = readTextFile(root / "src/bindgen/HostApi.cpp");
+    require(
+        hostApiCpp.find("RsBindParser.h") == std::string::npos &&
+            hostApiCpp.find("Compilation.h") == std::string::npos,
+        "HostApi.cpp must not include RsBindParser.h or Compilation.h");
+
+    const std::string jitInternalH = readTextFile(root / "src/jit/JitInternal.h");
+    require(
+        jitInternalH.find("realscript/jit/StencilJit.h") != std::string::npos &&
+            jitInternalH.find("realscript/jit/Jit.h") == std::string::npos,
+        "JitInternal.h must include StencilJit.h instead of Jit.h");
 #endif
 }
 

@@ -139,6 +139,21 @@ static void rs_fixture_macro_expand(
                 "}\n",
                 input->module_name);
         }
+    } else if (input->kind == (uint32_t)RS_COMPILER_MACRO_ATTRIBUTE_V1 &&
+               strcmp(input->macro_name, "QualifiedProbe") == 0) {
+        if (input->target_name && input->arg_count >= 1u && input->arg_values &&
+            input->arg_values[0] && input->arg_values[0][0] != '\0') {
+            written = snprintf(
+                buffer,
+                sizeof(buffer),
+                "module %s;\n"
+                "public string probe_%s() {\n"
+                "    return \"%s\";\n"
+                "}\n",
+                input->module_name,
+                input->arg_values[0],
+                input->target_name);
+        }
     }
 
     if (written > 0 && (size_t)written < sizeof(buffer)) {
@@ -146,9 +161,10 @@ static void rs_fixture_macro_expand(
     }
 }
 
-static const RsCompilerMacroDescriptorV1 kFixtureMacros[2] = {
+static const RsCompilerMacroDescriptorV1 kFixtureMacros[3] = {
     {"AutoGetter", (uint32_t)RS_COMPILER_MACRO_ATTRIBUTE_V1},
-    {"plugin_magic", (uint32_t)RS_COMPILER_MACRO_EXPRESSION_V1}
+    {"plugin_magic", (uint32_t)RS_COMPILER_MACRO_EXPRESSION_V1},
+    {"QualifiedProbe", (uint32_t)RS_COMPILER_MACRO_ATTRIBUTE_V1}
 };
 
 static const RsCompilerMacroPluginV1 kFixtureMacroPlugin = {
@@ -156,7 +172,7 @@ static const RsCompilerMacroPluginV1 kFixtureMacroPlugin = {
     RS_COMPILER_PLUGIN_ABI_VERSION_1,
     "kernel_fixture_macro_plugin",
     "1.0.0",
-    2u,
+    3u,
     kFixtureMacros,
     &rs_fixture_macro_expand,
     NULL,
