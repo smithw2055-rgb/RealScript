@@ -4049,11 +4049,20 @@ Program::~Program() {
     }
     modifiedHotPatchSlots_.clear();
     if (lifecycleTarget_) {
-        std::lock_guard<std::mutex> lock(lifecycleTarget_->mutex);
-        lifecycleTarget_->program = nullptr;
-    }
-    if (heap_) {
-        heap_->setValueLifecycleSweepCallback({});
+        std::shared_ptr<runtime::ManagedHeap> regHeap;
+        std::uint64_t token = 0;
+        {
+            std::lock_guard<std::mutex> lock(lifecycleTarget_->mutex);
+            lifecycleTarget_->program = nullptr;
+            lifecycleTarget_->alive = false;
+            regHeap = lifecycleTarget_->registeredHeap.lock();
+            token = lifecycleTarget_->sweepToken;
+            lifecycleTarget_->registeredHeap.reset();
+            lifecycleTarget_->sweepToken = 0;
+        }
+        if (regHeap && token != 0) {
+            regHeap->removeValueLifecycleSweepHandler(token);
+        }
     }
 }
 
@@ -5222,8 +5231,19 @@ void Program::setBindings(
 }
 
 void Program::setHeap(std::shared_ptr<runtime::ManagedHeap> heap) {
-    if (heap_ && heap_.get() != heap.get()) {
-        heap_->setValueLifecycleSweepCallback({});
+    if (lifecycleTarget_) {
+        std::shared_ptr<runtime::ManagedHeap> regHeap;
+        std::uint64_t token = 0;
+        {
+            std::lock_guard<std::mutex> lock(lifecycleTarget_->mutex);
+            regHeap = lifecycleTarget_->registeredHeap.lock();
+            token = lifecycleTarget_->sweepToken;
+            lifecycleTarget_->registeredHeap.reset();
+            lifecycleTarget_->sweepToken = 0;
+        }
+        if (regHeap && token != 0) {
+            regHeap->removeValueLifecycleSweepHandler(token);
+        }
     }
     heap_ = heap ? std::move(heap) : std::make_shared<runtime::ManagedHeap>();
     if (asyncRuntime_) asyncRuntime_->setHeap(heap_.get());
@@ -5232,6 +5252,20 @@ void Program::setHeap(std::shared_ptr<runtime::ManagedHeap> heap) {
 }
 
 void Program::registerValueLifecycleHooks() {
+    if (lifecycleTarget_) {
+        std::shared_ptr<runtime::ManagedHeap> regHeap;
+        std::uint64_t token = 0;
+        {
+            std::lock_guard<std::mutex> lock(lifecycleTarget_->mutex);
+            regHeap = lifecycleTarget_->registeredHeap.lock();
+            token = lifecycleTarget_->sweepToken;
+            lifecycleTarget_->registeredHeap.reset();
+            lifecycleTarget_->sweepToken = 0;
+        }
+        if (regHeap && token != 0) {
+            regHeap->removeValueLifecycleSweepHandler(token);
+        }
+    }
     if (!heap_) return;
     std::unordered_map<semantic::SymbolId, semantic::SymbolId> disposeMap;
     const auto canonicalTypeName = [](const TypeDescriptor& td) -> std::string {
@@ -5271,29 +5305,31 @@ void Program::registerValueLifecycleHooks() {
         }
     }
     if (disposeMap.empty()) {
-        heap_->setValueLifecycleSweepCallback({});
         return;
     }
     if (!lifecycleTarget_) {
         lifecycleTarget_ = std::make_shared<LifecycleTarget>();
         lifecycleTarget_->program = this;
+        lifecycleTarget_->alive = true;
     }
-    heap_->setValueLifecycleSweepCallback(
+    const std::uint64_t sweepToken = heap_->addValueLifecycleSweepHandler(
         [weakTarget = std::weak_ptr<LifecycleTarget>(lifecycleTarget_),
          disposeMap = std::move(disposeMap),
-         heapPtr = heap_.get()](const runtime::Value& sweptValue) {
-            if (tlsInAotValueLifecycleDispose) return;
-            if (sweptValue.rawTag() != runtime::ValueTag::Struct) return;
+         heapPtr = heap_.get()](const runtime::Value& sweptValue) -> bool {
+            if (tlsInAotValueLifecycleDispose) return true;
+            if (sweptValue.rawTag() != runtime::ValueTag::Struct) return false;
             const auto locked = weakTarget.lock();
-            if (!locked) return;
+            if (!locked) return false;
             std::lock_guard<std::mutex> lock(locked->mutex);
             const Program* self = locked->program;
-            if (!self || !self->heap_ || self->heap_.get() != heapPtr) return;
+            if (!locked->alive || !self || !self->heap_ || self->heap_.get() != heapPtr) {
+                return false;
+            }
             const auto& st = sweptValue.asStructUnchecked();
             const auto it = disposeMap.find(st.typeId);
-            if (it == disposeMap.end() || it->second == 0) return;
+            if (it == disposeMap.end() || it->second == 0) return false;
             const auto fnIt = self->functions_.find(it->second);
-            if (fnIt == self->functions_.end() || !fnIt->second) return;
+            if (fnIt == self->functions_.end() || !fnIt->second) return false;
             const FunctionDescriptor* disposeFn = fnIt->second;
 
             struct DisposeGuard {
@@ -5313,12 +5349,12 @@ void Program::registerValueLifecycleHooks() {
                         disposeFn->parameterTypeIds) {
                         const semantic::SymbolId wrapperTypeId =
                             disposeFn->parameterTypeIds[0];
-                        if (wrapperTypeId == 0) return;
+                        if (wrapperTypeId == 0) return true;
                         const auto wrapped = self->heap_->allocateObject(
                             wrapperTypeId,
                             std::vector<runtime::Value>{sweptValue},
                             std::vector<std::size_t>{});
-                        if (!wrapped) return;
+                        if (!wrapped) return true;
                         args.emplace_back(*wrapped);
                     } else {
                         args.push_back(sweptValue);
@@ -5332,7 +5368,21 @@ void Program::registerValueLifecycleHooks() {
             } catch (...) {
             }
 #endif
+            return true;
         });
+
+    bool stillAlive = true;
+    {
+        std::lock_guard<std::mutex> lock(lifecycleTarget_->mutex);
+        stillAlive = lifecycleTarget_->alive;
+        if (stillAlive) {
+            lifecycleTarget_->registeredHeap = heap_;
+            lifecycleTarget_->sweepToken = sweepToken;
+        }
+    }
+    if (!stillAlive && sweepToken != 0) {
+        heap_->removeValueLifecycleSweepHandler(sweepToken);
+    }
 }
 
 std::shared_ptr<runtime::ManagedHeap> Program::heap() const noexcept {

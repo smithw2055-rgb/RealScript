@@ -220,13 +220,18 @@ thread_local bool tlsInValueLifecycleDispose = false;
 }
 
 [[nodiscard]] bool isValueLifecycleAttrName(std::string_view attrName) noexcept {
-    if (attrName == "ValueLifecycle" || attrName == "ValueLifecycleAttribute") {
+    if (attrName == "ValueLifecycle" || attrName == "ValueLifecycleAttribute" ||
+        attrName == "RefCounted" || attrName == "RefCountedAttribute") {
         return true;
     }
     return endsWithSv(attrName, "::ValueLifecycle") ||
         endsWithSv(attrName, ".ValueLifecycle") ||
         endsWithSv(attrName, "::ValueLifecycleAttribute") ||
-        endsWithSv(attrName, ".ValueLifecycleAttribute");
+        endsWithSv(attrName, ".ValueLifecycleAttribute") ||
+        endsWithSv(attrName, "::RefCounted") ||
+        endsWithSv(attrName, ".RefCounted") ||
+        endsWithSv(attrName, "::RefCountedAttribute") ||
+        endsWithSv(attrName, ".RefCountedAttribute");
 }
 
 [[nodiscard]] bool targetMatchesLifecycleStruct(
@@ -246,11 +251,38 @@ thread_local bool tlsInValueLifecycleDispose = false;
 
 } // namespace
 
+void Interpreter::DispatchTarget::detachSweepHandler(bool markDead) {
+    std::shared_ptr<ManagedHeap> oldHeap;
+    std::uint64_t oldToken = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (markDead) {
+            interpreter = nullptr;
+            alive = false;
+            program.reset();
+            heap.reset();
+            bindings.reset();
+            asyncRuntime.reset();
+        }
+        oldHeap = registeredHeap.lock();
+        oldToken = sweepToken;
+        registeredHeap.reset();
+        sweepToken = 0;
+    }
+    if (oldHeap && oldToken != 0) {
+        oldHeap->removeValueLifecycleSweepHandler(oldToken);
+    }
+}
+
 void Interpreter::installValueLifecycleHooks(
     const std::shared_ptr<const ProgramImage>& program,
     const std::shared_ptr<ManagedHeap>& heap,
     std::shared_ptr<DispatchTarget> target) {
-    if (!program || !heap || !target) {
+    if (!target) {
+        return;
+    }
+    target->detachSweepHandler(false);
+    if (!program || !heap) {
         return;
     }
     std::vector<std::string> attrTargets;
@@ -317,15 +349,18 @@ void Interpreter::installValueLifecycleHooks(
         return;
     }
 
-    heap->setValueLifecycleSweepCallback(
+    const std::uint64_t sweepToken = heap->addValueLifecycleSweepHandler(
         [weakTarget = std::weak_ptr<DispatchTarget>(target),
-         disposeMap = std::move(disposeByTypeId)](const Value& sweptValue) {
-            if (tlsInValueLifecycleDispose || sweptValue.rawTag() != ValueTag::Struct) {
-                return;
+         disposeMap = std::move(disposeByTypeId)](const Value& sweptValue) -> bool {
+            if (tlsInValueLifecycleDispose) {
+                return true;
+            }
+            if (sweptValue.rawTag() != ValueTag::Struct) {
+                return false;
             }
             const auto locked = weakTarget.lock();
             if (!locked) {
-                return;
+                return false;
             }
             Interpreter* rawInterp = nullptr;
             std::shared_ptr<const ProgramImage> prog;
@@ -335,7 +370,7 @@ void Interpreter::installValueLifecycleHooks(
             {
                 std::lock_guard<std::mutex> guardLock(locked->mutex);
                 if (!locked->alive) {
-                    return;
+                    return false;
                 }
                 rawInterp = locked->interpreter;
                 if (rawInterp != nullptr) {
@@ -349,16 +384,16 @@ void Interpreter::installValueLifecycleHooks(
                 }
             }
             if (!prog || !targetHeap) {
-                return;
+                return false;
             }
             const auto& st = sweptValue.asStructUnchecked();
             const auto it = disposeMap.find(st.typeId);
             if (it == disposeMap.end() || it->second == 0) {
-                return;
+                return false;
             }
             const auto* loc = prog->resolveFunction(it->second);
             if (!loc || !loc->function) {
-                return;
+                return false;
             }
             struct ReentrancyGuard {
                 bool& flag;
@@ -368,7 +403,9 @@ void Interpreter::installValueLifecycleHooks(
                 ReentrancyGuard& operator=(const ReentrancyGuard&) = delete;
             } guard(tlsInValueLifecycleDispose);
 
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
             try {
+#endif
                 ExecutionOptions opts;
                 opts.limits.instructionBudget = 1'000'000;
                 opts.limits.recursionLimit = 128;
@@ -381,7 +418,7 @@ void Interpreter::installValueLifecycleHooks(
                                 ? 0
                                 : loc->function->parameterTypeIds[0];
                         if (wrapperTypeId == 0) {
-                            return;
+                            return true;
                         }
                         std::vector<std::size_t> refFields;
                         if (sweptValue.isTraceable()) {
@@ -394,7 +431,7 @@ void Interpreter::installValueLifecycleHooks(
                             std::move(refFields),
                             &allocErr);
                         if (!wrappedThis) {
-                            return;
+                            return true;
                         }
                         args.push_back(*wrappedThis);
                     } else {
@@ -412,10 +449,26 @@ void Interpreter::installValueLifecycleHooks(
                         std::move(asyncRt));
                     (void)transientInvoker.invoke(it->second, args, std::move(opts));
                 }
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
             } catch (...) {
                 // Sweep finalizers must never propagate errors out of GC cycles.
             }
+#endif
+            return true;
         });
+
+    bool stillAlive = true;
+    {
+        std::lock_guard<std::mutex> lock(target->mutex);
+        stillAlive = target->alive;
+        if (stillAlive) {
+            target->registeredHeap = heap;
+            target->sweepToken = sweepToken;
+        }
+    }
+    if (!stillAlive && sweepToken != 0) {
+        heap->removeValueLifecycleSweepHandler(sweepToken);
+    }
 }
 
 void Interpreter::registerValueLifecycleHooks() {
@@ -484,9 +537,7 @@ Interpreter::Interpreter(
 
 Interpreter::~Interpreter() {
     if (dispatchTarget_) {
-        std::lock_guard<std::mutex> lock(dispatchTarget_->mutex);
-        dispatchTarget_->interpreter = nullptr;
-        dispatchTarget_->alive = false;
+        dispatchTarget_->detachSweepHandler(true);
     }
 }
 
@@ -506,9 +557,7 @@ Interpreter& Interpreter::operator=(const Interpreter& other) {
         return *this;
     }
     if (dispatchTarget_) {
-        std::lock_guard<std::mutex> lock(dispatchTarget_->mutex);
-        dispatchTarget_->interpreter = nullptr;
-        dispatchTarget_->alive = false;
+        dispatchTarget_->detachSweepHandler(true);
     }
     program_ = other.program_;
     programError_ = other.programError_;
@@ -542,9 +591,7 @@ Interpreter& Interpreter::operator=(Interpreter&& other) noexcept {
         return *this;
     }
     if (dispatchTarget_) {
-        std::lock_guard<std::mutex> lock(dispatchTarget_->mutex);
-        dispatchTarget_->interpreter = nullptr;
-        dispatchTarget_->alive = false;
+        dispatchTarget_->detachSweepHandler(true);
     }
     program_ = std::move(other.program_);
     programError_ = std::move(other.programError_);
@@ -567,6 +614,9 @@ void Interpreter::setExternalResolver(ExternalFunction resolver) {
 }
 
 void Interpreter::setHeap(std::shared_ptr<ManagedHeap> heap) {
+    if (dispatchTarget_) {
+        dispatchTarget_->detachSweepHandler(false);
+    }
     heap_ = heap ? std::move(heap) : std::make_shared<ManagedHeap>();
     if (program_ && heap_) {
         heap_->registerTypeHierarchy(*program_);

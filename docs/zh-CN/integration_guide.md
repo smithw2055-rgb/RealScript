@@ -71,7 +71,8 @@ target_link_libraries(MyGameShippingClient PRIVATE
 
 ```cpp
 #include "realscript/AbiGovernance.h"
-#include "realscript/game/GameProductization.h"
+// 若使用 RealScript-GamePack 伴生 SDK 的产品化加载器，可额外引入：
+// #include "realscript/game/GameProductization.h"
 
 bool validateAndLoadScriptPackage(
     const std::vector<std::uint8_t>& rawRsbcBytes,
@@ -118,13 +119,14 @@ rsbind \
   --output-stub scripts/ambient/EngineHost.d.rscript
 ```
 
-也可以在 C++ 中通过 `GameApi` 直接声明宿主类型、方法、属性与引用计数资源桥接：
+也可以在 C++ 中通过 L0 `bindgen::HostApi` 直接声明宿主类型、方法与属性（游戏专用扩展如 `GameApi` / `SceneScriptRuntime` / `ResourceHandle` 位于配套 **`RealScript-GamePack`** 仓库）：
 
 ```cpp
-#include "realscript/game/GameScripting.h"
-#include "realscript/game/ResourceHandle.h"
+// L0 内核通用绑定示例（RealScript::BindGen + RealScript::Compiler）
+#include "realscript/bindgen/BindGen.h"
+#include "realscript/compiler/Compilation.h"
 
-void registerEngineApis(realscript::game::GameApi& api) {
+void registerEngineApis(realscript::bindgen::HostApi& api) {
     // 注册全局确定性宿主函数
     api.function("Engine.Math", "ClampInt", +[](int v, int lo, int hi) {
         return v < lo ? lo : (v > hi ? hi : v);
@@ -138,9 +140,10 @@ void registerEngineApis(realscript::game::GameApi& api) {
 
 ### 3.2 场景脚本生命周期与零拷贝原生 ECS 列绑定
 
-`SceneScriptRuntime` 采用扁平化 `FlatLifecycleSlot` 缓存表驱动 `fixedUpdate`、`update` 与 `lateUpdate`，并支持将 C++ 连续结构体数组零拷贝映射为脚本侧 `RawColumnArray`，消除每帧编组拷贝：
+> **注意**：`SceneScriptRuntime` 与 `realscript/game/GameScripting.h` 属于配套 **`RealScript-GamePack`** SDK，而非独立 `RealScript` L0 内核目标。
 
 ```cpp
+// 以下示例需链接配套 RealScript-GamePack（含 realscript/game/*）
 #include "realscript/game/GameScripting.h"
 
 struct NativeTransformColumn {
@@ -590,12 +593,12 @@ void integrateWorkshopMods(const std::vector<realscript::plugin::ModPackage>& pa
 ```cpp
 #include "realscript/AbiGovernance.h"
 #include "realscript/debug/DapServer.h"
-#include "realscript/game/GameScripting.h"
 #include "realscript/hot_reload/HotReload.h"
 #include "realscript/jit/Jit.h"
 #include "realscript/plugin/ModHost.h"
 #include "realscript/reflection/Reflection.h"
 #include "realscript/runtime/ParallelJob.h"
+// 若需 SceneScriptRuntime / GameplayHost 等游戏封装，请另行链接伴生仓库 RealScript-GamePack 的 realscript/game/GameScripting.h
 
 class RealScriptEngineSubsystem {
 public:

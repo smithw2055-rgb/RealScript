@@ -8,6 +8,44 @@ using namespace jit_detail;
 namespace {
 
 thread_local StencilTlsScratch g_stencilTlsScratch;
+thread_local bool tlsInStencilValueLifecycleDispose = false;
+
+[[nodiscard]] bool stencilEndsWithSv(
+    std::string_view text,
+    std::string_view suffix) noexcept {
+    return text.size() >= suffix.size() &&
+        text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+[[nodiscard]] bool isStencilLifecycleAttrName(std::string_view attrName) noexcept {
+    if (attrName == "ValueLifecycle" || attrName == "ValueLifecycleAttribute" ||
+        attrName == "RefCounted" || attrName == "RefCountedAttribute") {
+        return true;
+    }
+    return stencilEndsWithSv(attrName, "::ValueLifecycle") ||
+        stencilEndsWithSv(attrName, ".ValueLifecycle") ||
+        stencilEndsWithSv(attrName, "::ValueLifecycleAttribute") ||
+        stencilEndsWithSv(attrName, ".ValueLifecycleAttribute") ||
+        stencilEndsWithSv(attrName, "::RefCounted") ||
+        stencilEndsWithSv(attrName, ".RefCounted") ||
+        stencilEndsWithSv(attrName, "::RefCountedAttribute") ||
+        stencilEndsWithSv(attrName, ".RefCountedAttribute");
+}
+
+[[nodiscard]] bool stencilTargetMatchesLifecycleStruct(
+    std::string_view attrTarget,
+    std::string_view candidate) noexcept {
+    if (attrTarget.empty() || candidate.empty()) {
+        return false;
+    }
+    if (attrTarget == candidate) {
+        return true;
+    }
+    return candidate.size() > attrTarget.size() + 2u &&
+        candidate.compare(0, attrTarget.size(), attrTarget) == 0 &&
+        candidate[attrTarget.size()] == '_' &&
+        candidate[attrTarget.size() + 1u] == '_';
+}
 
 // P2-A Tier 1: Pre-Bound Direct-Threaded C++ Stencil Thunks (Portable Fallback)
 // ============================================================================
@@ -1039,6 +1077,35 @@ struct StencilModule::Impl {
     mutable std::atomic<std::size_t> codeBytes{0};
     bool nativeBackendAvailable = false;
 
+    struct LifecycleTarget {
+        std::mutex mutex;
+        const Impl* impl = nullptr;
+        bool alive = true;
+        std::weak_ptr<runtime::ManagedHeap> registeredHeap;
+        std::uint64_t sweepToken = 0;
+
+        void detachSweepHandler(bool markDead) {
+            std::shared_ptr<runtime::ManagedHeap> oldHeap;
+            std::uint64_t oldToken = 0;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (markDead) {
+                    alive = false;
+                    impl = nullptr;
+                }
+                oldHeap = registeredHeap.lock();
+                oldToken = sweepToken;
+                registeredHeap.reset();
+                sweepToken = 0;
+            }
+            if (oldHeap && oldToken != 0) {
+                oldHeap->removeValueLifecycleSweepHandler(oldToken);
+            }
+        }
+    };
+
+    std::shared_ptr<LifecycleTarget> lifecycleTarget;
+
     explicit Impl(
         std::shared_ptr<const runtime::ProgramImage> prog,
         StencilJitOptions opts)
@@ -1046,7 +1113,194 @@ struct StencilModule::Impl {
           heap(std::make_shared<runtime::ManagedHeap>()),
           asyncRuntime(std::make_shared<runtime::AsyncRuntimeContext>(heap.get())),
           options(opts),
-          primaryArena(opts.arenaBlockBytes) {}
+          primaryArena(opts.arenaBlockBytes),
+          lifecycleTarget(std::make_shared<LifecycleTarget>()) {
+        lifecycleTarget->impl = this;
+    }
+
+    ~Impl() {
+        if (lifecycleTarget) {
+            lifecycleTarget->detachSweepHandler(true);
+        }
+    }
+
+    void registerValueLifecycleHooks() {
+        if (!lifecycleTarget) {
+            return;
+        }
+        lifecycleTarget->detachSweepHandler(false);
+        if (!program || !heap) {
+            return;
+        }
+        heap->registerTypeHierarchy(*program);
+
+        std::vector<std::string> attrTargets;
+        for (const auto& mod : program->modules()) {
+            for (const auto& attr : mod.languageMetadata.attributes) {
+                if (isStencilLifecycleAttrName(attr.name) && !attr.target.empty()) {
+                    attrTargets.push_back(attr.target);
+                }
+            }
+        }
+
+        std::unordered_map<semantic::SymbolId, semantic::SymbolId> disposeByTypeId;
+        for (const auto& mod : program->modules()) {
+            for (const auto& ts : mod.types) {
+                if (ts.kind != semantic::TypeKind::Struct || ts.id == 0) {
+                    continue;
+                }
+                const std::string canonical = semantic::canonicalTypeName(ts);
+                bool hasLifecycle = ts.hasValueLifecycle ||
+                    canonical == "Core::ResourceHandle" ||
+                    canonical.rfind("Core::ResourceHandle<", 0) == 0;
+                if (!hasLifecycle) {
+                    for (const auto& targetName : attrTargets) {
+                        if (stencilTargetMatchesLifecycleStruct(targetName, canonical) ||
+                            stencilTargetMatchesLifecycleStruct(targetName, ts.name)) {
+                            hasLifecycle = true;
+                            break;
+                        }
+                    }
+                }
+                if (!hasLifecycle) {
+                    continue;
+                }
+
+                heap->registerValueLifecycleType(ts.id);
+
+                semantic::SymbolId disposeId = 0;
+                for (const auto& m : ts.methods) {
+                    if (m.staticMethod || m.parameters.size() > 1u || m.id == 0) {
+                        continue;
+                    }
+                    if (m.name == "Dispose" ||
+                        stencilEndsWithSv(m.name, ".Dispose") ||
+                        stencilEndsWithSv(m.name, "::Dispose")) {
+                        if (program->resolveFunction(m.id) != nullptr) {
+                            disposeId = m.id;
+                            break;
+                        }
+                    }
+                }
+                if (disposeId == 0) {
+                    if (const auto found = program->findFunction(canonical + ".Dispose")) {
+                        disposeId = *found;
+                    } else if (const auto foundScope = program->findFunction(canonical + "::Dispose")) {
+                        disposeId = *foundScope;
+                    }
+                }
+                if (disposeId != 0) {
+                    disposeByTypeId.emplace(ts.id, disposeId);
+                }
+            }
+        }
+
+        if (disposeByTypeId.empty()) {
+            return;
+        }
+
+        const std::uint64_t token = heap->addValueLifecycleSweepHandler(
+            [weakTarget = std::weak_ptr<LifecycleTarget>(lifecycleTarget),
+             disposeMap = std::move(disposeByTypeId)](const runtime::Value& sweptValue) -> bool {
+                if (tlsInStencilValueLifecycleDispose) {
+                    return true;
+                }
+                if (sweptValue.rawTag() != runtime::ValueTag::Struct) {
+                    return false;
+                }
+                const auto locked = weakTarget.lock();
+                if (!locked) {
+                    return false;
+                }
+                std::shared_ptr<const runtime::ProgramImage> prog;
+                std::shared_ptr<runtime::ManagedHeap> targetHeap;
+                std::shared_ptr<const runtime::BindingRegistry> targetBindings;
+                runtime::ExternalFunction targetResolver;
+                std::shared_ptr<runtime::AsyncRuntimeContext> targetAsyncRt;
+                {
+                    std::lock_guard<std::mutex> guardLock(locked->mutex);
+                    if (!locked->alive || locked->impl == nullptr) {
+                        return false;
+                    }
+                    prog = locked->impl->program;
+                    targetHeap = locked->impl->heap;
+                    targetBindings = locked->impl->bindings;
+                    targetResolver = locked->impl->externalResolver;
+                    targetAsyncRt = locked->impl->asyncRuntime;
+                }
+                if (!prog || !targetHeap) {
+                    return false;
+                }
+                const auto& st = sweptValue.asStructUnchecked();
+                const auto it = disposeMap.find(st.typeId);
+                if (it == disposeMap.end() || it->second == 0) {
+                    return false;
+                }
+                const auto* loc = prog->resolveFunction(it->second);
+                if (!loc || !loc->function) {
+                    return false;
+                }
+
+                struct ReentrancyGuard {
+                    bool& flag;
+                    explicit ReentrancyGuard(bool& f) noexcept : flag(f) { flag = true; }
+                    ~ReentrancyGuard() noexcept { flag = false; }
+                    ReentrancyGuard(const ReentrancyGuard&) = delete;
+                    ReentrancyGuard& operator=(const ReentrancyGuard&) = delete;
+                } guard(tlsInStencilValueLifecycleDispose);
+
+                runtime::ExecutionOptions opts;
+                opts.limits.instructionBudget = 1'000'000;
+                opts.limits.recursionLimit = 128;
+                std::vector<runtime::Value> args;
+                if (!loc->function->parameterTypes.empty()) {
+                    if (loc->function->parameterTypes[0] == semantic::PrimitiveType::Object) {
+                        const semantic::SymbolId wrapperTypeId =
+                            loc->function->parameterTypeIds.empty()
+                                ? 0
+                                : loc->function->parameterTypeIds[0];
+                        if (wrapperTypeId == 0) {
+                            return true;
+                        }
+                        std::vector<std::size_t> refFields;
+                        if (sweptValue.isTraceable()) {
+                            refFields.push_back(0);
+                        }
+                        runtime::RuntimeError allocErr;
+                        const auto wrappedThis = targetHeap->allocateObject(
+                            wrapperTypeId,
+                            std::vector<runtime::Value>{sweptValue},
+                            std::move(refFields),
+                            &allocErr);
+                        if (!wrappedThis) {
+                            return true;
+                        }
+                        args.push_back(*wrappedThis);
+                    } else {
+                        args.push_back(sweptValue);
+                    }
+                }
+                runtime::Interpreter invoker(std::move(prog), std::move(targetHeap));
+                if (targetBindings) invoker.setBindingRegistry(std::move(targetBindings));
+                if (targetResolver) invoker.setExternalResolver(std::move(targetResolver));
+                if (targetAsyncRt) invoker.setAsyncRuntime(std::move(targetAsyncRt));
+                (void)invoker.invoke(it->second, args, std::move(opts));
+                return true;
+            });
+
+        bool stillAlive = true;
+        {
+            std::lock_guard<std::mutex> lock(lifecycleTarget->mutex);
+            stillAlive = lifecycleTarget->alive;
+            if (stillAlive) {
+                lifecycleTarget->registeredHeap = heap;
+                lifecycleTarget->sweepToken = token;
+            }
+        }
+        if (!stillAlive && token != 0) {
+            heap->removeValueLifecycleSweepHandler(token);
+        }
+    }
 
     bool promoteFunctionToNativeLocked(CompiledFunctionRecord& rec, ExecutableCodeArena* batchArena) const {
 #if !defined(__EMSCRIPTEN__) && (UINTPTR_MAX == 0xffffffffffffffffULL) && \
@@ -1437,10 +1691,14 @@ void StencilModule::setExternalResolver(runtime::ExternalFunction resolver) {
 
 void StencilModule::setHeap(std::shared_ptr<runtime::ManagedHeap> heap) {
     if (!impl_) return;
+    if (impl_->lifecycleTarget) {
+        impl_->lifecycleTarget->detachSweepHandler(false);
+    }
     impl_->heap = heap ? std::move(heap) : std::make_shared<runtime::ManagedHeap>();
     if (impl_->asyncRuntime) {
         impl_->asyncRuntime->setHeap(impl_->heap.get());
     }
+    impl_->registerValueLifecycleHooks();
 }
 
 std::shared_ptr<runtime::ManagedHeap> StencilModule::heap() const noexcept {
@@ -1767,6 +2025,7 @@ StencilCompileResult StencilJit::compile(
     result.threadedFunctionCount = nThreaded;
     result.fallbackFunctionCount = nFallback;
     result.machineCodeBytes = codeSize;
+    impl->registerValueLifecycleHooks();
     result.nativeBackendActive = impl->nativeBackendAvailable;
     result.module = std::shared_ptr<StencilModule>(new StencilModule(std::move(impl)));
     return result;

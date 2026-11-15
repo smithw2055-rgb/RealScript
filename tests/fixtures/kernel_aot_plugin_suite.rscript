@@ -1,0 +1,19 @@
+module Kernel.AotPlugin;
+
+[AutoGetter]
+public partial class AutoItem {
+    private int raw;
+
+    public AutoItem(int v) {
+        raw = v;
+    }
+
+    public int ReadRaw() {
+        return raw;
+    }
+}
+
+public int RunAotPluginMacro(int seed) {
+    AutoItem item = new AutoItem(seed);
+    return item.ReadRaw() + item.GetAutoValue() + plugin_magic(seed);
+}

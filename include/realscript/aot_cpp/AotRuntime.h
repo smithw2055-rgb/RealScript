@@ -2467,6 +2467,9 @@ private:
     struct LifecycleTarget {
         std::mutex mutex;
         const Program* program = nullptr;
+        bool alive = true;
+        std::weak_ptr<runtime::ManagedHeap> registeredHeap;
+        std::uint64_t sweepToken = 0;
     };
 
     struct ModifiedHotPatchSlotRecord {

@@ -114,19 +114,18 @@ build/rsaot \
 输出包括公共 Header、C++17 实现、确定性 Manifest、源码元数据和 Native Function
 Descriptor。生成代码直接执行经过验证的 Typed MIR 语义，不嵌入 Bytecode VM。
 
-### 嵌入 Game SDK
+### 嵌入 L0 运行时（或配套 `RealScript-GamePack`）
+
+L0 内核提供 `realscript/runtime/Runtime.h`（`EngineRuntime`、`ManagedHeap`）与 `realscript/bindgen/BindGen.h`（`HostApi`）；游戏专用 SDK（`realscript/game/*`、`RealScript.Game`、场景驱动）位于配套仓库 **`RealScript-GamePack`**：
 
 ```cpp
-#include "realscript/game/Gameplay.h"
+// L0 内核通用嵌入（无游戏耦合）
+#include "realscript/bindgen/BindGen.h"
+#include "realscript/compiler/Compilation.h"
+#include "realscript/runtime/Runtime.h"
 
-realscript::game::GameApi api;
-auto gameplay = std::make_shared<realscript::game::GameplayHost>(60, 1234, 7);
-realscript::game::installGameplayBindings(api, gameplay);
-
-realscript::game::GameScriptCompiler compiler(api);
-auto compiled = compiler.compile(sources);
-realscript::game::ScriptRuntime scripts(compiled.program);
-realscript::game::SceneScriptRuntime scene(scripts);
+realscript::bindgen::HostApi api;
+// 通过 HostApi 注册宿主绑定，编译生成 ProgramImage 后由 EngineRuntime 驱动执行
 ```
 
 多文件 Module、Bytecode Artifact、CMake AOT、调试与编辑器接入见

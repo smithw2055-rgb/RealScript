@@ -178,7 +178,11 @@ struct Interpreter::DispatchTarget {
     std::shared_ptr<ManagedHeap> heap;
     std::shared_ptr<const BindingRegistry> bindings;
     std::shared_ptr<AsyncRuntimeContext> asyncRuntime;
+    std::weak_ptr<ManagedHeap> registeredHeap;
+    std::uint64_t sweepToken = 0;
     bool alive = true;
+
+    void detachSweepHandler(bool markDead);
 };
 
 } // namespace realscript::runtime

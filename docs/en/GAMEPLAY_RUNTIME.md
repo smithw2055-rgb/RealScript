@@ -19,7 +19,10 @@ This layer deliberately stays separate from the parser, binder, MIR, bytecode, a
 - a typed deterministic event queue;
 - in-memory snapshots and stable state hashes.
 
+> **Architecture Note:** `RealScript` L0 kernel provides generic `sequence` lowering (`Schedule` / `CancelTimer` / `SubscribeOnce` / `WaitAsyncOperation` resolved from any imported host module), `FiberScheduler`, and `EngineRuntime`. The `realscript/game/*` C++ SDK and `RealScript.Game` bindings described below live in the companion **`RealScript-GamePack`** repository.
+
 ```cpp
+// Provided by companion repository RealScript-GamePack
 #include "realscript/game/Gameplay.h"
 
 realscript::game::DeterministicGameplayRuntime gameplay(60, 1234, 7);

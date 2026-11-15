@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented as an additive layer over the Phase 7 Game Scripting SDK and RS0 productization API.
+Implemented in the companion **`RealScript-GamePack`** repository as an additive layer over L0 RealScript.
 
 ## Phase 8
 

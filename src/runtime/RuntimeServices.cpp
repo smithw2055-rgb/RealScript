@@ -1898,12 +1898,7 @@ EngineRuntime::EngineRuntime(std::shared_ptr<const ProgramImage> program)
 
 EngineRuntime::~EngineRuntime() {
     if (lifecycleTarget_) {
-        std::lock_guard<std::mutex> lock(lifecycleTarget_->mutex);
-        lifecycleTarget_->alive = false;
-        lifecycleTarget_->program.reset();
-        lifecycleTarget_->heap.reset();
-        lifecycleTarget_->bindings.reset();
-        lifecycleTarget_->asyncRuntime.reset();
+        lifecycleTarget_->detachSweepHandler(true);
     }
 }
 
@@ -1940,6 +1935,9 @@ void EngineRuntime::setBindings(std::shared_ptr<const BindingRegistry> bindings)
 }
 
 void EngineRuntime::setHeap(std::shared_ptr<ManagedHeap> heap) {
+    if (lifecycleTarget_) {
+        lifecycleTarget_->detachSweepHandler(false);
+    }
     auto oldHeap = std::move(heap_);
     heap_ = heap ? std::move(heap) : std::make_shared<ManagedHeap>();
     if (asyncRuntime_) {

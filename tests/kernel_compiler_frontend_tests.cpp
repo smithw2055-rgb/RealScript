@@ -434,6 +434,80 @@ public int main() {
     const auto res = interp.invoke("Test.NumLife::main");
     require(res.succeeded && std::get<std::int64_t>(res.value) == 194,
         "exact numerics + [ValueLifecycle] execution mismatch: " + res.error.message);
+
+    // Parenthesis-free C# 8 declaration-form `using` (`using Type v = ...;` and `using var v = ...;`),
+    // including LIFO disposal order on block exit and early return.
+    auto declProg = buildAndLink({{"UsingDecl.rscript", R"RS(
+module Test.UsingDecl;
+import RealScript.Resource;
+
+public static class DeclLog {
+    public static int Trace = 0;
+    public static int Pins = 0;
+}
+
+public class ValueLifecycleAttribute { public ValueLifecycleAttribute() {} }
+
+[ValueLifecycle]
+public struct ScopedHandle : IDisposable {
+    public int Id;
+
+    public static ScopedHandle Open(int id) {
+        DeclLog.Pins = DeclLog.Pins + 1;
+        ScopedHandle h = new ScopedHandle();
+        h.Id = id;
+        return h;
+    }
+
+    public ScopedHandle Retain() {
+        if (Id != 0) {
+            DeclLog.Pins = DeclLog.Pins + 1;
+        }
+        return this;
+    }
+
+    public void Dispose() {
+        if (Id != 0) {
+            DeclLog.Trace = DeclLog.Trace * 10 + Id;
+            DeclLog.Pins = DeclLog.Pins - 1;
+            Id = 0;
+        }
+    }
+}
+
+public int RunEarly(bool early) {
+    using ScopedHandle first = ScopedHandle.Open(1);
+    {
+        using var second = ScopedHandle.Open(2);
+        if (early) {
+            using var third = ScopedHandle.Open(3);
+            return DeclLog.Pins; // Expected 3; disposes 3, 2, 1 in LIFO order
+        }
+        if (DeclLog.Pins != 2) { return -10; }
+    }
+    if (DeclLog.Trace != 2 || DeclLog.Pins != 1) { return -20; }
+    return 99;
+}
+
+public int main() {
+    int r1 = RunEarly(false);
+    int trace1 = DeclLog.Trace; // Expected 21
+    int pins1 = DeclLog.Pins;   // Expected 0
+
+    DeclLog.Trace = 0;
+    int r2 = RunEarly(true);
+    int trace2 = DeclLog.Trace; // Expected 321
+    int pins2 = DeclLog.Pins;   // Expected 0
+
+    if (r1 != 99 || trace1 != 21 || pins1 != 0) { return -1; }
+    if (r2 != 3 || trace2 != 321 || pins2 != 0) { return -2; }
+    return trace2;
+}
+)RS"}});
+    runtime::Interpreter declInterp(declProg);
+    const auto declRes = declInterp.invoke("Test.UsingDecl::main");
+    require(declRes.succeeded && std::get<std::int64_t>(declRes.value) == 321,
+        "declaration-form `using` / `using var` execution mismatch: " + declRes.error.message);
 }
 
 // ---------------------------------------------------------------------------

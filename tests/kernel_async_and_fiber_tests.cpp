@@ -1098,6 +1098,195 @@ public void ExternalFallbackKernel(int idx, int[] input, int[] output) {
     }
 }
 
+void testNonGameHostSequenceComposition() {
+    const std::string schedSrc = R"RS(
+module CustomHost.Scheduler;
+
+public class SchedState {
+    public static int ScheduledCount = 0;
+    public static int EventSubCount = 0;
+    public static int AsyncWaitCount = 0;
+    public static int CanceledCount = 0;
+    public static string LastCallback = "";
+}
+
+public long Schedule(long target, string callback, int delay) {
+    SchedState.ScheduledCount = SchedState.ScheduledCount + 1;
+    SchedState.LastCallback = callback;
+    return target * 100 + delay;
+}
+
+public bool CancelTimer(long timer) {
+    if (timer != 0) {
+        SchedState.CanceledCount = SchedState.CanceledCount + 1;
+        return true;
+    }
+    return false;
+}
+
+public long SubscribeOnce(long target, string callback, string topic) {
+    SchedState.EventSubCount = SchedState.EventSubCount + 1;
+    SchedState.LastCallback = callback;
+    return target + 10;
+}
+
+public long WaitAsyncOperation(long target, string callback, long asyncOp) {
+    SchedState.AsyncWaitCount = SchedState.AsyncWaitCount + 1;
+    SchedState.LastCallback = callback;
+    return asyncOp + 1;
+}
+
+public int ReadScheduledCount() { return SchedState.ScheduledCount; }
+public int ReadEventSubCount() { return SchedState.EventSubCount; }
+public int ReadAsyncWaitCount() { return SchedState.AsyncWaitCount; }
+public int ReadCanceledCount() { return SchedState.CanceledCount; }
+public string ReadLastCallback() { return SchedState.LastCallback; }
+)RS";
+
+    const std::string workflowSrc = R"RS(
+module CustomHost.Workflow;
+import CustomHost.Scheduler;
+
+public class NonGameTask {
+    public int stage = 0;
+
+    public sequence ExecuteFlow(long target, long asyncOp) {
+        stage = 10;
+        yield wait_ticks(2);
+        stage = 20;
+        yield wait_event("custom.done");
+        stage = 30;
+        yield wait_async(asyncOp);
+        stage = 40;
+    }
+
+    public int ReadStage() { return stage; }
+}
+
+public NonGameTask CreateTask() { return new NonGameTask(); }
+)RS";
+
+    auto bundle = compileAndLink({
+        {"custom_sched.rscript", schedSrc},
+        {"custom_workflow.rscript", workflowSrc},
+    });
+    runtime::EngineRuntime rt(bundle.program);
+
+    const auto readString = [&](const std::string& fn) {
+        const auto res = rt.invoke(fn);
+        require(res.succeeded, fn + " failed: " + res.error.message);
+        if (const auto* ref = std::get_if<runtime::ObjectRef>(&res.value)) {
+            if (const auto view = rt.heap()->stringView(*ref)) {
+                return std::string(*view);
+            }
+        }
+        require(false, fn + " did not return string");
+        return std::string{};
+    };
+    const auto readInt = [&](const std::string& fn) {
+        const auto res = rt.invoke(fn);
+        require(res.succeeded && std::holds_alternative<std::int64_t>(res.value),
+            fn + " failed");
+        return std::get<std::int64_t>(res.value);
+    };
+
+    const auto taskRes = rt.invoke("CustomHost.Workflow::CreateTask");
+    require(taskRes.succeeded, "CreateTask failed");
+    const auto taskRef = std::get<runtime::ObjectRef>(taskRes.value);
+    auto pin = rt.heap()->retain(runtime::Value{taskRef});
+
+    require(rt.invoke("CustomHost.Workflow::NonGameTask.ExecuteFlow",
+                {runtime::Value{taskRef}, runtime::Value{runtime::LongValue{7}}, runtime::Value{runtime::LongValue{55}}})
+                .succeeded,
+        "NonGameTask.ExecuteFlow start failed");
+    require(readInt("CustomHost.Scheduler::ReadScheduledCount") == 1,
+        "Expected CustomHost.Scheduler::Schedule call on wait_ticks");
+    const std::string cb1 = "CustomHost.Workflow::NonGameTask." + readString("CustomHost.Scheduler::ReadLastCallback");
+    require(rt.invoke(cb1, {runtime::Value{taskRef}}).succeeded,
+        "Resume callback 1 failed: " + cb1);
+    require(readInt("CustomHost.Scheduler::ReadEventSubCount") == 1,
+        "Expected CustomHost.Scheduler::SubscribeOnce call on wait_event");
+    const std::string cb2 = "CustomHost.Workflow::NonGameTask." + readString("CustomHost.Scheduler::ReadLastCallback");
+    require(rt.invoke(cb2, {runtime::Value{taskRef}}).succeeded,
+        "Resume callback 2 failed: " + cb2);
+    require(readInt("CustomHost.Scheduler::ReadAsyncWaitCount") == 1,
+        "Expected CustomHost.Scheduler::WaitAsyncOperation call on wait_async");
+    const std::string cb3 = "CustomHost.Workflow::NonGameTask." + readString("CustomHost.Scheduler::ReadLastCallback");
+    require(rt.invoke(cb3, {runtime::Value{taskRef}}).succeeded,
+        "Resume callback 3 failed: " + cb3);
+
+    const auto stageRes = rt.invoke("CustomHost.Workflow::NonGameTask.ReadStage", {runtime::Value{taskRef}});
+    require(stageRes.succeeded && std::get<std::int64_t>(stageRes.value) == 40,
+        "Expected final stage 40 from non-game host sequence");
+
+    // Starting a new sequence mid-flight invokes CustomHost.Scheduler::CancelTimer on restart.
+    require(rt.invoke("CustomHost.Workflow::NonGameTask.ExecuteFlow",
+                {runtime::Value{taskRef}, runtime::Value{runtime::LongValue{8}}, runtime::Value{runtime::LongValue{66}}})
+                .succeeded,
+        "Restarted sequence initial start failed");
+    require(rt.invoke("CustomHost.Workflow::NonGameTask.ExecuteFlow",
+                {runtime::Value{taskRef}, runtime::Value{runtime::LongValue{8}}, runtime::Value{runtime::LongValue{66}}})
+                .succeeded,
+        "Second restart while suspended failed");
+    require(readInt("CustomHost.Scheduler::ReadCanceledCount") >= 1,
+        "Expected CustomHost.Scheduler::CancelTimer call on sequence restart");
+}
+
+void testFiberSchedulerHotReloadPreservesSuspendedFibers() {
+    const auto compileFiberMod = [](const std::string& secondCmdArgSource) {
+        const std::string src =
+            "module Kernel.FiberReload;\n"
+            "import RealScript.Fiber;\n"
+            "public void WorkerRoutine() {\n"
+            "    Fiber.Command(1, 0, 10);\n"
+            "    Fiber.Yield(3);\n"
+            "    Fiber.Command(2, 0, " + secondCmdArgSource + ");\n"
+            "}\n";
+        auto bundle = compileAndLink({{"fiber_reload.rscript", src}}, {}, optimization::Level::None);
+        const mir::Module* mirMod = nullptr;
+        for (const auto& m : bundle.mirModules) {
+            if (m.name == "Kernel.FiberReload") {
+                mirMod = &m;
+                break;
+            }
+        }
+        require(mirMod != nullptr, "Kernel.FiberReload MIR module missing");
+        return runtime::FiberCompiler::compileAutoLoweredModule(*mirMod);
+    };
+
+    const auto modV1 = compileFiberMod("20");
+    const auto modV2 = compileFiberMod("99");
+    require(modV1.hasFunction("WorkerRoutine") && modV2.hasFunction("WorkerRoutine"),
+        "CompiledFiberModule missing WorkerRoutine");
+
+    MockFiberHost host;
+    runtime::FiberScheduler sched(&host);
+    const std::uint32_t progId = sched.registerModule(modV1);
+    const auto ent = runtime::GenerationalEntityHandle{42, 1};
+    const std::uint32_t fiberId = sched.spawnFiberByProgram(progId, modV1.entryPc("WorkerRoutine"), ent, 1);
+    require(fiberId != 0u, "spawnFiberByProgram failed");
+
+    // Run ticks 1..2: executes first Fiber.Command(1, 0, 10) and suspends on Fiber.Yield(3).
+    (void)sched.stepTick(1);
+    (void)sched.stepTick(2);
+    require(sched.activeFiberCount() == 1u, "Expected 1 suspended fiber before hot reload");
+    require(host.commands.size() == 1u && std::get<3>(host.commands[0]) == 10u,
+        "Expected initial Fiber.Command(1, 0, 10) before hot reload");
+
+    const auto report = sched.reloadModuleWithReport(progId, modV1, modV2);
+    require(report.succeeded && report.preservedFibers == 1u && report.abortedFibers == 0u,
+        "Expected FiberScheduler reloadModuleWithReport preservedFibers == 1 and abortedFibers == 0");
+
+    // Step ticks 3..5 so suspended fiber wakes up and runs v2's post-yield Fiber.Command(2, 0, 99).
+    for (std::uint32_t tick = 3; tick <= 5; ++tick) {
+        (void)sched.stepTick(tick);
+    }
+    require(host.commands.size() == 2u &&
+            std::get<1>(host.commands[1]) == 2u &&
+            std::get<3>(host.commands[1]) == 99u,
+        "Expected preserved fiber to resume into v2 post-yield instruction (arg32 == 99)");
+}
+
 } // namespace
 
 int main() {
@@ -1110,6 +1299,8 @@ int main() {
             {"IAwaitScheduler fast path & true suspension/resumption", testDuckTypedAwaitSchedulerFastAndSuspendedPaths},
             {"Pillar 2: IAwaitScheduler immediate & resumed faults + finally cleanup", testAwaitSchedulerFaultAndDelayedResumePaths},
             {"ParallelJob RawColumnArray zero-copy, allowReadOnlyStaticColumnLoads & ParallelNativeBatchKernel", testParallelJobRawColumnsAndNativeBatchKernel},
+            {"Non-game host module sequence lowering without RealScript.Game/Scene", testNonGameHostSequenceComposition},
+            {"FiberScheduler reloadModuleWithReport preserves suspended fibers", testFiberSchedulerHotReloadPreservesSuspendedFibers},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

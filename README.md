@@ -122,19 +122,19 @@ Generated output contains a public header, C++17 implementation, deterministic
 manifest, source metadata, and native function descriptors. It executes
 verified Typed MIR semantics directly and does not embed the bytecode VM.
 
-### Embed the Game SDK
+### Embed the Runtime or Companion GamePack
+
+The L0 kernel provides `realscript/runtime/Runtime.h` (`EngineRuntime`, `ManagedHeap`) and `realscript/bindgen/BindGen.h` (`HostApi`). Game-specific helpers (`realscript/game/*`, `RealScript.Game`, scene runtime) live in the companion **`RealScript-GamePack`** repository:
 
 ```cpp
-#include "realscript/game/Gameplay.h"
+// L0 kernel host embedding (zero game dependencies)
+#include "realscript/bindgen/BindGen.h"
+#include "realscript/compiler/Compilation.h"
+#include "realscript/runtime/Runtime.h"
 
-realscript::game::GameApi api;
-auto gameplay = std::make_shared<realscript::game::GameplayHost>(60, 1234, 7);
-realscript::game::installGameplayBindings(api, gameplay);
-
-realscript::game::GameScriptCompiler compiler(api);
-auto compiled = compiler.compile(sources);
-realscript::game::ScriptRuntime scripts(compiled.program);
-realscript::game::SceneScriptRuntime scene(scripts);
+realscript::bindgen::HostApi api;
+// Register domain APIs, compile scripts to ProgramImage, and drive via EngineRuntime:
+// realscript::runtime::EngineRuntime runtime(program);
 ```
 
 See [Getting Started](docs/en/GETTING_STARTED.md) for multi-file modules,

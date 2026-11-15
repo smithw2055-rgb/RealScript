@@ -1898,7 +1898,7 @@ std::unique_ptr<BoundBlockStatement> Binder::bindSequenceCancellation(
     if (!cancel) {
         diagnostics_.report(
             "RS8804",
-            "sequence cancellation requires imported RealScript.Game.CancelTimer",
+            "sequence cancellation requires imported host CancelTimer",
             input.symbol.declarationSpan);
         return result;
     }
@@ -2054,7 +2054,7 @@ Binder::bindSingleYieldLoopSequence(const FunctionBindingInput& input) {
     if (!schedule) {
         diagnostics_.report(
             "RS2493",
-            "sequence requires imported RealScript.Game.Schedule",
+            "sequence requires imported host Schedule",
             yieldSyntax.span());
     } else {
         auto call = std::make_unique<BoundCallExpression>();
@@ -2578,7 +2578,7 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
         if (!schedule) {
             diagnostics_.report(
                 "RS2493",
-                "nested sequence composition requires imported RealScript.Game.Schedule",
+                "nested sequence composition requires imported host Schedule",
                 span);
         } else {
             auto call = std::make_unique<BoundCallExpression>();
@@ -2771,16 +2771,14 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
                             candidate.parameters[1].type == PrimitiveType::String &&
                             candidate.parameters[2].type == PrimitiveType::Long) {
                             waitAsync = &candidate;
-                            if (candidate.moduleName == "RealScript.Scene") {
-                                break;
-                            }
+                            break;
                         }
                     }
                 }
                 if (!waitAsync) {
                     diagnostics_.report(
                         "RS2493",
-                        "sequence wait_async requires imported RealScript.Game.WaitAsyncOperation",
+                        "sequence wait_async requires imported host WaitAsyncOperation",
                         yield.span());
                 } else {
                     auto call = std::make_unique<BoundCallExpression>();
@@ -2835,7 +2833,7 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
                 if (!subscribeOnce) {
                     diagnostics_.report(
                         "RS2493",
-                        "sequence wait_event requires imported RealScript.Game.SubscribeOnce",
+                        "sequence wait_event requires imported host SubscribeOnce",
                         yield.span());
                 } else {
                     auto call = std::make_unique<BoundCallExpression>();
@@ -2921,7 +2919,7 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
                 if (!schedule) {
                     diagnostics_.report(
                         "RS2493",
-                        "sequence requires imported RealScript.Game.Schedule",
+                        "sequence requires imported host Schedule",
                         yield.span());
                 } else {
                     auto call = std::make_unique<BoundCallExpression>();
@@ -3810,7 +3808,7 @@ std::unique_ptr<BoundBlockStatement> Binder::bindSequenceSegment(
         if (!schedule || !input.sequenceNextCallback) {
             diagnostics_.report(
                 "RS2493",
-                "sequence requires imported RealScript.Game.Schedule",
+                "sequence requires imported host Schedule",
                 yieldSyntax.span());
         } else {
             auto call = std::make_unique<BoundCallExpression>();

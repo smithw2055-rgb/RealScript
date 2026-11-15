@@ -19,7 +19,6 @@ option(REALSCRIPT_SLIM_RUNTIME "Build only slim L0 runtime and AOT runtime targe
 if(REALSCRIPT_SLIM_RUNTIME)
     set(REALSCRIPT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(REALSCRIPT_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
-    set(REALSCRIPT_INSTALL_SDK OFF CACHE BOOL "" FORCE)
     set(REALSCRIPT_ENABLE_DEBUG_SERVICES OFF CACHE BOOL "" FORCE)
     set(REALSCRIPT_ENABLE_TOOLING OFF CACHE BOOL "" FORCE)
     set(REALSCRIPT_ENABLE_EXTENSIBILITY OFF CACHE BOOL "" FORCE)
@@ -442,6 +441,13 @@ if(REALSCRIPT_ENABLE_BINDGEN)
     target_link_libraries(realscript_frontend INTERFACE realscript_app_bindgen)
     target_link_libraries(realscript_full INTERFACE realscript_app_bindgen)
 endif()
+set(REALSCRIPT_SLIM_RUNTIME_CMAKE OFF)
+else()
+set(REALSCRIPT_SLIM_RUNTIME_CMAKE ON)
+set(REALSCRIPT_HAS_DEBUG_SERVICES_CMAKE OFF)
+set(REALSCRIPT_HAS_TOOLING_CMAKE OFF)
+set(REALSCRIPT_HAS_EXTENSIBILITY_CMAKE OFF)
+set(REALSCRIPT_HAS_BINDGEN_CMAKE OFF)
 endif()
 
 include(cmake/RealScriptAot.cmake)
@@ -628,12 +634,25 @@ if(REALSCRIPT_BUILD_TESTS)
         SOURCES
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/kernel_aot_trusted.rscript")
 
+    realscript_add_aot_library(
+        realscript_kernel_aot_plugin_fixture
+        PROGRAM_NAME KernelAotPlugin
+        CPP_NAMESPACE kernel_aot_plugin_ns
+        QUERY_SYMBOL rs_module_query_kernel_aot_plugin
+        OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated/kernel_aot_plugin"
+        OPT_LEVEL 2
+        COMPILER_PLUGINS
+            "$<TARGET_FILE:kernel_fixture_macro_plugin>"
+        SOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/kernel_aot_plugin_suite.rscript")
+
     add_executable(realscript_kernel_aot_backend_tests tests/kernel_aot_backend_tests.cpp)
     target_link_libraries(
         realscript_kernel_aot_backend_tests
         PRIVATE
             realscript_kernel_aot_fixture
             realscript_kernel_aot_trusted_fixture
+            realscript_kernel_aot_plugin_fixture
             RealScript::Kernel)
     target_compile_features(realscript_kernel_aot_backend_tests PRIVATE cxx_std_17)
     target_compile_definitions(
@@ -741,40 +760,46 @@ if(REALSCRIPT_BUILD_TESTS)
     endif()
 endif()
 
-if(REALSCRIPT_INSTALL_SDK AND NOT REALSCRIPT_SLIM_RUNTIME)
+if(REALSCRIPT_INSTALL_SDK)
     set(realscript_install_export_targets
         realscript_slice_foundation_core
         realscript_slice_bytecode_core
-        realscript_slice_compiler_core
         realscript_slice_runtime_core
         realscript_slice_aot_runtime
         realscript_slice_bindgen_runtime
         realscript_slice_stencil_jit
         realscript_slice_hot_reload
-        realscript_slice_native_backends
         realscript_aot_support
         realscript_slim_runtime
-        realscript_kernel
-        realscript_frontend
-        realscript_full
-        rsaot
     )
-    set(realscript_install_cli_targets rsc rsbench)
+    set(realscript_install_cli_targets)
 
-    if(REALSCRIPT_ENABLE_DEBUG_SERVICES)
-        list(APPEND realscript_install_export_targets realscript_app_debug)
-        list(APPEND realscript_install_cli_targets rsdebug)
-    endif()
-    if(REALSCRIPT_ENABLE_TOOLING)
-        list(APPEND realscript_install_export_targets realscript_app_tooling)
-        list(APPEND realscript_install_cli_targets rslsp)
-    endif()
-    if(REALSCRIPT_ENABLE_EXTENSIBILITY)
-        list(APPEND realscript_install_export_targets realscript_app_extensibility)
-    endif()
-    if(REALSCRIPT_ENABLE_BINDGEN)
-        list(APPEND realscript_install_export_targets realscript_app_bindgen)
-        list(APPEND realscript_install_cli_targets rsbind)
+    if(NOT REALSCRIPT_SLIM_RUNTIME)
+        list(APPEND realscript_install_export_targets
+            realscript_slice_compiler_core
+            realscript_slice_native_backends
+            realscript_kernel
+            realscript_frontend
+            realscript_full
+            rsaot
+        )
+        list(APPEND realscript_install_cli_targets rsc rsbench)
+
+        if(REALSCRIPT_ENABLE_DEBUG_SERVICES)
+            list(APPEND realscript_install_export_targets realscript_app_debug)
+            list(APPEND realscript_install_cli_targets rsdebug)
+        endif()
+        if(REALSCRIPT_ENABLE_TOOLING)
+            list(APPEND realscript_install_export_targets realscript_app_tooling)
+            list(APPEND realscript_install_cli_targets rslsp)
+        endif()
+        if(REALSCRIPT_ENABLE_EXTENSIBILITY)
+            list(APPEND realscript_install_export_targets realscript_app_extensibility)
+        endif()
+        if(REALSCRIPT_ENABLE_BINDGEN)
+            list(APPEND realscript_install_export_targets realscript_app_bindgen)
+            list(APPEND realscript_install_cli_targets rsbind)
+        endif()
     endif()
 
     install(
@@ -784,15 +809,19 @@ if(REALSCRIPT_INSTALL_SDK AND NOT REALSCRIPT_SLIM_RUNTIME)
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
-    install(
-        TARGETS ${realscript_install_cli_targets}
-        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-    )
+    if(realscript_install_cli_targets)
+        install(
+            TARGETS ${realscript_install_cli_targets}
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        )
+    endif()
     install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
     install(FILES LICENSE
         DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/RealScript)
-    install(FILES cmake/RealScriptAot.cmake
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/RealScript)
+    if(NOT REALSCRIPT_SLIM_RUNTIME)
+        install(FILES cmake/RealScriptAot.cmake
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/RealScript)
+    endif()
     install(DIRECTORY tools/debuggers/
         DESTINATION ${CMAKE_INSTALL_DATADIR}/RealScript/debuggers)
 

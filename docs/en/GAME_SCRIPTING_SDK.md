@@ -1,6 +1,6 @@
-# Game Scripting SDK
+# Game Scripting SDK (`RealScript-GamePack`)
 
-The Game Scripting SDK connects RealScript's compiler and runtime to a C++17 game object model. It provides compiler-visible host APIs, typed C++ bindings, rooted script instances, scene lifecycle dispatch, queued events, and condition-based triggers.
+The companion **`RealScript-GamePack`** repository connects RealScript's L0 compiler and runtime (`bindgen::HostApi`, `EngineRuntime`, `ManagedHeap`) to a C++17 game object model via `realscript/game/*` headers.
 
 ## Integration model
 
@@ -25,6 +25,7 @@ C++ game objects / ECS / scene graph
 ## Register C++ functions and classes
 
 ```cpp
+// Requires companion repository RealScript-GamePack linked alongside RealScript
 #include "realscript/game/GameScripting.h"
 
 struct Character {

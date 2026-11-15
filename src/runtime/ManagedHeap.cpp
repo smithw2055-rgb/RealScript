@@ -3482,6 +3482,9 @@ struct ManagedHeap::Impl {
     std::atomic<bool> hasValueLifecycleTypes{false};
     std::unordered_set<semantic::SymbolId> valueLifecycleTypes;
     ValueLifecycleSweepCallback valueLifecycleSweepCallback;
+    std::uint64_t nextValueLifecycleSweepToken = 1;
+    std::vector<std::pair<std::uint64_t, ValueLifecycleSweepHandler>>
+        valueLifecycleSweepHandlers;
 
     struct PendingValueLifecycleSweep {
         Value value;
@@ -3626,6 +3629,7 @@ struct ManagedHeap::Impl {
     void flushPendingValueLifecycleSweeps() {
         std::vector<PendingValueLifecycleSweep> pending;
         ValueLifecycleSweepCallback callback;
+        std::vector<std::pair<std::uint64_t, ValueLifecycleSweepHandler>> handlers;
         {
             HeapSyncMutexGuard heapLock(syncState->mutex);
             if (pendingValueLifecycleSweeps.empty()) {
@@ -3633,7 +3637,8 @@ struct ManagedHeap::Impl {
             }
             pending.swap(pendingValueLifecycleSweeps);
             callback = valueLifecycleSweepCallback;
-            if (!callback) {
+            handlers = valueLifecycleSweepHandlers;
+            if (!callback && handlers.empty()) {
                 for (const auto& entry : pending) {
                     if (entry.rootToken != 0) {
                         persistentRoots.erase(entry.rootToken);
@@ -3665,7 +3670,16 @@ struct ManagedHeap::Impl {
 
         for (; nextIdx < pending.size(); ++nextIdx) {
             const auto& entry = pending[nextIdx];
-            callback(entry.value);
+            bool handled = false;
+            for (auto it = handlers.rbegin(); it != handlers.rend(); ++it) {
+                if (it->second && it->second(entry.value)) {
+                    handled = true;
+                    break;
+                }
+            }
+            if (!handled && callback) {
+                callback(entry.value);
+            }
             if (entry.rootToken != 0) {
                 HeapSyncMutexGuard heapLock(syncState->mutex);
                 persistentRoots.erase(entry.rootToken);
@@ -5259,6 +5273,45 @@ void ManagedHeap::registerValueLifecycleType(semantic::SymbolId typeId) {
 void ManagedHeap::setValueLifecycleSweepCallback(ValueLifecycleSweepCallback callback) {
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     impl_->valueLifecycleSweepCallback = std::move(callback);
+}
+
+std::uint64_t ManagedHeap::addValueLifecycleSweepHandler(
+    ValueLifecycleSweepHandler handler) {
+    if (!handler) {
+        return 0;
+    }
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    const std::uint64_t token = impl_->nextValueLifecycleSweepToken++;
+    if (impl_->nextValueLifecycleSweepToken == 0) {
+        impl_->nextValueLifecycleSweepToken = 1;
+    }
+    impl_->valueLifecycleSweepHandlers.emplace_back(token, std::move(handler));
+    return token;
+}
+
+void ManagedHeap::removeValueLifecycleSweepHandler(std::uint64_t token) {
+    if (token == 0 || !impl_ || !impl_->syncState) {
+        return;
+    }
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    auto& handlers = impl_->valueLifecycleSweepHandlers;
+    handlers.erase(
+        std::remove_if(
+            handlers.begin(),
+            handlers.end(),
+            [token](const auto& entry) noexcept {
+                return entry.first == token;
+            }),
+        handlers.end());
+}
+
+bool ManagedHeap::hasValueLifecycleSweepCallback() const noexcept {
+    if (!impl_ || !impl_->syncState) {
+        return false;
+    }
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    return !impl_->valueLifecycleSweepHandlers.empty() ||
+        static_cast<bool>(impl_->valueLifecycleSweepCallback);
 }
 
 bool ManagedHeap::hasRegisteredValueLifecycleTypes() const noexcept {

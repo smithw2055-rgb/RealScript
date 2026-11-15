@@ -93,7 +93,7 @@ sequence Attack(long target)
 }
 ```
 
-The compiler creates an entry method, fixed-tick callback methods, and a typed target-handle field as compiler-owned semantic symbols. Each segment between top-level yields is bound independently. Schedule calls bind directly to imported `RealScript.Game.Schedule`; no script source is generated.
+The compiler creates an entry method, fixed-tick callback methods, and a typed target-handle field as compiler-owned semantic symbols. Each segment between top-level yields is bound independently. Schedule calls bind directly to any imported host `Schedule` symbol (e.g., `RealScript.Game.Schedule` in `RealScript-GamePack` or a custom host scheduler module); no script source is generated.
 
 Native sequence metadata is retained through `BuildResult`, `GameCompileResult`, and `GameProgram`. Callbacks continue to use `GameplayHost` and `TickScheduler`, preserving fixed-tick ordering and existing replay/rollback behavior.
 

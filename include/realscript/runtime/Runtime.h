@@ -2054,6 +2054,7 @@ private:
 };
 
 using ValueLifecycleSweepCallback = std::function<void(const Value&)>;
+using ValueLifecycleSweepHandler = std::function<bool(const Value&)>;
 
 struct NativeBufferViewDesc {
     void* data = nullptr;
@@ -2685,6 +2686,9 @@ public:
     void setNativeWrapperSweepCallback(NativeWrapperSweepCallback callback);
     void registerValueLifecycleType(semantic::SymbolId typeId);
     void setValueLifecycleSweepCallback(ValueLifecycleSweepCallback callback);
+    std::uint64_t addValueLifecycleSweepHandler(ValueLifecycleSweepHandler handler);
+    void removeValueLifecycleSweepHandler(std::uint64_t token);
+    [[nodiscard]] bool hasValueLifecycleSweepCallback() const noexcept;
     [[nodiscard]] bool hasRegisteredValueLifecycleTypes() const noexcept;
     [[nodiscard]] static std::optional<std::string> tryCopyStringGlobal(ObjectRef reference);
     [[nodiscard]] std::optional<std::size_t> arrayLength(ObjectRef reference) const;

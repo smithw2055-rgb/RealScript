@@ -25,6 +25,10 @@ namespace kernel_aot_trusted_ns {
 const realscript::aot::ProgramDescriptor& KernelAotTrustedProgram() noexcept;
 }
 
+namespace kernel_aot_plugin_ns {
+const realscript::aot::ProgramDescriptor& KernelAotPluginProgram() noexcept;
+}
+
 namespace {
 
 using namespace realscript;
@@ -1184,6 +1188,17 @@ public int Caller(int x) { return Calc(x) + 1; }
     }
 }
 
+void testAotPluginMacroDependency() {
+    aot::Program program(kernel_aot_plugin_ns::KernelAotPluginProgram());
+    const auto res = program.invoke(
+        "Kernel.AotPlugin::RunAotPluginMacro",
+        {runtime::Value{std::int64_t{10}}});
+    require(res.succeeded && std::holds_alternative<std::int64_t>(res.value) &&
+            std::get<std::int64_t>(res.value) == 1465,
+        "Kernel.AotPlugin::RunAotPluginMacro(10) expected 1465, got: " +
+            res.error.message);
+}
+
 } // namespace
 
 int main() {
@@ -1195,6 +1210,7 @@ int main() {
             {"Pillar 2 & 4: AotRuntime IAwaitScheduler, [ValueLifecycle] sweep & Span SIMD", testAotAwaitSchedulerValueLifecycleAndSpanSimd},
             {"L0 AttributeDescriptor emission, IExecutionPolicy & AOT weak delegate default return", testAotAttributeDescriptorsPolicyAndWeakDelegates},
             {"AotCpp emitHotPatchThunks & AotRuntime applyMethodBodyHotPatch", testAotHotPatchThunksAndApplyMethodBodyHotPatch},
+            {"realscript_add_aot_library COMPILER_PLUGINS dependency & macro expansion", testAotPluginMacroDependency},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

@@ -104,7 +104,7 @@ Implemented and validated:
 - original source spans retained for sequence declarations and yield points;
 - compiler-owned entry method, callback methods, and target-handle field symbols;
 - each top-level yield segment is bound independently, so locals cannot silently cross suspension boundaries;
-- generated schedule calls bind directly to imported `RealScript.Game.Schedule` rather than generated script text;
+- generated schedule calls bind directly to any imported host `Schedule` symbol (such as `RealScript.Game.Schedule` in companion `RealScript-GamePack` or custom non-game schedulers) rather than generated script text;
 - fixed-tick callbacks continue to use `GameplayHost` and `TickScheduler` for replay/rollback behavior;
 - canonical sequence metadata is retained in `BuildResult`, `GameCompileResult`, and `GameProgram`;
 - invalid sequence signatures, missing scheduling APIs, nested/out-of-context yields, and non-class owners receive explicit diagnostics;

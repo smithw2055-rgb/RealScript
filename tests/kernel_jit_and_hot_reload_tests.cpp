@@ -593,6 +593,127 @@ public Stats Create() { return new Stats(); }
     }
 }
 
+void testStencilJitValueLifecycleAndSharedHeapResilience() {
+    auto bundle = compileAndLink({{"StencilLifecycle.rscript", R"RS(
+module Kernel.StencilLifecycle;
+
+public class ValueLifecycleAttribute { public ValueLifecycleAttribute() {} }
+
+public static class Stats {
+    public static int DisposedCount = 0;
+    public static int LastToken = 0;
+}
+
+[ValueLifecycle]
+public struct NativeToken {
+    public int Token;
+
+    public static NativeToken Make(int t) {
+        NativeToken n = new NativeToken();
+        n.Token = t;
+        return n;
+    }
+
+    public NativeToken Retain() {
+        return this;
+    }
+
+    public void Dispose() {
+        if (Token != 0) {
+            Stats.DisposedCount = Stats.DisposedCount + 1;
+            Stats.LastToken = Token;
+            Token = 0;
+        }
+    }
+}
+
+public class BoxHolder {
+    public NativeToken Handle;
+}
+
+public int AllocateTransient(int token) {
+    BoxHolder holder = new BoxHolder();
+    holder.Handle = NativeToken.Make(token);
+    return holder.Handle.Token;
+}
+
+public int ReadDisposedCount() {
+    return Stats.DisposedCount;
+}
+
+public int ReadLastToken() {
+    return Stats.LastToken;
+}
+)RS"}}, optimization::Level::Basic);
+
+    // 1. Standalone StencilModule with default heap + explicit setHeap(customHeap).
+    {
+        jit::StencilJit jitEngine;
+        auto compiled = jitEngine.compile(bundle.program);
+        require(compiled.succeeded() && compiled.module && compiled.module->valid(),
+            "StencilJit compile failed for ValueLifecycle test: " + compiled.error);
+
+        auto customHeap = std::make_shared<runtime::ManagedHeap>();
+        compiled.module->setHeap(customHeap);
+        require(customHeap->hasRegisteredValueLifecycleTypes(),
+            "StencilModule::setHeap must register [ValueLifecycle] types");
+        require(customHeap->hasValueLifecycleSweepCallback(),
+            "StencilModule::setHeap must register a sweep handler");
+
+        auto allocRes = compiled.module->invoke(
+            "Kernel.StencilLifecycle::AllocateTransient", {runtime::Value{42LL}});
+        require(allocRes.succeeded && std::get<std::int64_t>(allocRes.value) == 42,
+            "StencilModule AllocateTransient failed: " + allocRes.error.message);
+
+        customHeap->collect();
+
+        auto countRes = compiled.module->invoke("Kernel.StencilLifecycle::ReadDisposedCount");
+        auto tokenRes = compiled.module->invoke("Kernel.StencilLifecycle::ReadLastToken");
+        require(countRes.succeeded && std::get<std::int64_t>(countRes.value) == 1,
+            "StencilModule GC sweep must invoke Dispose() once (got " +
+            std::to_string(std::get<std::int64_t>(countRes.value)) + ")");
+        require(tokenRes.succeeded && std::get<std::int64_t>(tokenRes.value) == 42,
+            "StencilModule GC sweep must observe Token == 42");
+    }
+
+    // 2. Shared ManagedHeap between Interpreter and StencilModule: no double-dispose and
+    // surviving Interpreter continues firing Dispose() after StencilModule destruction.
+    {
+        auto sharedHeap = std::make_shared<runtime::ManagedHeap>();
+        runtime::Interpreter interp(bundle.program, sharedHeap);
+
+        jit::StencilJit jitEngine;
+        auto compiled = jitEngine.compile(bundle.program);
+        require(compiled.succeeded() && compiled.module, "StencilJit compile failed");
+        compiled.module->setHeap(sharedHeap);
+
+        auto r1 = compiled.module->invoke(
+            "Kernel.StencilLifecycle::AllocateTransient", {runtime::Value{71LL}});
+        require(r1.succeeded, "shared heap StencilModule invoke failed");
+        sharedHeap->collect();
+
+        auto c1 = interp.invoke("Kernel.StencilLifecycle::ReadDisposedCount");
+        require(c1.succeeded && std::get<std::int64_t>(c1.value) == 1,
+            "shared heap GC must fire Dispose() exactly once (not double-disposed)");
+
+        compiled.module.reset();
+        require(sharedHeap->hasValueLifecycleSweepCallback(),
+            "destroying StencilModule must leave outer Interpreter sweep handler intact");
+
+        auto r2 = interp.invoke(
+            "Kernel.StencilLifecycle::AllocateTransient", {runtime::Value{88LL}});
+        require(r2.succeeded, "Interpreter AllocateTransient failed after StencilModule reset");
+        sharedHeap->collect();
+
+        auto c2 = interp.invoke("Kernel.StencilLifecycle::ReadDisposedCount");
+        auto t2 = interp.invoke("Kernel.StencilLifecycle::ReadLastToken");
+        require(c2.succeeded && std::get<std::int64_t>(c2.value) == 2,
+            "Interpreter sweep handler must still fire Dispose() after StencilModule destruction");
+        require(t2.succeeded && std::get<std::int64_t>(t2.value) == 88,
+            "Interpreter sweep handler must see Token == 88 after StencilModule destruction");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -602,6 +723,7 @@ int main() {
             {"ToolchainJit shell-free hardening & AOT sync header diet", testToolchainJitShellFreeAndHeaderDiet},
             {"HotReload -O2 inline invalidation, structural migration & active sequence", testHotReloadInlineStructuralAndSequences},
             {"HotReload Pillar 6: [FieldTag(N)] rename & multi-hop [FormerlySerializedAs]", testHotReloadFieldTagAndMultiHopFormerlySerializedAs},
+            {"StencilJit [ValueLifecycle] sweep registration & shared-heap resilience", testStencilJitValueLifecycleAndSharedHeapResilience},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';
