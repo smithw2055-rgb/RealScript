@@ -75,7 +75,8 @@ std::string canonicalInput(
         "emitLineDirectives=" + (options.emitLineDirectives ? "1" : "0") + "\n" +
         "trustedRelease=" + (options.trustedRelease ? "1" : "0") + "\n" +
         "enableSharedReferenceGenerics=" +
-        (options.enableSharedReferenceGenerics ? "1" : "0") + "\n";
+        (options.enableSharedReferenceGenerics ? "1" : "0") + "\n" +
+        "emitHotPatchThunks=" + (options.emitHotPatchThunks ? "1" : "0") + "\n";
     for (const auto* module : ordered) {
         value += mir::printModule(*module);
         for (const auto& type : module->types) {
@@ -1154,6 +1155,14 @@ GeneratedProgram CppGenerator::generate(
     generated.sharedGenericBodyCount = sharedGenericGroups.size();
     generated.foldedGenericFunctionCount = sharedGenericBySymbol.size();
 
+    std::unordered_map<semantic::SymbolId, std::size_t> hotPatchSlotsBySymbol;
+    if (options.emitHotPatchThunks) {
+        hotPatchSlotsBySymbol.reserve(functions.size());
+        for (std::size_t idx = 0; idx < functions.size(); ++idx) {
+            hotPatchSlotsBySymbol.emplace(functions[idx].function->symbolId, idx);
+        }
+    }
+
     for (const auto& view : functions) {
         const auto& function = *view.function;
         if (!function.parameterTypes.empty()) {
@@ -1176,6 +1185,13 @@ GeneratedProgram CppGenerator::generate(
         if (typedFunctions.find(function.symbolId) != typedFunctions.end()) {
             source.line(typedScalarFunctionSignature(view, true));
         }
+        if (options.emitHotPatchThunks) {
+            source.line("static bool " + view.cppName + "_body(");
+            source.line("    ExecutionContext& context,");
+            source.line("    const runtime::Value* arguments,");
+            source.line("    std::size_t argumentCount,");
+            source.line("    runtime::Value& result);");
+        }
         source.line("static bool " + view.cppName + "(");
         source.line("    ExecutionContext& context,");
         source.line("    const runtime::Value* arguments,");
@@ -1188,6 +1204,7 @@ GeneratedProgram CppGenerator::generate(
         source.line("    void* result);");
     }
     source.line();
+    emitHotPatchThunks(source, functions, options);
 
     for (const auto& call : callSites) {
         const auto& instruction = *call.instruction;
@@ -1932,7 +1949,10 @@ GeneratedProgram CppGenerator::generate(
                 hexId(function.symbolId) + "ULL, 0x" +
                 hexId(function.returnTypeId) + "ULL, " +
                 typesPtrExpr + ", " + callsPtrExpr + "};");
-            source.line("static bool " + view.cppName + "(");
+            const std::string entryBodyName = options.emitHotPatchThunks
+                ? (view.cppName + "_body")
+                : view.cppName;
+            source.line("static bool " + entryBodyName + "(");
             source.line("    ExecutionContext& context,");
             source.line("    const runtime::Value* arguments,");
             source.line("    std::size_t argumentCount,");
@@ -1945,9 +1965,13 @@ GeneratedProgram CppGenerator::generate(
             source.line();
         } else if (typedFunctions.find(function.symbolId) != typedFunctions.end()) {
             emitTypedPrimitiveFunction(
-                source, view, options, sourceMap, typedFunctions, types, callIds);
+                source, view, options, sourceMap, typedFunctions, types, callIds,
+                hotPatchSlotsBySymbol);
         } else {
-        source.line("static bool " + view.cppName + "(");
+        const std::string entryBodyName = options.emitHotPatchThunks
+            ? (view.cppName + "_body")
+            : view.cppName;
+        source.line("static bool " + entryBodyName + "(");
         source.line("    ExecutionContext& context,");
         source.line("    const runtime::Value* arguments,");
         source.line("    std::size_t argumentCount,");
@@ -2625,6 +2649,12 @@ GeneratedProgram CppGenerator::generate(
         ? std::string("nullptr")
         : std::string("programAttributes")) + ",");
     source.line("    " + std::to_string(emittedAttributes.size()) + "u,");
+    source.line("    " + ((options.emitHotPatchThunks && !functions.empty())
+        ? std::string("programHotPatchSlots")
+        : std::string("nullptr")) + ",");
+    source.line("    " + ((options.emitHotPatchThunks && !functions.empty())
+        ? (std::to_string(functions.size()) + "u")
+        : std::string("0u")) + ",");
     source.line("};");
     source.line();
     source.line("const ProgramDescriptor& " + options.programName +
@@ -2782,6 +2812,47 @@ GeneratedProgram CppGenerator::generate(
     generated.manifest = manifest.str();
     return generated;
 }
+
+namespace detail {
+
+void emitHotPatchThunks(
+    Emitter& source,
+    const std::vector<FunctionView>& functions,
+    const GenerationOptions& options) {
+    if (!options.emitHotPatchThunks || functions.empty()) return;
+    source.line("static ::realscript::aot::HotPatchSlot programHotPatchSlots[] = {");
+    for (const auto& view : functions) {
+        source.line("    {0x" + hexId(view.function->symbolId) + "ULL, \"" +
+            escapeCppString(view.qualifiedName) + "\", &" +
+            view.cppName + "_body, &" + view.cppName + "_body, 0u},");
+    }
+    source.line("};");
+    source.line();
+    for (std::size_t idx = 0; idx < functions.size(); ++idx) {
+        const auto& view = functions[idx];
+        source.line("static bool " + view.cppName + "(");
+        source.line("    ExecutionContext& context,");
+        source.line("    const runtime::Value* arguments,");
+        source.line("    std::size_t argumentCount,");
+        source.line("    runtime::Value& result) {");
+        source.line("    if (const auto overrideImpl = context.resolveHotPatchImplementation(0x" +
+            hexId(view.function->symbolId) + "ULL)) {");
+        source.line("        return overrideImpl(context, arguments, argumentCount, result);");
+        source.line("    }");
+        source.line("    const auto slotImpl = programHotPatchSlots[" +
+            std::to_string(idx) + "u].patchedImplementation;");
+        source.line("    if (RS_AOT_UNLIKELY(slotImpl != nullptr && slotImpl != &" +
+            view.cppName + "_body)) {");
+        source.line("        return slotImpl(context, arguments, argumentCount, result);");
+        source.line("    }");
+        source.line("    return " + view.cppName +
+            "_body(context, arguments, argumentCount, result);");
+        source.line("}");
+        source.line();
+    }
+}
+
+} // namespace detail
 
 } // namespace realscript::aot
 

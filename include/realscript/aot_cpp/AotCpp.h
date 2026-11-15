@@ -17,6 +17,7 @@ struct GenerationOptions {
     bool emitLineDirectives = true;
     bool trustedRelease = false;
     bool enableSharedReferenceGenerics = true;
+    bool emitHotPatchThunks = false;
 };
 
 struct GeneratedProgram {

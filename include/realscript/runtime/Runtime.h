@@ -3335,22 +3335,90 @@ struct FunctionProfile {
     std::size_t maximumCallDepth = 0;
 };
 
+struct ProfileTraceEvent {
+    TraceEventKind kind = TraceEventKind::FunctionEnter;
+    std::uint64_t timestampNs = 0;
+    std::uint64_t durationNs = 0;
+    semantic::SymbolId functionId = 0;
+    std::string function;
+    std::uint32_t callDepth = 0;
+    std::uint32_t threadId = 0;
+};
+
 struct ExecutionProfile {
     std::vector<FunctionProfile> functions;
     std::uint64_t totalEvents = 0;
+    std::vector<ProfileTraceEvent> traceEvents;
 };
 
 class ProfileCollector {
 public:
+    static constexpr std::size_t TraceRingCapacity = 8192;
+    static constexpr std::size_t TraceRingMask = TraceRingCapacity - 1;
+    static constexpr std::size_t MaxStoredTraceEvents = 65536;
+
+    ProfileCollector();
+
     void record(const TraceEvent& event);
+    void recordCallBegin(
+        semantic::SymbolId functionId,
+        std::string_view functionName,
+        std::size_t callDepth) noexcept;
+    void recordCallEnd(
+        semantic::SymbolId functionId,
+        std::string_view functionName,
+        std::size_t callDepth,
+        std::uint64_t durationNs = 0) noexcept;
+    void recordTraceSpan(
+        semantic::SymbolId functionId,
+        std::string_view functionName,
+        std::uint64_t beginTimestampNs,
+        std::uint64_t durationNs,
+        std::size_t callDepth) noexcept;
+    [[nodiscard]] std::uint64_t nowSteadyNs() const noexcept;
+
+    void flush();
     void merge(const ExecutionProfile& profile);
     [[nodiscard]] ExecutionProfile snapshot() const;
     void reset();
 
 private:
+    struct TraceRingSlot {
+        std::atomic<std::uint64_t> version{0};
+        std::uint64_t timestampNs = 0;
+        std::uint64_t durationNs = 0;
+        semantic::SymbolId functionId = 0;
+        std::uint32_t callDepth = 0;
+        std::uint32_t threadId = 0;
+        TraceEventKind kind = TraceEventKind::Instruction;
+        std::uint16_t nameLength = 0;
+        bool hasTimestamp = false;
+        bool isSpan = false;
+        bool countInSummary = true;
+        char functionName[128]{};
+    };
+
+    void pushRingSlot(
+        TraceEventKind kind,
+        semantic::SymbolId functionId,
+        std::string_view functionName,
+        std::uint64_t timestampNs,
+        std::uint64_t durationNs,
+        std::size_t callDepth,
+        bool hasTimestamp,
+        bool isSpan,
+        bool countInSummary) noexcept;
+    void drainLocked() const;
+
+    std::chrono::steady_clock::time_point epochStart_;
+    std::unique_ptr<TraceRingSlot[]> ring_;
+    mutable std::atomic<std::uint64_t> writeCursor_{0};
+    mutable std::uint64_t readCursor_ = 0;
     mutable std::mutex mutex_;
-    std::map<std::string, FunctionProfile> functions_;
-    std::uint64_t totalEvents_ = 0;
+    mutable std::map<std::string, FunctionProfile> functions_;
+    mutable std::vector<ProfileTraceEvent> traceEvents_;
+    mutable std::unordered_map<std::uint32_t, std::vector<ProfileTraceEvent>> openCallsByThread_;
+    mutable std::uint64_t totalEvents_ = 0;
 };
 
 class ProgramImage;

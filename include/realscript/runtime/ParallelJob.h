@@ -68,6 +68,8 @@ struct ParallelJobVerifyOptions {
     std::unordered_set<semantic::SymbolId> pureExternalSymbols;
     std::unordered_set<std::string> pureExternalNames;
     bool allowBuiltInParallelPrng = true;
+    bool allowRawColumnArrays = false;
+    bool allowReadOnlyStaticColumnLoads = false;
 };
 
 struct ParallelJobVerificationReport {
@@ -87,6 +89,9 @@ struct ParallelJobVerificationReport {
     std::vector<semantic::SymbolId> referencedStaticFieldIds;
 
     bool usesParallelPrng = false;
+    bool allowRawColumnArrays = false;
+    bool allowReadOnlyStaticColumnLoads = false;
+    bool usesReadOnlyStaticColumnLoads = false;
     std::size_t verifiedFunctionCount = 0;
     std::vector<ParallelVerifyViolation> violations;
 
@@ -136,6 +141,45 @@ using ParallelCustomReducer = std::function<bool(
     Value& outReduced,
     RuntimeError& outError)>;
 
+struct ParallelNativeColumnBinding {
+    std::size_t parameterIndex = 0;
+    std::size_t userArgIndex = 0;
+    void* basePtr = nullptr;
+    std::size_t count = 0;
+    std::size_t strideBytes = 0;
+    bool readOnly = false;
+    bool isWritten = false;
+    RawColumnMode mode = RawColumnMode::EcsFields;
+    semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
+    semantic::SymbolId elementTypeId = 0;
+    PackedElemEncoding packedEncoding = PackedElemEncoding::None;
+    const NativeRawColumnView* rawColumnView = nullptr;
+    PackedArrayFastView packedView{};
+};
+
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
+struct ParallelNativeBatchContext {
+    std::size_t batchIndex = 0;
+    std::size_t start = 0;
+    std::size_t count = 0;
+    std::uint32_t batchSeed = 0;
+    const ManagedHeap* heap = nullptr;
+    const std::vector<Value>* userArguments = nullptr;
+    const std::vector<ParallelNativeColumnBinding>* columns = nullptr;
+    Value reducedValue{};
+    bool hasReducedValue = false;
+    RuntimeError error{};
+    RuntimeStatistics statistics{};
+};
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+
+using ParallelNativeBatchKernel = std::function<bool(ParallelNativeBatchContext&)>;
+
 struct ParallelJobConfig {
     std::size_t workerCount = 0; // 0 => hardware_concurrency() (clamped >= 1)
     std::size_t batchSize = 64;
@@ -144,6 +188,10 @@ struct ParallelJobConfig {
     ParallelCustomReducer customReducer;
     ExecutionOptions executionOptions{};
     bool allowInPlaceSingleArrayReadWrite = true;
+    bool allowRawColumnArrays = false;
+    bool allowReadOnlyStaticColumnLoads = false;
+    bool enableNativeBatchKernel = true;
+    ParallelNativeBatchKernel nativeBatchKernel;
 
     // Optional explicit 0-based indices into `userArguments` (after index / start,count):
     std::unordered_set<std::size_t> explicitReadOnlyUserArgIndices;
@@ -168,6 +216,8 @@ struct ParallelJobResult {
     std::size_t effectiveWorkerCount = 0;
     std::size_t totalItemsProcessed = 0;
     std::vector<std::uint64_t> batchDigests;
+    bool usedNativeBatchKernel = false;
+    std::size_t workerInterpretersConstructed = 0;
 };
 #if defined(_MSC_VER)
 #pragma warning(pop)

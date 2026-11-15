@@ -4474,6 +4474,7 @@ CachedAotBuildResult ModuleBuildCache::buildAotWithGenerator(
         mixU8(aotKey, aotOptions.emitLineDirectives ? 1u : 0u);
         mixU8(aotKey, aotOptions.trustedRelease ? 1u : 0u);
         mixU8(aotKey, aotOptions.enableSharedReferenceGenerics ? 1u : 0u);
+        mixU8(aotKey, aotOptions.emitHotPatchThunks ? 1u : 0u);
         mixU64(aotKey, static_cast<std::uint64_t>(modKeys.size()));
         for (const auto& [mName, mKey] : modKeys) {
             mixString(aotKey, mName);

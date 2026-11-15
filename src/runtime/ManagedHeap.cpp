@@ -8358,8 +8358,13 @@ std::optional<ObjectRef> ManagedHeap::allocateRawColumnArray(
         return std::nullopt;
     }
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    const semantic::PrimitiveType layoutElementType =
+        (view.mode == RawColumnMode::ScalarPacked &&
+         view.elementType != semantic::PrimitiveType::Error)
+            ? view.elementType
+            : semantic::PrimitiveType::Struct;
     const std::uint32_t layoutId = impl_->internArrayLayout(
-        arrayTypeId, semantic::PrimitiveType::Struct, elementTypeId);
+        arrayTypeId, layoutElementType, elementTypeId);
     const auto slotIndex = impl_->acquireSlot(Impl::BaseObjectSizeBytes, error);
     if (!slotIndex) return std::nullopt;
     auto& slot = impl_->slots[*slotIndex];

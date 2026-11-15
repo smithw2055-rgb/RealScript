@@ -270,25 +270,259 @@ void ReplayLog::clear() {
     entries_.clear();
 }
 
-void ProfileCollector::record(const TraceEvent& event) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    ++totalEvents_;
-    auto& profile = functions_[event.function];
-    profile.function = event.function;
-    profile.maximumCallDepth = std::max(profile.maximumCallDepth, event.callDepth);
-    switch (event.kind) {
-    case TraceEventKind::FunctionEnter: ++profile.calls; break;
-    case TraceEventKind::FunctionExit: ++profile.returns; break;
-    case TraceEventKind::Instruction: ++profile.instructions; break;
-    case TraceEventKind::Branch: ++profile.branches; break;
-    case TraceEventKind::ExternalCall: ++profile.externalCalls; break;
-    case TraceEventKind::GcStep: ++profile.gcSteps; break;
-    case TraceEventKind::RuntimeError: ++profile.runtimeErrors; break;
+namespace {
+
+std::uint32_t currentProfileThreadId() noexcept {
+    static std::atomic<std::uint32_t> nextThreadId{1u};
+    thread_local const std::uint32_t tlsThreadId =
+        nextThreadId.fetch_add(1u, std::memory_order_relaxed);
+    return tlsThreadId;
+}
+
+} // namespace
+
+ProfileCollector::ProfileCollector()
+    : epochStart_(std::chrono::steady_clock::now()),
+      ring_(std::make_unique<TraceRingSlot[]>(TraceRingCapacity)) {}
+
+std::uint64_t ProfileCollector::nowSteadyNs() const noexcept {
+    const auto now = std::chrono::steady_clock::now();
+    if (now <= epochStart_) return 0ULL;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        now - epochStart_).count();
+    return elapsed > 0 ? static_cast<std::uint64_t>(elapsed) : 0ULL;
+}
+
+void ProfileCollector::pushRingSlot(
+    TraceEventKind kind,
+    semantic::SymbolId functionId,
+    std::string_view functionName,
+    std::uint64_t timestampNs,
+    std::uint64_t durationNs,
+    std::size_t callDepth,
+    bool hasTimestamp,
+    bool isSpan,
+    bool countInSummary) noexcept {
+    if (!ring_) return;
+    const std::uint64_t seq = writeCursor_.fetch_add(1ULL, std::memory_order_relaxed);
+    TraceRingSlot& slot = ring_[static_cast<std::size_t>(seq & TraceRingMask)];
+    const std::uint64_t busyTag = ((seq + 1ULL) << 1ULL) | 1ULL;
+    const std::uint64_t readyTag = (seq + 1ULL) << 1ULL;
+    slot.version.store(busyTag, std::memory_order_release);
+    slot.timestampNs = timestampNs;
+    slot.durationNs = durationNs;
+    slot.functionId = functionId;
+    slot.callDepth = static_cast<std::uint32_t>(
+        std::min<std::size_t>(callDepth, std::numeric_limits<std::uint32_t>::max()));
+    slot.threadId = currentProfileThreadId();
+    slot.kind = kind;
+    slot.hasTimestamp = hasTimestamp;
+    slot.isSpan = isSpan;
+    slot.countInSummary = countInSummary;
+    const std::size_t copyLen = std::min<std::size_t>(
+        functionName.size(), sizeof(slot.functionName) - 1u);
+    slot.nameLength = static_cast<std::uint16_t>(copyLen);
+    if (copyLen != 0u) {
+        std::memcpy(slot.functionName, functionName.data(), copyLen);
     }
+    slot.functionName[copyLen] = '\0';
+    slot.version.store(readyTag, std::memory_order_release);
+}
+
+void ProfileCollector::record(const TraceEvent& event) {
+    const bool trackCallTs =
+        event.kind == TraceEventKind::FunctionEnter ||
+        event.kind == TraceEventKind::FunctionExit;
+    const std::uint64_t tsNs = trackCallTs ? nowSteadyNs() : 0ULL;
+    pushRingSlot(
+        event.kind,
+        0,
+        event.function,
+        tsNs,
+        0ULL,
+        event.callDepth,
+        trackCallTs,
+        false,
+        true);
+}
+
+void ProfileCollector::recordCallBegin(
+    semantic::SymbolId functionId,
+    std::string_view functionName,
+    std::size_t callDepth) noexcept {
+    pushRingSlot(
+        TraceEventKind::FunctionEnter,
+        functionId,
+        functionName,
+        nowSteadyNs(),
+        0ULL,
+        callDepth,
+        true,
+        false,
+        false);
+}
+
+void ProfileCollector::recordCallEnd(
+    semantic::SymbolId functionId,
+    std::string_view functionName,
+    std::size_t callDepth,
+    std::uint64_t durationNs) noexcept {
+    pushRingSlot(
+        TraceEventKind::FunctionExit,
+        functionId,
+        functionName,
+        nowSteadyNs(),
+        durationNs,
+        callDepth,
+        true,
+        false,
+        false);
+}
+
+void ProfileCollector::recordTraceSpan(
+    semantic::SymbolId functionId,
+    std::string_view functionName,
+    std::uint64_t beginTimestampNs,
+    std::uint64_t durationNs,
+    std::size_t callDepth) noexcept {
+    pushRingSlot(
+        TraceEventKind::FunctionExit,
+        functionId,
+        functionName,
+        beginTimestampNs,
+        durationNs,
+        callDepth,
+        true,
+        true,
+        false);
+}
+
+void ProfileCollector::drainLocked() const {
+    if (!ring_) return;
+    const std::uint64_t head = writeCursor_.load(std::memory_order_acquire);
+    if (readCursor_ >= head) return;
+    if (head - readCursor_ > TraceRingCapacity) {
+        const std::uint64_t skipped = (head - TraceRingCapacity) - readCursor_;
+        totalEvents_ += skipped;
+        readCursor_ = head - TraceRingCapacity;
+    }
+    for (std::uint64_t seq = readCursor_; seq < head; ++seq) {
+        const TraceRingSlot& slot = ring_[static_cast<std::size_t>(seq & TraceRingMask)];
+        std::uint64_t v1 = 0;
+        bool readOk = false;
+        for (int retry = 0; retry < 64; ++retry) {
+            v1 = slot.version.load(std::memory_order_acquire);
+            const std::uint64_t slotSeq = v1 >> 1ULL;
+            if ((v1 & 1ULL) == 0ULL && slotSeq >= (seq + 1ULL)) {
+                if (slotSeq > (seq + 1ULL)) {
+                    break;
+                }
+                const std::uint64_t tsNs = slot.timestampNs;
+                const std::uint64_t durNs = slot.durationNs;
+                const semantic::SymbolId fnId = slot.functionId;
+                const std::uint32_t depth = slot.callDepth;
+                const std::uint32_t tid = slot.threadId;
+                const TraceEventKind kind = slot.kind;
+                const bool hasTs = slot.hasTimestamp;
+                const bool isSpan = slot.isSpan;
+                const bool countSummary = slot.countInSummary;
+                const std::size_t nLen = std::min<std::size_t>(
+                    slot.nameLength, sizeof(slot.functionName) - 1u);
+                char nameBuf[sizeof(slot.functionName)]{};
+                if (nLen != 0u) {
+                    std::memcpy(nameBuf, slot.functionName, nLen);
+                }
+                std::atomic_thread_fence(std::memory_order_acquire);
+                const std::uint64_t v2 = slot.version.load(std::memory_order_acquire);
+                if (v1 == v2) {
+                    readOk = true;
+                    const std::string fnName(nameBuf, nLen);
+                    if (countSummary) {
+                        ++totalEvents_;
+                        auto& profile = functions_[fnName];
+                        profile.function = fnName;
+                        profile.maximumCallDepth = std::max<std::size_t>(
+                            profile.maximumCallDepth, depth);
+                        switch (kind) {
+                        case TraceEventKind::FunctionEnter: ++profile.calls; break;
+                        case TraceEventKind::FunctionExit: ++profile.returns; break;
+                        case TraceEventKind::Instruction: ++profile.instructions; break;
+                        case TraceEventKind::Branch: ++profile.branches; break;
+                        case TraceEventKind::ExternalCall: ++profile.externalCalls; break;
+                        case TraceEventKind::GcStep: ++profile.gcSteps; break;
+                        case TraceEventKind::RuntimeError: ++profile.runtimeErrors; break;
+                        }
+                    }
+                    if (hasTs) {
+                        if (isSpan) {
+                            if (traceEvents_.size() < MaxStoredTraceEvents) {
+                                traceEvents_.push_back(ProfileTraceEvent{
+                                    TraceEventKind::FunctionExit,
+                                    tsNs,
+                                    durNs,
+                                    fnId,
+                                    fnName,
+                                    depth,
+                                    tid,
+                                });
+                            }
+                        } else if (kind == TraceEventKind::FunctionEnter) {
+                            openCallsByThread_[tid].push_back(ProfileTraceEvent{
+                                TraceEventKind::FunctionEnter,
+                                tsNs,
+                                0ULL,
+                                fnId,
+                                fnName,
+                                depth,
+                                tid,
+                            });
+                        } else if (kind == TraceEventKind::FunctionExit) {
+                            auto& callStack = openCallsByThread_[tid];
+                            if (!callStack.empty()) {
+                                ProfileTraceEvent completed = std::move(callStack.back());
+                                callStack.pop_back();
+                                completed.kind = TraceEventKind::FunctionExit;
+                                completed.durationNs = tsNs >= completed.timestampNs
+                                    ? (tsNs - completed.timestampNs)
+                                    : 0ULL;
+                                if (completed.function.empty()) {
+                                    completed.function = fnName;
+                                }
+                                if (traceEvents_.size() < MaxStoredTraceEvents) {
+                                    traceEvents_.push_back(std::move(completed));
+                                }
+                            } else if (traceEvents_.size() < MaxStoredTraceEvents) {
+                                traceEvents_.push_back(ProfileTraceEvent{
+                                    TraceEventKind::FunctionExit,
+                                    tsNs,
+                                    durNs,
+                                    fnId,
+                                    fnName,
+                                    depth,
+                                    tid,
+                                });
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        if (!readOk && (v1 & 1ULL) != 0ULL && (v1 >> 1ULL) == (seq + 1ULL)) {
+            break;
+        }
+        readCursor_ = seq + 1ULL;
+    }
+}
+
+void ProfileCollector::flush() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    drainLocked();
 }
 
 void ProfileCollector::merge(const ExecutionProfile& profile) {
     std::lock_guard<std::mutex> lock(mutex_);
+    drainLocked();
     totalEvents_ += profile.totalEvents;
     for (const auto& function : profile.functions) {
         auto& merged = functions_[function.function];
@@ -303,10 +537,15 @@ void ProfileCollector::merge(const ExecutionProfile& profile) {
         merged.maximumCallDepth = std::max(
             merged.maximumCallDepth, function.maximumCallDepth);
     }
+    for (const auto& ev : profile.traceEvents) {
+        if (traceEvents_.size() >= MaxStoredTraceEvents) break;
+        traceEvents_.push_back(ev);
+    }
 }
 
 ExecutionProfile ProfileCollector::snapshot() const {
     std::lock_guard<std::mutex> lock(mutex_);
+    drainLocked();
     ExecutionProfile profile;
     profile.totalEvents = totalEvents_;
     profile.functions.reserve(functions_.size());
@@ -314,13 +553,38 @@ ExecutionProfile ProfileCollector::snapshot() const {
         (void)name;
         profile.functions.push_back(function);
     }
+    std::size_t openCount = 0;
+    for (const auto& [tid, stack] : openCallsByThread_) {
+        (void)tid;
+        openCount += stack.size();
+    }
+    profile.traceEvents.reserve(traceEvents_.size() + openCount);
+    profile.traceEvents.insert(
+        profile.traceEvents.end(), traceEvents_.begin(), traceEvents_.end());
+    for (const auto& [tid, stack] : openCallsByThread_) {
+        (void)tid;
+        for (const auto& openEv : stack) {
+            if (profile.traceEvents.size() >= MaxStoredTraceEvents) break;
+            profile.traceEvents.push_back(openEv);
+        }
+    }
     return profile;
 }
 
 void ProfileCollector::reset() {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (ring_) {
+        for (std::size_t i = 0; i < TraceRingCapacity; ++i) {
+            ring_[i].version.store(0ULL, std::memory_order_relaxed);
+        }
+    }
+    writeCursor_.store(0ULL, std::memory_order_relaxed);
+    readCursor_ = 0ULL;
     functions_.clear();
+    traceEvents_.clear();
+    openCallsByThread_.clear();
     totalEvents_ = 0;
+    epochStart_ = std::chrono::steady_clock::now();
 }
 
 // ============================================================================
@@ -1116,6 +1380,24 @@ std::string profileToJson(const ExecutionProfile& profile) {
     return out.str();
 }
 
+namespace {
+
+void appendMicrosecondsFromNs(std::ostringstream& out, std::uint64_t ns) {
+    const std::uint64_t wholeUs = ns / 1000ULL;
+    const std::uint64_t fracNs = ns % 1000ULL;
+    out << wholeUs;
+    if (fracNs != 0ULL) {
+        out << '.';
+        if (fracNs < 100ULL) out << '0';
+        if (fracNs < 10ULL) out << '0';
+        std::uint64_t trimmed = fracNs;
+        while (trimmed % 10ULL == 0ULL) trimmed /= 10ULL;
+        out << trimmed;
+    }
+}
+
+} // namespace
+
 std::string exportChromeTraceJson(
     const ExecutionProfile& profile,
     const GcStatistics* gcStatistics) {
@@ -1130,47 +1412,127 @@ std::string exportChromeTraceJson(
     comma();
     out << "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":1,\"tid\":1,"
         << "\"args\":{\"name\":\"RealScript VM\"}}";
-    comma();
-    out << "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":1,"
-        << "\"args\":{\"name\":\"Script Main Thread\"}}";
 
-    std::uint64_t cursorUs = 0;
-    for (const auto& function : profile.functions) {
-        const std::uint64_t durationUs = std::max<std::uint64_t>(
-            1,
-            function.instructions + function.externalCalls * 2 + function.gcSteps * 5);
-        const std::string name = function.function.empty()
-            ? "<runtime>"
-            : escapeJson(function.function);
+    std::uint64_t maxEndNs = 0ULL;
+
+    if (!profile.traceEvents.empty()) {
+        std::vector<std::uint32_t> threadIds;
+        threadIds.reserve(4);
+        for (const auto& ev : profile.traceEvents) {
+            const std::uint32_t tid = ev.threadId != 0u ? ev.threadId : 1u;
+            if (std::find(threadIds.begin(), threadIds.end(), tid) == threadIds.end()) {
+                threadIds.push_back(tid);
+            }
+        }
+        std::sort(threadIds.begin(), threadIds.end());
+        for (const std::uint32_t tid : threadIds) {
+            comma();
+            out << "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":" << tid
+                << ",\"args\":{\"name\":\""
+                << (tid == 1u ? std::string("Script Main Thread")
+                              : ("Script Worker Thread " + std::to_string(tid)))
+                << "\"}}";
+        }
+
+        std::unordered_map<std::string, const FunctionProfile*> summaryByName;
+        summaryByName.reserve(profile.functions.size());
+        for (const auto& fnProf : profile.functions) {
+            summaryByName[fnProf.function] = &fnProf;
+        }
+
+        std::vector<std::size_t> order(profile.traceEvents.size());
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            order[i] = i;
+        }
+        std::sort(order.begin(), order.end(), [&](std::size_t lhsIdx, std::size_t rhsIdx) {
+            const auto& a = profile.traceEvents[lhsIdx];
+            const auto& b = profile.traceEvents[rhsIdx];
+            if (a.timestampNs != b.timestampNs) return a.timestampNs < b.timestampNs;
+            if (a.durationNs != b.durationNs) return a.durationNs > b.durationNs;
+            if (a.callDepth != b.callDepth) return a.callDepth < b.callDepth;
+            return lhsIdx < rhsIdx;
+        });
+
+        for (const std::size_t idx : order) {
+            const auto& ev = profile.traceEvents[idx];
+            const std::uint32_t tid = ev.threadId != 0u ? ev.threadId : 1u;
+            const std::string name = ev.function.empty()
+                ? std::string("<runtime>")
+                : escapeJson(ev.function);
+            const char phase = (ev.kind == TraceEventKind::FunctionEnter) ? 'B' : 'X';
+            comma();
+            out << "{\"name\":\"" << name << "\",\"cat\":\"script\",\"ph\":\""
+                << phase << "\",\"pid\":1,\"tid\":" << tid << ",\"ts\":";
+            appendMicrosecondsFromNs(out, ev.timestampNs);
+            if (phase == 'X') {
+                out << ",\"dur\":";
+                appendMicrosecondsFromNs(out, ev.durationNs);
+                maxEndNs = std::max(maxEndNs, ev.timestampNs + ev.durationNs);
+            } else {
+                maxEndNs = std::max(maxEndNs, ev.timestampNs);
+            }
+            out << ",\"args\":{\"functionId\":" << ev.functionId
+                << ",\"callDepth\":" << ev.callDepth;
+            if (const auto sumIt = summaryByName.find(ev.function);
+                sumIt != summaryByName.end() && sumIt->second != nullptr) {
+                const auto* fn = sumIt->second;
+                out << ",\"calls\":" << fn->calls
+                    << ",\"returns\":" << fn->returns
+                    << ",\"instructions\":" << fn->instructions
+                    << ",\"branches\":" << fn->branches
+                    << ",\"externalCalls\":" << fn->externalCalls
+                    << ",\"gcSteps\":" << fn->gcSteps
+                    << ",\"runtimeErrors\":" << fn->runtimeErrors
+                    << ",\"maximumCallDepth\":" << fn->maximumCallDepth;
+            }
+            out << "}}";
+        }
+    } else {
         comma();
-        out << "{\"name\":\"" << name << "\",\"cat\":\"script\",\"ph\":\"X\","
-            << "\"pid\":1,\"tid\":1,\"ts\":" << cursorUs
-            << ",\"dur\":" << durationUs
-            << ",\"args\":{\"calls\":" << function.calls
-            << ",\"returns\":" << function.returns
-            << ",\"instructions\":" << function.instructions
-            << ",\"branches\":" << function.branches
-            << ",\"externalCalls\":" << function.externalCalls
-            << ",\"gcSteps\":" << function.gcSteps
-            << ",\"runtimeErrors\":" << function.runtimeErrors
-            << ",\"maximumCallDepth\":" << function.maximumCallDepth
-            << "}}";
-        cursorUs += durationUs;
+        out << "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":1,"
+            << "\"args\":{\"name\":\"Script Main Thread\"}}";
+
+        std::uint64_t cursorUs = 0;
+        for (const auto& function : profile.functions) {
+            const std::uint64_t durationUs = std::max<std::uint64_t>(
+                1,
+                function.instructions + function.externalCalls * 2 + function.gcSteps * 5);
+            const std::string name = function.function.empty()
+                ? "<runtime>"
+                : escapeJson(function.function);
+            comma();
+            out << "{\"name\":\"" << name << "\",\"cat\":\"script\",\"ph\":\"X\","
+                << "\"pid\":1,\"tid\":1,\"ts\":" << cursorUs
+                << ",\"dur\":" << durationUs
+                << ",\"args\":{\"calls\":" << function.calls
+                << ",\"returns\":" << function.returns
+                << ",\"instructions\":" << function.instructions
+                << ",\"branches\":" << function.branches
+                << ",\"externalCalls\":" << function.externalCalls
+                << ",\"gcSteps\":" << function.gcSteps
+                << ",\"runtimeErrors\":" << function.runtimeErrors
+                << ",\"maximumCallDepth\":" << function.maximumCallDepth
+                << "}}";
+            cursorUs += durationUs;
+        }
+        maxEndNs = cursorUs * 1000ULL;
     }
 
     if (gcStatistics) {
         comma();
         out << "{\"name\":\"GC Memory\",\"cat\":\"gc\",\"ph\":\"C\","
-            << "\"pid\":1,\"tid\":1,\"ts\":" << cursorUs
-            << ",\"args\":{\"liveBytes\":" << gcStatistics->liveBytes
+            << "\"pid\":1,\"tid\":1,\"ts\":";
+        appendMicrosecondsFromNs(out, maxEndNs);
+        out << ",\"args\":{\"liveBytes\":" << gcStatistics->liveBytes
             << ",\"peakLiveBytes\":" << gcStatistics->peakLiveBytes
             << ",\"bytesAllocated\":" << gcStatistics->bytesAllocated
             << ",\"bytesReclaimed\":" << gcStatistics->bytesReclaimed
             << "}}";
         comma();
         out << "{\"name\":\"GC Objects\",\"cat\":\"gc\",\"ph\":\"C\","
-            << "\"pid\":1,\"tid\":1,\"ts\":" << cursorUs
-            << ",\"args\":{\"liveObjects\":" << gcStatistics->liveObjects
+            << "\"pid\":1,\"tid\":1,\"ts\":";
+        appendMicrosecondsFromNs(out, maxEndNs);
+        out << ",\"args\":{\"liveObjects\":" << gcStatistics->liveObjects
             << ",\"objectsAllocated\":" << gcStatistics->objectsAllocated
             << ",\"objectsReclaimed\":" << gcStatistics->objectsReclaimed
             << ",\"collectionsCompleted\":" << gcStatistics->collectionsCompleted

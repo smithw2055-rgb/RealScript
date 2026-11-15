@@ -1312,6 +1312,139 @@ public int PolicyTarget(int x) { return x + 100; }
     }
 }
 
+void testZeroLockProfileRingBufferAndChromeTrace() {
+    const std::string src = R"RS(
+module Kernel.ProfTrace;
+
+public int LeafWork(int n) {
+    int acc = 0;
+    for (int i = 0; i < n; i = i + 1) {
+        acc = acc + (i * 3) + 1;
+    }
+    return acc;
+}
+
+public int InnerCall(int n) {
+    int s = 0;
+    for (int j = 0; j < 4; j = j + 1) {
+        s = s + LeafWork(n);
+    }
+    return s;
+}
+
+public int OuterRoot(int n) {
+    int total = 0;
+    for (int k = 0; k < 3; k = k + 1) {
+        total = total + InnerCall(n);
+    }
+    return total;
+}
+)RS";
+
+    auto prog = compileAndLink({{"prof_trace.rscript", src}}, optimization::Level::None);
+    auto heap = std::make_shared<runtime::ManagedHeap>();
+    runtime::Interpreter interp(prog, heap);
+
+    auto collector = std::make_shared<runtime::ProfileCollector>();
+    runtime::ExecutionOptions opts;
+    opts.profile = collector;
+
+    const auto res = interp.invoke("Kernel.ProfTrace::OuterRoot", {runtime::Value{std::int64_t{40}}}, opts);
+    require(res.succeeded && std::holds_alternative<std::int64_t>(res.value),
+        "OuterRoot execution failed: " + res.error.message);
+
+    const runtime::ExecutionProfile prof = collector->snapshot();
+    std::uint64_t sumCalls = 0;
+    std::uint64_t sumReturns = 0;
+    for (const auto& fnProf : prof.functions) {
+        sumCalls += fnProf.calls;
+        sumReturns += fnProf.returns;
+    }
+    require(sumCalls == 16u && sumReturns == 16u,
+        "Expected 1 OuterRoot + 3 InnerCall + 12 LeafWork = 16 calls/returns, got calls=" +
+            std::to_string(sumCalls) + " returns=" + std::to_string(sumReturns));
+    require(prof.traceEvents.size() == 16u,
+        "Expected 16 ring-buffered steady_clock trace spans, got " +
+            std::to_string(prof.traceEvents.size()));
+
+    bool sawOuter = false;
+    bool sawInner = false;
+    bool sawLeaf = false;
+    runtime::ProfileTraceEvent outerSpan{};
+    runtime::ProfileTraceEvent innerSpan{};
+    for (const auto& ev : prof.traceEvents) {
+        const std::uint64_t evEndNs = ev.timestampNs + ev.durationNs;
+        require(evEndNs >= ev.timestampNs,
+            "Trace event must have monotonic steady_clock timestamps");
+        if (ev.function == "Kernel.ProfTrace::OuterRoot") {
+            sawOuter = true;
+            outerSpan = ev;
+        } else if (ev.function == "Kernel.ProfTrace::InnerCall") {
+            if (!sawInner) {
+                sawInner = true;
+                innerSpan = ev;
+            }
+        } else if (ev.function == "Kernel.ProfTrace::LeafWork") {
+            sawLeaf = true;
+        }
+    }
+    require(sawOuter && sawInner && sawLeaf,
+        "Expected traceEvents for OuterRoot, InnerCall, and LeafWork");
+    require(outerSpan.callDepth < innerSpan.callDepth &&
+            outerSpan.timestampNs <= innerSpan.timestampNs &&
+            (outerSpan.timestampNs + outerSpan.durationNs) >=
+                (innerSpan.timestampNs + innerSpan.durationNs),
+        "Parent OuterRoot steady_clock span must hierarchically enclose child InnerCall span");
+
+    const std::string chromeJson = runtime::exportChromeTraceJson(prof);
+    require(chromeJson.find("\"ph\":\"X\"") != std::string::npos &&
+            chromeJson.find("\"dur\":") != std::string::npos &&
+            chromeJson.find("\"ts\":") != std::string::npos &&
+            chromeJson.find("\"functionId\":") != std::string::npos &&
+            chromeJson.find("\"callDepth\":") != std::string::npos &&
+            chromeJson.find("Kernel.ProfTrace::OuterRoot") != std::string::npos &&
+            chromeJson.find("Kernel.ProfTrace::InnerCall") != std::string::npos &&
+            chromeJson.find("Kernel.ProfTrace::LeafWork") != std::string::npos,
+        "exportChromeTraceJson must emit real steady_clock 'X' flamegraph events with ts/dur");
+
+    // Verify fallback path when no ring-buffer trace spans exist
+    runtime::ExecutionProfile legacyOnly;
+    runtime::FunctionProfile fp;
+    fp.function = "Legacy::Synthetic";
+    fp.calls = 2;
+    fp.returns = 2;
+    fp.instructions = 25;
+    legacyOnly.functions.push_back(fp);
+    const std::string legacyJson = runtime::exportChromeTraceJson(legacyOnly);
+    require(legacyJson.find("\"name\":\"Legacy::Synthetic\"") != std::string::npos &&
+            legacyJson.find("\"ph\":\"X\"") != std::string::npos &&
+            legacyJson.find("\"dur\":25") != std::string::npos &&
+            legacyJson.find("\"functionId\":") == std::string::npos,
+        "exportChromeTraceJson must fall back cleanly to legacy instruction counters when traceEvents is empty");
+
+    // Verify ring-buffer wraparound (>8192 events) stays crash-free and preserves exact total summary counts
+    for (std::size_t i = 0; i < 9000u; ++i) {
+        collector->record(runtime::TraceEvent{
+            runtime::TraceEventKind::FunctionEnter, "Stress::Leaf", {}, 0u, 2u});
+        collector->record(runtime::TraceEvent{
+            runtime::TraceEventKind::FunctionExit, "Stress::Leaf", {}, 0u, 2u});
+        collector->recordTraceSpan(77u, "Stress::Leaf", 1000u + i, 200u, 2u);
+    }
+    const auto afterWrap = collector->snapshot();
+    std::uint64_t wrapCalls = 0;
+    for (const auto& fnProf : afterWrap.functions) {
+        wrapCalls += fnProf.calls;
+    }
+    require(afterWrap.totalEvents >= 16u &&
+            wrapCalls <= 16u + 9000u &&
+            afterWrap.traceEvents.size() <= 16u + runtime::ProfileCollector::TraceRingCapacity,
+        "Ring-buffer wraparound must overwrite unread slots safely without crashing");
+    collector->reset();
+    const auto cleared = collector->snapshot();
+    require(cleared.functions.empty() && cleared.totalEvents == 0u && cleared.traceEvents.empty(),
+        "ProfileCollector::reset() must clear both counters and traceEvents");
+}
+
 } // namespace
 
 int main() {
@@ -1327,6 +1460,7 @@ int main() {
             {"Pillar 4: Zero-copy NativeBufferView, Span<T>, readOnly & revocation", testZeroCopyNativeBufferViewsAndRevocation},
             {"Pillar 6: ManagedHeap::trimExcessCapacity & ABA safety", testManagedHeapTrimExcessCapacity},
             {"L0 dirty callbacks, dynamic array ops, UTF-8/borrowed, weak delegates & IExecutionPolicy", testL0DirtyCallbacksArraysUtf8WeakDelegatesAndPolicy},
+            {"Zero-lock ProfileCollector RingBuffer & steady_clock ChromeTrace flamegraph", testZeroLockProfileRingBufferAndChromeTrace},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

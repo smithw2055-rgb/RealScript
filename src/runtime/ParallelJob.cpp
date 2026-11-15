@@ -416,6 +416,84 @@ constexpr std::size_t kMaxParallelFlatStructLeafSlots = 256u;
     return allowed;
 }
 
+[[nodiscard]] std::unordered_set<semantic::SymbolId> buildAllowedRawColumnArrayTypeIds(
+    const ProgramImage& program) {
+    std::unordered_set<semantic::SymbolId> allowed;
+    auto insertStructArray = [&](const std::string& elemName) {
+        if (elemName.empty()) return;
+        allowed.insert(semantic::stableTypeId(
+            semantic::arrayTypeName(semantic::PrimitiveType::Struct, elemName)));
+    };
+    insertStructArray("Fixed");
+    insertStructArray("RealScript.Math::Fixed");
+    insertStructArray("Fixed16");
+    insertStructArray("RealScript.Math::Fixed16");
+    insertStructArray("Fixed64");
+    insertStructArray("RealScript.Math::Fixed64");
+    insertStructArray("Vec2");
+    insertStructArray("RealScript.Math::Vec2");
+    insertStructArray("Vec2f");
+    insertStructArray("RealScript.Math::Vec2f");
+    insertStructArray("Vec3");
+    insertStructArray("RealScript.Math::Vec3");
+    insertStructArray("Vec3f");
+    insertStructArray("RealScript.Math::Vec3f");
+    insertStructArray("Quat");
+    insertStructArray("RealScript.Math::Quat");
+    insertStructArray("Quatf");
+    insertStructArray("RealScript.Math::Quatf");
+    for (const auto& mod : program.modules()) {
+        for (const auto& type : mod.types) {
+            if (type.kind == semantic::TypeKind::Struct &&
+                isFlatStackSafeCustomStruct(program, type.id)) {
+                insertStructArray(semantic::canonicalTypeName(type));
+                insertStructArray(type.name);
+            }
+        }
+    }
+    return allowed;
+}
+
+[[nodiscard]] bool tryParseReadOnlyEcsColDenseId(
+    std::string_view subOp,
+    semantic::SymbolId& outDenseId) {
+    constexpr std::string_view prefix = "ecs_col::";
+    if (subOp.rfind(prefix, 0) != 0) return false;
+    const auto rest = subOp.substr(prefix.size());
+    const auto sep = rest.find("::");
+    if (sep == std::string_view::npos || sep == 0) return false;
+    const auto idxStr = rest.substr(0, sep);
+    std::size_t colIdx = 0;
+    for (const char ch : idxStr) {
+        if (ch < '0' || ch > '9') return false;
+        colIdx = colIdx * 10u + static_cast<std::size_t>(ch - '0');
+    }
+    const auto specView = rest.substr(sep + 2u);
+    const auto p1 = specView.find(';');
+    const std::string_view colsPart =
+        p1 == std::string_view::npos ? specView : specView.substr(0, p1);
+    if (p1 != std::string_view::npos) {
+        const auto afterCols = specView.substr(p1 + 1u);
+        for (const char ch : afterCols) {
+            if (ch != ';') return false; // `with` / `without` filters require dynamic sparse queries
+        }
+    }
+    std::vector<std::string> cols;
+    std::size_t pos = 0;
+    while (pos <= colsPart.size()) {
+        const auto comma = colsPart.find(',', pos);
+        const auto len = (comma == std::string_view::npos) ? (colsPart.size() - pos) : (comma - pos);
+        if (len > 0) {
+            cols.emplace_back(colsPart.substr(pos, len));
+        }
+        if (comma == std::string_view::npos) break;
+        pos = comma + 1u;
+    }
+    if (colIdx >= cols.size()) return false;
+    outDenseId = semantic::stableTypeId("$ecs_column::" + cols[colIdx]);
+    return true;
+}
+
 [[nodiscard]] bool isAllowedKernelReturnType(
     const ProgramImage& program,
     semantic::PrimitiveType type,
@@ -642,6 +720,18 @@ ParallelJobVerificationReport verifyParallelJobFunction(
     }
 
     const auto allowedPackedArrayIds = buildAllowedPackedArrayTypeIds(program);
+    std::unordered_set<semantic::SymbolId> allowedRawColumnArrayIds;
+    if (options.allowRawColumnArrays) {
+        allowedRawColumnArrayIds = buildAllowedRawColumnArrayTypeIds(program);
+    }
+    report.allowRawColumnArrays = options.allowRawColumnArrays;
+    report.allowReadOnlyStaticColumnLoads = options.allowReadOnlyStaticColumnLoads;
+    auto isAllowedArrayTypeId = [&](semantic::SymbolId arrTid) -> bool {
+        if (arrTid == 0) return false;
+        if (allowedPackedArrayIds.find(arrTid) != allowedPackedArrayIds.end()) return true;
+        return options.allowRawColumnArrays &&
+               allowedRawColumnArrayIds.find(arrTid) != allowedRawColumnArrayIds.end();
+    };
 
     for (std::size_t p = 0; p < entryFn.parameterTypes.size(); ++p) {
         const auto pType = entryFn.parameterTypes[p];
@@ -682,7 +772,7 @@ ParallelJobVerificationReport verifyParallelJobFunction(
             break;
         }
         case semantic::PrimitiveType::Array:
-            if (pTid == 0 || allowedPackedArrayIds.find(pTid) == allowedPackedArrayIds.end()) {
+            if (!isAllowedArrayTypeId(pTid)) {
                 addViolation(
                     *entryLoc, 0, 0, "param",
                     ParallelVerifyViolationKind::NonPackedArrayParameter,
@@ -818,7 +908,7 @@ ParallelJobVerificationReport verifyParallelJobFunction(
                     break;
                 }
                 case semantic::PrimitiveType::Array:
-                    if (pTid == 0 || allowedPackedArrayIds.find(pTid) == allowedPackedArrayIds.end()) {
+                    if (!isAllowedArrayTypeId(pTid)) {
                         addViolation(
                             *loc, 0, 0, "param",
                             ParallelVerifyViolationKind::NonPackedArrayParameter,
@@ -857,7 +947,7 @@ ParallelJobVerificationReport verifyParallelJobFunction(
                         "Delegate local " + std::to_string(l) + " is forbidden in ParallelJob");
                 }
             } else if (lType == semantic::PrimitiveType::Array) {
-                if (lTid == 0 || allowedPackedArrayIds.find(lTid) == allowedPackedArrayIds.end()) {
+                if (!isAllowedArrayTypeId(lTid)) {
                     addViolation(
                         *loc, 0, 0, "local",
                         ParallelVerifyViolationKind::NonPackedArrayParameter,
@@ -989,8 +1079,11 @@ ParallelJobVerificationReport verifyParallelJobFunction(
                     break;
                 }
                 case bytecode::Opcode::LoadElement:
-                case bytecode::Opcode::StoreElement:
-                    if (!isPackedParallelElementType(inst.elementType)) {
+                case bytecode::Opcode::StoreElement: {
+                    const bool elemOk = isPackedParallelElementType(inst.elementType) ||
+                        (options.allowRawColumnArrays &&
+                         inst.elementType == semantic::PrimitiveType::Struct);
+                    if (!elemOk) {
                         addViolation(
                             *loc, block.id, uInstIdx, opName,
                             ParallelVerifyViolationKind::NonPackedArrayElementAccess,
@@ -999,6 +1092,7 @@ ParallelJobVerificationReport verifyParallelJobFunction(
                                 "' is forbidden in ParallelJob");
                     }
                     break;
+                }
                 case bytecode::Opcode::Call: {
                     if (inst.index >= mod.functionReferences.size()) {
                         addViolation(
@@ -1045,9 +1139,14 @@ ParallelJobVerificationReport verifyParallelJobFunction(
                         } else if (op.rfind("static_get::", 0) == 0) {
                             const std::string_view subOp = op.substr(12u);
                             semantic::SymbolId staticId = 0;
-                            if (subOp.rfind("ecs_col::", 0) == 0 ||
-                                subOp.rfind("ecs_ent::", 0) == 0 ||
-                                !tryParseNumericStaticFieldId(subOp, staticId)) {
+                            semantic::SymbolId ecsColDenseId = 0;
+                            if (options.allowReadOnlyStaticColumnLoads &&
+                                tryParseReadOnlyEcsColDenseId(subOp, ecsColDenseId)) {
+                                staticFieldIdSet.insert(ecsColDenseId);
+                                report.usesReadOnlyStaticColumnLoads = true;
+                            } else if (subOp.rfind("ecs_col::", 0) == 0 ||
+                                       subOp.rfind("ecs_ent::", 0) == 0 ||
+                                       !tryParseNumericStaticFieldId(subOp, staticId)) {
                                 addViolation(
                                     *loc, block.id, uInstIdx, opName,
                                     ParallelVerifyViolationKind::ImpureRuntimeIntrinsic,
@@ -1055,6 +1154,19 @@ ParallelJobVerificationReport verifyParallelJobFunction(
                                         "' may allocate or mutate ManagedHeap");
                             } else {
                                 staticFieldIdSet.insert(staticId);
+                                if (fn.registerTypes.size() > inst.result &&
+                                    inst.result != bytecode::InvalidRegister &&
+                                    fn.registerTypes[inst.result] == semantic::PrimitiveType::Array) {
+                                    if (!options.allowReadOnlyStaticColumnLoads) {
+                                        addViolation(
+                                            *loc, block.id, uInstIdx, opName,
+                                            ParallelVerifyViolationKind::ImpureRuntimeIntrinsic,
+                                            "Static column array load '" + ref.name +
+                                                "' requires allowReadOnlyStaticColumnLoads");
+                                    } else {
+                                        report.usesReadOnlyStaticColumnLoads = true;
+                                    }
+                                }
                             }
                         } else if (op == "stable_hash" ||
                                    op.rfind("stable_hash::", 0) == 0 ||
@@ -1691,6 +1803,1489 @@ struct alignas(64) ParallelBatchOutcome {
 #pragma warning(pop)
 #endif
 
+enum class PodValKind : std::uint8_t {
+    Unset = 0,
+    Null,
+    Bool,
+    Int32,
+    Int64,
+    Float32,
+    Float64,
+    Enum64,
+    ColumnRef,
+    PodStruct,
+};
+
+struct PodStructDesc {
+    semantic::SymbolId typeId = 0;
+    std::uint8_t fieldCount = 0;
+    std::array<semantic::PrimitiveType, 16> fieldTypes{};
+};
+
+struct PodSlot {
+    PodValKind kind = PodValKind::Unset;
+    std::int64_t i64 = 0;
+    double f64 = 0.0;
+    float f32 = 0.0f;
+    bool b = false;
+    std::int32_t colIndex = -1;
+    semantic::SymbolId typeId = 0;
+    std::uint8_t structFieldCount = 0;
+    std::array<PodValKind, 16> fieldKinds{};
+    std::array<std::int64_t, 16> fieldI64{};
+    std::array<double, 16> fieldF64{};
+    std::array<float, 16> fieldF32{};
+    std::array<bool, 16> fieldBool{};
+    std::array<semantic::SymbolId, 16> fieldTypeIds{};
+};
+
+[[nodiscard]] bool isNativePodFieldKind(NativeFieldKind k) noexcept {
+    switch (k) {
+    case NativeFieldKind::Int8:
+    case NativeFieldKind::UInt8:
+    case NativeFieldKind::Int16:
+    case NativeFieldKind::UInt16:
+    case NativeFieldKind::Int32:
+    case NativeFieldKind::UInt32:
+    case NativeFieldKind::Int64:
+    case NativeFieldKind::UInt64:
+    case NativeFieldKind::Float32:
+    case NativeFieldKind::Float64:
+    case NativeFieldKind::Bool:
+        return true;
+    default:
+        return false;
+    }
+}
+
+[[nodiscard]] bool isNativeSupportedScalarPrim(semantic::PrimitiveType prim) noexcept {
+    switch (prim) {
+    case semantic::PrimitiveType::Bool:
+    case semantic::PrimitiveType::Int:
+    case semantic::PrimitiveType::Long:
+    case semantic::PrimitiveType::Float:
+    case semantic::PrimitiveType::Double:
+    case semantic::PrimitiveType::Enum:
+        return true;
+    default:
+        return false;
+    }
+}
+
+[[nodiscard]] bool podSlotFromValue(const Value& v, semantic::PrimitiveType expectedPrim, PodSlot& out) noexcept {
+    switch (expectedPrim) {
+    case semantic::PrimitiveType::Bool: {
+        const auto* p = std::get_if<bool>(&v);
+        if (!p) return false;
+        out.kind = PodValKind::Bool;
+        out.b = *p;
+        return true;
+    }
+    case semantic::PrimitiveType::Int: {
+        const auto* p = std::get_if<std::int64_t>(&v);
+        if (!p) return false;
+        out.kind = PodValKind::Int32;
+        out.i64 = *p;
+        return true;
+    }
+    case semantic::PrimitiveType::Long: {
+        const auto* p = std::get_if<LongValue>(&v);
+        if (!p) return false;
+        out.kind = PodValKind::Int64;
+        out.i64 = p->value;
+        return true;
+    }
+    case semantic::PrimitiveType::Float: {
+        const auto* p = std::get_if<FloatValue>(&v);
+        if (!p) return false;
+        out.kind = PodValKind::Float32;
+        out.f32 = p->value;
+        return true;
+    }
+    case semantic::PrimitiveType::Double: {
+        const auto* p = std::get_if<double>(&v);
+        if (!p) return false;
+        out.kind = PodValKind::Float64;
+        out.f64 = *p;
+        return true;
+    }
+    case semantic::PrimitiveType::Enum: {
+        EnumValue ev{};
+        if (!v.tryGetEnum(ev)) return false;
+        out.kind = PodValKind::Enum64;
+        out.i64 = ev.value;
+        out.typeId = ev.typeId;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+[[nodiscard]] Value podSlotToValue(const PodSlot& s, semantic::PrimitiveType expectedPrim) noexcept {
+    if (expectedPrim == semantic::PrimitiveType::Void || s.kind == PodValKind::Unset) {
+        return Value{std::monostate{}};
+    }
+    switch (s.kind) {
+    case PodValKind::Bool: return Value{s.b};
+    case PodValKind::Int32: return Value{s.i64};
+    case PodValKind::Int64: return Value{LongValue{s.i64}};
+    case PodValKind::Float32: return Value{FloatValue{s.f32}};
+    case PodValKind::Float64: return Value{s.f64};
+    case PodValKind::Enum64: return Value{EnumValue{s.typeId, s.i64}};
+    case PodValKind::Null: return Value{NullObject{}};
+    default: return Value{std::monostate{}};
+    }
+}
+
+[[nodiscard]] bool readNativeFieldIntoPod(
+    const std::uint8_t* elemBase,
+    const NativeFieldLayout& layout,
+    PodSlot& dst,
+    std::size_t fieldIdx) noexcept {
+    const std::uint8_t* ptr = elemBase + layout.byteOffset;
+    auto assignInt = [&](std::int64_t val, semantic::PrimitiveType req) {
+        if (req == semantic::PrimitiveType::Long) {
+            dst.fieldKinds[fieldIdx] = PodValKind::Int64;
+            dst.fieldI64[fieldIdx] = val;
+        } else {
+            dst.fieldKinds[fieldIdx] = PodValKind::Int32;
+            dst.fieldI64[fieldIdx] = val;
+        }
+    };
+    switch (layout.kind) {
+    case NativeFieldKind::Int8: {
+        std::int8_t v = 0;
+        std::memcpy(&v, ptr, sizeof(v));
+        assignInt(static_cast<std::int64_t>(v), layout.scriptType);
+        return true;
+    }
+    case NativeFieldKind::UInt8: {
+        std::uint8_t v = 0;
+        std::memcpy(&v, ptr, sizeof(v));
+        assignInt(static_cast<std::int64_t>(v), layout.scriptType);
+        return true;
+    }
+    case NativeFieldKind::Int16: {
+        std::int16_t v = 0;
+        std::memcpy(&v, ptr, sizeof(v));
+        assignInt(static_cast<std::int64_t>(v), layout.scriptType);
+        return true;
+    }
+    case NativeFieldKind::UInt16: {
+        std::uint16_t v = 0;
+        std::memcpy(&v, ptr, sizeof(v));
+        assignInt(static_cast<std::int64_t>(v), layout.scriptType);
+        return true;
+    }
+    case NativeFieldKind::Int32: {
+        std::int32_t v = 0;
+        std::memcpy(&v, ptr, sizeof(v));
+        assignInt(static_cast<std::int64_t>(v), layout.scriptType);
+        return true;
+    }
+    case NativeFieldKind::UInt32: {
+        std::uint32_t v = 0;
+        std::memcpy(&v, ptr, sizeof(v));
+        assignInt(static_cast<std::int64_t>(v), layout.scriptType);
+        return true;
+    }
+    case NativeFieldKind::Int64: {
+        std::int64_t v = 0;
+        std::memcpy(&v, ptr, sizeof(v));
+        assignInt(v, layout.scriptType);
+        return true;
+    }
+    case NativeFieldKind::UInt64: {
+        std::uint64_t v = 0;
+        std::memcpy(&v, ptr, sizeof(v));
+        assignInt(static_cast<std::int64_t>(v), layout.scriptType);
+        return true;
+    }
+    case NativeFieldKind::Float32: {
+        float v = 0.0f;
+        std::memcpy(&v, ptr, sizeof(v));
+        if (layout.scriptType == semantic::PrimitiveType::Double) {
+            dst.fieldKinds[fieldIdx] = PodValKind::Float64;
+            dst.fieldF64[fieldIdx] = static_cast<double>(v);
+        } else {
+            dst.fieldKinds[fieldIdx] = PodValKind::Float32;
+            dst.fieldF32[fieldIdx] = v;
+        }
+        return true;
+    }
+    case NativeFieldKind::Float64: {
+        double v = 0.0;
+        std::memcpy(&v, ptr, sizeof(v));
+        if (layout.scriptType == semantic::PrimitiveType::Float) {
+            dst.fieldKinds[fieldIdx] = PodValKind::Float32;
+            dst.fieldF32[fieldIdx] = static_cast<float>(v);
+        } else {
+            dst.fieldKinds[fieldIdx] = PodValKind::Float64;
+            dst.fieldF64[fieldIdx] = v;
+        }
+        return true;
+    }
+    case NativeFieldKind::Bool: {
+        bool v = false;
+        std::memcpy(&v, ptr, sizeof(v));
+        dst.fieldKinds[fieldIdx] = PodValKind::Bool;
+        dst.fieldBool[fieldIdx] = v;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+[[nodiscard]] bool writePodFieldToNativeBytes(
+    std::uint8_t* elemBase,
+    const NativeFieldLayout& layout,
+    const PodSlot& src,
+    std::size_t fieldIdx) noexcept {
+    std::uint8_t* ptr = elemBase + layout.byteOffset;
+    const auto k = src.fieldKinds[fieldIdx];
+    const auto getInt64 = [&]() -> std::pair<bool, std::int64_t> {
+        if (k == PodValKind::Int32 || k == PodValKind::Int64 || k == PodValKind::Enum64) {
+            return {true, src.fieldI64[fieldIdx]};
+        }
+        return {false, 0};
+    };
+    switch (layout.kind) {
+    case NativeFieldKind::Int8: {
+        auto [ok, iv] = getInt64();
+        if (!ok) return false;
+        const auto v = static_cast<std::int8_t>(iv);
+        std::memcpy(ptr, &v, sizeof(v));
+        return true;
+    }
+    case NativeFieldKind::UInt8: {
+        auto [ok, iv] = getInt64();
+        if (!ok) return false;
+        const auto v = static_cast<std::uint8_t>(iv);
+        std::memcpy(ptr, &v, sizeof(v));
+        return true;
+    }
+    case NativeFieldKind::Int16: {
+        auto [ok, iv] = getInt64();
+        if (!ok) return false;
+        const auto v = static_cast<std::int16_t>(iv);
+        std::memcpy(ptr, &v, sizeof(v));
+        return true;
+    }
+    case NativeFieldKind::UInt16: {
+        auto [ok, iv] = getInt64();
+        if (!ok) return false;
+        const auto v = static_cast<std::uint16_t>(iv);
+        std::memcpy(ptr, &v, sizeof(v));
+        return true;
+    }
+    case NativeFieldKind::Int32: {
+        auto [ok, iv] = getInt64();
+        if (!ok) return false;
+        const auto v = static_cast<std::int32_t>(iv);
+        std::memcpy(ptr, &v, sizeof(v));
+        return true;
+    }
+    case NativeFieldKind::UInt32: {
+        auto [ok, iv] = getInt64();
+        if (!ok) return false;
+        const auto v = static_cast<std::uint32_t>(iv);
+        std::memcpy(ptr, &v, sizeof(v));
+        return true;
+    }
+    case NativeFieldKind::Int64: {
+        auto [ok, iv] = getInt64();
+        if (!ok) return false;
+        std::memcpy(ptr, &iv, sizeof(iv));
+        return true;
+    }
+    case NativeFieldKind::UInt64: {
+        auto [ok, iv] = getInt64();
+        if (!ok) return false;
+        const auto v = static_cast<std::uint64_t>(iv);
+        std::memcpy(ptr, &v, sizeof(v));
+        return true;
+    }
+    case NativeFieldKind::Float32: {
+        float v = 0.0f;
+        if (k == PodValKind::Float32) v = src.fieldF32[fieldIdx];
+        else if (k == PodValKind::Float64) v = static_cast<float>(src.fieldF64[fieldIdx]);
+        else return false;
+        std::memcpy(ptr, &v, sizeof(v));
+        return true;
+    }
+    case NativeFieldKind::Float64: {
+        double v = 0.0;
+        if (k == PodValKind::Float64) v = src.fieldF64[fieldIdx];
+        else if (k == PodValKind::Float32) v = static_cast<double>(src.fieldF32[fieldIdx]);
+        else return false;
+        std::memcpy(ptr, &v, sizeof(v));
+        return true;
+    }
+    case NativeFieldKind::Bool: {
+        if (k != PodValKind::Bool) return false;
+        const bool v = src.fieldBool[fieldIdx];
+        std::memcpy(ptr, &v, sizeof(v));
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+[[nodiscard]] bool readColumnElementIntoPod(
+    const ParallelNativeColumnBinding& col,
+    std::size_t index,
+    PodSlot& out) noexcept {
+    if (index >= col.count) return false;
+    if (col.rawColumnView && col.rawColumnView->mode == RawColumnMode::EcsFields) {
+        const auto& view = *col.rawColumnView;
+        if (!view.basePtr || view.fields.size() > 16u) return false;
+        const auto* elemBase = static_cast<const std::uint8_t*>(view.basePtr) + index * view.strideBytes;
+        out.kind = PodValKind::PodStruct;
+        out.typeId = view.structTypeId;
+        out.structFieldCount = static_cast<std::uint8_t>(view.fields.size());
+        for (std::size_t f = 0; f < view.fields.size(); ++f) {
+            if (!readNativeFieldIntoPod(elemBase, view.fields[f], out, f)) return false;
+            out.fieldTypeIds[f] = view.fields[f].scriptTypeId;
+        }
+        return true;
+    }
+    const auto* rawBytes = static_cast<const std::uint8_t*>(col.basePtr);
+    if (!rawBytes) return false;
+    const std::size_t stride = col.strideBytes;
+    const PackedElemEncoding enc = (col.rawColumnView && col.rawColumnView->mode == RawColumnMode::ScalarPacked)
+        ? col.rawColumnView->packedEncoding
+        : col.packedEncoding;
+    const semantic::SymbolId elemTid = col.elementTypeId;
+    const auto* ptr = rawBytes + index * stride;
+    switch (enc) {
+    case PackedElemEncoding::Bool: {
+        std::uint8_t v = 0;
+        std::memcpy(&v, ptr, 1u);
+        out.kind = PodValKind::Bool;
+        out.b = (v != 0u);
+        return true;
+    }
+    case PackedElemEncoding::Int32: {
+        std::int32_t v = 0;
+        std::memcpy(&v, ptr, sizeof(v));
+        out.kind = PodValKind::Int32;
+        out.i64 = static_cast<std::int64_t>(v);
+        return true;
+    }
+    case PackedElemEncoding::Int64: {
+        std::int64_t v = 0;
+        std::memcpy(&v, ptr, sizeof(v));
+        out.kind = PodValKind::Int64;
+        out.i64 = v;
+        return true;
+    }
+    case PackedElemEncoding::Int64Wide: {
+        std::int64_t v = 0;
+        std::memcpy(&v, ptr, sizeof(v));
+        out.kind = PodValKind::Int32;
+        out.i64 = v;
+        return true;
+    }
+    case PackedElemEncoding::Float32: {
+        float v = 0.0f;
+        std::memcpy(&v, ptr, sizeof(v));
+        out.kind = PodValKind::Float32;
+        out.f32 = v;
+        return true;
+    }
+    case PackedElemEncoding::Float64: {
+        double v = 0.0;
+        std::memcpy(&v, ptr, sizeof(v));
+        out.kind = PodValKind::Float64;
+        out.f64 = v;
+        return true;
+    }
+    case PackedElemEncoding::EnumInline: {
+        std::int32_t v = 0;
+        std::memcpy(&v, ptr, sizeof(v));
+        out.kind = PodValKind::Enum64;
+        out.i64 = static_cast<std::int64_t>(v);
+        out.typeId = elemTid;
+        return true;
+    }
+    case PackedElemEncoding::EnumWide: {
+        std::int64_t v = 0;
+        std::memcpy(&v, ptr, sizeof(v));
+        out.kind = PodValKind::Enum64;
+        out.i64 = v;
+        out.typeId = elemTid;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+[[nodiscard]] bool writePodIntoColumnElement(
+    const ParallelNativeColumnBinding& col,
+    std::size_t index,
+    const PodSlot& val,
+    bool& outNeedsWidenOrTypeErr) noexcept {
+    outNeedsWidenOrTypeErr = false;
+    if (col.readOnly || index >= col.count || !col.basePtr) return false;
+    if (col.rawColumnView && col.rawColumnView->mode == RawColumnMode::EcsFields) {
+        const auto& view = *col.rawColumnView;
+        if (val.kind != PodValKind::PodStruct || val.typeId != view.structTypeId ||
+            val.structFieldCount != view.fields.size()) {
+            outNeedsWidenOrTypeErr = true;
+            return false;
+        }
+        auto* elemBase = static_cast<std::uint8_t*>(view.basePtr) + index * view.strideBytes;
+        for (std::size_t f = 0; f < view.fields.size(); ++f) {
+            if (!writePodFieldToNativeBytes(elemBase, view.fields[f], val, f)) {
+                outNeedsWidenOrTypeErr = true;
+                return false;
+            }
+        }
+        return true;
+    }
+    auto* ptr = static_cast<std::uint8_t*>(col.basePtr) + index * col.strideBytes;
+    const PackedElemEncoding enc = (col.rawColumnView && col.rawColumnView->mode == RawColumnMode::ScalarPacked)
+        ? col.rawColumnView->packedEncoding
+        : col.packedEncoding;
+    switch (enc) {
+    case PackedElemEncoding::Bool: {
+        if (val.kind != PodValKind::Bool) { outNeedsWidenOrTypeErr = true; return false; }
+        const std::uint8_t b = val.b ? 1u : 0u;
+        std::memcpy(ptr, &b, 1u);
+        return true;
+    }
+    case PackedElemEncoding::Int32: {
+        if (val.kind != PodValKind::Int32) { outNeedsWidenOrTypeErr = true; return false; }
+        if (val.i64 < std::numeric_limits<std::int32_t>::min() ||
+            val.i64 > std::numeric_limits<std::int32_t>::max()) {
+            outNeedsWidenOrTypeErr = true;
+            return false;
+        }
+        const auto v = static_cast<std::int32_t>(val.i64);
+        std::memcpy(ptr, &v, sizeof(v));
+        return true;
+    }
+    case PackedElemEncoding::Int64:
+    case PackedElemEncoding::Int64Wide: {
+        if (val.kind != PodValKind::Int64 && val.kind != PodValKind::Int32) {
+            outNeedsWidenOrTypeErr = true;
+            return false;
+        }
+        std::memcpy(ptr, &val.i64, sizeof(val.i64));
+        return true;
+    }
+    case PackedElemEncoding::Float32: {
+        if (val.kind != PodValKind::Float32) { outNeedsWidenOrTypeErr = true; return false; }
+        std::memcpy(ptr, &val.f32, sizeof(val.f32));
+        return true;
+    }
+    case PackedElemEncoding::Float64: {
+        if (val.kind != PodValKind::Float64) { outNeedsWidenOrTypeErr = true; return false; }
+        std::memcpy(ptr, &val.f64, sizeof(val.f64));
+        return true;
+    }
+    case PackedElemEncoding::EnumInline: {
+        if (val.kind != PodValKind::Enum64) { outNeedsWidenOrTypeErr = true; return false; }
+        if (val.i64 < std::numeric_limits<std::int32_t>::min() ||
+            val.i64 > std::numeric_limits<std::int32_t>::max()) {
+            outNeedsWidenOrTypeErr = true;
+            return false;
+        }
+        const auto v = static_cast<std::int32_t>(val.i64);
+        std::memcpy(ptr, &v, sizeof(v));
+        return true;
+    }
+    case PackedElemEncoding::EnumWide: {
+        if (val.kind != PodValKind::Enum64) { outNeedsWidenOrTypeErr = true; return false; }
+        std::memcpy(ptr, &val.i64, sizeof(val.i64));
+        return true;
+    }
+    default:
+        outNeedsWidenOrTypeErr = true;
+        return false;
+    }
+}
+
+[[nodiscard]] bool isNativeBatchColumnCompatible(const ParallelNativeColumnBinding& col) noexcept {
+    if (col.rawColumnView && col.rawColumnView->mode == RawColumnMode::EcsFields) {
+        if (col.rawColumnView->fields.empty() || col.rawColumnView->fields.size() > 16u) {
+            return false;
+        }
+        for (const auto& f : col.rawColumnView->fields) {
+            if (!isNativePodFieldKind(f.kind)) return false;
+        }
+        return true;
+    }
+    const PackedElemEncoding enc = (col.rawColumnView && col.rawColumnView->mode == RawColumnMode::ScalarPacked)
+        ? col.rawColumnView->packedEncoding
+        : col.packedEncoding;
+    switch (enc) {
+    case PackedElemEncoding::Bool:
+    case PackedElemEncoding::Int32:
+    case PackedElemEncoding::Int64:
+    case PackedElemEncoding::Int64Wide:
+    case PackedElemEncoding::Float32:
+    case PackedElemEncoding::Float64:
+    case PackedElemEncoding::EnumInline:
+    case PackedElemEncoding::EnumWide:
+        return true;
+    default:
+        return false;
+    }
+}
+
+[[nodiscard]] ParallelNativeBatchKernel tryBuildAutoNativeBatchKernel(
+    const ProgramImage& program,
+    const ProgramImage::FunctionLocation& entryLoc,
+    ParallelKernelKind kernelKind,
+    std::size_t prefixParamCount,
+    const std::vector<ParallelNativeColumnBinding>& paramColumns,
+    const std::unordered_map<semantic::SymbolId, ParallelNativeColumnBinding>& staticColumnBindings,
+    const ParallelJobConfig& config,
+    std::vector<ParallelNativeColumnBinding>& outCombinedColumns) {
+    outCombinedColumns.clear();
+    if (!entryLoc.function || !entryLoc.module) return {};
+    if (config.executionOptions.profile != nullptr ||
+        config.executionOptions.trace ||
+        config.executionOptions.executionPolicy != nullptr ||
+        config.executionOptions.debugger != nullptr) {
+        return {};
+    }
+    const auto& fn = *entryLoc.function;
+    const auto& mod = *entryLoc.module;
+    if (fn.blocks.empty()) return {};
+
+    // Check parameter & return & local & register types
+    if (fn.returnType != semantic::PrimitiveType::Void &&
+        !isNativeSupportedScalarPrim(fn.returnType)) {
+        return {};
+    }
+    std::unordered_map<semantic::SymbolId, PodStructDesc> structDescs;
+    auto inspectStructType = [&](semantic::SymbolId tid) -> bool {
+        if (tid == 0) return false;
+        if (structDescs.find(tid) != structDescs.end()) return true;
+        if (isInlineBuiltInMathStruct(tid)) return false; // fall back for complex dual math structs
+        const auto* t = program.resolveType(tid);
+        if (!t || t->kind != semantic::TypeKind::Struct) return false;
+        PodStructDesc desc;
+        desc.typeId = tid;
+        std::size_t count = 0;
+        for (const auto& f : t->fields) {
+            if (f.staticField || f.constField) continue;
+            if (count >= 16u || !isNativeSupportedScalarPrim(f.type)) return false;
+            desc.fieldTypes[count++] = f.type;
+        }
+        desc.fieldCount = static_cast<std::uint8_t>(count);
+        structDescs.emplace(tid, desc);
+        return true;
+    };
+
+    for (std::size_t p = 0; p < fn.parameterTypes.size(); ++p) {
+        const auto pt = fn.parameterTypes[p];
+        if (pt == semantic::PrimitiveType::Array) continue;
+        if (pt == semantic::PrimitiveType::Struct) {
+            const auto ptid = p < fn.parameterTypeIds.size() ? fn.parameterTypeIds[p] : 0;
+            if (!inspectStructType(ptid)) return {};
+        } else if (!isNativeSupportedScalarPrim(pt)) {
+            return {};
+        }
+    }
+    for (std::size_t l = 0; l < fn.localTypes.size(); ++l) {
+        const auto lt = fn.localTypes[l];
+        if (lt == semantic::PrimitiveType::Array) continue;
+        if (lt == semantic::PrimitiveType::Struct) {
+            const auto ltid = l < fn.localTypeIds.size() ? fn.localTypeIds[l] : 0;
+            if (!inspectStructType(ltid)) return {};
+        } else if (!isNativeSupportedScalarPrim(lt)) {
+            return {};
+        }
+    }
+    for (std::size_t r = 0; r < fn.registerTypes.size(); ++r) {
+        const auto rt = fn.registerTypes[r];
+        if (rt == semantic::PrimitiveType::Array || rt == semantic::PrimitiveType::Null ||
+            rt == semantic::PrimitiveType::Void) {
+            continue;
+        }
+        if (rt == semantic::PrimitiveType::Struct) {
+            const auto rtid = r < fn.registerTypeIds.size() ? fn.registerTypeIds[r] : 0;
+            if (!inspectStructType(rtid)) return {};
+        } else if (!isNativeSupportedScalarPrim(rt)) {
+            return {};
+        }
+    }
+
+    // Check column bindings compatibility
+    std::vector<std::int32_t> paramToCombinedCol(fn.parameterTypes.size(), -1);
+    for (const auto& binding : paramColumns) {
+        if (!isNativeBatchColumnCompatible(binding)) return {};
+        const std::int32_t idx = static_cast<std::int32_t>(outCombinedColumns.size());
+        outCombinedColumns.push_back(binding);
+        if (binding.parameterIndex < paramToCombinedCol.size()) {
+            paramToCombinedCol[binding.parameterIndex] = idx;
+        }
+    }
+
+    std::unordered_map<semantic::SymbolId, std::int32_t> staticIdToCombinedCol;
+    for (const auto& [sid, binding] : staticColumnBindings) {
+        if (!isNativeBatchColumnCompatible(binding)) return {};
+        const std::int32_t idx = static_cast<std::int32_t>(outCombinedColumns.size());
+        outCombinedColumns.push_back(binding);
+        staticIdToCombinedCol.emplace(sid, idx);
+    }
+
+    // Build dense BlockId map and inspect all instructions
+    std::unordered_map<bytecode::BlockId, std::size_t> blockIdToDense;
+    blockIdToDense.reserve(fn.blocks.size());
+    for (std::size_t i = 0; i < fn.blocks.size(); ++i) {
+        blockIdToDense.emplace(fn.blocks[i].id, i);
+    }
+
+    struct ResolvedCallTarget {
+        bool isStaticColLoad = false;
+        std::int32_t colIndex = -1;
+    };
+    struct CompiledBlock {
+        const bytecode::BasicBlock* bc = nullptr;
+        std::size_t jumpTargetDense = 0;
+        std::size_t falseTargetDense = 0;
+        std::vector<ResolvedCallTarget> callTargets;
+    };
+    std::vector<CompiledBlock> compiledBlocks(fn.blocks.size());
+
+    for (std::size_t b = 0; b < fn.blocks.size(); ++b) {
+        const auto& block = fn.blocks[b];
+        auto& cb = compiledBlocks[b];
+        cb.bc = &block;
+        cb.callTargets.resize(block.instructions.size());
+
+        for (std::size_t ii = 0; ii < block.instructions.size(); ++ii) {
+            const auto& inst = block.instructions[ii];
+            switch (inst.opcode) {
+            case bytecode::Opcode::LoadParameter:
+            case bytecode::Opcode::LoadLocal:
+            case bytecode::Opcode::StoreLocal:
+            case bytecode::Opcode::ConstantInt:
+            case bytecode::Opcode::ConstantDouble:
+            case bytecode::Opcode::ConstantBool:
+            case bytecode::Opcode::ConstantNull:
+            case bytecode::Opcode::ConvertNullToArray:
+            case bytecode::Opcode::CheckNotNull:
+            case bytecode::Opcode::ConvertIntToLong:
+            case bytecode::Opcode::ConvertIntToDouble:
+            case bytecode::Opcode::ConvertLongToDouble:
+            case bytecode::Opcode::ConvertNumeric:
+            case bytecode::Opcode::ArrayLength:
+            case bytecode::Opcode::LoadElement:
+            case bytecode::Opcode::StoreElement:
+            case bytecode::Opcode::NegateInt:
+            case bytecode::Opcode::NegateLong:
+            case bytecode::Opcode::NegateDouble:
+            case bytecode::Opcode::LogicalNot:
+            case bytecode::Opcode::Equal:
+            case bytecode::Opcode::NotEqual:
+            case bytecode::Opcode::AddInt:
+            case bytecode::Opcode::SubtractInt:
+            case bytecode::Opcode::MultiplyInt:
+            case bytecode::Opcode::DivideInt:
+            case bytecode::Opcode::RemainderInt:
+            case bytecode::Opcode::LessInt:
+            case bytecode::Opcode::LessOrEqualInt:
+            case bytecode::Opcode::GreaterInt:
+            case bytecode::Opcode::GreaterOrEqualInt:
+            case bytecode::Opcode::AddLong:
+            case bytecode::Opcode::SubtractLong:
+            case bytecode::Opcode::MultiplyLong:
+            case bytecode::Opcode::DivideLong:
+            case bytecode::Opcode::RemainderLong:
+            case bytecode::Opcode::LessLong:
+            case bytecode::Opcode::LessOrEqualLong:
+            case bytecode::Opcode::GreaterLong:
+            case bytecode::Opcode::GreaterOrEqualLong:
+            case bytecode::Opcode::AddDouble:
+            case bytecode::Opcode::SubtractDouble:
+            case bytecode::Opcode::MultiplyDouble:
+            case bytecode::Opcode::DivideDouble:
+            case bytecode::Opcode::LessDouble:
+            case bytecode::Opcode::LessOrEqualDouble:
+            case bytecode::Opcode::GreaterDouble:
+            case bytecode::Opcode::GreaterOrEqualDouble:
+                break;
+            case bytecode::Opcode::NewStruct: {
+                const semantic::SymbolId tid = inst.typeIndex < mod.types.size()
+                    ? mod.types[inst.typeIndex].id
+                    : inst.activeElementTypeId();
+                if (!inspectStructType(tid)) return {};
+                break;
+            }
+            case bytecode::Opcode::LoadStructField:
+            case bytecode::Opcode::StoreStructField: {
+                const semantic::SymbolId tid = inst.typeIndex < mod.types.size()
+                    ? mod.types[inst.typeIndex].id
+                    : 0;
+                if (!inspectStructType(tid)) return {};
+                const auto& desc = structDescs.at(tid);
+                if (inst.index >= desc.fieldCount) return {};
+                break;
+            }
+            case bytecode::Opcode::Call: {
+                if (inst.index >= mod.functionReferences.size()) return {};
+                const auto& ref = mod.functionReferences[inst.index];
+                constexpr std::string_view kStaticGet = "$intrinsic::static_get::";
+                if (ref.name.rfind(kStaticGet, 0) != 0) return {};
+                const std::string_view subOp = std::string_view(ref.name).substr(kStaticGet.size());
+                semantic::SymbolId sid = 0;
+                if (!tryParseReadOnlyEcsColDenseId(subOp, sid) &&
+                    !tryParseNumericStaticFieldId(subOp, sid)) {
+                    return {};
+                }
+                const auto sit = staticIdToCombinedCol.find(sid);
+                if (sit == staticIdToCombinedCol.end()) return {};
+                cb.callTargets[ii] = ResolvedCallTarget{true, sit->second};
+                break;
+            }
+            default:
+                return {};
+            }
+
+            if ((inst.opcode >= bytecode::Opcode::AddInt &&
+                 inst.opcode <= bytecode::Opcode::GreaterOrEqualInt) &&
+                inst.opcode != bytecode::Opcode::Equal &&
+                inst.opcode != bytecode::Opcode::NotEqual) {
+                if (inst.operands.size() < 2u ||
+                    inst.operands[0] >= fn.registerTypes.size() ||
+                    inst.operands[1] >= fn.registerTypes.size() ||
+                    fn.registerTypes[inst.operands[0]] != semantic::PrimitiveType::Int ||
+                    fn.registerTypes[inst.operands[1]] != semantic::PrimitiveType::Int) {
+                    return {};
+                }
+            } else if (inst.opcode >= bytecode::Opcode::AddLong &&
+                       inst.opcode <= bytecode::Opcode::GreaterOrEqualLong) {
+                if (inst.operands.size() < 2u ||
+                    inst.operands[0] >= fn.registerTypes.size() ||
+                    inst.operands[1] >= fn.registerTypes.size() ||
+                    fn.registerTypes[inst.operands[0]] != semantic::PrimitiveType::Long ||
+                    fn.registerTypes[inst.operands[1]] != semantic::PrimitiveType::Long) {
+                    return {};
+                }
+            }
+        }
+
+        switch (block.terminator.kind) {
+        case bytecode::TerminatorKind::ReturnVoid:
+        case bytecode::TerminatorKind::ReturnValue:
+            break;
+        case bytecode::TerminatorKind::Jump: {
+            const auto it = blockIdToDense.find(block.terminator.target);
+            if (it == blockIdToDense.end()) return {};
+            cb.jumpTargetDense = it->second;
+            break;
+        }
+        case bytecode::TerminatorKind::Branch: {
+            const auto tIt = blockIdToDense.find(block.terminator.target);
+            const auto fIt = blockIdToDense.find(block.terminator.falseTarget);
+            if (tIt == blockIdToDense.end() || fIt == blockIdToDense.end()) return {};
+            cb.jumpTargetDense = tIt->second;
+            cb.falseTargetDense = fIt->second;
+            break;
+        }
+        default:
+            return {};
+        }
+    }
+
+    // Build self-contained native execution lambda (zero VM/Interpreter objects!)
+    struct SharedNativePlan {
+        const bytecode::Function* fn = nullptr;
+        const bytecode::Module* mod = nullptr;
+        ParallelKernelKind kernelKind = ParallelKernelKind::Auto;
+        std::size_t prefixParamCount = 1u;
+        std::vector<std::int32_t> paramToCombinedCol;
+        std::unordered_map<semantic::SymbolId, PodStructDesc> structDescs;
+        std::vector<CompiledBlock> blocks;
+        ParallelReduceOp reduceOp = ParallelReduceOp::None;
+        ParallelCustomReducer customReducer;
+        bool strictDet = false;
+        std::uint64_t instructionBudget = 0;
+    };
+    auto plan = std::make_shared<SharedNativePlan>();
+    plan->fn = &fn;
+    plan->mod = &mod;
+    plan->kernelKind = kernelKind;
+    plan->prefixParamCount = prefixParamCount;
+    plan->paramToCombinedCol = std::move(paramToCombinedCol);
+    plan->structDescs = std::move(structDescs);
+    plan->blocks = std::move(compiledBlocks);
+    plan->reduceOp = config.reduceOp;
+    plan->customReducer = config.customReducer;
+    plan->strictDet = (config.executionOptions.determinism.mode == DeterminismMode::Strict);
+    plan->instructionBudget = config.executionOptions.limits.instructionBudget;
+
+    return [plan](ParallelNativeBatchContext& ctx) -> bool {
+        if (!ctx.columns || !ctx.userArguments) return false;
+        const auto& fnRef = *plan->fn;
+        const auto& cols = *ctx.columns;
+        const std::size_t nRegs = fnRef.registerTypes.size();
+        const std::size_t nLocals = fnRef.localTypes.size();
+
+        std::vector<PodSlot> params(fnRef.parameterTypes.size());
+        for (std::size_t p = 0; p < fnRef.parameterTypes.size(); ++p) {
+            if (fnRef.parameterTypes[p] == semantic::PrimitiveType::Array) {
+                params[p].kind = PodValKind::ColumnRef;
+                params[p].colIndex = plan->paramToCombinedCol[p];
+            } else if (p >= plan->prefixParamCount) {
+                const std::size_t u = p - plan->prefixParamCount;
+                if (!podSlotFromValue((*ctx.userArguments)[u], fnRef.parameterTypes[p], params[p])) {
+                    ctx.error.code = ErrorCode::TypeMismatch;
+                    ctx.error.message = "native batch parameter conversion failed";
+                    return false;
+                }
+            }
+        }
+
+        std::vector<PodSlot> defaultLocals(nLocals);
+        for (std::size_t l = 0; l < nLocals; ++l) {
+            switch (fnRef.localTypes[l]) {
+            case semantic::PrimitiveType::Bool:
+                defaultLocals[l].kind = PodValKind::Bool;
+                defaultLocals[l].b = false;
+                break;
+            case semantic::PrimitiveType::Int:
+                defaultLocals[l].kind = PodValKind::Int32;
+                defaultLocals[l].i64 = 0;
+                break;
+            case semantic::PrimitiveType::Long:
+                defaultLocals[l].kind = PodValKind::Int64;
+                defaultLocals[l].i64 = 0;
+                break;
+            case semantic::PrimitiveType::Float:
+                defaultLocals[l].kind = PodValKind::Float32;
+                defaultLocals[l].f32 = 0.0f;
+                break;
+            case semantic::PrimitiveType::Double:
+                defaultLocals[l].kind = PodValKind::Float64;
+                defaultLocals[l].f64 = 0.0;
+                break;
+            case semantic::PrimitiveType::Enum:
+                defaultLocals[l].kind = PodValKind::Enum64;
+                defaultLocals[l].i64 = 0;
+                defaultLocals[l].typeId = l < fnRef.localTypeIds.size() ? fnRef.localTypeIds[l] : 0;
+                break;
+            case semantic::PrimitiveType::Array:
+                defaultLocals[l].kind = PodValKind::ColumnRef;
+                defaultLocals[l].colIndex = -1;
+                break;
+            case semantic::PrimitiveType::Struct: {
+                const auto ltid = l < fnRef.localTypeIds.size() ? fnRef.localTypeIds[l] : 0;
+                const auto dIt = plan->structDescs.find(ltid);
+                if (dIt == plan->structDescs.end()) {
+                    ctx.error.code = ErrorCode::InvalidProgram;
+                    ctx.error.message = "missing native POD struct layout";
+                    return false;
+                }
+                const auto& desc = dIt->second;
+                defaultLocals[l].kind = PodValKind::PodStruct;
+                defaultLocals[l].typeId = ltid;
+                defaultLocals[l].structFieldCount = desc.fieldCount;
+                for (std::size_t f = 0; f < desc.fieldCount; ++f) {
+                    const auto ft = desc.fieldTypes[f];
+                    if (ft == semantic::PrimitiveType::Bool) defaultLocals[l].fieldKinds[f] = PodValKind::Bool;
+                    else if (ft == semantic::PrimitiveType::Long) defaultLocals[l].fieldKinds[f] = PodValKind::Int64;
+                    else if (ft == semantic::PrimitiveType::Float) defaultLocals[l].fieldKinds[f] = PodValKind::Float32;
+                    else if (ft == semantic::PrimitiveType::Double) defaultLocals[l].fieldKinds[f] = PodValKind::Float64;
+                    else if (ft == semantic::PrimitiveType::Enum) defaultLocals[l].fieldKinds[f] = PodValKind::Enum64;
+                    else defaultLocals[l].fieldKinds[f] = PodValKind::Int32;
+                }
+                break;
+            }
+            default:
+                break;
+            }
+        }
+
+        std::vector<PodSlot> regs(nRegs);
+        std::vector<PodSlot> locals(nLocals);
+        std::vector<PodSlot> edgeArgs;
+        edgeArgs.reserve(16u);
+
+        auto failNative = [&](ErrorCode code, std::string msg) -> bool {
+            ctx.error.code = code;
+            ctx.error.message = std::move(msg);
+            return false;
+        };
+
+        auto checkedInt32Op = [&](std::int64_t val, bool checked, PodSlot& out) -> bool {
+            if (!checked) {
+                const auto u32 = static_cast<std::uint32_t>(val);
+                const auto s32 = static_cast<std::int32_t>(u32);
+                out.kind = PodValKind::Int32;
+                out.i64 = static_cast<std::int64_t>(s32);
+                return true;
+            }
+            if (val < std::numeric_limits<std::int32_t>::min() ||
+                val > std::numeric_limits<std::int32_t>::max()) {
+                return failNative(ErrorCode::IntegerOverflow, "integer overflow");
+            }
+            out.kind = PodValKind::Int32;
+            out.i64 = val;
+            return true;
+        };
+
+        auto executeSingleInvocation = [&](Value& outReturnValue) -> bool {
+            locals = defaultLocals;
+            std::size_t denseBlockIdx = 0u;
+            std::uint64_t executed = 0u;
+            const std::uint64_t budget = plan->instructionBudget;
+
+            for (;;) {
+                const auto& cb = plan->blocks[denseBlockIdx];
+                const auto& block = *cb.bc;
+
+                for (std::size_t ii = 0; ii < block.instructions.size(); ++ii) {
+                    if (executed >= budget) {
+                        return failNative(ErrorCode::InstructionBudgetExceeded, "instruction budget exceeded");
+                    }
+                    ++executed;
+                    ++ctx.statistics.instructionsExecuted;
+
+                    const auto& inst = block.instructions[ii];
+                    const auto res = inst.result;
+                    auto storeScalar = [&](PodSlot v) {
+                        if (res != bytecode::InvalidRegister && res < nRegs) regs[res] = v;
+                    };
+
+                    switch (inst.opcode) {
+                    case bytecode::Opcode::LoadParameter:
+                        if (inst.index < params.size()) storeScalar(params[inst.index]);
+                        break;
+                    case bytecode::Opcode::LoadLocal:
+                        if (inst.index < locals.size()) storeScalar(locals[inst.index]);
+                        break;
+                    case bytecode::Opcode::StoreLocal:
+                        if (inst.index < locals.size() && !inst.operands.empty() && inst.operands[0] < nRegs) {
+                            locals[inst.index] = regs[inst.operands[0]];
+                        }
+                        break;
+                    case bytecode::Opcode::ConstantInt: {
+                        PodSlot s{};
+                        if (res < fnRef.registerTypes.size() && fnRef.registerTypes[res] == semantic::PrimitiveType::Long) {
+                            s.kind = PodValKind::Int64;
+                        } else if (res < fnRef.registerTypes.size() && fnRef.registerTypes[res] == semantic::PrimitiveType::Enum) {
+                            s.kind = PodValKind::Enum64;
+                            s.typeId = res < fnRef.registerTypeIds.size() ? fnRef.registerTypeIds[res] : 0;
+                        } else {
+                            s.kind = PodValKind::Int32;
+                        }
+                        s.i64 = inst.integerImmediate;
+                        storeScalar(s);
+                        break;
+                    }
+                    case bytecode::Opcode::ConstantDouble: {
+                        PodSlot s{};
+                        if (res < fnRef.registerTypes.size() && fnRef.registerTypes[res] == semantic::PrimitiveType::Float) {
+                            s.kind = PodValKind::Float32;
+                            s.f32 = static_cast<float>(inst.doubleImmediate);
+                        } else {
+                            s.kind = PodValKind::Float64;
+                            s.f64 = inst.doubleImmediate;
+                        }
+                        storeScalar(s);
+                        break;
+                    }
+                    case bytecode::Opcode::ConstantBool: {
+                        PodSlot s{};
+                        s.kind = PodValKind::Bool;
+                        s.b = inst.boolImmediate;
+                        storeScalar(s);
+                        break;
+                    }
+                    case bytecode::Opcode::ConstantNull:
+                    case bytecode::Opcode::ConvertNullToArray: {
+                        PodSlot s{};
+                        s.kind = (inst.opcode == bytecode::Opcode::ConvertNullToArray)
+                            ? PodValKind::ColumnRef
+                            : PodValKind::Null;
+                        s.colIndex = -1;
+                        storeScalar(s);
+                        break;
+                    }
+                    case bytecode::Opcode::CheckNotNull: {
+                        const auto& v = regs[inst.operands[0]];
+                        if (v.kind == PodValKind::Null ||
+                            (v.kind == PodValKind::ColumnRef && v.colIndex < 0)) {
+                            return failNative(ErrorCode::NullReference, "null reference");
+                        }
+                        storeScalar(v);
+                        break;
+                    }
+                    case bytecode::Opcode::ConvertIntToLong: {
+                        const auto& v = regs[inst.operands[0]];
+                        PodSlot s{};
+                        s.kind = PodValKind::Int64;
+                        s.i64 = v.i64;
+                        storeScalar(s);
+                        break;
+                    }
+                    case bytecode::Opcode::ConvertIntToDouble:
+                    case bytecode::Opcode::ConvertLongToDouble: {
+                        const auto& v = regs[inst.operands[0]];
+                        PodSlot s{};
+                        if (res < fnRef.registerTypes.size() && fnRef.registerTypes[res] == semantic::PrimitiveType::Float) {
+                            s.kind = PodValKind::Float32;
+                            s.f32 = static_cast<float>(v.i64);
+                        } else {
+                            s.kind = PodValKind::Float64;
+                            s.f64 = static_cast<double>(v.i64);
+                        }
+                        storeScalar(s);
+                        break;
+                    }
+                    case bytecode::Opcode::ConvertNumeric: {
+                        const auto srcPrim = fnRef.registerTypes[inst.operands[0]];
+                        const auto dstPrim = fnRef.registerTypes[res];
+                        const Value boxed = podSlotToValue(regs[inst.operands[0]], srcPrim);
+                        Value conv{};
+                        if (!tryConvertNumeric(boxed, dstPrim, conv, inst.checkedArithmetic)) {
+                            return failNative(ErrorCode::IntegerOverflow, "numeric conversion overflow");
+                        }
+                        PodSlot s{};
+                        if (!podSlotFromValue(conv, dstPrim, s)) {
+                            return failNative(ErrorCode::TypeMismatch, "numeric conversion failed");
+                        }
+                        storeScalar(s);
+                        break;
+                    }
+                    case bytecode::Opcode::Call: {
+                        const auto& ct = cb.callTargets[ii];
+                        PodSlot s{};
+                        s.kind = PodValKind::ColumnRef;
+                        s.colIndex = ct.colIndex;
+                        storeScalar(s);
+                        break;
+                    }
+                    case bytecode::Opcode::ArrayLength: {
+                        const auto& arr = regs[inst.operands[0]];
+                        if (arr.kind != PodValKind::ColumnRef || arr.colIndex < 0 ||
+                            static_cast<std::size_t>(arr.colIndex) >= cols.size()) {
+                            return failNative(ErrorCode::NullReference, "null array reference");
+                        }
+                        PodSlot s{};
+                        s.kind = PodValKind::Int32;
+                        s.i64 = static_cast<std::int64_t>(cols[arr.colIndex].count);
+                        storeScalar(s);
+                        break;
+                    }
+                    case bytecode::Opcode::LoadElement: {
+                        const auto& arr = regs[inst.operands[0]];
+                        const auto& idxReg = regs[inst.operands[1]];
+                        if (arr.kind != PodValKind::ColumnRef || arr.colIndex < 0 ||
+                            static_cast<std::size_t>(arr.colIndex) >= cols.size()) {
+                            return failNative(ErrorCode::NullReference, "null array reference");
+                        }
+                        if (idxReg.i64 < 0) {
+                            return failNative(ErrorCode::IndexOutOfRange, "array index out of range");
+                        }
+                        const auto& col = cols[arr.colIndex];
+                        const std::size_t elemIdx = static_cast<std::size_t>(idxReg.i64);
+                        if (elemIdx >= col.count) {
+                            return failNative(ErrorCode::IndexOutOfRange, "array index out of range");
+                        }
+                        PodSlot out{};
+                        if (!readColumnElementIntoPod(col, elemIdx, out)) {
+                            return failNative(ErrorCode::TypeMismatch, "native column read failed");
+                        }
+                        storeScalar(out);
+                        break;
+                    }
+                    case bytecode::Opcode::StoreElement: {
+                        const auto& arr = regs[inst.operands[0]];
+                        const auto& idxReg = regs[inst.operands[1]];
+                        const auto& valReg = regs[inst.operands[2]];
+                        if (arr.kind != PodValKind::ColumnRef || arr.colIndex < 0 ||
+                            static_cast<std::size_t>(arr.colIndex) >= cols.size()) {
+                            return failNative(ErrorCode::NullReference, "null array reference");
+                        }
+                        if (idxReg.i64 < 0) {
+                            return failNative(ErrorCode::IndexOutOfRange, "array index out of range");
+                        }
+                        const auto& col = cols[arr.colIndex];
+                        if (col.readOnly) {
+                            return failNative(ErrorCode::CapabilityDenied, "cannot write to read-only raw column array");
+                        }
+                        const std::size_t elemIdx = static_cast<std::size_t>(idxReg.i64);
+                        if (elemIdx >= col.count) {
+                            return failNative(ErrorCode::IndexOutOfRange, "array index out of range");
+                        }
+                        bool typeOrWidenErr = false;
+                        if (!writePodIntoColumnElement(col, elemIdx, valReg, typeOrWidenErr)) {
+                            return failNative(
+                                typeOrWidenErr ? ErrorCode::TypeMismatch : ErrorCode::InvalidArguments,
+                                "native column write failed");
+                        }
+                        break;
+                    }
+                    case bytecode::Opcode::NewStruct: {
+                        const semantic::SymbolId tid = inst.typeIndex < plan->mod->types.size()
+                            ? plan->mod->types[inst.typeIndex].id
+                            : inst.activeElementTypeId();
+                        const auto& desc = plan->structDescs.at(tid);
+                        PodSlot s{};
+                        s.kind = PodValKind::PodStruct;
+                        s.typeId = tid;
+                        s.structFieldCount = desc.fieldCount;
+                        for (std::size_t f = 0; f < desc.fieldCount; ++f) {
+                            const auto ft = desc.fieldTypes[f];
+                            if (ft == semantic::PrimitiveType::Bool) s.fieldKinds[f] = PodValKind::Bool;
+                            else if (ft == semantic::PrimitiveType::Long) s.fieldKinds[f] = PodValKind::Int64;
+                            else if (ft == semantic::PrimitiveType::Float) s.fieldKinds[f] = PodValKind::Float32;
+                            else if (ft == semantic::PrimitiveType::Double) s.fieldKinds[f] = PodValKind::Float64;
+                            else if (ft == semantic::PrimitiveType::Enum) s.fieldKinds[f] = PodValKind::Enum64;
+                            else s.fieldKinds[f] = PodValKind::Int32;
+                        }
+                        storeScalar(s);
+                        break;
+                    }
+                    case bytecode::Opcode::LoadStructField: {
+                        const auto& recv = regs[inst.operands[0]];
+                        if (recv.kind != PodValKind::PodStruct || inst.index >= recv.structFieldCount) {
+                            return failNative(ErrorCode::InvalidProgram, "invalid struct field read");
+                        }
+                        PodSlot fval{};
+                        fval.kind = recv.fieldKinds[inst.index];
+                        fval.i64 = recv.fieldI64[inst.index];
+                        fval.f64 = recv.fieldF64[inst.index];
+                        fval.f32 = recv.fieldF32[inst.index];
+                        fval.b = recv.fieldBool[inst.index];
+                        fval.typeId = recv.fieldTypeIds[inst.index];
+                        storeScalar(fval);
+                        break;
+                    }
+                    case bytecode::Opcode::StoreStructField: {
+                        PodSlot copy = regs[inst.operands[0]];
+                        if (copy.kind != PodValKind::PodStruct || inst.index >= copy.structFieldCount) {
+                            return failNative(ErrorCode::InvalidProgram, "invalid struct field write");
+                        }
+                        const auto& newVal = regs[inst.operands[1]];
+                        copy.fieldKinds[inst.index] = newVal.kind;
+                        copy.fieldI64[inst.index] = newVal.i64;
+                        copy.fieldF64[inst.index] = newVal.f64;
+                        copy.fieldF32[inst.index] = newVal.f32;
+                        copy.fieldBool[inst.index] = newVal.b;
+                        copy.fieldTypeIds[inst.index] = newVal.typeId;
+                        storeScalar(copy);
+                        break;
+                    }
+                    case bytecode::Opcode::NegateInt: {
+                        const std::int64_t a = regs[inst.operands[0]].i64;
+                        if (inst.checkedArithmetic && a == std::numeric_limits<std::int32_t>::min()) {
+                            return failNative(ErrorCode::IntegerOverflow, "integer negation overflow");
+                        }
+                        PodSlot out{};
+                        if (!checkedInt32Op(-a, inst.checkedArithmetic, out)) return false;
+                        storeScalar(out);
+                        break;
+                    }
+                    case bytecode::Opcode::NegateLong: {
+                        const std::int64_t a = regs[inst.operands[0]].i64;
+                        if (inst.checkedArithmetic && a == std::numeric_limits<std::int64_t>::min()) {
+                            return failNative(ErrorCode::IntegerOverflow, "long negation overflow");
+                        }
+                        PodSlot out{};
+                        out.kind = PodValKind::Int64;
+                        out.i64 = static_cast<std::int64_t>(0ULL - static_cast<std::uint64_t>(a));
+                        storeScalar(out);
+                        break;
+                    }
+                    case bytecode::Opcode::NegateDouble: {
+                        const auto& v = regs[inst.operands[0]];
+                        PodSlot out{};
+                        out.kind = v.kind;
+                        if (v.kind == PodValKind::Float32) out.f32 = -v.f32;
+                        else out.f64 = -v.f64;
+                        storeScalar(out);
+                        break;
+                    }
+                    case bytecode::Opcode::LogicalNot: {
+                        PodSlot out{};
+                        out.kind = PodValKind::Bool;
+                        out.b = !regs[inst.operands[0]].b;
+                        storeScalar(out);
+                        break;
+                    }
+                    case bytecode::Opcode::Equal:
+                    case bytecode::Opcode::NotEqual: {
+                        const auto& l = regs[inst.operands[0]];
+                        const auto& r = regs[inst.operands[1]];
+                        bool eq = false;
+                        if (l.kind == r.kind) {
+                            switch (l.kind) {
+                            case PodValKind::Bool: eq = (l.b == r.b); break;
+                            case PodValKind::Int32:
+                            case PodValKind::Int64: eq = (l.i64 == r.i64); break;
+                            case PodValKind::Enum64: eq = (l.i64 == r.i64 && l.typeId == r.typeId); break;
+                            case PodValKind::Float32: eq = (l.f32 == r.f32); break;
+                            case PodValKind::Float64: eq = (l.f64 == r.f64); break;
+                            case PodValKind::ColumnRef: eq = (l.colIndex == r.colIndex); break;
+                            case PodValKind::Null: eq = true; break;
+                            default: eq = false; break;
+                            }
+                        }
+                        PodSlot out{};
+                        out.kind = PodValKind::Bool;
+                        out.b = (inst.opcode == bytecode::Opcode::Equal) ? eq : !eq;
+                        storeScalar(out);
+                        break;
+                    }
+                    case bytecode::Opcode::AddInt:
+                    case bytecode::Opcode::SubtractInt:
+                    case bytecode::Opcode::MultiplyInt:
+                    case bytecode::Opcode::DivideInt:
+                    case bytecode::Opcode::RemainderInt: {
+                        const std::int64_t a = regs[inst.operands[0]].i64;
+                        const std::int64_t b = regs[inst.operands[1]].i64;
+                        PodSlot out{};
+                        if (inst.opcode == bytecode::Opcode::AddInt) {
+                            if (!checkedInt32Op(a + b, inst.checkedArithmetic, out)) return false;
+                        } else if (inst.opcode == bytecode::Opcode::SubtractInt) {
+                            if (!checkedInt32Op(a - b, inst.checkedArithmetic, out)) return false;
+                        } else if (inst.opcode == bytecode::Opcode::MultiplyInt) {
+                            if (!checkedInt32Op(a * b, inst.checkedArithmetic, out)) return false;
+                        } else if (inst.opcode == bytecode::Opcode::DivideInt) {
+                            if (b == 0) return failNative(ErrorCode::DivisionByZero, "division by zero");
+                            if (a == std::numeric_limits<std::int32_t>::min() && b == -1) {
+                                return failNative(ErrorCode::IntegerOverflow, "integer division overflow");
+                            }
+                            out.kind = PodValKind::Int32;
+                            out.i64 = a / b;
+                        } else {
+                            if (b == 0) return failNative(ErrorCode::DivisionByZero, "remainder by zero");
+                            out.kind = PodValKind::Int32;
+                            out.i64 = (a == std::numeric_limits<std::int32_t>::min() && b == -1) ? 0 : (a % b);
+                        }
+                        storeScalar(out);
+                        break;
+                    }
+                    case bytecode::Opcode::LessInt:
+                    case bytecode::Opcode::LessOrEqualInt:
+                    case bytecode::Opcode::GreaterInt:
+                    case bytecode::Opcode::GreaterOrEqualInt: {
+                        const std::int64_t a = regs[inst.operands[0]].i64;
+                        const std::int64_t b = regs[inst.operands[1]].i64;
+                        PodSlot out{};
+                        out.kind = PodValKind::Bool;
+                        if (inst.opcode == bytecode::Opcode::LessInt) out.b = (a < b);
+                        else if (inst.opcode == bytecode::Opcode::LessOrEqualInt) out.b = (a <= b);
+                        else if (inst.opcode == bytecode::Opcode::GreaterInt) out.b = (a > b);
+                        else out.b = (a >= b);
+                        storeScalar(out);
+                        break;
+                    }
+                    case bytecode::Opcode::AddLong:
+                    case bytecode::Opcode::SubtractLong:
+                    case bytecode::Opcode::MultiplyLong:
+                    case bytecode::Opcode::DivideLong:
+                    case bytecode::Opcode::RemainderLong: {
+                        const std::int64_t a = regs[inst.operands[0]].i64;
+                        const std::int64_t b = regs[inst.operands[1]].i64;
+                        PodSlot out{};
+                        out.kind = PodValKind::Int64;
+                        if (inst.opcode == bytecode::Opcode::AddLong) {
+                            if (inst.checkedArithmetic &&
+                                ((b > 0 && a > std::numeric_limits<std::int64_t>::max() - b) ||
+                                 (b < 0 && a < std::numeric_limits<std::int64_t>::min() - b))) {
+                                return failNative(ErrorCode::IntegerOverflow, "long addition overflow");
+                            }
+                            out.i64 = static_cast<std::int64_t>(
+                                static_cast<std::uint64_t>(a) + static_cast<std::uint64_t>(b));
+                        } else if (inst.opcode == bytecode::Opcode::SubtractLong) {
+                            if (inst.checkedArithmetic &&
+                                ((b < 0 && a > std::numeric_limits<std::int64_t>::max() + b) ||
+                                 (b > 0 && a < std::numeric_limits<std::int64_t>::min() + b))) {
+                                return failNative(ErrorCode::IntegerOverflow, "long subtraction overflow");
+                            }
+                            out.i64 = static_cast<std::int64_t>(
+                                static_cast<std::uint64_t>(a) - static_cast<std::uint64_t>(b));
+                        } else if (inst.opcode == bytecode::Opcode::MultiplyLong) {
+                            if (inst.checkedArithmetic && a != 0 && b != 0) {
+                                if ((a == -1 && b == std::numeric_limits<std::int64_t>::min()) ||
+                                    (b == -1 && a == std::numeric_limits<std::int64_t>::min())) {
+                                    return failNative(ErrorCode::IntegerOverflow, "long multiplication overflow");
+                                }
+                                const auto absA = a < 0 ? (0ULL - static_cast<std::uint64_t>(a)) : static_cast<std::uint64_t>(a);
+                                const auto absB = b < 0 ? (0ULL - static_cast<std::uint64_t>(b)) : static_cast<std::uint64_t>(b);
+                                const auto limit = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) +
+                                    ((a < 0) != (b < 0) ? 1ULL : 0ULL);
+                                if (absA > limit / absB) {
+                                    return failNative(ErrorCode::IntegerOverflow, "long multiplication overflow");
+                                }
+                            }
+                            out.i64 = static_cast<std::int64_t>(
+                                static_cast<std::uint64_t>(a) * static_cast<std::uint64_t>(b));
+                        } else if (inst.opcode == bytecode::Opcode::DivideLong) {
+                            if (b == 0) return failNative(ErrorCode::DivisionByZero, "division by zero");
+                            if (a == std::numeric_limits<std::int64_t>::min() && b == -1) {
+                                return failNative(ErrorCode::IntegerOverflow, "long division overflow");
+                            }
+                            out.i64 = a / b;
+                        } else {
+                            if (b == 0) return failNative(ErrorCode::DivisionByZero, "remainder by zero");
+                            out.i64 = (a == std::numeric_limits<std::int64_t>::min() && b == -1) ? 0 : (a % b);
+                        }
+                        storeScalar(out);
+                        break;
+                    }
+                    case bytecode::Opcode::LessLong:
+                    case bytecode::Opcode::LessOrEqualLong:
+                    case bytecode::Opcode::GreaterLong:
+                    case bytecode::Opcode::GreaterOrEqualLong: {
+                        const std::int64_t a = regs[inst.operands[0]].i64;
+                        const std::int64_t b = regs[inst.operands[1]].i64;
+                        PodSlot out{};
+                        out.kind = PodValKind::Bool;
+                        if (inst.opcode == bytecode::Opcode::LessLong) out.b = (a < b);
+                        else if (inst.opcode == bytecode::Opcode::LessOrEqualLong) out.b = (a <= b);
+                        else if (inst.opcode == bytecode::Opcode::GreaterLong) out.b = (a > b);
+                        else out.b = (a >= b);
+                        storeScalar(out);
+                        break;
+                    }
+                    case bytecode::Opcode::AddDouble:
+                    case bytecode::Opcode::SubtractDouble:
+                    case bytecode::Opcode::MultiplyDouble:
+                    case bytecode::Opcode::DivideDouble:
+                    case bytecode::Opcode::LessDouble:
+                    case bytecode::Opcode::LessOrEqualDouble:
+                    case bytecode::Opcode::GreaterDouble:
+                    case bytecode::Opcode::GreaterOrEqualDouble: {
+                        const auto& l = regs[inst.operands[0]];
+                        const auto& r = regs[inst.operands[1]];
+                        PodSlot out{};
+                        if (l.kind == PodValKind::Float32 && r.kind == PodValKind::Float32) {
+                            const float a = l.f32;
+                            const float b = r.f32;
+                            if (inst.opcode >= bytecode::Opcode::LessDouble) {
+                                out.kind = PodValKind::Bool;
+                                if (inst.opcode == bytecode::Opcode::LessDouble) out.b = (a < b);
+                                else if (inst.opcode == bytecode::Opcode::LessOrEqualDouble) out.b = (a <= b);
+                                else if (inst.opcode == bytecode::Opcode::GreaterDouble) out.b = (a > b);
+                                else out.b = (a >= b);
+                            } else {
+                                out.kind = PodValKind::Float32;
+                                if (inst.opcode == bytecode::Opcode::AddDouble) out.f32 = a + b;
+                                else if (inst.opcode == bytecode::Opcode::SubtractDouble) out.f32 = a - b;
+                                else if (inst.opcode == bytecode::Opcode::MultiplyDouble) out.f32 = a * b;
+                                else out.f32 = a / b;
+                            }
+                        } else {
+                            const double a = (l.kind == PodValKind::Float32) ? static_cast<double>(l.f32) : l.f64;
+                            const double b = (r.kind == PodValKind::Float32) ? static_cast<double>(r.f32) : r.f64;
+                            if (inst.opcode >= bytecode::Opcode::LessDouble) {
+                                out.kind = PodValKind::Bool;
+                                if (inst.opcode == bytecode::Opcode::LessDouble) out.b = (a < b);
+                                else if (inst.opcode == bytecode::Opcode::LessOrEqualDouble) out.b = (a <= b);
+                                else if (inst.opcode == bytecode::Opcode::GreaterDouble) out.b = (a > b);
+                                else out.b = (a >= b);
+                            } else {
+                                out.kind = PodValKind::Float64;
+                                if (inst.opcode == bytecode::Opcode::AddDouble) out.f64 = a + b;
+                                else if (inst.opcode == bytecode::Opcode::SubtractDouble) out.f64 = a - b;
+                                else if (inst.opcode == bytecode::Opcode::MultiplyDouble) out.f64 = a * b;
+                                else out.f64 = a / b;
+                            }
+                        }
+                        storeScalar(out);
+                        break;
+                    }
+                    default:
+                        return failNative(ErrorCode::InvalidProgram, "unsupported native batch opcode");
+                    }
+                }
+
+                const auto& term = block.terminator;
+                if (term.kind == bytecode::TerminatorKind::ReturnVoid) {
+                    outReturnValue = Value{std::monostate{}};
+                    return true;
+                }
+                if (term.kind == bytecode::TerminatorKind::ReturnValue) {
+                    outReturnValue = podSlotToValue(regs[term.value], fnRef.returnType);
+                    return true;
+                }
+                std::size_t nextBlockIdx = cb.jumpTargetDense;
+                const bytecode::SmallRegisterVector* eRegs = &term.arguments;
+                if (term.kind == bytecode::TerminatorKind::Branch) {
+                    ++ctx.statistics.branchesTaken;
+                    const bool cond = regs[term.condition].b;
+                    if (!cond) {
+                        nextBlockIdx = cb.falseTargetDense;
+                        eRegs = &term.falseArguments;
+                    }
+                }
+                const auto& targetParams = plan->blocks[nextBlockIdx].bc->parameters;
+                edgeArgs.clear();
+                for (std::size_t k = 0; k < std::min(eRegs->size(), targetParams.size()); ++k) {
+                    edgeArgs.push_back(regs[(*eRegs)[k]]);
+                }
+                for (std::size_t k = 0; k < edgeArgs.size(); ++k) {
+                    regs[targetParams[k].target] = edgeArgs[k];
+                }
+                denseBlockIdx = nextBlockIdx;
+            }
+        };
+
+        if (plan->kernelKind == ParallelKernelKind::Range) {
+            params[0].kind = PodValKind::Int32;
+            params[0].i64 = static_cast<std::int64_t>(ctx.start);
+            params[1].kind = PodValKind::Int32;
+            params[1].i64 = static_cast<std::int64_t>(ctx.count);
+            Value retVal{};
+            if (!executeSingleInvocation(retVal)) return false;
+            ctx.reducedValue = std::move(retVal);
+            ctx.hasReducedValue = true;
+            ctx.statistics.functionCalls += 1u;
+            ctx.statistics.maximumCallDepth = 1u;
+            return true;
+        }
+
+        bool hasAcc = false;
+        Value accValue{};
+        for (std::size_t off = 0; off < ctx.count; ++off) {
+            params[0].kind = PodValKind::Int32;
+            params[0].i64 = static_cast<std::int64_t>(ctx.start + off);
+            Value elemVal{};
+            if (!executeSingleInvocation(elemVal)) return false;
+            ctx.statistics.functionCalls += 1u;
+            ctx.statistics.maximumCallDepth = 1u;
+            if (plan->reduceOp != ParallelReduceOp::None) {
+                if (!hasAcc) {
+                    accValue = std::move(elemVal);
+                    hasAcc = true;
+                } else {
+                    Value nextAcc{};
+                    if (!reduceTwoValues(
+                            plan->reduceOp,
+                            plan->customReducer,
+                            plan->strictDet,
+                            accValue,
+                            elemVal,
+                            nextAcc,
+                            ctx.error)) {
+                        return false;
+                    }
+                    accValue = std::move(nextAcc);
+                }
+            }
+        }
+        ctx.hasReducedValue = hasAcc;
+        ctx.reducedValue = (plan->reduceOp == ParallelReduceOp::None || !hasAcc)
+            ? Value{std::monostate{}}
+            : std::move(accValue);
+        return true;
+    };
+}
+
 } // namespace
 
 struct ParallelJobScheduler::Impl {
@@ -1722,6 +3317,8 @@ struct ParallelJobScheduler::Impl {
         ParallelKernelKind kind = ParallelKernelKind::Auto;
         const BindingRegistry* bindings = nullptr;
         std::size_t bindingsSize = 0;
+        bool allowRawColumnArrays = false;
+        bool allowReadOnlyStaticColumnLoads = false;
 
         bool operator==(const CachedVerifyKey& other) const noexcept {
             return program == other.program &&
@@ -1729,7 +3326,9 @@ struct ParallelJobScheduler::Impl {
                    symbolId == other.symbolId &&
                    kind == other.kind &&
                    bindings == other.bindings &&
-                   bindingsSize == other.bindingsSize;
+                   bindingsSize == other.bindingsSize &&
+                   allowRawColumnArrays == other.allowRawColumnArrays &&
+                   allowReadOnlyStaticColumnLoads == other.allowReadOnlyStaticColumnLoads;
         }
     };
     struct CachedVerifyKeyHash {
@@ -1740,6 +3339,8 @@ struct ParallelJobScheduler::Impl {
             h ^= static_cast<std::size_t>(k.kind) * 0x517cc1b7u;
             h ^= std::hash<const void*>{}(k.bindings) << 1u;
             h ^= k.bindingsSize * 0x85ebca6bu;
+            h ^= (k.allowRawColumnArrays ? 0x27d4eb2du : 0u);
+            h ^= (k.allowReadOnlyStaticColumnLoads ? 0x165667b1u : 0u);
             return h;
         }
     };
@@ -1865,7 +3466,7 @@ struct ParallelJobScheduler::Impl {
         return merged;
     }
 
-    void prepareWorkerInterpreters(
+    std::size_t prepareWorkerInterpreters(
         std::size_t numWorkers,
         const std::shared_ptr<const ProgramImage>& program,
         const std::shared_ptr<ManagedHeap>& heap,
@@ -1885,10 +3486,12 @@ struct ParallelJobScheduler::Impl {
             workerInterpreters.clear();
         }
 
+        std::size_t constructed = 0u;
         while (workerInterpreters.size() < numWorkers) {
             auto interp = std::make_unique<Interpreter>(program, heap);
             interp->setBindingRegistry(augmentedBindings);
             workerInterpreters.push_back(std::move(interp));
+            ++constructed;
         }
 
         // Pre-warm ExecutionMirror and BindingRegistry symbol cache on main thread
@@ -1901,6 +3504,7 @@ struct ParallelJobScheduler::Impl {
                 }
             }
         }
+        return constructed;
     }
 
     ParallelJobResult executeDispatch(
@@ -1954,7 +3558,9 @@ struct ParallelJobScheduler::Impl {
             symbolId,
             kernelKind,
             bindings.get(),
-            bindings ? bindings->size() : 0u};
+            bindings ? bindings->size() : 0u,
+            config.allowRawColumnArrays,
+            config.allowReadOnlyStaticColumnLoads};
         if (canUseVerifyCache) {
             const auto foundIt = verifyCache.find(cacheKey);
             if (foundIt != verifyCache.end()) {
@@ -1963,6 +3569,8 @@ struct ParallelJobScheduler::Impl {
                 ParallelJobVerifyOptions vOpts;
                 vOpts.expectedKind = kernelKind;
                 vOpts.bindings = bindings.get();
+                vOpts.allowRawColumnArrays = config.allowRawColumnArrays;
+                vOpts.allowReadOnlyStaticColumnLoads = config.allowReadOnlyStaticColumnLoads;
                 report = verifyParallelJobFunction(*program, symbolId, vOpts);
                 if (report.valid) {
                     verifyCache.emplace(cacheKey, report);
@@ -1974,6 +3582,8 @@ struct ParallelJobScheduler::Impl {
             vOpts.bindings = bindings.get();
             vOpts.pureExternalSymbols = config.pureExternalSymbols;
             vOpts.pureExternalNames = config.pureExternalNames;
+            vOpts.allowRawColumnArrays = config.allowRawColumnArrays;
+            vOpts.allowReadOnlyStaticColumnLoads = config.allowReadOnlyStaticColumnLoads;
             report = verifyParallelJobFunction(*program, symbolId, vOpts);
         }
 
@@ -2012,18 +3622,84 @@ struct ParallelJobScheduler::Impl {
             heap->finishWallClockCycleForDeterminism(emptyRoots);
         }
 
-        // Verify referenced static fields are already materialized so workers never lazily write
+        // Verify referenced static fields are already materialized so workers never lazily write,
+        // and pre-bind any read-only static column arrays for zero-copy native execution + alias checks.
+        std::unordered_map<semantic::SymbolId, ParallelNativeColumnBinding> staticColumnBindings;
+        struct StaticBufferSpan {
+            ObjectRef ref{};
+            const void* basePtr = nullptr;
+            std::size_t byteExtent = 0;
+        };
+        std::vector<StaticBufferSpan> readOnlyStaticBuffers;
         for (const semantic::SymbolId staticId : report.referencedStaticFieldIds) {
-            if (!heap->hasStaticField(staticId)) {
+            const auto staticValOpt = heap->getStaticField(staticId);
+            if (!staticValOpt) {
                 result.error.code = ErrorCode::DeterminismViolation;
                 result.error.message =
                     "ParallelJob referenced uninitialized static field (lazy init forbidden in parallel region)";
                 return result;
             }
+            if (const auto* sRef = std::get_if<ObjectRef>(&*staticValOpt)) {
+                if (heap->isAlive(*sRef) && heap->arrayTypeId(*sRef).has_value()) {
+                    if (heap->isRawColumnArray(*sRef)) {
+                        if (!config.allowRawColumnArrays) {
+                            result.error.code = ErrorCode::CapabilityDenied;
+                            result.error.message =
+                                "ParallelJob static raw column load requires allowRawColumnArrays = true";
+                            return result;
+                        }
+                        const NativeRawColumnView* rawView = heap->rawColumnView(*sRef);
+                        if (!rawView || (rawView->count > 0u && rawView->basePtr == nullptr)) {
+                            result.error.code = ErrorCode::InvalidArguments;
+                            result.error.message =
+                                "ParallelJob static raw column has invalid storage";
+                            return result;
+                        }
+                        ParallelNativeColumnBinding col{};
+                        col.parameterIndex = std::numeric_limits<std::size_t>::max();
+                        col.userArgIndex = std::numeric_limits<std::size_t>::max();
+                        col.basePtr = rawView->basePtr;
+                        col.count = rawView->count;
+                        col.strideBytes = rawView->strideBytes;
+                        col.readOnly = true;
+                        col.isWritten = false;
+                        col.mode = rawView->mode;
+                        col.elementType = rawView->elementType;
+                        col.elementTypeId = rawView->elementTypeId;
+                        col.packedEncoding = rawView->packedEncoding;
+                        col.rawColumnView = rawView;
+                        staticColumnBindings.emplace(staticId, col);
+                        readOnlyStaticBuffers.push_back(StaticBufferSpan{
+                            *sRef, rawView->basePtr, rawView->count * rawView->strideBytes});
+                    } else {
+                        PackedArrayFastView packedView{};
+                        if (heap->tryBindPackedArrayFastView(*sRef, packedView)) {
+                            ParallelNativeColumnBinding col{};
+                            col.parameterIndex = std::numeric_limits<std::size_t>::max();
+                            col.userArgIndex = std::numeric_limits<std::size_t>::max();
+                            col.basePtr = packedView.rawData;
+                            col.count = packedView.length;
+                            col.strideBytes = packedView.strideBytes;
+                            col.readOnly = true;
+                            col.isWritten = false;
+                            col.mode = RawColumnMode::ScalarPacked;
+                            col.elementType = packedView.elementType;
+                            col.elementTypeId = packedView.elementTypeId;
+                            col.packedEncoding = packedView.encoding;
+                            col.packedView = packedView;
+                            staticColumnBindings.emplace(staticId, col);
+                            readOnlyStaticBuffers.push_back(StaticBufferSpan{
+                                *sRef,
+                                packedView.rawData,
+                                static_cast<std::size_t>(packedView.length) * packedView.strideBytes});
+                        }
+                    }
+                }
+            }
         }
 
-        // 3. Pre-validate all user arguments (PackedArray liveness, encoding & Object liveness)
-        //    and check output vs input ObjectRef non-aliasing on the main thread!
+        // 3. Pre-validate all user arguments (PackedArray / RawColumn liveness, encoding & Object liveness)
+        //    and check output vs input ObjectRef & raw-buffer non-aliasing on the main thread!
         std::unordered_set<std::size_t> readParamSet(
             report.readArrayParamIndices.begin(),
             report.readArrayParamIndices.end());
@@ -2049,12 +3725,15 @@ struct ParallelJobScheduler::Impl {
             std::size_t fullParamIndex = 0;
             std::size_t userArgIndex = 0;
             ObjectRef ref{};
-            PackedArrayFastView view{};
+            const void* basePtr = nullptr;
+            std::size_t byteExtent = 0;
             bool isRead = false;
             bool isWrite = false;
         };
         std::vector<ValidatedArrayArg> arrayArgs;
         arrayArgs.reserve(userArguments.size());
+        std::vector<ParallelNativeColumnBinding> paramColumns;
+        paramColumns.reserve(userArguments.size());
         std::vector<Value> normalizedUserArguments;
         normalizedUserArguments.reserve(userArguments.size());
 
@@ -2088,13 +3767,6 @@ struct ParallelJobScheduler::Impl {
                         " runtime array type mismatch";
                     return result;
                 }
-                PackedArrayFastView view{};
-                if (!heap->tryBindPackedArrayFastView(*ref, view)) {
-                    result.error.code = ErrorCode::TypeMismatch;
-                    result.error.message = "ParallelJob array argument " + std::to_string(u) +
-                        " is not backed by P0 PackedArray storage";
-                    return result;
-                }
                 const bool isRead = readParamSet.find(pIdx) != readParamSet.end();
                 const bool isWrite = writeParamSet.find(pIdx) != writeParamSet.end();
                 if (isRead && isWrite && !config.allowInPlaceSingleArrayReadWrite) {
@@ -2103,7 +3775,71 @@ struct ParallelJobScheduler::Impl {
                         " performs both read and write while allowInPlaceSingleArrayReadWrite is false";
                     return result;
                 }
-                arrayArgs.push_back(ValidatedArrayArg{pIdx, u, *ref, view, isRead, isWrite});
+                if (heap->isRawColumnArray(*ref)) {
+                    if (!config.allowRawColumnArrays) {
+                        result.error.code = ErrorCode::CapabilityDenied;
+                        result.error.message = "ParallelJob raw column array argument " +
+                            std::to_string(u) + " requires allowRawColumnArrays = true";
+                        return result;
+                    }
+                    const NativeRawColumnView* rawView = heap->rawColumnView(*ref);
+                    if (!rawView || (rawView->count > 0u && rawView->basePtr == nullptr)) {
+                        result.error.code = ErrorCode::InvalidArguments;
+                        result.error.message = "ParallelJob raw column array argument " +
+                            std::to_string(u) + " has invalid host column view";
+                        return result;
+                    }
+                    if (rawView->readOnly && isWrite) {
+                        result.error.code = ErrorCode::CapabilityDenied;
+                        result.error.message = "ParallelJob read-only raw column array argument " +
+                            std::to_string(u) + " cannot be written";
+                        return result;
+                    }
+                    ParallelNativeColumnBinding col{};
+                    col.parameterIndex = pIdx;
+                    col.userArgIndex = u;
+                    col.basePtr = rawView->basePtr;
+                    col.count = rawView->count;
+                    col.strideBytes = rawView->strideBytes;
+                    col.readOnly = rawView->readOnly;
+                    col.isWritten = isWrite;
+                    col.mode = rawView->mode;
+                    col.elementType = rawView->elementType;
+                    col.elementTypeId = rawView->elementTypeId;
+                    col.packedEncoding = rawView->packedEncoding;
+                    col.rawColumnView = rawView;
+                    paramColumns.push_back(col);
+                    arrayArgs.push_back(ValidatedArrayArg{
+                        pIdx, u, *ref, rawView->basePtr, rawView->count * rawView->strideBytes,
+                        isRead, isWrite});
+                } else {
+                    PackedArrayFastView view{};
+                    if (!heap->tryBindPackedArrayFastView(*ref, view)) {
+                        result.error.code = ErrorCode::TypeMismatch;
+                        result.error.message = "ParallelJob array argument " + std::to_string(u) +
+                            " is not backed by P0 PackedArray storage";
+                        return result;
+                    }
+                    ParallelNativeColumnBinding col{};
+                    col.parameterIndex = pIdx;
+                    col.userArgIndex = u;
+                    col.basePtr = view.rawData;
+                    col.count = view.length;
+                    col.strideBytes = view.strideBytes;
+                    col.readOnly = (config.explicitReadOnlyUserArgIndices.find(u) !=
+                                    config.explicitReadOnlyUserArgIndices.end());
+                    col.isWritten = isWrite;
+                    col.mode = RawColumnMode::ScalarPacked;
+                    col.elementType = view.elementType;
+                    col.elementTypeId = view.elementTypeId;
+                    col.packedEncoding = view.encoding;
+                    col.packedView = view;
+                    paramColumns.push_back(col);
+                    arrayArgs.push_back(ValidatedArrayArg{
+                        pIdx, u, *ref, view.rawData,
+                        static_cast<std::size_t>(view.length) * view.strideBytes,
+                        isRead, isWrite});
+                }
             } else if (expectedPrim == semantic::PrimitiveType::Object) {
                 if (!std::holds_alternative<NullObject>(argVal)) {
                     const auto* ref = std::get_if<ObjectRef>(&argVal);
@@ -2156,20 +3892,52 @@ struct ParallelJobScheduler::Impl {
             normalizedUserArguments.push_back(std::move(normalizedArg));
         }
 
-        // Cross-parameter ObjectRef non-aliasing check:
-        // Any written output array must NOT share an ObjectRef with any other written
-        // or read-only array parameter!
+        // Cross-parameter ObjectRef & raw-buffer non-aliasing check:
+        // Any written output array must NOT share an ObjectRef or overlapping host memory
+        // with any other written or read-only array parameter or read-only static column!
+        const auto rawRangesOverlap = [](
+            const void* ptrA,
+            std::size_t bytesA,
+            const void* ptrB,
+            std::size_t bytesB) noexcept -> bool {
+            if (!ptrA || !ptrB || bytesA == 0u || bytesB == 0u) return false;
+            const auto a0 = reinterpret_cast<std::uintptr_t>(ptrA);
+            const auto b0 = reinterpret_cast<std::uintptr_t>(ptrB);
+            if (a0 == b0) return true;
+            if (a0 < b0) {
+                return (b0 - a0) < bytesA;
+            }
+            return (a0 - b0) < bytesB;
+        };
         for (std::size_t i = 0; i < arrayArgs.size(); ++i) {
             for (std::size_t j = i + 1u; j < arrayArgs.size(); ++j) {
-                if (arrayArgs[i].ref == arrayArgs[j].ref &&
-                    (arrayArgs[i].isWrite || arrayArgs[j].isWrite)) {
+                if ((arrayArgs[i].isWrite || arrayArgs[j].isWrite) &&
+                    (arrayArgs[i].ref == arrayArgs[j].ref ||
+                     rawRangesOverlap(
+                         arrayArgs[i].basePtr, arrayArgs[i].byteExtent,
+                         arrayArgs[j].basePtr, arrayArgs[j].byteExtent))) {
                     result.error.code = ErrorCode::InvalidArguments;
                     result.error.message =
                         "ParallelJob aliasing violation: array arguments " +
                         std::to_string(arrayArgs[i].userArgIndex) + " and " +
                         std::to_string(arrayArgs[j].userArgIndex) +
-                        " reference the same ObjectRef while at least one is written";
+                        " alias or overlap while at least one is written";
                     return result;
+                }
+            }
+            if (arrayArgs[i].isWrite) {
+                for (const auto& sc : readOnlyStaticBuffers) {
+                    if (arrayArgs[i].ref == sc.ref ||
+                        rawRangesOverlap(
+                            arrayArgs[i].basePtr, arrayArgs[i].byteExtent,
+                            sc.basePtr, sc.byteExtent)) {
+                        result.error.code = ErrorCode::InvalidArguments;
+                        result.error.message =
+                            "ParallelJob aliasing violation: written array argument " +
+                            std::to_string(arrayArgs[i].userArgIndex) +
+                            " aliases or overlaps a read-only static column";
+                        return result;
+                    }
                 }
             }
         }
@@ -2202,26 +3970,103 @@ struct ParallelJobScheduler::Impl {
         const std::size_t requestedWorkers = resolveWorkerCount(config.workerCount);
         const std::size_t effectiveWorkers = std::min(requestedWorkers, numBatches);
 
-        prepareWorkerInterpreters(
-            effectiveWorkers, program, heap, bindings, report.usesParallelPrng);
+        ParallelNativeBatchKernel activeNativeKernel;
+        std::vector<ParallelNativeColumnBinding> nativeColumns;
+        if (config.enableNativeBatchKernel) {
+            if (config.nativeBatchKernel) {
+                activeNativeKernel = config.nativeBatchKernel;
+                nativeColumns = paramColumns;
+                for (const auto& [sid, scb] : staticColumnBindings) {
+                    (void)sid;
+                    nativeColumns.push_back(scb);
+                }
+            } else {
+                const auto* entryLoc = program->resolveFunction(symbolId);
+                if (entryLoc != nullptr) {
+                    activeNativeKernel = tryBuildAutoNativeBatchKernel(
+                        *program,
+                        *entryLoc,
+                        kernelKind,
+                        prefixParamCount,
+                        paramColumns,
+                        staticColumnBindings,
+                        config,
+                        nativeColumns);
+                }
+            }
+        }
 
         std::vector<ParallelBatchOutcome> batchOutcomes(numBatches);
         std::atomic<std::size_t> nextChunkIndex{0u};
 
-        // Base per-invocation ExecutionOptions: force gcWorkBudget = 0 and strip
-        // non-thread-safe debugger hooks so worker Interpreters run 100% lock-free.
-        ExecutionOptions baseWorkerOpts = config.executionOptions;
-        baseWorkerOpts.limits.gcWorkBudget = 0u;
-        baseWorkerOpts.debugger.reset();
+        if (activeNativeKernel) {
+            result.usedNativeBatchKernel = true;
+            result.workerInterpretersConstructed = 0u;
 
-        {
-            // Enter zero-mutex lock-free parallel heap epoch on main thread!
+            // Enter zero-mutex lock-free parallel heap epoch without constructing worker Interpreters!
             ManagedHeap::ParallelLockFreeScope lockFreeHeapScope(*heap);
 
-            runOnWorkerPool(effectiveWorkers, [&](std::size_t workerSlot) {
-                // Hold a single ActiveMutatorScope per worker thread across the entire
-                // job so inner Interpreter::invoke() calls hit the 1ns TLS depth fast-path!
-                detail::ActiveMutatorScope outerWorkerMutatorScope;
+            runOnWorkerPool(effectiveWorkers, [&](std::size_t) {
+                for (;;) {
+                    const std::size_t chunkIndex =
+                        nextChunkIndex.fetch_add(1u, std::memory_order_relaxed);
+                    if (chunkIndex >= numBatches) break;
+
+                    const std::size_t batchStart = chunkIndex * config.batchSize;
+                    const std::size_t batchCount =
+                        std::min(config.batchSize, totalCount - batchStart);
+
+                    ParallelNativeBatchContext ctx{};
+                    ctx.batchIndex = chunkIndex;
+                    ctx.start = batchStart;
+                    ctx.count = batchCount;
+                    ctx.batchSeed = config.baseSeed ^ static_cast<std::uint32_t>(chunkIndex);
+                    ctx.heap = heap.get();
+                    ctx.userArguments = &normalizedUserArguments;
+                    ctx.columns = &nativeColumns;
+
+                    const bool ok = activeNativeKernel(ctx);
+                    auto& outSlot = batchOutcomes[chunkIndex];
+                    outSlot.succeeded = ok;
+                    outSlot.hasReducedValue = ok && ctx.hasReducedValue;
+                    outSlot.value = ok ? std::move(ctx.reducedValue) : Value{};
+                    outSlot.error = std::move(ctx.error);
+                    if (!ok && outSlot.error.code == ErrorCode::None) {
+                        outSlot.error.code = ErrorCode::ExecutionTerminated;
+                        outSlot.error.message = "ParallelNativeBatchKernel failed";
+                    }
+                    outSlot.statistics = ctx.statistics;
+
+                    std::uint64_t batchDigest = kFnvOffset;
+                    fnvMixScalar(batchDigest, static_cast<std::uint64_t>(chunkIndex));
+                    fnvMixScalar(batchDigest, static_cast<std::uint64_t>(batchCount));
+                    fnvMixScalar(batchDigest, ctx.batchSeed);
+                    fnvMixScalar(batchDigest, ok);
+                    if (outSlot.hasReducedValue) {
+                        fnvMixScalar(batchDigest, stableValueHash(outSlot.value));
+                    }
+                    outSlot.determinismDigest = batchDigest;
+                }
+            });
+        } else {
+            result.usedNativeBatchKernel = false;
+            result.workerInterpretersConstructed = prepareWorkerInterpreters(
+                effectiveWorkers, program, heap, bindings, report.usesParallelPrng);
+
+            // Base per-invocation ExecutionOptions: force gcWorkBudget = 0 and strip
+            // non-thread-safe debugger hooks so worker Interpreters run 100% lock-free.
+            ExecutionOptions baseWorkerOpts = config.executionOptions;
+            baseWorkerOpts.limits.gcWorkBudget = 0u;
+            baseWorkerOpts.debugger.reset();
+
+            {
+                // Enter zero-mutex lock-free parallel heap epoch on main thread!
+                ManagedHeap::ParallelLockFreeScope lockFreeHeapScope(*heap);
+
+                runOnWorkerPool(effectiveWorkers, [&](std::size_t workerSlot) {
+                    // Hold a single ActiveMutatorScope per worker thread across the entire
+                    // job so inner Interpreter::invoke() calls hit the 1ns TLS depth fast-path!
+                    detail::ActiveMutatorScope outerWorkerMutatorScope;
                 Interpreter& workerInterp = *workerInterpreters[workerSlot];
 
                 std::vector<Value> callArgs;
@@ -2325,7 +4170,8 @@ struct ParallelJobScheduler::Impl {
                     }
                 }
             });
-        } // Leaves ManagedHeap::ParallelLockFreeScope with release/acquire barrier
+            } // Leaves ManagedHeap::ParallelLockFreeScope with release/acquire barrier
+        } // Fallback workerInterpreter execution
 
         // 4. Deterministic ordered reduction across `chunkIndex = 0 .. numBatches - 1`
         result.numBatches = numBatches;

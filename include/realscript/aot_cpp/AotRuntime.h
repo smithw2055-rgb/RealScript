@@ -2,6 +2,7 @@
 
 #include "realscript/Version.h"
 #include "realscript/aot_cpp/RuntimeAbi.h"
+#include "realscript/hot_reload/HotReload.h"
 #include "realscript/runtime/AsyncHandles.h"
 #include "realscript/runtime/Runtime.h"
 #if !defined(REALSCRIPT_AOT_NO_ASYNC_INLINES)
@@ -447,6 +448,22 @@ struct AttributeDescriptor {
     const char* name = nullptr;
 };
 
+struct HotPatchSlot {
+    semantic::SymbolId symbolId = 0;
+    const char* name = nullptr;
+    FunctionImplementation originalImplementation = nullptr;
+    FunctionImplementation patchedImplementation = nullptr;
+    std::uint32_t revision = 0;
+};
+
+struct HotPatchResult {
+    bool applied = false;
+    std::uint32_t revision = 0;
+    std::size_t patchedMethodCount = 0;
+    std::vector<semantic::SymbolId> patchedSymbolIds;
+    std::string message;
+};
+
 struct ProgramDescriptor {
     std::uint32_t abiMajor = RuntimeAbiMajor;
     std::uint32_t abiMinor = RuntimeAbiMinor;
@@ -462,6 +479,8 @@ struct ProgramDescriptor {
     std::uint32_t sourceMapCount = 0;
     const AttributeDescriptor* attributes = nullptr;
     std::uint32_t attributeCount = 0;
+    HotPatchSlot* hotPatchSlots = nullptr;
+    std::uint32_t hotPatchSlotCount = 0;
 };
 
 #if defined(_MSC_VER)
@@ -876,6 +895,22 @@ public:
             stackSites_.back().generatedLine = generatedLine;
         }
     }
+    void setHotPatchedBodies(
+        const std::unordered_map<semantic::SymbolId, FunctionImplementation>* patchedBodies) noexcept {
+        hotPatchedBodiesPtr_ = patchedBodies;
+    }
+    [[nodiscard]] FunctionImplementation resolveHotPatchImplementation(
+        semantic::SymbolId symbolId) const noexcept {
+        if (RS_AOT_LIKELY(!hotPatchedBodiesPtr_ || hotPatchedBodiesPtr_->empty())) {
+            return nullptr;
+        }
+        const auto it = hotPatchedBodiesPtr_->find(symbolId);
+        return it == hotPatchedBodiesPtr_->end() ? nullptr : it->second;
+    }
+    [[nodiscard]] bool hasHotPatchOverride(
+        semantic::SymbolId symbolId) const noexcept {
+        return resolveHotPatchImplementation(symbolId) != nullptr;
+    }
 
     template <bool FastAccounting, bool DeterminismAccounting, bool TrustedRelease = false>
     [[nodiscard]] bool enterTypedDirectCall(
@@ -917,6 +952,10 @@ public:
                     stack_.size());
                 ++determinismEventCount_;
             } else if constexpr (!FastAccounting) {
+                if (options_.profile) {
+                    profileSpanStarts_.push_back(
+                        options_.profile->nowSteadyNs());
+                }
                 emitTrace(runtime::TraceEventKind::FunctionEnter);
             }
             return true;
@@ -934,6 +973,23 @@ public:
             (void)boxReturnValue;
             return;
         } else {
+            if constexpr (!FastAccounting && !DeterminismAccounting) {
+                if (options_.profile && !profileSpanStarts_.empty()) {
+                    const std::uint64_t startNs = profileSpanStarts_.back();
+                    profileSpanStarts_.pop_back();
+                    const std::uint64_t endNs =
+                        options_.profile->nowSteadyNs();
+                    const std::uint64_t durationNs =
+                        endNs >= startNs ? (endNs - startNs) : 0ULL;
+                    const char* fnName = stack_.empty() ? "<aot-function>" : stack_.back();
+                    options_.profile->recordTraceSpan(
+                        currentFunctionId_,
+                        fnName ? std::string_view(fnName) : std::string_view("<aot-function>"),
+                        startNs,
+                        durationNs,
+                        stack_.size());
+                }
+            }
             if (succeeded) {
                 if constexpr (DeterminismAccounting) {
                     determinismEventDigest_ = runtime::accumulateDeterminismEvent(
@@ -2355,6 +2411,8 @@ private:
     std::uint32_t activeStackRefScopes_ = 0;
     std::uint8_t stackRefBankId_ = 0;
     bool stackRefRootPushed_ = false;
+    const std::unordered_map<semantic::SymbolId, FunctionImplementation>* hotPatchedBodiesPtr_ = nullptr;
+    std::vector<std::uint64_t> profileSpanStarts_;
 };
 
 class Program {
@@ -2386,6 +2444,16 @@ public:
     [[nodiscard]] std::vector<std::string> symbolizeStackTrace(
         const runtime::RuntimeError& error) const;
 
+    [[nodiscard]] HotPatchResult applyMethodBodyHotPatch(
+        const hot_reload::ReloadPlan& plan,
+        const ProgramDescriptor& replacementProgram);
+    [[nodiscard]] HotPatchResult applyMethodBodyHotPatch(
+        const hot_reload::ReloadPlan& plan,
+        const std::unordered_map<semantic::SymbolId, FunctionImplementation>& patchedBodies);
+    [[nodiscard]] std::uint32_t hotPatchRevision() const noexcept {
+        return hotPatchRevision_;
+    }
+
     [[nodiscard]] runtime::ExecutionResult invoke(
         semantic::SymbolId symbolId,
         const std::vector<runtime::Value>& arguments = {},
@@ -2401,6 +2469,11 @@ private:
         const Program* program = nullptr;
     };
 
+    struct ModifiedHotPatchSlotRecord {
+        HotPatchSlot* slot = nullptr;
+        FunctionImplementation originalImplementation = nullptr;
+    };
+
     void registerValueLifecycleHooks();
 
     const ProgramDescriptor* descriptor_ = nullptr;
@@ -2413,6 +2486,9 @@ private:
     std::unordered_map<std::string, semantic::SymbolId> names_;
     std::unordered_map<semantic::SymbolId, const TypeDescriptor*> types_;
     std::unordered_map<semantic::SymbolId, const FunctionDescriptor*> functions_;
+    std::uint32_t hotPatchRevision_ = 0;
+    std::unordered_map<semantic::SymbolId, FunctionImplementation> hotPatchedBodies_;
+    std::vector<ModifiedHotPatchSlotRecord> modifiedHotPatchSlots_;
 };
 
 // Typed host binding adapters. They keep generated/native call sites on stable
