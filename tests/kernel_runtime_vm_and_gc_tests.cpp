@@ -1022,6 +1022,296 @@ void testManagedHeapTrimExcessCapacity() {
         "Slot reuse after trimExcessCapacity must preserve generation ABA safety");
 }
 
+// ---------------------------------------------------------------------------
+// 10. L0 Dirty Callbacks, Dynamic Array Ops, UTF-8/Borrowed, Weak Delegates & Policy
+// ---------------------------------------------------------------------------
+struct L0CallbackLog {
+    std::size_t fieldCallbacks = 0;
+    runtime::ObjectRef lastFieldObj{};
+    std::size_t lastFieldIndex = 0;
+    std::uint8_t lastDirtyBit = 0xFFu;
+    std::vector<runtime::ArrayMutationOp> arrayOps;
+    std::vector<runtime::ObjectRef> sweptRefs;
+};
+
+void onL0FieldMutated(
+    void* userData,
+    runtime::ManagedHeap&,
+    runtime::ObjectRef object,
+    std::size_t fieldIndex,
+    std::uint8_t dirtyBit) {
+    auto* log = static_cast<L0CallbackLog*>(userData);
+    ++log->fieldCallbacks;
+    log->lastFieldObj = object;
+    log->lastFieldIndex = fieldIndex;
+    log->lastDirtyBit = dirtyBit;
+}
+
+void onL0ArrayMutated(
+    void* userData,
+    runtime::ManagedHeap&,
+    runtime::ObjectRef,
+    runtime::ArrayMutationOp op,
+    std::size_t,
+    const runtime::Value&,
+    const runtime::Value&) {
+    auto* log = static_cast<L0CallbackLog*>(userData);
+    log->arrayOps.push_back(op);
+}
+
+void onL0SlotSwept(
+    void* userData,
+    runtime::ManagedHeap&,
+    runtime::ObjectRef sweptRef) {
+    auto* log = static_cast<L0CallbackLog*>(userData);
+    log->sweptRefs.push_back(sweptRef);
+}
+
+class InterceptCallPolicy final : public runtime::IExecutionPolicy {
+public:
+    semantic::SymbolId targetFn = 0;
+    bool interceptEnabled = true;
+    std::size_t seenCalls = 0;
+
+    bool interceptCall(
+        semantic::SymbolId functionId,
+        runtime::ValueSpan arguments,
+        bool& outIntercepted,
+        runtime::Value& outResult,
+        runtime::RuntimeError&) override {
+        if (functionId == targetFn && interceptEnabled) {
+            ++seenCalls;
+            outIntercepted = true;
+            const std::int64_t arg0 =
+                (!arguments.empty() && std::holds_alternative<std::int64_t>(arguments[0]))
+                    ? std::get<std::int64_t>(arguments[0])
+                    : 0;
+            outResult = runtime::Value{arg0 * 10 + 7};
+            return true;
+        }
+        outIntercepted = false;
+        return true;
+    }
+};
+
+void testL0DirtyCallbacksArraysUtf8WeakDelegatesAndPolicy() {
+    // A. Dirty tracking, observation flags, dynamic array ops & slot sweep callback
+    {
+        runtime::ManagedHeap heap;
+        L0CallbackLog log{};
+        heap.setFieldMutationCallback(&onL0FieldMutated, &log);
+        heap.setArrayMutationCallback(&onL0ArrayMutated, &log);
+        heap.setSlotSweepCallback(&onL0SlotSwept, &log);
+
+        const auto baseType = semantic::stableTypeId("L0Test::BaseObj");
+        const auto derivedType = semantic::stableTypeId("L0Test::DerivedObj");
+        heap.registerTypeParent(derivedType, baseType);
+        heap.enableTypeDirtyTracking(derivedType, {2u, 5u});
+
+        auto objOpt = heap.allocateObject(
+            derivedType,
+            {runtime::Value{std::int64_t{10}}, runtime::Value{std::int64_t{20}}},
+            {});
+        require(objOpt.has_value(), "allocateObject failed");
+        const auto objRef = *objOpt;
+        require(heap.setObjectObserved(objRef, true) && heap.isObjectObserved(objRef),
+            "setObjectObserved/isObjectObserved failed");
+
+        require(heap.fieldSet(objRef, 1u, runtime::Value{std::int64_t{99}}), "fieldSet failed");
+        require(log.fieldCallbacks >= 1u && log.lastFieldObj == objRef &&
+                log.lastFieldIndex == 1u && log.lastDirtyBit == 5u,
+            "FieldMutationCallback did not report expected dirtyBit");
+        require((heap.peekDirtyMask(objRef) & (1ULL << 5u)) != 0ULL,
+            "peekDirtyMask missing bit 5 after fieldSet");
+
+        require(heap.markDirtyBit(objRef, 11u), "markDirtyBit failed");
+        const auto mask = heap.consumeDirtyMask(objRef);
+        require((mask & ((1ULL << 5u) | (1ULL << 11u))) == ((1ULL << 5u) | (1ULL << 11u)) &&
+                heap.peekDirtyMask(objRef) == 0ULL,
+            "consumeDirtyMask must return combined mask and reset to 0");
+        const auto dirtyObjs = heap.consumeDirtyObjects();
+        require(!dirtyObjs.empty(), "Expected non-empty consumeDirtyObjects");
+
+        auto arrOpt = heap.allocateArray(0);
+        require(arrOpt.has_value(), "allocateArray failed");
+        const auto arrRef = *arrOpt;
+        require(heap.setArrayObserved(arrRef, true) && heap.isArrayObserved(arrRef),
+            "setArrayObserved/isArrayObserved failed");
+        auto arrPin = heap.retain(runtime::Value{arrRef});
+        require(heap.arrayPush(arrRef, runtime::Value{std::int64_t{10}}), "arrayPush failed");
+        require(heap.arrayInsert(arrRef, 0u, runtime::Value{std::int64_t{5}}), "arrayInsert failed");
+        require(heap.arraySet(arrRef, 1u, runtime::Value{std::int64_t{15}}), "arraySet failed");
+        runtime::Value removedVal;
+        require(heap.arrayRemoveAt(arrRef, 0u, &removedVal) &&
+                std::get<std::int64_t>(removedVal) == 5,
+            "arrayRemoveAt failed");
+        require(heap.arrayClear(arrRef) && heap.arrayLength(arrRef) == std::optional<std::size_t>(0),
+            "arrayClear failed");
+        require(log.arrayOps.size() == 5u &&
+                log.arrayOps[0] == runtime::ArrayMutationOp::Push &&
+                log.arrayOps[1] == runtime::ArrayMutationOp::Insert &&
+                log.arrayOps[2] == runtime::ArrayMutationOp::Set &&
+                log.arrayOps[3] == runtime::ArrayMutationOp::RemoveAt &&
+                log.arrayOps[4] == runtime::ArrayMutationOp::Clear,
+            "ArrayMutationCallback ops mismatch");
+
+        // Trigger GC sweep on unpinned objRef and verify SlotSweepCallback fires.
+        heap.collect(runtime::RootSet{});
+        bool sawObjSwept = false;
+        for (const auto swept : log.sweptRefs) {
+            if (swept == objRef) {
+                sawObjSwept = true;
+                break;
+            }
+        }
+        require(sawObjSwept, "SlotSweepCallback did not fire for collected ObjectRef");
+    }
+
+    // B. UTF-8 helpers + NativeHandleRegistry::createBorrowed
+    {
+        require(runtime::utf8IsAsciiFast("Hello_L0"), "ASCII check failed");
+        require(!runtime::utf8IsAsciiFast("Hi\xE4\xB8\xAD"), "Non-ASCII check failed");
+        const std::string utf8 = "A\xE4\xB8\xAD\xF0\x9F\x9A\x80Z"; // A + 中 + rocket + Z
+        require(runtime::utf8CodePointLength(utf8) == 4u, "utf8CodePointLength expected 4");
+        require(runtime::utf8CodePointSlice(utf8, 1u, 2u) == "\xE4\xB8\xAD\xF0\x9F\x9A\x80",
+            "utf8CodePointSlice failed");
+        require(runtime::utf8CodePointIndexOf(utf8, "\xF0\x9F\x9A\x80") == 2,
+            "utf8CodePointIndexOf failed");
+        require(runtime::utf8CodePointLastIndexOf("ab\xE4\xB8\xAD" "ab", "ab") == 3,
+            "utf8CodePointLastIndexOf failed");
+        std::u16string utf16;
+        std::string roundTrip;
+        runtime::utf8ToUtf16(utf8, utf16);
+        runtime::utf16ToUtf8(utf16, roundTrip);
+        require(roundTrip == utf8, "utf8 <-> utf16 roundtrip mismatch");
+
+        runtime::NativeHandleRegistry handles;
+        int dummyNative = 123;
+        const auto handleType = semantic::stableTypeId("L0Test::NativeObj");
+        const auto h = handles.createBorrowed(handleType, &dummyNative, true);
+        require(h.valid() && handles.findHandle(handleType, &dummyNative) == std::optional<runtime::NativeHandle>(h),
+            "createBorrowed / findHandle failed");
+        runtime::ManagedHeap heap;
+        auto wOpt = heap.allocateRecord(1u);
+        require(wOpt.has_value(), "allocateRecord for wrapper failed");
+        require(handles.setCachedWrapper(h, *wOpt, heap.heapId()), "setCachedWrapper failed");
+        require(handles.cachedWrapper(h, heap.heapId()) == wOpt, "cachedWrapper lookup failed");
+        require(handles.removeCachedWrapper(h, heap.heapId()), "removeCachedWrapper failed");
+        require(!handles.cachedWrapper(h, heap.heapId()).has_value(), "Expected cleared wrapper");
+    }
+
+    // C. Weak delegates (live, GC-expired void & non-void, multicast prune) + IExecutionPolicy::interceptCall
+    {
+        const std::string src = R"RS(
+module Kernel.WeakAndPolicy;
+public delegate int IntAction();
+public delegate void VoidAction();
+public class Target {
+    public int id = 0;
+    public int GetVal() { return id + 70; }
+    public void Ping() { id = id + 10; }
+}
+public int RunInt(IntAction d) { return d(); }
+public void RunVoid(VoidAction d) { d(); }
+public VoidAction CombineVoid(VoidAction a, VoidAction b) { return a + b; }
+public int PolicyTarget(int x) { return x + 100; }
+)RS";
+        auto prog = compileAndLink({{"weak_policy.rscript", src}});
+        auto heap = std::make_shared<runtime::ManagedHeap>();
+        runtime::Interpreter interp(prog, heap);
+
+        semantic::SymbolId getValId = 0;
+        semantic::SymbolId pingId = 0;
+        for (const auto& mod : prog->modules()) {
+            for (const auto& fn : mod.functions) {
+                if (fn.name.find("Target.GetVal") != std::string::npos) getValId = fn.symbolId;
+                if (fn.name.find("Target.Ping") != std::string::npos) pingId = fn.symbolId;
+            }
+        }
+        require(getValId != 0 && pingId != 0, "Could not locate Target method SymbolIds");
+
+        const auto targetTypeId = semantic::stableTypeId("Kernel.WeakAndPolicy::Target");
+        const auto intDelTypeId = semantic::stableTypeId("Kernel.WeakAndPolicy::IntAction");
+        const auto voidDelTypeId = semantic::stableTypeId("Kernel.WeakAndPolicy::VoidAction");
+
+        auto t1Opt = heap->allocateObject(targetTypeId, {runtime::Value{std::int64_t{7}}}, {});
+        auto t2Opt = heap->allocateObject(targetTypeId, {runtime::Value{std::int64_t{1}}}, {});
+        require(t1Opt.has_value() && t2Opt.has_value(), "Target allocation failed");
+        const auto t1 = *t1Opt;
+        const auto t2 = *t2Opt;
+
+        auto pinT1 = heap->retain(runtime::Value{t1});
+        auto pinT2 = heap->retain(runtime::Value{t2});
+
+        auto weakIntOpt = heap->allocateWeakDelegate(intDelTypeId, t2, getValId);
+        auto weakVoidLiveOpt = heap->allocateWeakDelegate(voidDelTypeId, t1, pingId);
+        auto weakVoidDeadOpt = heap->allocateWeakDelegate(voidDelTypeId, t2, pingId);
+        require(weakIntOpt.has_value() && weakVoidLiveOpt.has_value() && weakVoidDeadOpt.has_value(),
+            "allocateWeakDelegate failed");
+
+        auto pinWeakInt = heap->retain(runtime::Value{*weakIntOpt});
+        const auto combRes = interp.invoke(
+            "Kernel.WeakAndPolicy::CombineVoid",
+            {runtime::Value{*weakVoidLiveOpt}, runtime::Value{*weakVoidDeadOpt}});
+        require(combRes.succeeded && std::holds_alternative<runtime::ObjectRef>(combRes.value),
+            "CombineVoid failed");
+        auto pinComb = heap->retain(combRes.value);
+
+        // 1. Live invocation succeeds
+        const auto liveInt = interp.invoke(
+            "Kernel.WeakAndPolicy::RunInt", {runtime::Value{*weakIntOpt}});
+        require(liveInt.succeeded && std::get<std::int64_t>(liveInt.value) == 71,
+            "Live weak IntAction expected 71");
+
+        // 2. Drop pinT2 and collect GC -> t2 dies, t1 stays alive!
+        pinT2.reset();
+        heap->collect(runtime::RootSet{});
+        require(!heap->isAlive(t2) && heap->isAlive(t1), "GC state for weak targets mismatch");
+
+        // Expired non-void weak delegate returns default int 0 without crashing
+        const auto deadInt = interp.invoke(
+            "Kernel.WeakAndPolicy::RunInt", {runtime::Value{*weakIntOpt}});
+        require(deadInt.succeeded && std::holds_alternative<std::int64_t>(deadInt.value) &&
+                std::get<std::int64_t>(deadInt.value) == 0,
+            "Expired non-void weak delegate must return default int 0");
+
+        // Multicast weak invocation runs live leaf (t1.id += 10) and skips dead t2 cleanly
+        const auto multiRun = interp.invoke("Kernel.WeakAndPolicy::RunVoid", {combRes.value});
+        require(multiRun.succeeded, "Multicast weak RunVoid failed");
+        require(heap->fieldGet(t1, 0u) == std::optional<runtime::Value>(runtime::Value{std::int64_t{17}}),
+            "Expected live leaf t1.id to become 17");
+
+        // pruneDelegateChain prunes dead leaf and leaves live leaf
+        const auto pruned = heap->pruneDelegateChain(combRes.value);
+        require(std::holds_alternative<runtime::ObjectRef>(pruned) &&
+                std::get<runtime::ObjectRef>(pruned) != std::get<runtime::ObjectRef>(combRes.value),
+            "pruneDelegateChain should collapse multicast to remaining live leaf");
+        const auto deadPrune = heap->pruneDelegateChain(runtime::Value{*weakIntOpt});
+        require(std::holds_alternative<runtime::NullObject>(deadPrune),
+            "pruneDelegateChain on expired single weak delegate must return NullObject");
+
+        // 3. IExecutionPolicy::interceptCall
+        const auto policyFnOpt = prog->findFunction("Kernel.WeakAndPolicy::PolicyTarget");
+        require(policyFnOpt.has_value(), "PolicyTarget function not found");
+        InterceptCallPolicy policy;
+        policy.targetFn = *policyFnOpt;
+        interp.setExecutionPolicy(&policy);
+
+        const auto interceptedRes = interp.invoke(
+            *policyFnOpt, {runtime::Value{std::int64_t{5}}});
+        require(interceptedRes.succeeded && std::get<std::int64_t>(interceptedRes.value) == 57 &&
+                policy.seenCalls == 1u,
+            "IExecutionPolicy::interceptCall expected 57");
+
+        policy.interceptEnabled = false;
+        const auto passthroughRes = interp.invoke(
+            *policyFnOpt, {runtime::Value{std::int64_t{5}}});
+        require(passthroughRes.succeeded && std::get<std::int64_t>(passthroughRes.value) == 105,
+            "IExecutionPolicy bypass expected 105");
+        interp.setExecutionPolicy(nullptr);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1036,6 +1326,7 @@ int main() {
             {"Pillar 2: [ValueLifecycle] ManagedHeap sweep & ResourceServer useCount", testValueLifecycleHeapSweepResourceServer},
             {"Pillar 4: Zero-copy NativeBufferView, Span<T>, readOnly & revocation", testZeroCopyNativeBufferViewsAndRevocation},
             {"Pillar 6: ManagedHeap::trimExcessCapacity & ABA safety", testManagedHeapTrimExcessCapacity},
+            {"L0 dirty callbacks, dynamic array ops, UTF-8/borrowed, weak delegates & IExecutionPolicy", testL0DirtyCallbacksArraysUtf8WeakDelegatesAndPolicy},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

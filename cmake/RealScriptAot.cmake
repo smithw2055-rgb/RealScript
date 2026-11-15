@@ -10,6 +10,7 @@ function(realscript_add_aot_library target)
         NO_SHARED_GENERICS
         TRUSTED_RELEASE
         CACHE_STATS
+        NO_PROJECT_CONFIG
     )
     set(one_value_args
         PROGRAM_NAME
@@ -18,8 +19,13 @@ function(realscript_add_aot_library target)
         OUTPUT_DIRECTORY
         CACHE_DIR
         OPT_LEVEL
+        PROJECT_CONFIG
     )
-    set(multi_value_args SOURCES)
+    set(multi_value_args
+        SOURCES
+        MODULE_PACKS
+        COMPILER_PLUGINS
+    )
     cmake_parse_arguments(
         RSAOT
         "${options}"
@@ -112,6 +118,52 @@ function(realscript_add_aot_library target)
     if(RSAOT_CACHE_STATS)
         list(APPEND generator_arguments --cache-stats)
     endif()
+    set(aot_extra_depends)
+    if(RSAOT_NO_PROJECT_CONFIG)
+        list(APPEND generator_arguments --no-project-config)
+    elseif(RSAOT_PROJECT_CONFIG)
+        if(IS_ABSOLUTE "${RSAOT_PROJECT_CONFIG}")
+            set(resolved_project_config "${RSAOT_PROJECT_CONFIG}")
+        else()
+            get_filename_component(
+                resolved_project_config
+                "${RSAOT_PROJECT_CONFIG}"
+                REALPATH
+                BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
+            )
+        endif()
+        list(APPEND generator_arguments --project "${resolved_project_config}")
+        list(APPEND aot_extra_depends "${resolved_project_config}")
+    endif()
+    foreach(pack_entry IN LISTS RSAOT_MODULE_PACKS)
+        if(IS_ABSOLUTE "${pack_entry}")
+            set(resolved_pack "${pack_entry}")
+        else()
+            get_filename_component(
+                resolved_pack
+                "${pack_entry}"
+                REALPATH
+                BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
+            )
+        endif()
+        list(APPEND generator_arguments --pack "${resolved_pack}")
+        if(NOT IS_DIRECTORY "${resolved_pack}")
+            list(APPEND aot_extra_depends "${resolved_pack}")
+        endif()
+    endforeach()
+    foreach(plugin_entry IN LISTS RSAOT_COMPILER_PLUGINS)
+        if(IS_ABSOLUTE "${plugin_entry}" OR "${plugin_entry}" MATCHES "^\\$<")
+            set(resolved_plugin "${plugin_entry}")
+        else()
+            get_filename_component(
+                resolved_plugin
+                "${plugin_entry}"
+                REALPATH
+                BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
+            )
+        endif()
+        list(APPEND generator_arguments --plugin "${resolved_plugin}")
+    endforeach()
     list(APPEND generator_arguments ${aot_sources})
 
     add_custom_command(
@@ -126,7 +178,7 @@ function(realscript_add_aot_library target)
             "${generated_header}"
             "${generated_source}"
             "${generated_manifest}"
-        DEPENDS ${realscript_rsaot_target} ${aot_sources}
+        DEPENDS ${realscript_rsaot_target} ${aot_sources} ${aot_extra_depends}
         COMMENT "Generating RealScript C++17 AOT target ${target}"
         VERBATIM
     )

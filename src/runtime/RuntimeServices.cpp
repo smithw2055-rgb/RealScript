@@ -2231,14 +2231,15 @@ bool makeIntrinsicStringResult(
     std::string text,
     ManagedHeap* heap,
     Value& result,
-    std::string& errorMessage) {
+    RuntimeError& error) {
     if (heap) {
         RuntimeError err;
         const auto ref = heap->allocateString(std::move(text), &err);
         if (!ref) {
-            errorMessage = err.message.empty()
+            error.code = err.code != ErrorCode::None ? err.code : ErrorCode::OutOfMemory;
+            error.message = err.message.empty()
                 ? "out of memory allocating string"
-                : err.message;
+                : std::move(err.message);
             return false;
         }
         result = *ref;
@@ -2248,14 +2249,37 @@ bool makeIntrinsicStringResult(
     return true;
 }
 
-} // namespace
+std::optional<std::string_view> extractIntrinsicStringView(
+    const Value& val,
+    const ManagedHeap* heap) noexcept {
+    if (const auto* sv = std::get_if<StringValue>(&val)) {
+        return sv->view();
+    }
+    if (const auto* ref = std::get_if<ObjectRef>(&val)) {
+        if (heap && ref->kind == ObjectKind::String) {
+            return heap->stringView(*ref);
+        }
+    }
+    return std::nullopt;
+}
 
-bool tryExecuteRuntimeIntrinsic(
+bool tryExecuteRuntimeIntrinsicImpl(
     std::string_view name,
     ValueSpan arguments,
     ManagedHeap* heap,
     Value& result,
-    std::string& errorMessage) {
+    RuntimeError& error) {
+    const auto setErr = [&](ErrorCode code, std::string msg) -> bool {
+        error.code = code;
+        error.message = std::move(msg);
+        return false;
+    };
+    const auto propagateErr = [&](RuntimeError err, std::string fallback) -> bool {
+        error.code = err.code != ErrorCode::None ? err.code : ErrorCode::InvalidProgram;
+        error.message = err.message.empty() ? std::move(fallback) : std::move(err.message);
+        return false;
+    };
+
     constexpr std::string_view prefix = "$intrinsic::";
     if (name.rfind(prefix, 0) != 0) return false;
     const std::string_view op = name.substr(prefix.size());
@@ -2320,8 +2344,7 @@ bool tryExecuteRuntimeIntrinsic(
             }
             const auto& cached = cacheIt->second;
             if (!cached.valid) {
-                errorMessage = "malformed ecs_col intrinsic";
-                return false;
+                return setErr(ErrorCode::InvalidProgram, "malformed ecs_col intrinsic");
             }
             const auto getOrCreateEmptyColArray = [&]() -> Value {
                 if (!arguments.empty() && std::holds_alternative<ObjectRef>(arguments[0])) {
@@ -2423,8 +2446,7 @@ bool tryExecuteRuntimeIntrinsic(
             const auto outArr = heap->allocateTypedArray(
                 arrTypeId, elemPrim, elemTypeId, matchedVals.size(), matchedVals[0], &allocErr);
             if (!outArr) {
-                errorMessage = allocErr.message;
-                return false;
+                return propagateErr(std::move(allocErr), "out of memory allocating ecs column array");
             }
             for (std::size_t i = 0; i < matchedVals.size(); ++i) {
                 (void)heap->arraySet(*outArr, i, matchedVals[i], &allocErr);
@@ -2511,8 +2533,7 @@ bool tryExecuteRuntimeIntrinsic(
                 std::int64_t{0},
                 &allocErr);
             if (!outArr) {
-                errorMessage = allocErr.message;
-                return false;
+                return propagateErr(std::move(allocErr), "out of memory allocating ecs entity array");
             }
             for (std::size_t i = 0; i < matched.size(); ++i) {
                 (void)heap->arraySet(*outArr, i, matched[i], &allocErr);
@@ -2612,8 +2633,8 @@ bool tryExecuteRuntimeIntrinsic(
                 const auto targetVal = heap->getStaticField(cached.wbTargetId);
                 if (targetVal && std::holds_alternative<ObjectRef>(*targetVal)) {
                     const auto targetRef = std::get<ObjectRef>(*targetVal);
-                    RuntimeError setErr;
-                    (void)heap->arraySet(targetRef, srcIdx, arguments[1], &setErr);
+                    RuntimeError arrSetErr;
+                    (void)heap->arraySet(targetRef, srcIdx, arguments[1], &arrSetErr);
                     result = std::monostate{};
                     return true;
                 }
@@ -2643,8 +2664,8 @@ bool tryExecuteRuntimeIntrinsic(
                 if (it != sparseIds.end() && *it == entId) {
                     const auto srcIdx = static_cast<std::size_t>(
                         std::distance(sparseIds.begin(), it));
-                    RuntimeError setErr;
-                    (void)heap->arraySet(sparseValsRef, srcIdx, arguments[1], &setErr);
+                    RuntimeError arrSetErr;
+                    (void)heap->arraySet(sparseValsRef, srcIdx, arguments[1], &arrSetErr);
                 }
             }
         }
@@ -2750,55 +2771,50 @@ bool tryExecuteRuntimeIntrinsic(
 
     if (op == "string_concat") {
         if (arguments.size() != 2) {
-            errorMessage = "string_concat requires 2 arguments";
-            return false;
+            return setErr(ErrorCode::InvalidArguments, "string_concat requires 2 arguments");
         }
         return makeIntrinsicStringResult(
             detail::extractIntrinsicString(arguments[0], heap) +
                 detail::extractIntrinsicString(arguments[1], heap),
             heap,
             result,
-            errorMessage);
+            error);
     }
 
     constexpr std::string_view toStringPrefix = "to_string::";
     if (op.rfind(toStringPrefix, 0) == 0) {
         if (arguments.empty()) {
-            errorMessage = "to_string requires 1 argument";
-            return false;
+            return setErr(ErrorCode::InvalidArguments, "to_string requires 1 argument");
         }
         const auto& val = arguments[0];
         if (const auto* d = std::get_if<double>(&val)) {
             char buf[64];
             std::snprintf(buf, sizeof(buf), "%g", *d);
-            return makeIntrinsicStringResult(buf, heap, result, errorMessage);
+            return makeIntrinsicStringResult(buf, heap, result, error);
         }
         if (const auto* f = std::get_if<FloatValue>(&val)) {
             char buf[64];
             std::snprintf(buf, sizeof(buf), "%g", static_cast<double>(f->value));
-            return makeIntrinsicStringResult(buf, heap, result, errorMessage);
+            return makeIntrinsicStringResult(buf, heap, result, error);
         }
         return makeIntrinsicStringResult(
-            valueToString(val, heap), heap, result, errorMessage);
+            valueToString(val, heap), heap, result, error);
     }
 
     if (op.rfind("array_", 0) == 0) {
         if (arguments.empty() || std::holds_alternative<NullArray>(arguments[0])) {
-            errorMessage = "cannot invoke array method on null array";
-            return false;
+            return setErr(ErrorCode::NullReference, "cannot invoke array method on null array");
         }
         const auto* arrRef = std::get_if<ObjectRef>(&arguments[0]);
         const auto lenOpt = (arrRef && heap) ? heap->arrayLength(*arrRef) : std::nullopt;
         if (!lenOpt) {
-            errorMessage = "invalid array reference";
-            return false;
+            return setErr(ErrorCode::InvalidObjectReference, "invalid array reference");
         }
         const std::size_t len = *lenOpt;
 
         if (op.rfind("array_index_of::", 0) == 0) {
             if (arguments.size() < 2) {
-                errorMessage = "array_index_of requires 2 arguments";
-                return false;
+                return setErr(ErrorCode::InvalidArguments, "array_index_of requires 2 arguments");
             }
             std::int64_t found = -1;
             for (std::size_t i = 0; i < len; ++i) {
@@ -2813,8 +2829,7 @@ bool tryExecuteRuntimeIntrinsic(
         }
         if (op.rfind("array_last_index_of::", 0) == 0) {
             if (arguments.size() < 2) {
-                errorMessage = "array_last_index_of requires 2 arguments";
-                return false;
+                return setErr(ErrorCode::InvalidArguments, "array_last_index_of requires 2 arguments");
             }
             std::int64_t found = -1;
             for (std::size_t i = len; i > 0; --i) {
@@ -2829,8 +2844,7 @@ bool tryExecuteRuntimeIntrinsic(
         }
         if (op.rfind("array_contains::", 0) == 0) {
             if (arguments.size() < 2) {
-                errorMessage = "array_contains requires 2 arguments";
-                return false;
+                return setErr(ErrorCode::InvalidArguments, "array_contains requires 2 arguments");
             }
             bool found = false;
             for (std::size_t i = 0; i < len; ++i) {
@@ -2843,16 +2857,94 @@ bool tryExecuteRuntimeIntrinsic(
             result = found;
             return true;
         }
-        if (op.rfind("array_reverse::", 0) == 0) {
-            for (std::size_t i = 0; i < len / 2; ++i) {
-                const std::size_t j = len - 1 - i;
-                const auto leftVal = heap->arrayGet(*arrRef, i);
-                const auto rightVal = heap->arrayGet(*arrRef, j);
-                if (leftVal && rightVal) {
-                    RuntimeError setErr;
-                    (void)heap->arraySet(*arrRef, i, *rightVal, &setErr);
-                    (void)heap->arraySet(*arrRef, j, *leftVal, &setErr);
+        if (op.rfind("array_push::", 0) == 0) {
+            if (arguments.size() < 2) {
+                return setErr(ErrorCode::InvalidArguments, "array_push requires 2 arguments");
+            }
+            RuntimeError mutErr;
+            if (!heap->arrayPush(
+                    *arrRef,
+                    arguments[1],
+                    &mutErr,
+                    ArrayStoreTypePolicy::PrevalidatedAssignableObject)) {
+                return propagateErr(std::move(mutErr), "array push failed");
+            }
+            result = std::monostate{};
+            return true;
+        }
+        if (op.rfind("array_insert::", 0) == 0) {
+            if (arguments.size() < 3 || !std::holds_alternative<std::int64_t>(arguments[1])) {
+                return setErr(ErrorCode::InvalidArguments, "array_insert requires (array, int index, value)");
+            }
+            const auto rawIdx = std::get<std::int64_t>(arguments[1]);
+            if (rawIdx < 0 || static_cast<std::size_t>(rawIdx) > len) {
+                return setErr(ErrorCode::IndexOutOfRange, "array insert index is out of range");
+            }
+            RuntimeError mutErr;
+            if (!heap->arrayInsert(
+                    *arrRef,
+                    static_cast<std::size_t>(rawIdx),
+                    arguments[2],
+                    &mutErr,
+                    ArrayStoreTypePolicy::PrevalidatedAssignableObject)) {
+                return propagateErr(std::move(mutErr), "array insert failed");
+            }
+            result = std::monostate{};
+            return true;
+        }
+        if (op.rfind("array_remove_at::", 0) == 0) {
+            if (arguments.size() < 2 || !std::holds_alternative<std::int64_t>(arguments[1])) {
+                return setErr(ErrorCode::InvalidArguments, "array_remove_at requires (array, int index)");
+            }
+            const auto rawIdx = std::get<std::int64_t>(arguments[1]);
+            if (rawIdx < 0 || static_cast<std::size_t>(rawIdx) >= len) {
+                return setErr(ErrorCode::IndexOutOfRange, "array removeAt index is out of range");
+            }
+            RuntimeError mutErr;
+            if (!heap->arrayRemoveAt(*arrRef, static_cast<std::size_t>(rawIdx), nullptr, &mutErr)) {
+                return propagateErr(std::move(mutErr), "array removeAt failed");
+            }
+            result = std::monostate{};
+            return true;
+        }
+        if (op.rfind("array_pop::", 0) == 0) {
+            if (len == 0) {
+                return setErr(ErrorCode::IndexOutOfRange, "cannot pop from an empty array");
+            }
+            Value popped{};
+            RuntimeError mutErr;
+            if (!heap->arrayRemoveAt(*arrRef, len - 1u, &popped, &mutErr)) {
+                return propagateErr(std::move(mutErr), "array pop failed");
+            }
+            result = std::move(popped);
+            return true;
+        }
+        if (op.rfind("array_clear::", 0) == 0) {
+            RuntimeError mutErr;
+            if (!heap->arrayClear(*arrRef, &mutErr)) {
+                return propagateErr(std::move(mutErr), "array clear failed");
+            }
+            result = std::monostate{};
+            return true;
+        }
+        if (op.rfind("array_reserve::", 0) == 0) {
+            if (arguments.size() < 2 || !std::holds_alternative<std::int64_t>(arguments[1])) {
+                return setErr(ErrorCode::InvalidArguments, "array_reserve requires (array, int capacity)");
+            }
+            const auto rawCap = std::get<std::int64_t>(arguments[1]);
+            if (rawCap > 0) {
+                RuntimeError mutErr;
+                if (!heap->arrayReserve(*arrRef, static_cast<std::size_t>(rawCap), &mutErr)) {
+                    return propagateErr(std::move(mutErr), "array reserve failed");
                 }
+            }
+            result = std::monostate{};
+            return true;
+        }
+        if (op.rfind("array_reverse::", 0) == 0) {
+            RuntimeError mutErr;
+            if (!heap->arrayReverse(*arrRef, &mutErr)) {
+                return propagateErr(std::move(mutErr), "array reverse failed");
             }
             result = std::monostate{};
             return true;
@@ -2879,9 +2971,9 @@ bool tryExecuteRuntimeIntrinsic(
                     [heap](const Value& a, const Value& b) {
                         return detail::intrinsicValueLess(a, b, heap);
                     });
-                RuntimeError setErr;
-                for (std::size_t i = 0; i < sortLen; ++i) {
-                    (void)heap->arraySet(*arrRef, i, elems[i], &setErr);
+                RuntimeError mutErr;
+                if (!heap->arrayWritePrefixWithReset(*arrRef, elems.data(), sortLen, &mutErr)) {
+                    return propagateErr(std::move(mutErr), "array sort failed");
                 }
             }
             result = std::monostate{};
@@ -2890,16 +2982,23 @@ bool tryExecuteRuntimeIntrinsic(
     }
 
     if (!arguments.empty() && std::holds_alternative<NullString>(arguments[0])) {
-        errorMessage = "cannot invoke string method on null string";
-        return false;
+        return setErr(ErrorCode::NullReference, "cannot invoke string method on null string");
     }
 
     if (op == "string_length") {
-        result = static_cast<std::int64_t>(
-            detail::extractIntrinsicString(arguments[0], heap).size());
+        if (const auto svOpt = extractIntrinsicStringView(arguments[0], heap)) {
+            result = static_cast<std::int64_t>(utf8CodePointLength(*svOpt));
+            return true;
+        }
+        const auto s = detail::extractIntrinsicString(arguments[0], heap);
+        result = static_cast<std::int64_t>(utf8CodePointLength(s));
         return true;
     }
     if (op == "string_is_empty") {
+        if (const auto svOpt = extractIntrinsicStringView(arguments[0], heap)) {
+            result = svOpt->empty();
+            return true;
+        }
         result = detail::extractIntrinsicString(arguments[0], heap).empty();
         return true;
     }
@@ -2923,21 +3022,27 @@ bool tryExecuteRuntimeIntrinsic(
         return true;
     }
     if (op == "string_index_of") {
+        if (const auto sView = extractIntrinsicStringView(arguments[0], heap)) {
+            if (const auto subView = extractIntrinsicStringView(arguments[1], heap)) {
+                result = utf8CodePointIndexOf(*sView, *subView);
+                return true;
+            }
+        }
         const auto s = detail::extractIntrinsicString(arguments[0], heap);
         const auto sub = detail::extractIntrinsicString(arguments[1], heap);
-        const auto pos = s.find(sub);
-        result = (pos == std::string::npos)
-            ? std::int64_t{-1}
-            : static_cast<std::int64_t>(pos);
+        result = utf8CodePointIndexOf(s, sub);
         return true;
     }
     if (op == "string_last_index_of") {
+        if (const auto sView = extractIntrinsicStringView(arguments[0], heap)) {
+            if (const auto subView = extractIntrinsicStringView(arguments[1], heap)) {
+                result = utf8CodePointLastIndexOf(*sView, *subView);
+                return true;
+            }
+        }
         const auto s = detail::extractIntrinsicString(arguments[0], heap);
         const auto sub = detail::extractIntrinsicString(arguments[1], heap);
-        const auto pos = s.rfind(sub);
-        result = (pos == std::string::npos)
-            ? std::int64_t{-1}
-            : static_cast<std::int64_t>(pos);
+        result = utf8CodePointLastIndexOf(s, sub);
         return true;
     }
     if (op == "string_substring_1") {
@@ -2945,13 +3050,12 @@ bool tryExecuteRuntimeIntrinsic(
         const auto rawStart = std::holds_alternative<std::int64_t>(arguments[1])
             ? std::get<std::int64_t>(arguments[1])
             : 0;
-        const auto clampedStart = std::clamp<std::int64_t>(
-            rawStart, 0, static_cast<std::int64_t>(s.size()));
+        const auto safeStart = static_cast<std::size_t>(std::max<std::int64_t>(0, rawStart));
         return makeIntrinsicStringResult(
-            s.substr(static_cast<std::size_t>(clampedStart)),
+            std::string(utf8CodePointSlice(s, safeStart)),
             heap,
             result,
-            errorMessage);
+            error);
     }
     if (op == "string_substring_2") {
         const auto s = detail::extractIntrinsicString(arguments[0], heap);
@@ -2961,17 +3065,13 @@ bool tryExecuteRuntimeIntrinsic(
         const auto rawLen = std::holds_alternative<std::int64_t>(arguments[2])
             ? std::get<std::int64_t>(arguments[2])
             : 0;
-        const auto clampedStart = std::clamp<std::int64_t>(
-            rawStart, 0, static_cast<std::int64_t>(s.size()));
-        const auto clampedLen = std::clamp<std::int64_t>(
-            rawLen, 0, static_cast<std::int64_t>(s.size()) - clampedStart);
+        const auto safeStart = static_cast<std::size_t>(std::max<std::int64_t>(0, rawStart));
+        const auto safeLen = static_cast<std::size_t>(std::max<std::int64_t>(0, rawLen));
         return makeIntrinsicStringResult(
-            s.substr(
-                static_cast<std::size_t>(clampedStart),
-                static_cast<std::size_t>(clampedLen)),
+            std::string(utf8CodePointSlice(s, safeStart, safeLen)),
             heap,
             result,
-            errorMessage);
+            error);
     }
     if (op == "string_trim") {
         const auto s = detail::extractIntrinsicString(arguments[0], heap);
@@ -2988,7 +3088,7 @@ bool tryExecuteRuntimeIntrinsic(
             --last;
         }
         return makeIntrinsicStringResult(
-            s.substr(first, last - first), heap, result, errorMessage);
+            s.substr(first, last - first), heap, result, error);
     }
     if (op == "string_trim_start") {
         const auto s = detail::extractIntrinsicString(arguments[0], heap);
@@ -3001,7 +3101,7 @@ bool tryExecuteRuntimeIntrinsic(
             ++first;
         }
         return makeIntrinsicStringResult(
-            s.substr(first), heap, result, errorMessage);
+            s.substr(first), heap, result, error);
     }
     if (op == "string_trim_end") {
         const auto s = detail::extractIntrinsicString(arguments[0], heap);
@@ -3014,12 +3114,11 @@ bool tryExecuteRuntimeIntrinsic(
             --last;
         }
         return makeIntrinsicStringResult(
-            s.substr(0, last), heap, result, errorMessage);
+            s.substr(0, last), heap, result, error);
     }
     if (op == "string_split") {
         if (!heap) {
-            errorMessage = "string_split requires a managed heap";
-            return false;
+            return setErr(ErrorCode::InvalidArguments, "string_split requires a managed heap");
         }
         const auto s = detail::extractIntrinsicString(arguments[0], heap);
         const auto sep = detail::extractIntrinsicString(arguments[1], heap);
@@ -3043,10 +3142,7 @@ bool tryExecuteRuntimeIntrinsic(
         RuntimeError allocErr;
         const auto defaultStrRef = heap->allocateString("", &allocErr);
         if (!defaultStrRef) {
-            errorMessage = allocErr.message.empty()
-                ? "out of memory allocating string array"
-                : allocErr.message;
-            return false;
+            return propagateErr(std::move(allocErr), "out of memory allocating string array");
         }
         const auto arrRef = heap->allocateTypedArray(
             arrTypeId,
@@ -3056,18 +3152,12 @@ bool tryExecuteRuntimeIntrinsic(
             *defaultStrRef,
             &allocErr);
         if (!arrRef) {
-            errorMessage = allocErr.message.empty()
-                ? "out of memory allocating string array"
-                : allocErr.message;
-            return false;
+            return propagateErr(std::move(allocErr), "out of memory allocating string array");
         }
         for (std::size_t i = 0; i < parts.size(); ++i) {
             const auto elemStrRef = heap->allocateString(std::move(parts[i]), &allocErr);
             if (!elemStrRef || !heap->arraySet(*arrRef, i, *elemStrRef, &allocErr)) {
-                errorMessage = allocErr.message.empty()
-                    ? "out of memory populating string array"
-                    : allocErr.message;
-                return false;
+                return propagateErr(std::move(allocErr), "out of memory populating string array");
             }
         }
         result = *arrRef;
@@ -3084,7 +3174,7 @@ bool tryExecuteRuntimeIntrinsic(
                 pos += to.size();
             }
         }
-        return makeIntrinsicStringResult(std::move(s), heap, result, errorMessage);
+        return makeIntrinsicStringResult(std::move(s), heap, result, error);
     }
     if (op == "string_to_upper") {
         auto s = detail::extractIntrinsicString(arguments[0], heap);
@@ -3093,7 +3183,7 @@ bool tryExecuteRuntimeIntrinsic(
                 ch = static_cast<char>(ch - 'a' + 'A');
             }
         }
-        return makeIntrinsicStringResult(std::move(s), heap, result, errorMessage);
+        return makeIntrinsicStringResult(std::move(s), heap, result, error);
     }
     if (op == "string_to_lower") {
         auto s = detail::extractIntrinsicString(arguments[0], heap);
@@ -3102,10 +3192,34 @@ bool tryExecuteRuntimeIntrinsic(
                 ch = static_cast<char>(ch - 'A' + 'a');
             }
         }
-        return makeIntrinsicStringResult(std::move(s), heap, result, errorMessage);
+        return makeIntrinsicStringResult(std::move(s), heap, result, error);
     }
 
-    errorMessage = "unknown runtime intrinsic '" + std::string(name) + "'";
+    return setErr(ErrorCode::InvalidProgram, "unknown runtime intrinsic '" + std::string(name) + "'");
+}
+
+} // namespace
+
+bool tryExecuteRuntimeIntrinsic(
+    std::string_view name,
+    ValueSpan arguments,
+    ManagedHeap* heap,
+    Value& result,
+    RuntimeError& error) {
+    return tryExecuteRuntimeIntrinsicImpl(name, arguments, heap, result, error);
+}
+
+bool tryExecuteRuntimeIntrinsic(
+    std::string_view name,
+    ValueSpan arguments,
+    ManagedHeap* heap,
+    Value& result,
+    std::string& errorMessage) {
+    RuntimeError error;
+    if (tryExecuteRuntimeIntrinsicImpl(name, arguments, heap, result, error)) {
+        return true;
+    }
+    errorMessage = std::move(error.message);
     return false;
 }
 
@@ -3613,6 +3727,126 @@ RuntimeValuePoolStatistics getRuntimeValuePoolStatistics() noexcept {
     }
 
     return stats;
+}
+
+bool utf8IsAsciiFast(std::string_view text) noexcept {
+    const char* ptr = text.data();
+    const std::size_t n = text.size();
+    std::size_t i = 0;
+    while (i + 8 <= n) {
+        std::uint64_t word = 0;
+        std::memcpy(&word, ptr + i, sizeof(word));
+        if ((word & 0x8080808080808080ULL) != 0) {
+            return false;
+        }
+        i += 8;
+    }
+    for (; i < n; ++i) {
+        if ((static_cast<unsigned char>(ptr[i]) & 0x80u) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::size_t utf8CodePointLength(std::string_view text) noexcept {
+    if (utf8IsAsciiFast(text)) {
+        return text.size();
+    }
+    std::size_t count = 0;
+    for (unsigned char ch : text) {
+        if ((ch & 0xC0u) != 0x80u) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+std::string_view utf8CodePointSlice(
+    std::string_view text,
+    std::size_t startCodePoint,
+    std::size_t codePointCount) noexcept {
+    if (utf8IsAsciiFast(text)) {
+        const std::size_t clampedStart = std::min(startCodePoint, text.size());
+        if (codePointCount == std::string_view::npos) {
+            return text.substr(clampedStart);
+        }
+        const std::size_t clampedLen = std::min(codePointCount, text.size() - clampedStart);
+        return text.substr(clampedStart, clampedLen);
+    }
+    const std::size_t n = text.size();
+    std::size_t byteIdx = 0;
+    std::size_t cpIdx = 0;
+    while (byteIdx < n && cpIdx < startCodePoint) {
+        ++byteIdx;
+        while (byteIdx < n &&
+               (static_cast<unsigned char>(text[byteIdx]) & 0xC0u) == 0x80u) {
+            ++byteIdx;
+        }
+        ++cpIdx;
+    }
+    const std::size_t startByte = byteIdx;
+    if (codePointCount == std::string_view::npos) {
+        return text.substr(startByte);
+    }
+    std::size_t taken = 0;
+    while (byteIdx < n && taken < codePointCount) {
+        ++byteIdx;
+        while (byteIdx < n &&
+               (static_cast<unsigned char>(text[byteIdx]) & 0xC0u) == 0x80u) {
+            ++byteIdx;
+        }
+        ++taken;
+    }
+    return text.substr(startByte, byteIdx - startByte);
+}
+
+std::int64_t utf8CodePointIndexOf(
+    std::string_view text,
+    std::string_view needle) noexcept {
+    const std::size_t bytePos = text.find(needle);
+    if (bytePos == std::string_view::npos) {
+        return -1;
+    }
+    if (bytePos == 0) {
+        return 0;
+    }
+    return static_cast<std::int64_t>(utf8CodePointLength(text.substr(0, bytePos)));
+}
+
+std::int64_t utf8CodePointLastIndexOf(
+    std::string_view text,
+    std::string_view needle) noexcept {
+    const std::size_t bytePos = text.rfind(needle);
+    if (bytePos == std::string_view::npos) {
+        return -1;
+    }
+    if (bytePos == 0) {
+        return 0;
+    }
+    return static_cast<std::int64_t>(utf8CodePointLength(text.substr(0, bytePos)));
+}
+
+bool StringValue::isAsciiFast() const noexcept {
+    return utf8IsAsciiFast(view());
+}
+
+std::size_t StringValue::codePointLength() const noexcept {
+    return utf8CodePointLength(view());
+}
+
+std::string_view StringValue::codePointSlice(
+    std::size_t startCodePoint,
+    std::size_t codePointCount) const noexcept {
+    return utf8CodePointSlice(view(), startCodePoint, codePointCount);
+}
+
+std::int64_t StringValue::codePointIndexOf(std::string_view needle) const noexcept {
+    return utf8CodePointIndexOf(view(), needle);
+}
+
+std::int64_t StringValue::codePointLastIndexOf(std::string_view needle) const noexcept {
+    return utf8CodePointLastIndexOf(view(), needle);
 }
 
 } // namespace realscript::runtime

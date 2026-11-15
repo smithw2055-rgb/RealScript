@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -165,6 +166,21 @@ FrameScope::FrameScope(
     context_->shadowStack().pushFrame(&arguments, &locals, &registers);
 }
 
+FrameScope::FrameScope(
+    ExecutionContext& context,
+    runtime::ValueSpan arguments,
+    runtime::ValueSpan locals,
+    runtime::ValueSpan registers,
+    bool allowTransientStackSlices)
+    : context_(&context),
+      savedStackRefTop_(context.stackRefTop_),
+      allowTransientStackSlices_(allowTransientStackSlices) {
+    if (allowTransientStackSlices_) {
+        ++context.activeStackRefScopes_;
+    }
+    context_->shadowStack().pushSpanFrame(arguments, locals, registers);
+}
+
 FrameScope::~FrameScope() {
     if (!context_) return;
     context_->shadowStack().popFrame();
@@ -210,6 +226,7 @@ ExecutionContext::ExecutionContext(
     const std::unordered_map<semantic::SymbolId, const FunctionDescriptor*>* prebuiltFunctions)
     : program_(&program),
       heap_(heap ? std::move(heap) : std::make_shared<runtime::ManagedHeap>()),
+      executionPolicy_(options.executionPolicy),
       bindings_(std::move(bindings)),
       options_([&]() {
           if (options.enforceCapabilities) {
@@ -291,6 +308,67 @@ ExecutionContext::~ExecutionContext() {
         runtime::detail::releaseFlatStackBank(stackRefBankId_);
         stackRefBankId_ = 0u;
     }
+}
+
+runtime::CrossHeapAccessPolicy ExecutionContext::effectiveCrossHeapPolicy(
+    const runtime::ManagedHeap* targetHeap) const noexcept {
+    auto policy = options_.crossHeapPolicy;
+    if (executionPolicy_) {
+        const auto domainPolicy =
+            executionPolicy_->crossHeapAccessPolicy(heap_.get(), targetHeap);
+        if (static_cast<std::uint8_t>(domainPolicy) >
+            static_cast<std::uint8_t>(policy)) {
+            policy = domainPolicy;
+        }
+    }
+    return policy;
+}
+
+bool ExecutionContext::checkCrossHeapRefAccess(
+    runtime::ObjectRef reference,
+    bool isWrite,
+    std::string_view context) {
+    if (reference.isStackSlotRef() || !heap_ || !reference.valid()) {
+        return true;
+    }
+    if (reference.heapId != 0 &&
+        reference.heapId != static_cast<std::uint32_t>(heap_->heapId())) {
+        runtime::ManagedHeap* targetHeap = resolveHeap(reference);
+        const auto policy = effectiveCrossHeapPolicy(targetHeap);
+        if (isWrite) {
+            if (policy != runtime::CrossHeapAccessPolicy::AllowReadWrite) {
+                return fail(
+                    runtime::ErrorCode::CrossHeapAccessViolation,
+                    std::string(context) +
+                        " rejected cross-heap mutation by active CrossHeapAccessPolicy");
+            }
+        } else if (policy == runtime::CrossHeapAccessPolicy::Deny) {
+            return fail(
+                runtime::ErrorCode::CrossHeapAccessViolation,
+                std::string(context) +
+                    " rejected cross-heap access by active CrossHeapAccessPolicy");
+        }
+    }
+    return true;
+}
+
+runtime::Value ExecutionContext::sanitizeCrossHeapValue(
+    runtime::ManagedHeap* sourceHeap,
+    runtime::Value val) {
+    if (sourceHeap && heap_ && sourceHeap != heap_.get()) {
+        if (const auto* strRef = std::get_if<runtime::ObjectRef>(&val)) {
+            if (strRef->kind == runtime::ObjectKind::String) {
+                if (const auto sv = sourceHeap->stringView(*strRef)) {
+                    runtime::RuntimeError err;
+                    if (const auto interned = heap_->internString(*sv, &err)) {
+                        return runtime::Value{*interned};
+                    }
+                    return runtime::Value{runtime::StringValue(std::string(*sv))};
+                }
+            }
+        }
+    }
+    return val;
 }
 
 namespace {
@@ -601,7 +679,16 @@ bool ExecutionContext::branch(std::uint32_t blockId) {
 
 bool ExecutionContext::throwScript(const runtime::Value& value) {
     const auto* reference = std::get_if<runtime::ObjectRef>(&value);
-    if (!reference || !heap_ || !heap_->isAlive(*reference)) {
+    if (!reference) {
+        return fail(
+            runtime::ErrorCode::NullReference,
+            "throw requires a non-null script object");
+    }
+    if (!checkCrossHeapRefAccess(*reference, false, "throw")) {
+        return false;
+    }
+    auto* targetHeap = resolveHeap(*reference);
+    if (!targetHeap || !targetHeap->isAlive(*reference)) {
         return fail(
             runtime::ErrorCode::NullReference,
             "throw requires a non-null script object");
@@ -623,8 +710,10 @@ bool ExecutionContext::pendingExceptionMatches(
     if (typeId == 0) return true;
     const auto* reference = std::get_if<runtime::ObjectRef>(
         &*pendingException_);
-    if (!reference || !heap_) return false;
-    const auto actual = heap_->objectTypeId(*reference);
+    if (!reference) return false;
+    auto* targetHeap = resolveHeap(*reference);
+    if (!targetHeap) return false;
+    const auto actual = targetHeap->objectTypeId(*reference);
     return actual && isAssignable(*actual, typeId);
 }
 
@@ -661,11 +750,17 @@ bool ExecutionContext::expectType(
                     std::string(context) +
                         " contains an expired AOT stack slot reference");
             }
-        } else if (!heap_ || !heap_->isAlive(*reference)) {
-            return fail(
-                runtime::ErrorCode::InvalidObjectReference,
-                std::string(context) +
-                    " contains an invalid managed object reference");
+        } else {
+            if (!checkCrossHeapRefAccess(*reference, false, context)) {
+                return false;
+            }
+            auto* targetHeap = resolveHeap(*reference);
+            if (!targetHeap || !targetHeap->isAlive(*reference)) {
+                return fail(
+                    runtime::ErrorCode::InvalidObjectReference,
+                    std::string(context) +
+                        " contains an invalid managed object reference");
+            }
         }
     }
     if (runtime::valueType(value) != type) {
@@ -708,8 +803,9 @@ bool ExecutionContext::expectSignatureType(
                 runtime::ErrorCode::TypeMismatch,
                 std::string(context) + " has an incompatible AOT stack reference type");
         }
-        const auto actual = reference && heap_
-            ? heap_->objectTypeId(*reference)
+        auto* targetHeap = reference ? resolveHeap(*reference) : nullptr;
+        const auto actual = reference && targetHeap
+            ? targetHeap->objectTypeId(*reference)
             : std::optional<semantic::SymbolId>{};
         if (!actual || !isAssignable(*actual, typeId)) {
             return fail(
@@ -721,8 +817,9 @@ bool ExecutionContext::expectSignatureType(
             return true;
         }
         const auto* reference = std::get_if<runtime::ObjectRef>(&value);
-        const auto actual = reference && heap_
-            ? heap_->arrayTypeId(*reference)
+        auto* targetHeap = reference ? resolveHeap(*reference) : nullptr;
+        const auto actual = reference && targetHeap
+            ? targetHeap->arrayTypeId(*reference)
             : std::optional<semantic::SymbolId>{};
         if (!actual || *actual != typeId) {
             return fail(
@@ -854,6 +951,51 @@ bool ExecutionContext::invoke(
             }
         }
     }
+    if (!isResumingThisFunction && executionPolicy_) {
+        bool intercepted = false;
+        runtime::Value interceptedResult{};
+        runtime::RuntimeError policyError{};
+        if (!executionPolicy_->interceptCall(
+                function->symbolId,
+                runtime::ValueSpan(arguments, argumentCount),
+                intercepted,
+                interceptedResult,
+                policyError)) {
+            const auto previousFunctionId = currentFunctionId_;
+            currentFunctionId_ = function->symbolId;
+            stack_.push_back(function->name ? function->name : "<aot-function>");
+            stackSites_.push_back({function->symbolId, 0});
+            error_ = std::move(policyError);
+            if (error_.code == runtime::ErrorCode::None) {
+                error_.code = runtime::ErrorCode::CapabilityDenied;
+            }
+            if (error_.message.empty()) {
+                error_.message = "call intercepted and rejected by execution policy";
+            }
+            populateErrorStackTrace();
+            if (!stack_.empty()) stack_.pop_back();
+            if (!stackSites_.empty()) stackSites_.pop_back();
+            currentFunctionId_ = previousFunctionId;
+            return false;
+        }
+        if (intercepted) {
+            if (function->returnType == semantic::PrimitiveType::Void) {
+                result = std::monostate{};
+            } else if (std::holds_alternative<std::monostate>(interceptedResult)) {
+                result = defaultValue(function->returnType, function->returnTypeId);
+            } else {
+                if (!expectSignatureType(
+                        interceptedResult,
+                        function->returnType,
+                        function->returnTypeId,
+                        "intercepted return value")) {
+                    return false;
+                }
+                result = std::move(interceptedResult);
+            }
+            return true;
+        }
+    }
 
     if (trustedReleaseEnabled()) {
         const auto previousFunctionId = currentFunctionId_;
@@ -886,6 +1028,7 @@ bool ExecutionContext::invoke(
     emitTrace(runtime::TraceEventKind::FunctionEnter);
 
     bool succeeded = false;
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
     try {
         succeeded = function->implementation(
             *this,
@@ -902,6 +1045,13 @@ bool ExecutionContext::invoke(
         succeeded = fail(runtime::ErrorCode::InvalidProgram,
             "AOT execution threw an unknown exception");
     }
+#else
+    succeeded = function->implementation(
+        *this,
+        arguments,
+        argumentCount,
+        result);
+#endif
     if (!succeeded) {
         if (!stack_.empty()) stack_.pop_back();
         if (!stackSites_.empty()) stackSites_.pop_back();
@@ -920,7 +1070,13 @@ bool ExecutionContext::invoke(
     }
     if (traceEventsEnabled_) {
         if (diagnosticEventsEnabled_) {
-            const auto operation = runtime::valueToString(result, heap_.get());
+            const auto* resHeap =
+                result.rawTag() == runtime::ValueTag::ObjectRef
+                    ? resolveHeap(result.asObjectRefUnchecked())
+                    : heap_.get();
+            const auto operation = runtime::valueToString(
+                result,
+                resHeap ? resHeap : heap_.get());
             emitTrace(runtime::TraceEventKind::FunctionExit, 0, operation);
         } else {
             emitTrace(runtime::TraceEventKind::FunctionExit);
@@ -978,8 +1134,17 @@ bool ExecutionContext::call(
         }
         const auto* receiver =
             std::get_if<runtime::ObjectRef>(&arguments[0]);
-        const auto actualTypeId = receiver && heap_
-            ? heap_->objectTypeId(*receiver)
+        if (!receiver) {
+            return fail(
+                runtime::ErrorCode::InvalidObjectReference,
+                "AOT virtual call receiver is invalid");
+        }
+        if (!checkCrossHeapRefAccess(*receiver, false, "virtual call")) {
+            return false;
+        }
+        auto* targetHeap = resolveHeap(*receiver);
+        const auto actualTypeId = targetHeap
+            ? targetHeap->objectTypeId(*receiver)
             : std::optional<semantic::SymbolId>{};
         const auto* actualType = actualTypeId
             ? findType(*actualTypeId)
@@ -1021,25 +1186,42 @@ bool ExecutionContext::call(
         }
         const auto* receiver =
             std::get_if<runtime::ObjectRef>(&arguments[0]);
-        const auto actualTypeId = receiver && heap_
-            ? heap_->objectTypeId(*receiver)
+        if (!receiver) {
+            return fail(
+                runtime::ErrorCode::InvalidObjectReference,
+                "AOT interface call receiver is invalid");
+        }
+        if (!checkCrossHeapRefAccess(*receiver, false, "interface call")) {
+            return false;
+        }
+        auto* targetHeap = resolveHeap(*receiver);
+        const auto actualTypeId = targetHeap
+            ? targetHeap->objectTypeId(*receiver)
             : std::optional<semantic::SymbolId>{};
         const auto* actualType = actualTypeId
             ? findType(*actualTypeId)
             : nullptr;
         const InterfaceDispatchDescriptor* implementation = nullptr;
-        if (actualType && actualType->interfaceDispatchMaps) {
-            for (std::uint32_t index = 0;
-                 index < actualType->interfaceDispatchMapCount;
-                 ++index) {
-                const auto& candidate =
-                    actualType->interfaceDispatchMaps[index];
-                if (candidate.interfaceTypeId ==
-                    signature.interfaceTypeId) {
-                    implementation = &candidate;
-                    break;
+        const auto* curType = actualType;
+        for (std::size_t depth = 0;
+             curType != nullptr && depth < 256 && implementation == nullptr;
+             ++depth) {
+            if (curType->interfaceDispatchMaps) {
+                for (std::uint32_t index = 0;
+                     index < curType->interfaceDispatchMapCount;
+                     ++index) {
+                    const auto& candidate =
+                        curType->interfaceDispatchMaps[index];
+                    if (candidate.interfaceTypeId ==
+                        signature.interfaceTypeId) {
+                        implementation = &candidate;
+                        break;
+                    }
                 }
             }
+            curType = curType->baseTypeId != 0
+                ? findType(curType->baseTypeId)
+                : nullptr;
         }
         if (!implementation || !implementation->slots ||
             signature.interfaceSlot >= implementation->slotCount) {
@@ -1082,17 +1264,19 @@ bool ExecutionContext::call(
     }
     if (signature.name &&
         std::string_view(signature.name).rfind("$intrinsic::", 0) == 0) {
-        std::string intrinsicError;
+        runtime::RuntimeError intrinsicError;
         if (!runtime::tryExecuteRuntimeIntrinsic(
                 signature.name,
                 runtime::ValueSpan(arguments, argumentCount),
                 heap_.get(),
                 result,
                 intrinsicError)) {
-            const auto code = intrinsicError.find("null") != std::string::npos
-                ? runtime::ErrorCode::NullReference
-                : runtime::ErrorCode::InvalidProgram;
-            return fail(code, intrinsicError);
+            const auto code = intrinsicError.code != runtime::ErrorCode::None
+                ? intrinsicError.code
+                : (intrinsicError.message.find("null") != std::string::npos
+                    ? runtime::ErrorCode::NullReference
+                    : runtime::ErrorCode::InvalidProgram);
+            return fail(code, intrinsicError.message);
         }
         return true;
     }
@@ -1177,6 +1361,16 @@ bool readAotDelegateIdFromFields(
     outId = static_cast<std::uint64_t>(static_cast<std::uint32_t>(lo)) |
         (static_cast<std::uint64_t>(static_cast<std::uint32_t>(hi)) << 32u);
     return true;
+}
+
+bool isValidAotDelegateFlags(
+    std::int64_t rawFlags,
+    bool allowMulticast) noexcept {
+    if (rawFlags < 0) return false;
+    if (rawFlags == 4) return allowMulticast;
+    const auto base = static_cast<std::uint64_t>(rawFlags) &
+        ~static_cast<std::uint64_t>(runtime::ManagedHeap::DelegateWeakTargetFlag);
+    return base <= 3u;
 }
 
 } // namespace
@@ -1293,27 +1487,51 @@ bool ExecutionContext::combineDelegates(
     std::int64_t leftFlags = -1, rightFlags = -1;
 
     if (!leftNull) {
+        if (left.rawTag() == runtime::ValueTag::ObjectRef &&
+            !checkCrossHeapRefAccess(
+                left.asObjectRefUnchecked(),
+                false,
+                "delegate combination left operand")) {
+            return false;
+        }
+        auto* leftHeap = left.rawTag() == runtime::ValueTag::ObjectRef
+            ? resolveHeap(left.asObjectRefUnchecked())
+            : nullptr;
         if (RS_AOT_UNLIKELY(left.rawTag() != runtime::ValueTag::ObjectRef ||
-                            !heap_->tryBindObjectFastView(left.asObjectRefUnchecked(), leftView) ||
+                            !leftHeap ||
+                            !leftHeap->tryBindObjectFastView(left.asObjectRefUnchecked(), leftView) ||
                             leftView.typeId != delegateTypeId ||
                             leftView.fieldCount != 8u)) {
             return expectSignatureType(left, semantic::PrimitiveType::Object, delegateTypeId,
                 "delegate combination left operand");
         }
-        if (RS_AOT_UNLIKELY(!leftView.fields[3].tryGetInt64(leftFlags) || leftFlags < 0 || leftFlags > 4)) {
+        if (RS_AOT_UNLIKELY(!leftView.fields[3].tryGetInt64(leftFlags) ||
+                            !isValidAotDelegateFlags(leftFlags, true))) {
             return fail(runtime::ErrorCode::InvalidProgram,
                 "AOT delegate invocation-list metadata is corrupt");
         }
     }
     if (!rightNull) {
+        if (right.rawTag() == runtime::ValueTag::ObjectRef &&
+            !checkCrossHeapRefAccess(
+                right.asObjectRefUnchecked(),
+                false,
+                "delegate combination right operand")) {
+            return false;
+        }
+        auto* rightHeap = right.rawTag() == runtime::ValueTag::ObjectRef
+            ? resolveHeap(right.asObjectRefUnchecked())
+            : nullptr;
         if (RS_AOT_UNLIKELY(right.rawTag() != runtime::ValueTag::ObjectRef ||
-                            !heap_->tryBindObjectFastView(right.asObjectRefUnchecked(), rightView) ||
+                            !rightHeap ||
+                            !rightHeap->tryBindObjectFastView(right.asObjectRefUnchecked(), rightView) ||
                             rightView.typeId != delegateTypeId ||
                             rightView.fieldCount != 8u)) {
             return expectSignatureType(right, semantic::PrimitiveType::Object, delegateTypeId,
                 "delegate combination right operand");
         }
-        if (RS_AOT_UNLIKELY(!rightView.fields[3].tryGetInt64(rightFlags) || rightFlags < 0 || rightFlags > 4)) {
+        if (RS_AOT_UNLIKELY(!rightView.fields[3].tryGetInt64(rightFlags) ||
+                            !isValidAotDelegateFlags(rightFlags, true))) {
             return fail(runtime::ErrorCode::InvalidProgram,
                 "AOT delegate invocation-list metadata is corrupt");
         }
@@ -1367,16 +1585,25 @@ bool ExecutionContext::combineDelegates(
                 return fail(runtime::ErrorCode::InvalidProgram,
                     "AOT delegate invocation list is too deep");
             }
+            if (cur.rawTag() != runtime::ValueTag::ObjectRef) {
+                return fail(runtime::ErrorCode::InvalidProgram,
+                    "AOT delegate invocation-list metadata is corrupt");
+            }
+            const auto curRef = cur.asObjectRefUnchecked();
+            if (!checkCrossHeapRefAccess(curRef, false, "delegate combination")) {
+                return false;
+            }
+            auto* curHeap = resolveHeap(curRef);
             runtime::ObjectFastView v{};
-            if (cur.rawTag() != runtime::ValueTag::ObjectRef ||
-                !heap_->tryBindObjectFastView(cur.asObjectRefUnchecked(), v) ||
+            if (!curHeap ||
+                !curHeap->tryBindObjectFastView(curRef, v) ||
                 v.typeId != delegateTypeId ||
                 v.fieldCount != 8u) {
                 return fail(runtime::ErrorCode::InvalidProgram,
                     "AOT delegate invocation-list metadata is corrupt");
             }
             std::int64_t fl = -1;
-            if (!v.fields[3].tryGetInt64(fl) || fl < 0 || fl > 4) {
+            if (!v.fields[3].tryGetInt64(fl) || !isValidAotDelegateFlags(fl, true)) {
                 return fail(runtime::ErrorCode::InvalidProgram,
                     "AOT delegate invocation-list metadata is corrupt");
             }
@@ -1425,13 +1652,23 @@ bool ExecutionContext::combineDelegates(
         if (leftFlags == 4) {
             const auto checkChild = [&](const runtime::Value& child) -> bool {
                 if (child.rawTag() == runtime::ValueTag::NullObject) return true;
+                if (child.rawTag() != runtime::ValueTag::ObjectRef) {
+                    return fail(runtime::ErrorCode::InvalidProgram,
+                        "AOT delegate invocation-list metadata is corrupt");
+                }
+                const auto childRef = child.asObjectRefUnchecked();
+                if (!checkCrossHeapRefAccess(childRef, false, "delegate combination")) {
+                    return false;
+                }
+                auto* childHeap = resolveHeap(childRef);
                 runtime::ObjectFastView cv{};
                 std::int64_t cf = -1;
-                if (child.rawTag() != runtime::ValueTag::ObjectRef ||
-                    !heap_->tryBindObjectFastView(child.asObjectRefUnchecked(), cv) ||
+                if (!childHeap ||
+                    !childHeap->tryBindObjectFastView(childRef, cv) ||
                     cv.typeId != delegateTypeId ||
                     cv.fieldCount != 8u ||
-                    !cv.fields[3].tryGetInt64(cf) || cf < 0 || cf > 4) {
+                    !cv.fields[3].tryGetInt64(cf) ||
+                    !isValidAotDelegateFlags(cf, true)) {
                     return fail(runtime::ErrorCode::InvalidProgram,
                         "AOT delegate invocation-list metadata is corrupt");
                 }
@@ -1476,10 +1713,13 @@ bool ExecutionContext::combineDelegates(
         }
         const auto aRef = a.asObjectRefUnchecked();
         const auto bRef = b.asObjectRefUnchecked();
-        if (aRef == bRef && heap_->isAlive(aRef)) return true;
+        auto* aHeap = resolveHeap(aRef);
+        auto* bHeap = resolveHeap(bRef);
+        if (aRef == bRef && aHeap && aHeap->isAlive(aRef)) return true;
         runtime::ObjectFastView av{}, bv{};
-        if (!heap_->tryBindObjectFastView(aRef, av) ||
-            !heap_->tryBindObjectFastView(bRef, bv) ||
+        if (!aHeap || !bHeap ||
+            !aHeap->tryBindObjectFastView(aRef, av) ||
+            !bHeap->tryBindObjectFastView(bRef, bv) ||
             av.fieldCount < 7u || bv.fieldCount < 7u) {
             return false;
         }
@@ -1550,9 +1790,19 @@ int ExecutionContext::inspectDelegateSlow(
             "AOT delegate invocation attempted to dereference null");
         return 0;
     }
+    if (delValue.rawTag() != runtime::ValueTag::ObjectRef) {
+        (void)fail(runtime::ErrorCode::TypeMismatch,
+            "AOT delegate invocation received an incompatible value");
+        return 0;
+    }
+    const auto delRef = delValue.asObjectRefUnchecked();
+    if (!checkCrossHeapRefAccess(delRef, false, "delegate invocation")) {
+        return 0;
+    }
+    auto* delHeap = resolveHeap(delRef);
     runtime::ObjectFastView view{};
-    if (delValue.rawTag() != runtime::ValueTag::ObjectRef ||
-        !heap_->tryBindObjectFastView(delValue.asObjectRefUnchecked(), view) ||
+    if (!delHeap ||
+        !delHeap->tryBindObjectFastView(delRef, view) ||
         view.typeId != delegateTypeId ||
         view.fieldCount != 8u) {
         (void)fail(runtime::ErrorCode::TypeMismatch,
@@ -1560,24 +1810,29 @@ int ExecutionContext::inspectDelegateSlow(
         return 0;
     }
     std::int64_t flags = -1;
-    if (!view.fields[3].tryGetInt64(flags)) {
+    if (!view.fields[3].tryGetInt64(flags) || !isValidAotDelegateFlags(flags, true)) {
         (void)fail(runtime::ErrorCode::InvalidProgram,
             "AOT delegate dispatch metadata is corrupt");
         return 0;
     }
-    const auto delRef = delValue.asObjectRefUnchecked();
     if (flags == 4) {
-        auto& ce = delLeafCache_[delRef.slot & 15u];
-        ce.delRef = delRef;
-        ce.delegateTypeId = delegateTypeId;
-        ce.isMulticast = true;
-        ce.valid = true;
+        if (delHeap == heap_.get()) {
+            auto& ce = delLeafCache_[delRef.slot & 15u];
+            ce.delRef = delRef;
+            ce.delegateTypeId = delegateTypeId;
+            ce.isMulticast = true;
+            ce.valid = true;
+        }
         return 2;
     }
 
+    const bool isWeakTarget =
+        (flags & static_cast<std::int64_t>(runtime::ManagedHeap::DelegateWeakTargetFlag)) != 0;
+    const std::int64_t baseFlags =
+        flags & ~static_cast<std::int64_t>(runtime::ManagedHeap::DelegateWeakTargetFlag);
     std::int64_t slotVal = -1;
     semantic::SymbolId targetSymbolId = 0;
-    if (flags < 0 || flags > 3 ||
+    if (baseFlags < 0 || baseFlags > 3 ||
         !view.fields[4].tryGetInt64(slotVal) ||
         slotVal < 0 || slotVal > std::numeric_limits<std::uint32_t>::max() ||
         !readAotDelegateIdFromFields(view.fields, 1u, targetSymbolId)) {
@@ -1585,8 +1840,8 @@ int ExecutionContext::inspectDelegateSlow(
             "AOT delegate dispatch metadata is corrupt");
         return 0;
     }
-    const bool virtualDispatch = (flags & 1) != 0;
-    const bool interfaceDispatch = (flags & 2) != 0;
+    const bool virtualDispatch = (baseFlags & 1) != 0;
+    const bool interfaceDispatch = (baseFlags & 2) != 0;
     if (virtualDispatch && interfaceDispatch) {
         (void)fail(runtime::ErrorCode::InvalidProgram,
             "AOT delegate dispatch modes conflict");
@@ -1594,10 +1849,26 @@ int ExecutionContext::inspectDelegateSlow(
     }
     const runtime::Value& target = view.fields[0];
     const bool hasRecv = (target.rawTag() != runtime::ValueTag::NullObject);
+    if (isWeakTarget) {
+        if (target.rawTag() != runtime::ValueTag::ObjectRef) {
+            return 3;
+        }
+        const auto targetRef = target.asObjectRefUnchecked();
+        auto* weakRecvHeap = resolveHeap(targetRef);
+        if (!weakRecvHeap || !weakRecvHeap->isAlive(targetRef)) {
+            return 3;
+        }
+    }
     if (virtualDispatch || interfaceDispatch) {
-        const auto recvTid = (hasRecv && target.rawTag() == runtime::ValueTag::ObjectRef)
-            ? heap_->objectTypeIdFast(target.asObjectRefUnchecked())
-            : 0;
+        semantic::SymbolId recvTid = 0;
+        if (hasRecv && target.rawTag() == runtime::ValueTag::ObjectRef) {
+            const auto targetRef = target.asObjectRefUnchecked();
+            if (!checkCrossHeapRefAccess(targetRef, false, "delegate invocation")) {
+                return 0;
+            }
+            auto* recvHeap = resolveHeap(targetRef);
+            recvTid = recvHeap ? recvHeap->objectTypeIdFast(targetRef) : 0;
+        }
         const auto* runtimeType = recvTid != 0 ? findType(recvTid) : nullptr;
         if (!runtimeType) {
             (void)fail(runtime::ErrorCode::InvalidObjectReference,
@@ -1645,14 +1916,18 @@ int ExecutionContext::inspectDelegateSlow(
     outSingle.receiver = target;
     outSingle.hasReceiver = hasRecv;
 
-    auto& ce = delLeafCache_[delRef.slot & 15u];
-    ce.delRef = delRef;
-    ce.hasObjectReceiver = (hasRecv && target.rawTag() == runtime::ValueTag::ObjectRef);
-    ce.recvRef = ce.hasObjectReceiver ? target.asObjectRefUnchecked() : runtime::ObjectRef{};
-    ce.delegateTypeId = delegateTypeId;
-    ce.resolved = outSingle;
-    ce.isMulticast = false;
-    ce.valid = true;
+    const bool hasObjRecv = (hasRecv && target.rawTag() == runtime::ValueTag::ObjectRef);
+    const bool recvLocal = !hasObjRecv || resolveHeap(target.asObjectRefUnchecked()) == heap_.get();
+    if (!isWeakTarget && delHeap == heap_.get() && recvLocal) {
+        auto& ce = delLeafCache_[delRef.slot & 15u];
+        ce.delRef = delRef;
+        ce.hasObjectReceiver = hasObjRecv;
+        ce.recvRef = hasObjRecv ? target.asObjectRefUnchecked() : runtime::ObjectRef{};
+        ce.delegateTypeId = delegateTypeId;
+        ce.resolved = outSingle;
+        ce.isMulticast = false;
+        ce.valid = true;
+    }
     return 1;
 }
 
@@ -1661,13 +1936,23 @@ const ResolvedAotDelegateLeaf* ExecutionContext::acquireMulticastLeavesFast(
     const runtime::Value& rootValue,
     std::size_t& outCount,
     std::vector<ResolvedAotDelegateLeaf>& fallbackBuf) {
+    static const ResolvedAotDelegateLeaf kEmptyMulticastLeaf{};
     outCount = 0;
     if (RS_AOT_UNLIKELY(!heap_ || rootValue.rawTag() != runtime::ValueTag::ObjectRef)) {
         (void)fail(runtime::ErrorCode::InvalidProgram, "AOT delegate invocation list is corrupt");
         return nullptr;
     }
     const auto rootRef = rootValue.asObjectRefUnchecked();
-    if (RS_AOT_LIKELY(cachedMulticastTypeId_ == delegateTypeId &&
+    if (!checkCrossHeapRefAccess(rootRef, false, "delegate invocation")) {
+        return nullptr;
+    }
+    auto* rootHeap = resolveHeap(rootRef);
+    if (!rootHeap) {
+        (void)fail(runtime::ErrorCode::InvalidProgram, "AOT delegate invocation list is corrupt");
+        return nullptr;
+    }
+    if (RS_AOT_LIKELY(rootHeap == heap_.get() &&
+                      cachedMulticastTypeId_ == delegateTypeId &&
                       cachedMulticastRef_ == rootRef &&
                       !cachedMulticastLeaves_.empty() &&
                       heap_->objectTypeIdFast(rootRef) == delegateTypeId)) {
@@ -1686,7 +1971,8 @@ const ResolvedAotDelegateLeaf* ExecutionContext::acquireMulticastLeavesFast(
         }
     }
 
-    const bool canPopulateCache = (cachedMulticastPinCount_ == 0);
+    bool sawWeakOrCrossHeap = (rootHeap != heap_.get());
+    bool canPopulateCache = (cachedMulticastPinCount_ == 0 && !sawWeakOrCrossHeap);
     if (canPopulateCache) {
         cachedMulticastMeta_.clear();
         cachedMulticastLeaves_.clear();
@@ -1694,6 +1980,16 @@ const ResolvedAotDelegateLeaf* ExecutionContext::acquireMulticastLeavesFast(
     } else {
         fallbackBuf.clear();
     }
+    const auto disableCache = [&]() {
+        sawWeakOrCrossHeap = true;
+        if (canPopulateCache) {
+            fallbackBuf = std::move(cachedMulticastLeaves_);
+            cachedMulticastMeta_.clear();
+            cachedMulticastLeaves_.clear();
+            cachedMulticastTypeId_ = 0;
+            canPopulateCache = false;
+        }
+    };
 
     std::array<runtime::Value, 64> inlineStack{};
     std::size_t inlineTop = 0;
@@ -1715,16 +2011,30 @@ const ResolvedAotDelegateLeaf* ExecutionContext::acquireMulticastLeavesFast(
                 "AOT delegate invocation list is corrupt");
             return nullptr;
         }
-        runtime::ObjectFastView v{};
-        std::int64_t fl = -1;
-        if (cur.rawTag() != runtime::ValueTag::ObjectRef ||
-            !heap_->tryBindObjectFastView(cur.asObjectRefUnchecked(), v) ||
-            v.typeId != delegateTypeId ||
-            v.fieldCount != 8u ||
-            !v.fields[3].tryGetInt64(fl) || fl < 0 || fl > 4) {
+        if (cur.rawTag() != runtime::ValueTag::ObjectRef) {
             (void)fail(runtime::ErrorCode::InvalidProgram,
                 "AOT delegate invocation list is corrupt");
             return nullptr;
+        }
+        const auto curRef = cur.asObjectRefUnchecked();
+        if (!checkCrossHeapRefAccess(curRef, false, "delegate invocation")) {
+            return nullptr;
+        }
+        auto* curHeap = resolveHeap(curRef);
+        runtime::ObjectFastView v{};
+        std::int64_t fl = -1;
+        if (!curHeap ||
+            !curHeap->tryBindObjectFastView(curRef, v) ||
+            v.typeId != delegateTypeId ||
+            v.fieldCount != 8u ||
+            !v.fields[3].tryGetInt64(fl) ||
+            !isValidAotDelegateFlags(fl, true)) {
+            (void)fail(runtime::ErrorCode::InvalidProgram,
+                "AOT delegate invocation list is corrupt");
+            return nullptr;
+        }
+        if (curHeap != heap_.get()) {
+            disableCache();
         }
         if (fl != 4) {
             ResolvedAotDelegateLeaf resolved{};
@@ -1748,16 +2058,27 @@ const ResolvedAotDelegateLeaf* ExecutionContext::acquireMulticastLeavesFast(
                 resolved.receiver = v.fields[0];
                 resolved.hasReceiver = (resolved.receiver.rawTag() != runtime::ValueTag::NullObject);
             } else {
-                if (inspectDelegateSlow(delegateTypeId, cur, resolved) != 1) {
+                const int status = inspectDelegateSlow(delegateTypeId, cur, resolved);
+                if (status == 0) {
                     return nullptr;
                 }
+                if (status == 3) {
+                    disableCache();
+                    continue;
+                }
+            }
+            const bool isWeakLeaf =
+                (fl & static_cast<std::int64_t>(runtime::ManagedHeap::DelegateWeakTargetFlag)) != 0;
+            const bool hasObjR =
+                resolved.hasReceiver && resolved.receiver.rawTag() == runtime::ValueTag::ObjectRef;
+            if (isWeakLeaf ||
+                (hasObjR && resolveHeap(resolved.receiver.asObjectRefUnchecked()) != heap_.get())) {
+                disableCache();
             }
             if (canPopulateCache) {
-                const bool hasObjR =
-                    resolved.hasReceiver && resolved.receiver.rawTag() == runtime::ValueTag::ObjectRef;
                 cachedMulticastMeta_.push_back({
                     resolved,
-                    cur.asObjectRefUnchecked(),
+                    curRef,
                     hasObjR ? resolved.receiver.asObjectRefUnchecked() : runtime::ObjectRef{},
                     hasObjR,
                 });
@@ -1779,6 +2100,10 @@ const ResolvedAotDelegateLeaf* ExecutionContext::acquireMulticastLeavesFast(
     }
 
     if (canPopulateCache) {
+        if (cachedMulticastLeaves_.empty()) {
+            outCount = 0;
+            return &kEmptyMulticastLeaf;
+        }
         cachedMulticastTypeId_ = delegateTypeId;
         cachedMulticastRef_ = rootRef;
         ++cachedMulticastPinCount_;
@@ -1786,13 +2111,29 @@ const ResolvedAotDelegateLeaf* ExecutionContext::acquireMulticastLeavesFast(
         return cachedMulticastLeaves_.data();
     }
     outCount = fallbackBuf.size();
-    return fallbackBuf.data();
+    return fallbackBuf.empty() ? &kEmptyMulticastLeaf : fallbackBuf.data();
 }
 
 bool ExecutionContext::invokeDelegate(
     semantic::SymbolId delegateTypeId,
     const runtime::Value* arguments,
     std::size_t argumentCount,
+    runtime::Value& result) {
+    return invokeDelegate(
+        delegateTypeId,
+        arguments,
+        argumentCount,
+        semantic::PrimitiveType::Error,
+        0,
+        result);
+}
+
+bool ExecutionContext::invokeDelegate(
+    semantic::SymbolId delegateTypeId,
+    const runtime::Value* arguments,
+    std::size_t argumentCount,
+    semantic::PrimitiveType expectedReturnType,
+    semantic::SymbolId expectedReturnTypeId,
     runtime::Value& result) {
     runtime::ScopedValuePoolDomain domainScope(
         heap_ ? heap_->valuePoolDomain().get() : nullptr);
@@ -1810,16 +2151,44 @@ bool ExecutionContext::invokeDelegate(
     }
     const auto* delegateRef =
         std::get_if<runtime::ObjectRef>(&arguments[0]);
-    const auto actualType = delegateRef
-        ? heap_->objectTypeId(*delegateRef)
-        : std::optional<semantic::SymbolId>{};
-    if (!delegateRef || !actualType || *actualType != delegateTypeId ||
-        heap_->fieldCount(*delegateRef) != 8u) {
+    if (!delegateRef) {
         return fail(
             runtime::ErrorCode::TypeMismatch,
             "AOT delegate invocation received an incompatible value");
     }
-    const auto rootFlagsValue = heap_->fieldGet(*delegateRef, 3u);
+    if (!checkCrossHeapRefAccess(*delegateRef, false, "delegate invocation")) {
+        return false;
+    }
+    auto* delegateHeap = resolveHeap(*delegateRef);
+    const auto actualType = delegateHeap
+        ? delegateHeap->objectTypeId(*delegateRef)
+        : std::optional<semantic::SymbolId>{};
+    if (!actualType || *actualType != delegateTypeId ||
+        delegateHeap->fieldCount(*delegateRef) != 8u) {
+        return fail(
+            runtime::ErrorCode::TypeMismatch,
+            "AOT delegate invocation received an incompatible value");
+    }
+    const auto computeDeadReturn = [&](semantic::SymbolId fallbackFnId) -> runtime::Value {
+        if (expectedReturnType == semantic::PrimitiveType::Void ||
+            expectedReturnType == semantic::PrimitiveType::Null) {
+            return std::monostate{};
+        }
+        if (expectedReturnType != semantic::PrimitiveType::Error) {
+            return defaultValue(expectedReturnType, expectedReturnTypeId);
+        }
+        if (fallbackFnId != 0) {
+            if (const auto* fn = findFunction(fallbackFnId)) {
+                if (fn->returnType == semantic::PrimitiveType::Void ||
+                    fn->returnType == semantic::PrimitiveType::Null) {
+                    return std::monostate{};
+                }
+                return defaultValue(fn->returnType, fn->returnTypeId);
+            }
+        }
+        return std::monostate{};
+    };
+    const auto rootFlagsValue = delegateHeap->fieldGet(*delegateRef, 3u);
     const auto* rootFlags = rootFlagsValue
         ? std::get_if<std::int64_t>(&*rootFlagsValue)
         : nullptr;
@@ -1831,44 +2200,79 @@ bool ExecutionContext::invokeDelegate(
             if (depth > 1024) return false;
             const auto* reference =
                 std::get_if<runtime::ObjectRef>(&value);
-            const auto flagsValue = reference
-                ? heap_->fieldGet(*reference, 3u)
+            if (!reference) return false;
+            if (!checkCrossHeapRefAccess(*reference, false, "delegate invocation")) {
+                return false;
+            }
+            auto* curHeap = resolveHeap(*reference);
+            const auto flagsValue = curHeap
+                ? curHeap->fieldGet(*reference, 3u)
                 : std::optional<runtime::Value>{};
             const auto* flags = flagsValue
                 ? std::get_if<std::int64_t>(&*flagsValue)
                 : nullptr;
-            if (!reference || !flags) return false;
+            if (!flags || !isValidAotDelegateFlags(*flags, true)) return false;
             if (*flags != 4) {
                 leaves.push_back(value);
                 return true;
             }
-            const auto first = heap_->fieldGet(*reference, 0u);
-            const auto second = heap_->fieldGet(*reference, 7u);
+            const auto first = curHeap->fieldGet(*reference, 0u);
+            const auto second = curHeap->fieldGet(*reference, 7u);
             return first && second &&
                 self(self, *first, depth + 1) &&
                 self(self, *second, depth + 1);
         };
         if (!flatten(flatten, arguments[0], 0)) {
-            return fail(
-                runtime::ErrorCode::InvalidProgram,
-                "AOT delegate invocation list is corrupt");
+            return error_.code != runtime::ErrorCode::None
+                ? false
+                : fail(
+                    runtime::ErrorCode::InvalidProgram,
+                    "AOT delegate invocation list is corrupt");
         }
+        runtime::Value lastResult = computeDeadReturn(0);
         std::vector<runtime::Value> nested(
             arguments, arguments + argumentCount);
         for (const auto& leaf : leaves) {
+            if (const auto* leafRef = std::get_if<runtime::ObjectRef>(&leaf)) {
+                if (!checkCrossHeapRefAccess(*leafRef, false, "delegate invocation")) {
+                    return false;
+                }
+                if (auto* leafHeap = resolveHeap(*leafRef)) {
+                    const auto leafFlagsVal = leafHeap->fieldGet(*leafRef, 3u);
+                    const auto leafTargetVal = leafHeap->fieldGet(*leafRef, 0u);
+                    if (leafFlagsVal && leafTargetVal) {
+                        if (const auto* lf = std::get_if<std::int64_t>(&*leafFlagsVal);
+                            lf && (*lf & static_cast<std::int64_t>(runtime::ManagedHeap::DelegateWeakTargetFlag)) != 0) {
+                            const auto* tRef = std::get_if<runtime::ObjectRef>(&*leafTargetVal);
+                            auto* tHeap = tRef ? resolveHeap(*tRef) : nullptr;
+                            if (!tRef || !tHeap || !tHeap->isAlive(*tRef)) {
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
             nested[0] = leaf;
             if (!consume("invoke.delegate")) return false;
+            runtime::Value leafResult;
             if (!invokeDelegate(
-                    delegateTypeId, nested.data(), nested.size(), result)) {
+                    delegateTypeId,
+                    nested.data(),
+                    nested.size(),
+                    expectedReturnType,
+                    expectedReturnTypeId,
+                    leafResult)) {
                 return false;
             }
+            lastResult = std::move(leafResult);
         }
+        result = std::move(lastResult);
         return true;
     }
     const auto readId = [&](std::size_t lowIndex,
                             semantic::SymbolId& value) {
-        const auto low = heap_->fieldGet(*delegateRef, lowIndex);
-        const auto high = heap_->fieldGet(*delegateRef, lowIndex + 1u);
+        const auto low = delegateHeap->fieldGet(*delegateRef, lowIndex);
+        const auto high = delegateHeap->fieldGet(*delegateRef, lowIndex + 1u);
         const auto* lowValue = low
             ? std::get_if<std::int64_t>(&*low)
             : nullptr;
@@ -1893,21 +2297,30 @@ bool ExecutionContext::invokeDelegate(
             runtime::ErrorCode::InvalidProgram,
             "AOT delegate callable identity is corrupt");
     }
-    const auto target = heap_->fieldGet(*delegateRef, 0u);
-    const auto flagsValue = heap_->fieldGet(*delegateRef, 3u);
-    const auto slotValue = heap_->fieldGet(*delegateRef, 4u);
+    const auto target = delegateHeap->fieldGet(*delegateRef, 0u);
+    const auto flagsValue = delegateHeap->fieldGet(*delegateRef, 3u);
+    const auto slotValue = delegateHeap->fieldGet(*delegateRef, 4u);
     const auto* flags = flagsValue
         ? std::get_if<std::int64_t>(&*flagsValue)
         : nullptr;
     const auto* slot = slotValue
         ? std::get_if<std::int64_t>(&*slotValue)
         : nullptr;
-    if (!target || !flags || !slot || *flags < 0 || *flags > 3 ||
+    if (!target || !flags || !slot ||
+        !isValidAotDelegateFlags(*flags, false) ||
         *slot < 0 ||
         *slot > std::numeric_limits<std::uint32_t>::max()) {
         return fail(
             runtime::ErrorCode::InvalidProgram,
             "AOT delegate dispatch metadata is corrupt");
+    }
+    if ((*flags & static_cast<std::int64_t>(runtime::ManagedHeap::DelegateWeakTargetFlag)) != 0) {
+        const auto* weakTargetRef = std::get_if<runtime::ObjectRef>(&*target);
+        auto* weakTargetHeap = weakTargetRef ? resolveHeap(*weakTargetRef) : nullptr;
+        if (!weakTargetRef || !weakTargetHeap || !weakTargetHeap->isAlive(*weakTargetRef)) {
+            result = computeDeadReturn(targetSymbolId);
+            return true;
+        }
     }
     std::vector<runtime::Value> values;
     if (argumentCount > 1) {
@@ -1927,8 +2340,12 @@ bool ExecutionContext::invokeDelegate(
         const auto* receiver = values.empty()
             ? nullptr
             : std::get_if<runtime::ObjectRef>(&values.front());
-        const auto runtimeTypeId = receiver
-            ? heap_->objectTypeId(*receiver)
+        if (receiver && !checkCrossHeapRefAccess(*receiver, false, "delegate invocation")) {
+            return false;
+        }
+        auto* recvHeap = receiver ? resolveHeap(*receiver) : heap_.get();
+        const auto runtimeTypeId = receiver && recvHeap
+            ? recvHeap->objectTypeId(*receiver)
             : std::optional<semantic::SymbolId>{};
         const auto* runtimeType = runtimeTypeId
             ? findType(*runtimeTypeId)
@@ -1956,17 +2373,21 @@ bool ExecutionContext::invokeDelegate(
                     "AOT delegate interface identity is corrupt");
             }
             const InterfaceDispatchDescriptor* map = nullptr;
-            if (runtimeType->interfaceDispatchMaps) {
-                for (std::uint32_t index = 0;
-                     index < runtimeType->interfaceDispatchMapCount;
-                     ++index) {
-                    const auto& candidate =
-                        runtimeType->interfaceDispatchMaps[index];
-                    if (candidate.interfaceTypeId == interfaceTypeId) {
-                        map = &candidate;
-                        break;
+            const auto* curType = runtimeType;
+            for (std::size_t depth = 0; curType != nullptr && depth < 256 && map == nullptr; ++depth) {
+                if (curType->interfaceDispatchMaps) {
+                    for (std::uint32_t index = 0;
+                         index < curType->interfaceDispatchMapCount;
+                         ++index) {
+                        const auto& candidate =
+                            curType->interfaceDispatchMaps[index];
+                        if (candidate.interfaceTypeId == interfaceTypeId) {
+                            map = &candidate;
+                            break;
+                        }
                     }
                 }
+                curType = curType->baseTypeId != 0 ? findType(curType->baseTypeId) : nullptr;
             }
             if (!map || !map->slots || dispatchSlot >= map->slotCount) {
                 return fail(
@@ -2228,17 +2649,27 @@ bool ExecutionContext::typeOperation(
     bool matches = false;
     if (!nullValue) {
         if (targetType == semantic::PrimitiveType::Object) {
-            const auto* reference = std::get_if<runtime::ObjectRef>(&value);
-            const auto actual = reference && heap_
-                ? heap_->objectTypeId(*reference)
-                : std::optional<semantic::SymbolId>{};
-            matches = actual && isAssignable(*actual, targetTypeId);
+            if (const auto* reference = std::get_if<runtime::ObjectRef>(&value)) {
+                if (!checkCrossHeapRefAccess(*reference, false, "runtime type check")) {
+                    return false;
+                }
+                auto* targetHeap = resolveHeap(*reference);
+                const auto actual = targetHeap
+                    ? targetHeap->objectTypeId(*reference)
+                    : std::optional<semantic::SymbolId>{};
+                matches = actual && isAssignable(*actual, targetTypeId);
+            }
         } else if (targetType == semantic::PrimitiveType::Array) {
-            const auto* reference = std::get_if<runtime::ObjectRef>(&value);
-            const auto actual = reference && heap_
-                ? heap_->arrayTypeId(*reference)
-                : std::optional<semantic::SymbolId>{};
-            matches = actual && *actual == targetTypeId;
+            if (const auto* reference = std::get_if<runtime::ObjectRef>(&value)) {
+                if (!checkCrossHeapRefAccess(*reference, false, "runtime type check")) {
+                    return false;
+                }
+                auto* targetHeap = resolveHeap(*reference);
+                const auto actual = targetHeap
+                    ? targetHeap->arrayTypeId(*reference)
+                    : std::optional<semantic::SymbolId>{};
+                matches = actual && *actual == targetTypeId;
+            }
         } else {
             matches = sourceType == targetType;
         }
@@ -2272,8 +2703,11 @@ bool ExecutionContext::arrayLengthFast(
     const runtime::Value& receiver,
     std::int64_t& result) {
     if (const auto* reference = std::get_if<runtime::ObjectRef>(&receiver)) {
-        if (heap_) {
-            if (const auto length = heap_->arrayLength(*reference)) {
+        if (!checkCrossHeapRefAccess(*reference, false, "array length")) {
+            return false;
+        }
+        if (auto* targetHeap = resolveHeap(*reference)) {
+            if (const auto length = targetHeap->arrayLength(*reference)) {
                 if (*length <= static_cast<std::size_t>(INT32_MAX)) {
                     result = static_cast<std::int64_t>(*length);
                     return true;
@@ -2311,7 +2745,8 @@ bool ExecutionContext::loadElement(
     }
     const auto numericIndex = std::get<std::int64_t>(index);
     const auto reference = std::get<runtime::ObjectRef>(receiver);
-    const auto length = heap_->arrayLength(reference);
+    auto* targetHeap = resolveHeap(reference);
+    const auto length = targetHeap ? targetHeap->arrayLength(reference) : std::optional<std::size_t>{};
     if (!length) {
         return fail(
             runtime::ErrorCode::InvalidObjectReference,
@@ -2323,21 +2758,22 @@ bool ExecutionContext::loadElement(
             runtime::ErrorCode::IndexOutOfRange,
             "array element index is out of range");
     }
-    const auto actualType = heap_->arrayElementType(reference);
-    const auto actualTypeId = heap_->arrayElementTypeId(reference);
+    const auto actualType = targetHeap->arrayElementType(reference);
+    const auto actualTypeId = targetHeap->arrayElementTypeId(reference);
     if (!actualType || !actualTypeId ||
         *actualType != elementType || *actualTypeId != elementTypeId) {
         return fail(
             runtime::ErrorCode::TypeMismatch,
             "array element metadata does not match the AOT operation");
     }
-    if (elementType == semantic::PrimitiveType::Struct &&
+    if (targetHeap == heap_.get() &&
+        elementType == semantic::PrimitiveType::Struct &&
         activeStackRefScopes_ > 0 &&
         stackRefBankId_ != 0u) {
         constexpr std::size_t kMaxTransientStackSliceSlots = 65536u;
         if (const auto* sc = runtime::findFlatStructSchemaByTypeId(elementTypeId)) {
             runtime::FlatStructArrayFastView fView{};
-            if ((heap_->tryBindFlatStructArrayFastView(reference, fView) && fView.elementTypeId == elementTypeId && fView.flatStride == sc->flatSlotCount) &&
+            if ((targetHeap->tryBindFlatStructArrayFastView(reference, fView) && fView.elementTypeId == elementTypeId && fView.flatStride == sc->flatSlotCount) &&
                 fView.flatSchemaId == sc->schemaId) {
                 const std::uint32_t baseOff = stackRefTop_;
                 const std::size_t need = static_cast<std::size_t>(baseOff) + sc->flatSlotCount;
@@ -2360,17 +2796,21 @@ bool ExecutionContext::loadElement(
             }
         }
     }
-    const auto value = heap_->arrayGet(
+    const auto value = targetHeap->arrayGet(
         reference,
         static_cast<std::size_t>(numericIndex));
-    if (!value || !expectSignatureType(
-            *value,
+    if (!value) {
+        return false;
+    }
+    runtime::Value loaded = sanitizeCrossHeapValue(targetHeap, *value);
+    if (!expectSignatureType(
+            loaded,
             elementType,
             elementTypeId,
             "array element load value")) {
         return false;
     }
-    result = *value;
+    result = std::move(loaded);
     return true;
 }
 
@@ -2394,7 +2834,11 @@ bool ExecutionContext::storeElement(
     }
     const auto numericIndex = std::get<std::int64_t>(index);
     const auto reference = std::get<runtime::ObjectRef>(receiver);
-    const auto length = heap_->arrayLength(reference);
+    if (!checkCrossHeapRefAccess(reference, executionPolicy_ == nullptr, "array element store")) {
+        return false;
+    }
+    auto* targetHeap = resolveHeap(reference);
+    const auto length = targetHeap ? targetHeap->arrayLength(reference) : std::optional<std::size_t>{};
     if (!length) {
         return fail(
             runtime::ErrorCode::InvalidObjectReference,
@@ -2406,8 +2850,8 @@ bool ExecutionContext::storeElement(
             runtime::ErrorCode::IndexOutOfRange,
             "array element index is out of range");
     }
-    const auto actualType = heap_->arrayElementType(reference);
-    const auto actualTypeId = heap_->arrayElementTypeId(reference);
+    const auto actualType = targetHeap->arrayElementType(reference);
+    const auto actualTypeId = targetHeap->arrayElementTypeId(reference);
     if (!actualType || !actualTypeId ||
         *actualType != elementType || *actualTypeId != elementTypeId) {
         return fail(
@@ -2415,7 +2859,27 @@ bool ExecutionContext::storeElement(
             "array element metadata does not match the AOT operation");
     }
     runtime::RuntimeError arrayError;
-    if (!heap_->arraySet(
+    if (executionPolicy_ &&
+        !executionPolicy_->checkArrayWrite(
+            heap_.get(),
+            targetHeap,
+            reference,
+            value,
+            arrayError)) {
+        error_ = std::move(arrayError);
+        if (error_.code == runtime::ErrorCode::None) {
+            error_.code = runtime::ErrorCode::CapabilityDenied;
+        }
+        if (error_.message.empty()) {
+            error_.message = "array write rejected by execution policy";
+        }
+        populateErrorStackTrace();
+        return false;
+    }
+    if (!checkCrossHeapRefAccess(reference, true, "array element store")) {
+        return false;
+    }
+    if (!targetHeap->arraySet(
             reference,
             static_cast<std::size_t>(numericIndex),
             value,
@@ -2464,23 +2928,25 @@ bool ExecutionContext::loadField(
         result = sVal;
         return true;
     }
-    const auto value = heap_->fieldGet(
-        recvRef,
-        fieldIndex);
+    auto* targetHeap = resolveHeap(recvRef);
+    const auto value = targetHeap
+        ? targetHeap->fieldGet(recvRef, fieldIndex)
+        : std::optional<runtime::Value>{};
     if (!value) {
         return fail(
             runtime::ErrorCode::InvalidProgram,
             "field load references an invalid field slot");
     }
     const auto& field = type->fields[fieldIndex];
+    runtime::Value loaded = sanitizeCrossHeapValue(targetHeap, *value);
     if (!expectSignatureType(
-            *value,
+            loaded,
             field.type,
             field.typeId,
             "field load value")) {
         return false;
     }
-    result = *value;
+    result = std::move(loaded);
     return true;
 }
 
@@ -2518,8 +2984,33 @@ bool ExecutionContext::storeField(
         }
         return true;
     }
+    auto* targetHeap = resolveHeap(recvRef);
     runtime::RuntimeError fieldError;
-    if (!heap_->fieldSet(
+    if (executionPolicy_ &&
+        !executionPolicy_->checkFieldWrite(
+            heap_.get(),
+            targetHeap,
+            recvRef,
+            typeId,
+            fieldIndex,
+            field.name ? field.name : "",
+            value,
+            fieldError)) {
+        error_ = std::move(fieldError);
+        if (error_.code == runtime::ErrorCode::None) {
+            error_.code = runtime::ErrorCode::CapabilityDenied;
+        }
+        if (error_.message.empty()) {
+            error_.message = "field write rejected by execution policy";
+        }
+        populateErrorStackTrace();
+        return false;
+    }
+    if (!checkCrossHeapRefAccess(recvRef, true, "field store")) {
+        return false;
+    }
+    if (!targetHeap ||
+        !targetHeap->fieldSet(
             recvRef,
             fieldIndex,
             value,
@@ -2983,23 +3474,34 @@ bool ExecutionContext::binary(
                 equal = std::holds_alternative<runtime::NullString>(left) &&
                     std::holds_alternative<runtime::NullString>(right);
             } else {
-                const auto text = [&](const runtime::Value& value)
-                    -> std::optional<std::string_view> {
+                const auto text = [&](const runtime::Value& value,
+                                      std::optional<std::string_view>& outText) -> bool {
                     if (const auto* direct = std::get_if<std::string>(&value)) {
-                        return *direct;
+                        outText = *direct;
+                        return true;
                     }
                     if (const auto* reference =
                             std::get_if<runtime::ObjectRef>(&value)) {
-                        return heap_->stringView(*reference);
+                        if (!checkCrossHeapRefAccess(*reference, false, "string equality")) {
+                            return false;
+                        }
+                        auto* targetHeap = resolveHeap(*reference);
+                        outText = targetHeap ? targetHeap->stringView(*reference) : std::nullopt;
+                        if (!outText) {
+                            return fail(
+                                runtime::ErrorCode::InvalidObjectReference,
+                                "string equality encountered an invalid managed reference");
+                        }
+                        return true;
                     }
-                    return std::nullopt;
-                };
-                const auto a = text(left);
-                const auto b = text(right);
-                if (!a || !b) {
                     return fail(
                         runtime::ErrorCode::InvalidObjectReference,
                         "string equality encountered an invalid managed reference");
+                };
+                std::optional<std::string_view> a;
+                std::optional<std::string_view> b;
+                if (!text(left, a) || !text(right, b)) {
+                    return false;
                 }
                 equal = *a == *b;
             }
@@ -3038,15 +3540,30 @@ bool ExecutionContext::binary(
                 equal = false;
             }
         } else {
-            if ((runtime::valueType(left) == semantic::PrimitiveType::Object ||
-                 runtime::valueType(left) == semantic::PrimitiveType::Array) &&
-                ((!std::get_if<runtime::ObjectRef>(&left) ||
-                  heap_->isAlive(std::get<runtime::ObjectRef>(left))) == false ||
-                 (!std::get_if<runtime::ObjectRef>(&right) ||
-                  heap_->isAlive(std::get<runtime::ObjectRef>(right))) == false)) {
-                return fail(
-                    runtime::ErrorCode::InvalidObjectReference,
-                    "reference equality encountered an invalid managed reference");
+            if (runtime::valueType(left) == semantic::PrimitiveType::Object ||
+                runtime::valueType(left) == semantic::PrimitiveType::Array) {
+                const auto checkRef = [&](const runtime::Value& side) -> bool {
+                    if (const auto* r = std::get_if<runtime::ObjectRef>(&side)) {
+                        if (!checkCrossHeapRefAccess(*r, false, "reference equality")) {
+                            return false;
+                        }
+                        auto* h = resolveHeap(*r);
+                        if (!h || !h->isAlive(*r)) {
+                            return fail(
+                                runtime::ErrorCode::InvalidObjectReference,
+                                "reference equality encountered an invalid managed reference");
+                        }
+                    } else if (!std::holds_alternative<runtime::NullObject>(side) &&
+                               !std::holds_alternative<runtime::NullArray>(side)) {
+                        return fail(
+                            runtime::ErrorCode::InvalidObjectReference,
+                            "reference equality encountered an invalid managed reference");
+                    }
+                    return true;
+                };
+                if (!checkRef(left) || !checkRef(right)) {
+                    return false;
+                }
             }
             equal = left == right;
         }
@@ -3316,6 +3833,19 @@ std::size_t ExecutionContext::replayEntriesConsumed() const noexcept {
     return determinism_.replayEntriesConsumed();
 }
 
+namespace {
+
+[[noreturn]] void abortOrThrowInvalidArg(const char* message) {
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+    throw std::invalid_argument(message);
+#else
+    (void)message;
+    std::abort();
+#endif
+}
+
+} // namespace
+
 Program::Program(const ProgramDescriptor& descriptor)
     : descriptor_(&descriptor),
       heap_(std::make_shared<runtime::ManagedHeap>()),
@@ -3324,21 +3854,22 @@ Program::Program(const ProgramDescriptor& descriptor)
     lifecycleTarget_->program = this;
     if (descriptor.abiMajor != RuntimeAbiMajor ||
         descriptor.abiMinor > RuntimeAbiMinor) {
-        throw std::invalid_argument("AOT program requires an incompatible runtime ABI");
+        abortOrThrowInvalidArg("AOT program requires an incompatible runtime ABI");
     }
     if (!descriptor.name || descriptor.name[0] == '\0' ||
         descriptor.moduleCount == 0 || !descriptor.moduleNames ||
         descriptor.functionCount == 0 || !descriptor.functions ||
         (descriptor.typeCount != 0 && !descriptor.types) ||
-        (descriptor.sourceMapCount != 0 && !descriptor.sourceMap)) {
-        throw std::invalid_argument("AOT program descriptor is incomplete");
+        (descriptor.sourceMapCount != 0 && !descriptor.sourceMap) ||
+        (descriptor.attributeCount != 0 && !descriptor.attributes)) {
+        abortOrThrowInvalidArg("AOT program descriptor is incomplete");
     }
 
     std::unordered_set<std::string> moduleNames;
     for (std::uint32_t index = 0; index < descriptor.moduleCount; ++index) {
         const auto* name = descriptor.moduleNames[index];
         if (!name || name[0] == '\0' || !moduleNames.emplace(name).second) {
-            throw std::invalid_argument("AOT program contains an invalid module table");
+            abortOrThrowInvalidArg("AOT program contains an invalid module table");
         }
     }
 
@@ -3350,7 +3881,7 @@ Program::Program(const ProgramDescriptor& descriptor)
             !typeIds.insert(type.id).second ||
             (type.fieldCount != 0 && !type.fields) ||
             (type.enumMemberCount != 0 && !type.enumMembers)) {
-            throw std::invalid_argument("AOT program contains an invalid type table");
+            abortOrThrowInvalidArg("AOT program contains an invalid type table");
         }
         if (moduleNames.count(type.moduleName) == 0 ||
             (type.kind != semantic::TypeKind::Class &&
@@ -3359,7 +3890,7 @@ Program::Program(const ProgramDescriptor& descriptor)
             (type.kind == semantic::TypeKind::Enum && type.fieldCount != 0) ||
             (type.kind != semantic::TypeKind::Enum &&
              type.enumMemberCount != 0)) {
-            throw std::invalid_argument("AOT type descriptor kind is inconsistent");
+            abortOrThrowInvalidArg("AOT type descriptor kind is inconsistent");
         }
         std::unordered_set<std::string> fieldNames;
         for (std::uint32_t fieldIndex = 0;
@@ -3371,7 +3902,7 @@ Program::Program(const ProgramDescriptor& descriptor)
                 !validStorageType(field.type) ||
                 !validSignatureIdentity(field.type, field.typeId) ||
                 !fieldNames.emplace(field.name).second) {
-                throw std::invalid_argument("AOT program contains an invalid field table");
+                abortOrThrowInvalidArg("AOT program contains an invalid field table");
             }
         }
         std::unordered_set<std::string> enumNames;
@@ -3381,7 +3912,7 @@ Program::Program(const ProgramDescriptor& descriptor)
             const auto& member = type.enumMembers[memberIndex];
             if (!member.name || member.name[0] == '\0' ||
                 !enumNames.emplace(member.name).second) {
-                throw std::invalid_argument("AOT program contains an invalid enum table");
+                abortOrThrowInvalidArg("AOT program contains an invalid enum table");
             }
         }
     }
@@ -3395,7 +3926,7 @@ Program::Program(const ProgramDescriptor& descriptor)
             const auto& field = type.fields[fieldIndex];
             if (requiresDescriptor(field.type) &&
                 typeIds.count(field.typeId) == 0) {
-                throw std::invalid_argument(
+                abortOrThrowInvalidArg(
                     "AOT field references an unknown exact type");
             }
         }
@@ -3444,7 +3975,7 @@ Program::Program(const ProgramDescriptor& descriptor)
              typeIds.count(function.returnTypeId) == 0) ||
             (function.parameterCount != 0 &&
              (!function.parameterTypes || !function.parameterTypeIds))) {
-            throw std::invalid_argument("AOT program contains an invalid function table");
+            abortOrThrowInvalidArg("AOT program contains an invalid function table");
         }
         // Overloads intentionally share a qualified source name. Calls emitted
         // by the compiler use SymbolId; the name-only embedding convenience API
@@ -3460,7 +3991,7 @@ Program::Program(const ProgramDescriptor& descriptor)
                     function.parameterTypeIds[parameter]) ||
                 (requiresDescriptor(function.parameterTypes[parameter]) &&
                  typeIds.count(function.parameterTypeIds[parameter]) == 0)) {
-                throw std::invalid_argument(
+                abortOrThrowInvalidArg(
                     "AOT program contains an invalid function signature");
             }
         }
@@ -3472,7 +4003,7 @@ Program::Program(const ProgramDescriptor& descriptor)
             entry.generatedLine == 0 || !entry.sourcePath ||
             entry.sourcePath[0] == '\0' || entry.sourceLine == 0 ||
             entry.sourceColumn == 0) {
-            throw std::invalid_argument("AOT program contains an invalid source map");
+            abortOrThrowInvalidArg("AOT program contains an invalid source map");
         }
     }
 
@@ -4192,7 +4723,12 @@ bool ExecutionContext::finishUncaughtAsyncException(
     pendingException_.reset();
     error_ = runtime::RuntimeError{};
 
-    const bool isCanceled = runtime::isAsyncCanceledExceptionObject(heap_.get(), excVal);
+    runtime::ManagedHeap* excHeap = heap_.get();
+    if (const auto* excRef = std::get_if<runtime::ObjectRef>(&excVal)) {
+        excHeap = resolveHeap(*excRef);
+        if (!excHeap) excHeap = heap_.get();
+    }
+    const bool isCanceled = runtime::isAsyncCanceledExceptionObject(excHeap, excVal);
     if (activeCoroutine.valid()) {
         auto* frame = asyncRuntime_->coroutines().resolve(activeCoroutine);
         if (!frame) return false;
@@ -4200,7 +4736,7 @@ bool ExecutionContext::finishUncaughtAsyncException(
         if (isCanceled) {
             (void)asyncRuntime_->awaitables().trySetCanceled(frame->completionHandle);
         } else {
-            std::string msg = extractAotExceptionMessage(typesPtr_, heap_.get(), excVal);
+            std::string msg = extractAotExceptionMessage(typesPtr_, excHeap, excVal);
             (void)asyncRuntime_->awaitables().trySetFaulted(
                 frame->completionHandle,
                 runtime::ErrorCode::ScriptException,
@@ -4215,7 +4751,7 @@ bool ExecutionContext::finishUncaughtAsyncException(
         ? asyncRuntime_->awaitables().fromCanceled()
         : asyncRuntime_->awaitables().fromFaulted(
               runtime::ErrorCode::ScriptException,
-              extractAotExceptionMessage(typesPtr_, heap_.get(), excVal),
+              extractAotExceptionMessage(typesPtr_, excHeap, excVal),
               excVal);
     outResult = makePendingAsyncReturnCarrier(returnStructTypeId, h);
     return true;
@@ -4607,7 +5143,12 @@ bool ExecutionContext::finishUncaughtAsyncExceptionScalar(
     pendingException_.reset();
     error_ = runtime::RuntimeError{};
 
-    const bool isCanceled = runtime::isAsyncCanceledExceptionObject(heap_.get(), excVal);
+    runtime::ManagedHeap* excHeap = heap_.get();
+    if (const auto* excRef = std::get_if<runtime::ObjectRef>(&excVal)) {
+        excHeap = resolveHeap(*excRef);
+        if (!excHeap) excHeap = heap_.get();
+    }
+    const bool isCanceled = runtime::isAsyncCanceledExceptionObject(excHeap, excVal);
     if (activeCoroutine.valid()) {
         auto* frame = asyncRuntime_->coroutines().resolve(activeCoroutine);
         if (!frame) return false;
@@ -4615,7 +5156,7 @@ bool ExecutionContext::finishUncaughtAsyncExceptionScalar(
         if (isCanceled) {
             (void)asyncRuntime_->awaitables().trySetCanceled(frame->completionHandle);
         } else {
-            std::string msg = extractAotExceptionMessage(typesPtr_, heap_.get(), excVal);
+            std::string msg = extractAotExceptionMessage(typesPtr_, excHeap, excVal);
             (void)asyncRuntime_->awaitables().trySetFaulted(
                 frame->completionHandle,
                 runtime::ErrorCode::ScriptException,
@@ -4629,7 +5170,7 @@ bool ExecutionContext::finishUncaughtAsyncExceptionScalar(
         ? asyncRuntime_->awaitables().fromCanceled()
         : asyncRuntime_->awaitables().fromFaulted(
               runtime::ErrorCode::ScriptException,
-              extractAotExceptionMessage(typesPtr_, heap_.get(), excVal),
+              extractAotExceptionMessage(typesPtr_, excHeap, excVal),
               excVal);
     outPackedResult = static_cast<std::int64_t>(h.pack64());
     return true;
@@ -4724,7 +5265,9 @@ void Program::registerValueLifecycleHooks() {
 
             runtime::ScopedValuePoolDomain domainScope(
                 self->heap_->valuePoolDomain().get());
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
             try {
+#endif
                 std::vector<runtime::Value> args;
                 if (disposeFn->parameterCount > 0 && disposeFn->parameterTypes) {
                     if (disposeFn->parameterTypes[0] == semantic::PrimitiveType::Object &&
@@ -4746,13 +5289,24 @@ void Program::registerValueLifecycleHooks() {
                 opts.limits.instructionBudget = 1'000'000;
                 opts.limits.recursionLimit = 128;
                 (void)self->invoke(disposeFn->symbolId, args, std::move(opts));
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
             } catch (...) {
             }
+#endif
         });
 }
 
 std::shared_ptr<runtime::ManagedHeap> Program::heap() const noexcept {
     return heap_;
+}
+
+void Program::setExecutionPolicy(runtime::IExecutionPolicy* policy) noexcept {
+    executionPolicy_ = policy;
+    resumeEnv_.reset();
+}
+
+runtime::IExecutionPolicy* Program::executionPolicy() const noexcept {
+    return executionPolicy_;
 }
 
 void Program::setAsyncRuntime(
@@ -4780,6 +5334,9 @@ runtime::ExecutionResult Program::invoke(
     runtime::ExecutionOptions options) const {
     runtime::ScopedValuePoolDomain domainScope(
         heap_ ? heap_->valuePoolDomain().get() : nullptr);
+    if (!options.executionPolicy) {
+        options.executionPolicy = executionPolicy_;
+    }
     const runtime::ExecutionOptions invokeOptionsCopy = options;
     ExecutionContext context(
         *descriptor_,
@@ -4790,7 +5347,9 @@ runtime::ExecutionResult Program::invoke(
         &functions_);
     if (!resumeEnv_ ||
         static_cast<const AotResumeEnv*>(resumeEnv_.get())->options.awaitScheduler !=
-            invokeOptionsCopy.awaitScheduler) {
+            invokeOptionsCopy.awaitScheduler ||
+        static_cast<const AotResumeEnv*>(resumeEnv_.get())->options.executionPolicy !=
+            invokeOptionsCopy.executionPolicy) {
         auto env = std::make_shared<AotResumeEnv>();
         env->descriptor = descriptor_;
         env->heap = heap_;

@@ -239,6 +239,31 @@ bool consume(
     return true;
 }
 
+[[nodiscard]] inline CrossHeapAccessPolicy effectiveCrossHeapPolicy(
+    const State& state,
+    const ManagedHeap* targetHeap) noexcept {
+    auto policy = state.crossHeapPolicy;
+    if (state.executionPolicy) {
+        const auto domainPolicy =
+            state.executionPolicy->crossHeapAccessPolicy(state.heap, targetHeap);
+        if (static_cast<std::uint8_t>(domainPolicy) >
+            static_cast<std::uint8_t>(policy)) {
+            policy = domainPolicy;
+        }
+    }
+    return policy;
+}
+
+[[nodiscard]] inline bool isValidDelegateFlags(
+    std::int64_t flags,
+    bool allowMulticast = true) noexcept {
+    if (flags < 0) return false;
+    if (flags == 4) return allowMulticast;
+    const auto cleared = static_cast<std::uint64_t>(flags) &
+        ~static_cast<std::uint64_t>(ManagedHeap::DelegateWeakTargetFlag);
+    return cleared <= 2u;
+}
+
 bool checkCrossHeapRefAccess(
     State& state,
     const ObjectRef& reference,
@@ -248,14 +273,24 @@ bool checkCrossHeapRefAccess(
         return true;
     }
     if (reference.heapId != 0 &&
-        reference.heapId != static_cast<std::uint32_t>(state.heap->heapId()) &&
-        (isWrite || state.crossHeapPolicy != CrossHeapAccessPolicy::AllowReadWrite)) {
-        return fail(
-            state,
-            ErrorCode::CrossHeapAccessViolation,
-            std::string(context) + (isWrite
-                ? " rejected cross-heap mutation by active CrossHeapAccessPolicy"
-                : " rejected cross-heap access by active CrossHeapAccessPolicy"));
+        reference.heapId != static_cast<std::uint32_t>(state.heap->heapId())) {
+        ManagedHeap* targetHeap = resolveHeap(state, reference);
+        const auto policy = effectiveCrossHeapPolicy(state, targetHeap);
+        if (isWrite) {
+            if (policy != CrossHeapAccessPolicy::AllowReadWrite) {
+                return fail(
+                    state,
+                    ErrorCode::CrossHeapAccessViolation,
+                    std::string(context) +
+                        " rejected cross-heap mutation by active CrossHeapAccessPolicy");
+            }
+        } else if (policy == CrossHeapAccessPolicy::Deny) {
+            return fail(
+                state,
+                ErrorCode::CrossHeapAccessViolation,
+                std::string(context) +
+                    " rejected cross-heap access by active CrossHeapAccessPolicy");
+        }
     }
     return true;
 }
@@ -276,7 +311,8 @@ bool expectType(
             if (!checkCrossHeapRefAccess(state, *reference, false, context)) {
                 return false;
             }
-            if (!state.heap || !state.heap->isAlive(*reference)) {
+            ManagedHeap* targetHeap = resolveHeap(state, *reference);
+            if (!targetHeap || !targetHeap->isAlive(*reference)) {
                 return fail(state, ErrorCode::InvalidObjectReference,
                     std::string(context) + " contains an invalid managed object reference");
             }
@@ -429,11 +465,12 @@ bool expectObject(
     if (!checkCrossHeapRefAccess(state, *reference, false, context)) {
         return false;
     }
-    if (!state.heap || !state.heap->isAlive(*reference)) {
+    ManagedHeap* targetHeap = resolveHeap(state, *reference);
+    if (!targetHeap || !targetHeap->isAlive(*reference)) {
         return fail(state, ErrorCode::InvalidObjectReference,
             context + " contains an invalid managed object reference");
     }
-    const auto actual = state.heap->objectTypeId(*reference);
+    const auto actual = targetHeap->objectTypeId(*reference);
     if (!actual || !runtimeAssignable(state, *actual, type.id)) {
         return fail(state, ErrorCode::TypeMismatch,
             context + " expected object '" + semantic::canonicalTypeName(type) + "'");
@@ -464,8 +501,9 @@ bool expectSignatureType(
             return fail(state, ErrorCode::TypeMismatch,
                 std::string(context) + " has an incompatible stack reference type");
         }
-        const auto actual = reference && state.heap
-            ? state.heap->objectTypeId(*reference)
+        ManagedHeap* targetHeap = reference ? resolveHeap(state, *reference) : state.heap;
+        const auto actual = reference && targetHeap
+            ? targetHeap->objectTypeId(*reference)
             : std::optional<semantic::SymbolId>{};
         if (!actual || !runtimeAssignable(state, *actual, typeId)) {
             return fail(state, ErrorCode::TypeMismatch,
@@ -474,8 +512,9 @@ bool expectSignatureType(
     } else if (type == semantic::PrimitiveType::Array) {
         if (std::holds_alternative<NullArray>(value) || typeId == 0) return true;
         const auto* reference = std::get_if<ObjectRef>(&value);
-        const auto actual = reference && state.heap
-            ? state.heap->arrayTypeId(*reference)
+        ManagedHeap* targetHeap = reference ? resolveHeap(state, *reference) : state.heap;
+        const auto actual = reference && targetHeap
+            ? targetHeap->arrayTypeId(*reference)
             : std::optional<semantic::SymbolId>{};
         if (!actual || *actual != typeId) {
             return fail(state, ErrorCode::TypeMismatch,
@@ -586,7 +625,9 @@ bool valuesEqual(State& state, const Value& left, const Value& right, bool& equa
         }
         const auto validate = [&](const Value& value) {
             const auto* reference = std::get_if<ObjectRef>(&value);
-            return !reference || (state.heap && state.heap->isAlive(*reference));
+            if (!reference) return true;
+            ManagedHeap* targetHeap = resolveHeap(state, *reference);
+            return targetHeap && targetHeap->isAlive(*reference);
         };
         if (!validate(left) || !validate(right)) {
             return fail(state, ErrorCode::InvalidObjectReference,
@@ -640,8 +681,9 @@ bool valuesEqual(State& state, const Value& left, const Value& right, bool& equa
     const auto getText = [&](const Value& value) -> std::optional<std::string_view> {
         if (const auto* text = std::get_if<std::string>(&value)) return *text;
         if (const auto* reference = std::get_if<ObjectRef>(&value)) {
-            if (!state.heap) return std::nullopt;
-            return state.heap->stringView(*reference);
+            const auto* targetHeap = resolveHeap(state, *reference);
+            if (!targetHeap) return std::nullopt;
+            return targetHeap->stringView(*reference);
         }
         return std::nullopt;
     };
@@ -771,7 +813,8 @@ bool executeCall(
     };
     const auto tryCachedReceiver = [&](ObjectRef receiver)
             -> std::optional<bool> {
-        if (!state.heap || !state.heap->isAlive(receiver)) return std::nullopt;
+        ManagedHeap* recvHeap = resolveHeap(state, receiver);
+        if (!recvHeap || !recvHeap->isAlive(receiver)) return std::nullopt;
         const auto& cached = (*state.inlineCallCache)[cacheIndex()];
         return cached.receiver == receiver
             ? invokeCached(cached)
@@ -817,8 +860,9 @@ bool executeCall(
                 return *cached;
             }
         }
-        const auto actualTypeId = receiver && state.heap
-            ? state.heap->objectTypeId(*receiver)
+        ManagedHeap* recvHeap = receiver ? resolveHeap(state, *receiver) : state.heap;
+        const auto actualTypeId = receiver && recvHeap
+            ? recvHeap->objectTypeId(*receiver)
             : std::optional<semantic::SymbolId>{};
         if (!actualTypeId || !state.program) {
             return fail(state, ErrorCode::InvalidObjectReference,
@@ -877,8 +921,9 @@ bool executeCall(
                 return *cached;
             }
         }
-        const auto actualTypeId = receiver && state.heap
-            ? state.heap->objectTypeId(*receiver)
+        ManagedHeap* recvHeap = receiver ? resolveHeap(state, *receiver) : state.heap;
+        const auto actualTypeId = receiver && recvHeap
+            ? recvHeap->objectTypeId(*receiver)
             : std::optional<semantic::SymbolId>{};
         if (!actualTypeId) {
             return fail(state, ErrorCode::InvalidObjectReference,
@@ -922,8 +967,9 @@ bool executeCall(
         if ((reference.virtualDispatch || reference.interfaceDispatch) &&
             execution) {
             const auto* receiver = std::get_if<ObjectRef>(&arguments.front());
-            const auto receiverTypeId = receiver && state.heap
-                ? state.heap->objectTypeId(*receiver)
+            ManagedHeap* recvHeap = receiver ? resolveHeap(state, *receiver) : state.heap;
+            const auto receiverTypeId = receiver && recvHeap
+                ? recvHeap->objectTypeId(*receiver)
                 : std::optional<semantic::SymbolId>{};
             if (receiverTypeId) {
                 (*state.inlineCallCache)[cacheIndex()] = {
@@ -1000,13 +1046,15 @@ bool executeCall(
         return true;
     }
     if (reference.name.rfind("$intrinsic::", 0) == 0) {
-        std::string intrinsicError;
+        RuntimeError intrinsicError;
         if (!tryExecuteRuntimeIntrinsic(
                 reference.name, argSpan, state.heap, result, intrinsicError)) {
-            const auto code = intrinsicError.find("null") != std::string::npos
-                ? ErrorCode::NullReference
-                : ErrorCode::InvalidProgram;
-            return fail(state, code, intrinsicError);
+            const auto code = intrinsicError.code != ErrorCode::None
+                ? intrinsicError.code
+                : (intrinsicError.message.find("null") != std::string::npos
+                    ? ErrorCode::NullReference
+                    : ErrorCode::InvalidProgram);
+            return fail(state, code, intrinsicError.message);
         }
         return true;
     }
@@ -1148,16 +1196,20 @@ bool readDelegateId(
     std::size_t lowIndex,
     semantic::SymbolId& value,
     const char* context) {
+    ManagedHeap* targetHeap = resolveHeap(state, reference);
     ObjectFastView view{};
-    if (state.heap && state.heap->tryBindObjectFastView(reference, view) &&
+    if (targetHeap && targetHeap->tryBindObjectFastView(reference, view) &&
         lowIndex + 1u < view.fieldCount) {
         if (!readDelegateIdFromFields(view.fields, lowIndex, value)) {
             return fail(state, ErrorCode::InvalidProgram, context);
         }
         return true;
     }
-    const auto low = state.heap->fieldGet(reference, lowIndex);
-    const auto high = state.heap->fieldGet(reference, lowIndex + 1u);
+    if (!targetHeap) {
+        return fail(state, ErrorCode::InvalidProgram, context);
+    }
+    const auto low = targetHeap->fieldGet(reference, lowIndex);
+    const auto high = targetHeap->fieldGet(reference, lowIndex + 1u);
     const auto* lowValue = low ? std::get_if<std::int64_t>(&*low) : nullptr;
     const auto* highValue = high ? std::get_if<std::int64_t>(&*high) : nullptr;
     if (!lowValue || !highValue || *lowValue < 0 || *highValue < 0 ||
@@ -1201,16 +1253,21 @@ bool flattenDelegate(
                 "delegate invocation list is too deep");
         }
         const auto* reference = std::get_if<ObjectRef>(&cur);
+        if (reference && !checkCrossHeapRefAccess(state, *reference, false, "delegate invocation")) {
+            return false;
+        }
+        ManagedHeap* curHeap = reference ? resolveHeap(state, *reference) : nullptr;
         ObjectFastView view{};
         if (!reference ||
-            !state.heap->tryBindObjectFastView(*reference, view) ||
+            !curHeap ||
+            !curHeap->tryBindObjectFastView(*reference, view) ||
             view.typeId != delegateTypeId ||
             view.fieldCount != 8u) {
             return fail(state, ErrorCode::TypeMismatch,
                 "delegate invocation list contains an incompatible value");
         }
         std::int64_t flags = -1;
-        if (!view.fields[3].tryGetInt64(flags) || flags < 0 || flags > 4) {
+        if (!view.fields[3].tryGetInt64(flags) || !isValidDelegateFlags(flags, true)) {
             return fail(state, ErrorCode::InvalidProgram,
                 "delegate invocation-list metadata is corrupt");
         }
@@ -1239,10 +1296,13 @@ bool sameDelegateLeaf(
     const auto* leftRef = std::get_if<ObjectRef>(&left);
     const auto* rightRef = std::get_if<ObjectRef>(&right);
     if (!leftRef || !rightRef || !state.heap) return false;
-    if (*leftRef == *rightRef && state.heap->isAlive(*leftRef)) return true;
+    ManagedHeap* leftHeap = resolveHeap(state, *leftRef);
+    ManagedHeap* rightHeap = resolveHeap(state, *rightRef);
+    if (!leftHeap || !rightHeap) return false;
+    if (*leftRef == *rightRef && leftHeap->isAlive(*leftRef)) return true;
     ObjectFastView lv{}, rv{};
-    if (state.heap->tryBindObjectFastView(*leftRef, lv) &&
-        state.heap->tryBindObjectFastView(*rightRef, rv) &&
+    if (leftHeap->tryBindObjectFastView(*leftRef, lv) &&
+        rightHeap->tryBindObjectFastView(*rightRef, rv) &&
         lv.fieldCount >= 7u && rv.fieldCount >= 7u) {
         for (std::size_t index = 0; index < 7u; ++index) {
             if (!(lv.fields[index] == rv.fields[index])) return false;
@@ -1250,8 +1310,8 @@ bool sameDelegateLeaf(
         return true;
     }
     for (std::size_t index = 0; index < 7u; ++index) {
-        const auto a = state.heap->fieldGet(*leftRef, index);
-        const auto b = state.heap->fieldGet(*rightRef, index);
+        const auto a = leftHeap->fieldGet(*leftRef, index);
+        const auto b = rightHeap->fieldGet(*rightRef, index);
         if (!a || !b || !(*a == *b)) return false;
     }
     return true;
@@ -1336,27 +1396,43 @@ bool combineOrRemoveDelegateFastImpl(
     std::int64_t leftFlags = -1, rightFlags = -1;
 
     if (!leftNull) {
-        if (left.rawTag() != ValueTag::ObjectRef ||
-            !state.heap->tryBindObjectFastView(left.u_.objectRef, leftView) ||
+        if (left.rawTag() != ValueTag::ObjectRef) {
+            return fail(state, ErrorCode::TypeMismatch,
+                "delegate combination left operand has incompatible type");
+        }
+        if (!checkCrossHeapRefAccess(state, left.u_.objectRef, false, "delegate combination")) {
+            return false;
+        }
+        ManagedHeap* leftHeap = resolveHeap(state, left.u_.objectRef);
+        if (!leftHeap ||
+            !leftHeap->tryBindObjectFastView(left.u_.objectRef, leftView) ||
             leftView.typeId != delegateTypeId ||
             leftView.fieldCount != 8u) {
             return fail(state, ErrorCode::TypeMismatch,
                 "delegate combination left operand has incompatible type");
         }
-        if (!leftView.fields[3].tryGetInt64(leftFlags) || leftFlags < 0 || leftFlags > 4) {
+        if (!leftView.fields[3].tryGetInt64(leftFlags) || !isValidDelegateFlags(leftFlags, true)) {
             return fail(state, ErrorCode::InvalidProgram,
                 "delegate invocation-list metadata is corrupt");
         }
     }
     if (!rightNull) {
-        if (right.rawTag() != ValueTag::ObjectRef ||
-            !state.heap->tryBindObjectFastView(right.u_.objectRef, rightView) ||
+        if (right.rawTag() != ValueTag::ObjectRef) {
+            return fail(state, ErrorCode::TypeMismatch,
+                "delegate combination right operand has incompatible type");
+        }
+        if (!checkCrossHeapRefAccess(state, right.u_.objectRef, false, "delegate combination")) {
+            return false;
+        }
+        ManagedHeap* rightHeap = resolveHeap(state, right.u_.objectRef);
+        if (!rightHeap ||
+            !rightHeap->tryBindObjectFastView(right.u_.objectRef, rightView) ||
             rightView.typeId != delegateTypeId ||
             rightView.fieldCount != 8u) {
             return fail(state, ErrorCode::TypeMismatch,
                 "delegate combination right operand has incompatible type");
         }
-        if (!rightView.fields[3].tryGetInt64(rightFlags) || rightFlags < 0 || rightFlags > 4) {
+        if (!rightView.fields[3].tryGetInt64(rightFlags) || !isValidDelegateFlags(rightFlags, true)) {
             return fail(state, ErrorCode::InvalidProgram,
                 "delegate invocation-list metadata is corrupt");
         }
@@ -1390,16 +1466,24 @@ bool combineOrRemoveDelegateFastImpl(
         if (leftFlags == 4) {
             const auto checkChild = [&](const Value& child) -> bool {
                 if (child.rawTag() == ValueTag::NullObject) return true;
+                if (child.rawTag() != ValueTag::ObjectRef) {
+                    return fail(state, ErrorCode::TypeMismatch,
+                        "delegate invocation list contains an incompatible value");
+                }
+                if (!checkCrossHeapRefAccess(state, child.u_.objectRef, false, "delegate combination")) {
+                    return false;
+                }
+                ManagedHeap* childHeap = resolveHeap(state, child.u_.objectRef);
                 ObjectFastView cv{};
                 std::int64_t cf = -1;
-                if (child.rawTag() != ValueTag::ObjectRef ||
-                    !state.heap->tryBindObjectFastView(child.u_.objectRef, cv) ||
+                if (!childHeap ||
+                    !childHeap->tryBindObjectFastView(child.u_.objectRef, cv) ||
                     cv.typeId != delegateTypeId ||
                     cv.fieldCount != 8u) {
                     return fail(state, ErrorCode::TypeMismatch,
                         "delegate invocation list contains an incompatible value");
                 }
-                if (!cv.fields[3].tryGetInt64(cf) || cf < 0 || cf > 4) {
+                if (!cv.fields[3].tryGetInt64(cf) || !isValidDelegateFlags(cf, true)) {
                     return fail(state, ErrorCode::InvalidProgram,
                         "delegate invocation-list metadata is corrupt");
                 }
@@ -1688,7 +1772,8 @@ bool executeQuickInstruction(
             if (!checkCrossHeapRefAccess(state, *ref, false, "field access")) {
                 return false;
             }
-            if (state.heap && state.heap->isAlive(*ref)) {
+            ManagedHeap* targetHeap = resolveHeap(state, *ref);
+            if (targetHeap && targetHeap->isAlive(*ref)) {
                 registers[decoded.result] = val;
                 return true;
             }
@@ -1707,20 +1792,23 @@ bool executeQuickInstruction(
             if (!checkCrossHeapRefAccess(state, *ref, false, "array element load")) {
                 return false;
             }
+            ManagedHeap* targetHeap = resolveHeap(state, *ref);
             const auto idx = std::get<std::int64_t>(idxVal);
-            if (idx >= 0 && state.heap) {
-                if (const auto* elem = state.heap->arrayGetFast(
+            if (idx >= 0 && targetHeap) {
+                if (const auto* elem = targetHeap->arrayGetFast(
                         *ref, static_cast<std::size_t>(idx))) {
-                    registers[decoded.result] = *elem;
+                    registers[decoded.result] =
+                        sanitizeCrossHeapValue(state, targetHeap, *elem);
                     return true;
                 }
-                if (auto packedElem = state.heap->arrayGet(
+                if (auto packedElem = targetHeap->arrayGet(
                         *ref, static_cast<std::size_t>(idx))) {
-                    registers[decoded.result] = std::move(*packedElem);
+                    registers[decoded.result] = sanitizeCrossHeapValue(
+                        state, targetHeap, std::move(*packedElem));
                     return true;
                 }
             }
-            if (!state.heap || !state.heap->arrayLength(*ref)) {
+            if (!targetHeap || !targetHeap->arrayLength(*ref)) {
                 return fail(state, ErrorCode::InvalidObjectReference,
                     "array element load references an invalid managed array");
             }
@@ -1739,21 +1827,48 @@ bool executeQuickInstruction(
         const auto& idxVal = registers[decoded.op1];
         const auto& storeVal = registers[decoded.op2];
         if (const auto* ref = std::get_if<ObjectRef>(&arrVal)) {
-            if (!checkCrossHeapRefAccess(state, *ref, true, "array element store")) {
+            if (!checkCrossHeapRefAccess(
+                    state,
+                    *ref,
+                    state.executionPolicy == nullptr,
+                    "array element store")) {
                 return false;
             }
+            ManagedHeap* targetHeap = resolveHeap(state, *ref);
             const auto idx = std::get<std::int64_t>(idxVal);
-            if (idx >= 0 && state.heap &&
-                state.heap->arraySetPrevalidated(
-                    *ref, static_cast<std::size_t>(idx), storeVal, false)) {
-                return true;
-            }
-            if (!state.heap || !state.heap->arrayLength(*ref)) {
+            const auto len = targetHeap
+                ? targetHeap->arrayLength(*ref)
+                : std::optional<std::size_t>{};
+            if (!targetHeap || !len) {
                 return fail(state, ErrorCode::InvalidObjectReference,
                     "array element store references an invalid managed array");
             }
-            return fail(state, ErrorCode::IndexOutOfRange,
-                "array element index is out of range");
+            if (idx < 0 || static_cast<std::uint64_t>(idx) >= *len) {
+                return fail(state, ErrorCode::IndexOutOfRange,
+                    "array element index is out of range");
+            }
+            if (state.executionPolicy) {
+                RuntimeError arrayError;
+                if (!state.executionPolicy->checkArrayWrite(
+                        state.heap, targetHeap, *ref, storeVal, arrayError)) {
+                    return fail(state,
+                        arrayError.code == ErrorCode::None
+                            ? ErrorCode::CapabilityDenied
+                            : arrayError.code,
+                        arrayError.message.empty()
+                            ? "array element write rejected by active execution policy"
+                            : arrayError.message);
+                }
+            }
+            if (!checkCrossHeapRefAccess(state, *ref, true, "array element store")) {
+                return false;
+            }
+            if (targetHeap->arraySetPrevalidated(
+                    *ref, static_cast<std::size_t>(idx), storeVal, false)) {
+                return true;
+            }
+            return fail(state, ErrorCode::InvalidObjectReference,
+                "array element store references an invalid managed array");
         }
         if (std::holds_alternative<NullArray>(arrVal)) {
             return fail(state, ErrorCode::NullReference,
@@ -1799,7 +1914,8 @@ bool executeQuickInstruction(
     case detail::QuickOpcode::CallPolled: {
         const auto& instruction = *decoded.bytecode;
         const auto* receiver = std::get_if<ObjectRef>(&registers[decoded.op0]);
-        if (receiver && state.heap && state.heap->isAlive(*receiver)) {
+        ManagedHeap* recvHeap = receiver ? resolveHeap(state, *receiver) : nullptr;
+        if (receiver && recvHeap && recvHeap->isAlive(*receiver)) {
             const auto callSite = reinterpret_cast<std::uintptr_t>(&instruction);
             const auto idx = static_cast<std::size_t>((callSite >> 4U) & 63U);
             const auto& cached = (*state.inlineCallCache)[idx];
@@ -1960,28 +2076,32 @@ bool executeSuperInstruction(
 
 
 std::string extractScriptExceptionMessage(const State& state, const Value& excVal) {
-    if (!state.heap || !std::holds_alternative<ObjectRef>(excVal)) {
+    if (!std::holds_alternative<ObjectRef>(excVal)) {
         return "unhandled script exception in async function";
     }
     const ObjectRef ref = std::get<ObjectRef>(excVal);
-    const auto tid = state.heap->objectTypeId(ref);
+    ManagedHeap* excHeap = resolveHeap(state, ref);
+    if (!excHeap) {
+        return "unhandled script exception in async function";
+    }
+    const auto tid = excHeap->objectTypeId(ref);
     const auto* typeDesc = (tid && state.program) ? state.program->resolveType(*tid) : nullptr;
     if (typeDesc) {
         for (std::size_t f = 0; f < typeDesc->fields.size(); ++f) {
             if (typeDesc->fields[f].type == semantic::PrimitiveType::String) {
-                if (const auto fv = state.heap->fieldGet(ref, f)) {
+                if (const auto fv = excHeap->fieldGet(ref, f)) {
                     if (!std::holds_alternative<NullString>(*fv) &&
                         !std::holds_alternative<std::monostate>(*fv)) {
-                        const auto s = valueToString(*fv, state.heap);
+                        const auto s = valueToString(*fv, excHeap);
                         if (!s.empty()) return s;
                     }
                 }
             }
         }
         if (!typeDesc->name.empty()) return typeDesc->name;
-    } else if (const auto f0 = state.heap->fieldGet(ref, 0)) {
+    } else if (const auto f0 = excHeap->fieldGet(ref, 0)) {
         if (const auto* sObj = std::get_if<ObjectRef>(&*f0)) {
-            if (const auto sv = state.heap->stringView(*sObj); sv && !sv->empty()) {
+            if (const auto sv = excHeap->stringView(*sObj); sv && !sv->empty()) {
                 return std::string(*sv);
             }
         }
@@ -2566,8 +2686,9 @@ bool executeInstruction(
                 if (reference && !checkCrossHeapRefAccess(state, *reference, false, "runtime type check")) {
                     return false;
                 }
-                const auto actual = reference && state.heap
-                    ? state.heap->objectTypeId(*reference)
+                ManagedHeap* targetHeap = reference ? resolveHeap(state, *reference) : state.heap;
+                const auto actual = reference && targetHeap
+                    ? targetHeap->objectTypeId(*reference)
                     : std::optional<semantic::SymbolId>{};
                 matches = actual && runtimeAssignable(
                     state, *actual, instruction.elementTypeId);
@@ -2577,8 +2698,9 @@ bool executeInstruction(
                 if (reference && !checkCrossHeapRefAccess(state, *reference, false, "runtime type check")) {
                     return false;
                 }
-                const auto actual = reference && state.heap
-                    ? state.heap->arrayTypeId(*reference)
+                ManagedHeap* targetHeap = reference ? resolveHeap(state, *reference) : state.heap;
+                const auto actual = reference && targetHeap
+                    ? targetHeap->arrayTypeId(*reference)
                     : std::optional<semantic::SymbolId>{};
                 matches = actual && *actual == instruction.elementTypeId;
             } else {
@@ -2724,8 +2846,9 @@ bool executeInstruction(
             return false;
         }
         const auto* reference = std::get_if<ObjectRef>(receiver);
-        const auto length = reference && state.heap
-            ? state.heap->arrayLength(*reference)
+        ManagedHeap* targetHeap = reference ? resolveHeap(state, *reference) : state.heap;
+        const auto length = reference && targetHeap
+            ? targetHeap->arrayLength(*reference)
             : std::optional<std::size_t>{};
         if (!length || *length >
                 static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -2750,7 +2873,12 @@ bool executeInstruction(
         }
         const auto index = std::get<std::int64_t>(*indexValue);
         const auto reference = std::get<ObjectRef>(*receiver);
-        const auto length = state.heap->arrayLength(reference);
+        ManagedHeap* targetHeap = resolveHeap(state, reference);
+        if (!targetHeap) {
+            return fail(state, ErrorCode::InvalidObjectReference,
+                "array element load references an invalid managed array");
+        }
+        const auto length = targetHeap->arrayLength(reference);
         if (!length) {
             return fail(state, ErrorCode::InvalidObjectReference,
                 "array element load references an invalid managed array");
@@ -2759,22 +2887,26 @@ bool executeInstruction(
             return fail(state, ErrorCode::IndexOutOfRange,
                 "array element index is out of range");
         }
-        const auto elementType = state.heap->arrayElementType(reference);
-        const auto elementTypeId = state.heap->arrayElementTypeId(reference);
+        const auto elementType = targetHeap->arrayElementType(reference);
+        const auto elementTypeId = targetHeap->arrayElementTypeId(reference);
         if (!elementType || !elementTypeId ||
             *elementType != instruction.elementType ||
             *elementTypeId != instruction.elementTypeId) {
             return fail(state, ErrorCode::TypeMismatch,
                 "array element metadata does not match the bytecode operation");
         }
-        const auto value = state.heap->arrayGet(
+        const auto value = targetHeap->arrayGet(
             reference, static_cast<std::size_t>(index));
-        if (!value || !expectSignatureType(
-                state, *value, instruction.elementType,
+        if (!value) {
+            return false;
+        }
+        Value loaded = sanitizeCrossHeapValue(state, targetHeap, *value);
+        if (!expectSignatureType(
+                state, loaded, instruction.elementType,
                 instruction.elementTypeId, "array element value")) {
             return false;
         }
-        return storeResult(*value);
+        return storeResult(std::move(loaded));
     }
     case bytecode::Opcode::StoreElement: {
         const auto* receiver = operand(0);
@@ -2786,7 +2918,11 @@ bool executeInstruction(
                 "array element store attempted to dereference null");
         }
         if (const auto* recvRef = std::get_if<ObjectRef>(receiver)) {
-            if (!checkCrossHeapRefAccess(state, *recvRef, true, "array element store")) {
+            if (!checkCrossHeapRefAccess(
+                    state,
+                    *recvRef,
+                    state.executionPolicy == nullptr,
+                    "array element store")) {
                 return false;
             }
         }
@@ -2800,7 +2936,12 @@ bool executeInstruction(
         }
         const auto index = std::get<std::int64_t>(*indexValue);
         const auto reference = std::get<ObjectRef>(*receiver);
-        const auto length = state.heap->arrayLength(reference);
+        ManagedHeap* targetHeap = resolveHeap(state, reference);
+        if (!targetHeap) {
+            return fail(state, ErrorCode::InvalidObjectReference,
+                "array element store references an invalid managed array");
+        }
+        const auto length = targetHeap->arrayLength(reference);
         if (!length) {
             return fail(state, ErrorCode::InvalidObjectReference,
                 "array element store references an invalid managed array");
@@ -2809,8 +2950,8 @@ bool executeInstruction(
             return fail(state, ErrorCode::IndexOutOfRange,
                 "array element index is out of range");
         }
-        const auto elementType = state.heap->arrayElementType(reference);
-        const auto elementTypeId = state.heap->arrayElementTypeId(reference);
+        const auto elementType = targetHeap->arrayElementType(reference);
+        const auto elementTypeId = targetHeap->arrayElementTypeId(reference);
         if (!elementType || !elementTypeId ||
             *elementType != instruction.elementType ||
             *elementTypeId != instruction.elementTypeId) {
@@ -2818,7 +2959,21 @@ bool executeInstruction(
                 "array element metadata does not match the bytecode operation");
         }
         RuntimeError arrayError;
-        if (!state.heap->arraySet(
+        if (state.executionPolicy &&
+            !state.executionPolicy->checkArrayWrite(
+                state.heap, targetHeap, reference, *value, arrayError)) {
+            return fail(state,
+                arrayError.code == ErrorCode::None
+                    ? ErrorCode::CapabilityDenied
+                    : arrayError.code,
+                arrayError.message.empty()
+                    ? "array element write rejected by active execution policy"
+                    : arrayError.message);
+        }
+        if (!checkCrossHeapRefAccess(state, reference, true, "array element store")) {
+            return false;
+        }
+        if (!targetHeap->arraySet(
                 reference,
                 static_cast<std::size_t>(index),
                 *value,
@@ -2875,21 +3030,25 @@ bool executeInstruction(
             }
             return storeResult(stackVal);
         }
-        const auto value = state.heap->fieldGet(reference, instruction.index);
+        ManagedHeap* targetHeap = resolveHeap(state, reference);
+        const auto value = targetHeap
+            ? targetHeap->fieldGet(reference, instruction.index)
+            : std::optional<Value>{};
         if (!value) {
             return fail(state, ErrorCode::InvalidProgram,
                 "field load references an invalid field slot");
         }
+        Value loaded = sanitizeCrossHeapValue(state, targetHeap, *value);
         const auto& field = type->fields[instruction.index];
         if (!expectSignatureType(
                 state,
-                *value,
+                loaded,
                 field.type,
                 exactTypeId(field.type, field.typeName),
                 "field load value")) {
             return false;
         }
-        return storeResult(*value);
+        return storeResult(std::move(loaded));
     }
     case bytecode::Opcode::StoreField: {
         const auto* receiver = operand(0);
@@ -2900,7 +3059,11 @@ bool executeInstruction(
             return false;
         }
         if (const auto* recvRef = std::get_if<ObjectRef>(receiver)) {
-            if (!checkCrossHeapRefAccess(state, *recvRef, true, "field store")) {
+            if (!checkCrossHeapRefAccess(
+                    state,
+                    *recvRef,
+                    state.executionPolicy == nullptr,
+                    "field store")) {
                 return false;
             }
         }
@@ -2916,15 +3079,6 @@ bool executeInstruction(
             return false;
         }
         const auto recvRef = std::get<ObjectRef>(*receiver);
-        if (!recvRef.isStackSlotRef() &&
-            state.crossHeapPolicy != CrossHeapAccessPolicy::AllowReadWrite &&
-            state.heap && recvRef.valid() &&
-            recvRef.heapId != static_cast<std::uint32_t>(state.heap->heapId())) {
-            return fail(
-                state,
-                ErrorCode::CrossHeapAccessViolation,
-                "cross-heap field write rejected by active CrossHeapAccessPolicy");
-        }
         if (recvRef.isStackSlotRef()) {
             if (recvRef.stackRefSchemaId() == 0u) {
                 state.values[recvRef.slot] = detachFrameSliceValue(*value);
@@ -2936,8 +3090,30 @@ bool executeInstruction(
             }
             return true;
         }
+        ManagedHeap* targetHeap = resolveHeap(state, recvRef);
         RuntimeError fieldError;
-        if (!state.heap->fieldSet(
+        if (state.executionPolicy &&
+            !state.executionPolicy->checkFieldWrite(
+                state.heap,
+                targetHeap,
+                recvRef,
+                type->id,
+                instruction.index,
+                type->fields[instruction.index].name,
+                *value,
+                fieldError)) {
+            return fail(state,
+                fieldError.code == ErrorCode::None
+                    ? ErrorCode::CapabilityDenied
+                    : fieldError.code,
+                fieldError.message.empty()
+                    ? "field write rejected by active execution policy"
+                    : fieldError.message);
+        }
+        if (!checkCrossHeapRefAccess(state, recvRef, true, "field store")) {
+            return false;
+        }
+        if (!targetHeap || !targetHeap->fieldSet(
                 recvRef,
                 instruction.index,
                 *value,
@@ -3123,15 +3299,28 @@ bool executeInstruction(
         if (delegateRef && !checkCrossHeapRefAccess(state, *delegateRef, false, "delegate invocation")) {
             return false;
         }
-        const auto actualType = delegateRef
-            ? state.heap->objectTypeId(*delegateRef)
+        ManagedHeap* delegateHeap = delegateRef ? resolveHeap(state, *delegateRef) : state.heap;
+        const auto actualType = delegateRef && delegateHeap
+            ? delegateHeap->objectTypeId(*delegateRef)
             : std::optional<semantic::SymbolId>{};
-        if (!delegateRef || !actualType || *actualType != type->id ||
-            state.heap->fieldCount(*delegateRef) != 8u) {
+        if (!delegateRef || !delegateHeap || !actualType || *actualType != type->id ||
+            delegateHeap->fieldCount(*delegateRef) != 8u) {
             return fail(state, ErrorCode::TypeMismatch,
                 "delegate invocation received an incompatible value");
         }
-        const auto rootFlagsValue = state.heap->fieldGet(
+        const semantic::FunctionSymbol* invoke = nullptr;
+        for (const auto& method : type->methods) {
+            if (method.name == "Invoke") {
+                invoke = &method;
+                break;
+            }
+        }
+        if (!invoke || invoke->parameters.empty() ||
+            instruction.operands.size() != invoke->parameters.size()) {
+            return fail(state, ErrorCode::InvalidProgram,
+                "delegate invocation signature is invalid");
+        }
+        const auto rootFlagsValue = delegateHeap->fieldGet(
             *delegateRef, 3u);
         const auto* rootFlags = rootFlagsValue
             ? std::get_if<std::int64_t>(&*rootFlagsValue)
@@ -3142,8 +3331,29 @@ bool executeInstruction(
                     state, type->id, *delegateValue, leaves)) {
                 return false;
             }
-            Value lastResult;
+            Value lastResult = (instruction.result == bytecode::InvalidRegister)
+                ? Value{}
+                : defaultValue(
+                    module,
+                    invoke->returnType,
+                    exactTypeId(invoke->returnType, invoke->returnTypeName));
             for (const auto& leaf : leaves) {
+                if (const auto* leafRef = std::get_if<ObjectRef>(&leaf)) {
+                    if (ManagedHeap* leafHeap = resolveHeap(state, *leafRef)) {
+                        const auto leafFlagsVal = leafHeap->fieldGet(*leafRef, 3u);
+                        const auto leafTargetVal = leafHeap->fieldGet(*leafRef, 0u);
+                        if (leafFlagsVal && leafTargetVal) {
+                            if (const auto* lf = std::get_if<std::int64_t>(&*leafFlagsVal);
+                                lf && (*lf & static_cast<std::int64_t>(ManagedHeap::DelegateWeakTargetFlag)) != 0) {
+                                const auto* tRef = std::get_if<ObjectRef>(&*leafTargetVal);
+                                ManagedHeap* tHeap = tRef ? resolveHeap(state, *tRef) : nullptr;
+                                if (!tRef || !tHeap || !tHeap->isAlive(*tRef)) {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
                 std::vector<Value> nestedRegisterValues;
                 nestedRegisterValues.reserve(registers.size());
                 for (std::size_t index = 0; index < registers.size(); ++index) {
@@ -3167,18 +3377,6 @@ bool executeInstruction(
                 return true;
             }
             return storeResult(std::move(lastResult));
-        }
-        const semantic::FunctionSymbol* invoke = nullptr;
-        for (const auto& method : type->methods) {
-            if (method.name == "Invoke") {
-                invoke = &method;
-                break;
-            }
-        }
-        if (!invoke || invoke->parameters.empty() ||
-            instruction.operands.size() != invoke->parameters.size()) {
-            return fail(state, ErrorCode::InvalidProgram,
-                "delegate invocation signature is invalid");
         }
         std::vector<Value> delegateArguments;
         delegateArguments.reserve(instruction.operands.size());
@@ -3204,20 +3402,33 @@ bool executeInstruction(
                 "delegate callable identity is corrupt")) {
             return false;
         }
-        const auto target = state.heap->fieldGet(*delegateRef, 0u);
-        const auto flagsValue = state.heap->fieldGet(*delegateRef, 3u);
-        const auto slotValue = state.heap->fieldGet(*delegateRef, 4u);
+        const auto target = delegateHeap->fieldGet(*delegateRef, 0u);
+        const auto flagsValue = delegateHeap->fieldGet(*delegateRef, 3u);
+        const auto slotValue = delegateHeap->fieldGet(*delegateRef, 4u);
         const auto* flags = flagsValue
             ? std::get_if<std::int64_t>(&*flagsValue)
             : nullptr;
         const auto* slot = slotValue
             ? std::get_if<std::int64_t>(&*slotValue)
             : nullptr;
-        if (!target || !flags || !slot || *flags < 0 || *flags > 3 ||
+        if (!target || !flags || !slot || !isValidDelegateFlags(*flags, false) ||
             *slot < 0 ||
             *slot > std::numeric_limits<std::uint32_t>::max()) {
             return fail(state, ErrorCode::InvalidProgram,
                 "delegate dispatch metadata is corrupt");
+        }
+        if ((*flags & static_cast<std::int64_t>(ManagedHeap::DelegateWeakTargetFlag)) != 0) {
+            const auto* weakTargetRef = std::get_if<ObjectRef>(&*target);
+            ManagedHeap* weakTargetHeap = weakTargetRef ? resolveHeap(state, *weakTargetRef) : nullptr;
+            if (!weakTargetRef || !weakTargetHeap || !weakTargetHeap->isAlive(*weakTargetRef)) {
+                if (instruction.result == bytecode::InvalidRegister) {
+                    return true;
+                }
+                return storeResult(defaultValue(
+                    module,
+                    invoke->returnType,
+                    exactTypeId(invoke->returnType, invoke->returnTypeName)));
+            }
         }
         const bool virtualDispatch = (*flags & 1) != 0;
         const bool interfaceDispatch = (*flags & 2) != 0;
@@ -3235,8 +3446,9 @@ bool executeInstruction(
             if (receiver && !checkCrossHeapRefAccess(state, *receiver, false, "delegate invocation")) {
                 return false;
             }
-            const auto runtimeType = receiver
-                ? state.heap->objectTypeId(*receiver)
+            ManagedHeap* recvHeap = receiver ? resolveHeap(state, *receiver) : state.heap;
+            const auto runtimeType = receiver && recvHeap
+                ? recvHeap->objectTypeId(*receiver)
                 : std::optional<semantic::SymbolId>{};
             if (!runtimeType || !state.program) {
                 return fail(state, ErrorCode::InvalidObjectReference,
@@ -3801,7 +4013,10 @@ bool executeBlockVmFunction(
             return static_cast<const detail::ExecutionBlock*>(nullptr);
         }
         const auto reference = std::get<ObjectRef>(*state.pendingException);
-        const auto actual = state.heap->objectTypeId(reference);
+        ManagedHeap* excHeap = resolveHeap(state, reference);
+        const auto actual = excHeap
+            ? excHeap->objectTypeId(reference)
+            : std::optional<semantic::SymbolId>{};
         if (!actual) return static_cast<const detail::ExecutionBlock*>(nullptr);
         for (const auto& handler : function.exceptionHandlers) {
             if (std::find(handler.protectedBlocks.begin(),
@@ -3953,9 +4168,10 @@ bool executeBlockVmFunction(
             }
             if (state.debugger) {
                 const auto excRef = std::get<ObjectRef>(registers[terminator.value]);
+                ManagedHeap* excHeap = resolveHeap(state, excRef);
                 semantic::SymbolId actualTypeId = 0;
-                if (state.heap) {
-                    if (const auto tid = state.heap->objectTypeId(excRef)) {
+                if (excHeap) {
+                    if (const auto tid = excHeap->objectTypeId(excRef)) {
                         actualTypeId = *tid;
                     }
                 }
@@ -3966,13 +4182,13 @@ bool executeBlockVmFunction(
                     ? typeDesc->name
                     : "Exception";
                 std::string excDescription = excTypeName;
-                if (typeDesc && state.heap) {
+                if (typeDesc && excHeap) {
                     for (std::size_t fieldIdx = 0; fieldIdx < typeDesc->fields.size(); ++fieldIdx) {
                         if (typeDesc->fields[fieldIdx].type == semantic::PrimitiveType::String) {
-                            const auto fieldVal = state.heap->fieldGet(excRef, fieldIdx);
+                            const auto fieldVal = excHeap->fieldGet(excRef, fieldIdx);
                             if (fieldVal && !std::holds_alternative<NullString>(*fieldVal) &&
                                 !std::holds_alternative<std::monostate>(*fieldVal)) {
-                                const auto msg = valueToString(*fieldVal, state.heap);
+                                const auto msg = valueToString(*fieldVal, excHeap);
                                 if (!msg.empty()) {
                                     excDescription = excTypeName + ": " + msg;
                                 }

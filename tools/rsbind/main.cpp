@@ -1,5 +1,5 @@
 #include "realscript/Version.h"
-#include "realscript/game/GameScripting.h"
+#include "realscript/bindgen/BindGen.h"
 
 #include <filesystem>
 #include <fstream>
@@ -83,7 +83,7 @@ void usage() {
         << "  --output-cpp <path.h>             Output C++ registration & ECS column binding header\n"
         << "  --output-d-rscript <path.d.rscript> Output RealScript .d.rscript declaration stub\n"
         << "  --output-project <path.json>      Output realscript.project.json with embedded ambientStubs\n"
-        << "  --project-name <name>             Project name for realscript.project.json (default: GameProject)\n"
+        << "  --project-name <name>             Project name for realscript.project.json (default: RealScriptProject)\n"
         << "  -D<MACRO>[=<VALUE>]               Define preprocessor macro for #if / #ifdef evaluation\n"
         << "  -U<MACRO>                         Undefine preprocessor macro\n"
         << "  --help\n"
@@ -99,7 +99,7 @@ int main(int argc, char** argv) {
     }
 
     std::string moduleName = "Engine.Native";
-    std::string projectName = "GameProject";
+    std::string projectName = "RealScriptProject";
     std::filesystem::path outputCpp;
     std::filesystem::path outputStub;
     std::filesystem::path outputProject;
@@ -162,7 +162,7 @@ int main(int argc, char** argv) {
             combinedHeaders << readFile(hdr) << "\n";
         }
 
-        const auto generated = realscript::game::GameApi::generateBindingsFromCppHeader(
+        const auto generated = realscript::bindgen::HostApi::generateBindingsFromCppHeader(
             combinedHeaders.str(), moduleName, macros);
 
         if (!outputCpp.empty()) {

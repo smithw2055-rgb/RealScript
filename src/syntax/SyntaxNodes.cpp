@@ -109,13 +109,22 @@ text::TextSpan ParenthesizedPatternSyntax::span() const noexcept {
     return combine(openParenToken.span, closeParenToken.span);
 }
 
+LambdaExpressionSyntax::LambdaExpressionSyntax() = default;
+LambdaExpressionSyntax::~LambdaExpressionSyntax() = default;
+LambdaExpressionSyntax::LambdaExpressionSyntax(LambdaExpressionSyntax&&) noexcept = default;
+LambdaExpressionSyntax& LambdaExpressionSyntax::operator=(LambdaExpressionSyntax&&) noexcept = default;
+
 text::TextSpan LambdaExpressionSyntax::span() const noexcept {
     const auto start = openParenToken
         ? openParenToken->span
         : parameterTokens.empty()
             ? arrowToken.span
             : parameterTokens.front().span;
-    return combine(start, body->span());
+    return combine(
+        start,
+        blockBody
+            ? blockBody->span()
+            : (body ? body->span() : arrowToken.span));
 }
 
 text::TextSpan UnaryExpressionSyntax::span() const noexcept {
@@ -638,11 +647,16 @@ std::unique_ptr<ExpressionSyntax> cloneExpressionSyntax(const ExpressionSyntax& 
         const auto& src = static_cast<const LambdaExpressionSyntax&>(value);
         auto out = std::make_unique<LambdaExpressionSyntax>();
         out->openParenToken = src.openParenToken;
+        out->parameterTypes = src.parameterTypes;
         out->parameterTokens = src.parameterTokens;
         out->commaTokens = src.commaTokens;
         out->closeParenToken = src.closeParenToken;
         out->arrowToken = src.arrowToken;
         if (src.body) out->body = cloneExpressionSyntax(*src.body);
+        if (src.blockBody) {
+            out->blockBody = std::make_unique<BlockStatementSyntax>(
+                cloneBlockStatementSyntax(*src.blockBody));
+        }
         return out;
     }
     case SyntaxKind::UnaryExpression: {
@@ -1094,6 +1108,7 @@ ConstructorDeclarationSyntax cloneConstructorDeclarationSyntax(
     out.closeParenToken = value.closeParenToken;
     out.initializerColonToken = value.initializerColonToken;
     out.baseKeyword = value.baseKeyword;
+    out.thisKeyword = value.thisKeyword;
     out.initializerOpenParenToken = value.initializerOpenParenToken;
     for (const auto& arg : value.baseArguments) {
         out.baseArguments.push_back(arg ? cloneExpressionSyntax(*arg) : nullptr);
@@ -1234,6 +1249,9 @@ InterfaceDeclarationSyntax cloneInterfaceDeclarationSyntax(const InterfaceDeclar
     out.typeParameters = value.typeParameters;
     out.typeParameterCommaTokens = value.typeParameterCommaTokens;
     out.typeParameterGreaterToken = value.typeParameterGreaterToken;
+    out.colonToken = value.colonToken;
+    out.interfaces = value.interfaces;
+    out.interfaceCommaTokens = value.interfaceCommaTokens;
     out.constraints = value.constraints;
     out.openBraceToken = value.openBraceToken;
     for (const auto& m : value.methods) {

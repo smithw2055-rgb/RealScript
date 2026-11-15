@@ -1,6 +1,7 @@
 #include "realscript/bytecode/Bytecode.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <unordered_map>
@@ -89,7 +90,11 @@ public:
     }
     void patchU32(std::size_t offset, std::uint32_t value) {
         if (offset + 4 > data_.size()) {
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
             throw std::logic_error("bytecode writer patch is outside buffer");
+#else
+            std::abort();
+#endif
         }
         for (int shift = 0; shift < 32; shift += 8) {
             data_[offset++] = static_cast<std::uint8_t>(value >> shift);
@@ -208,7 +213,11 @@ std::uint8_t encodeType(semantic::PrimitiveType type) {
     case semantic::PrimitiveType::Char: return 19;
     case semantic::PrimitiveType::Error: break;
     }
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
     throw std::logic_error("invalid type in bytecode encoder");
+#else
+    std::abort();
+#endif
 }
 
 bool decodeType(std::uint8_t tag, semantic::PrimitiveType& type) {
@@ -262,7 +271,11 @@ public:
     [[nodiscard]] std::uint32_t indexOf(const std::string& value) const {
         const auto found = indices_.find(value);
         if (found == indices_.end()) {
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
             throw std::logic_error("missing string in bytecode pool");
+#else
+            std::abort();
+#endif
         }
         return found->second;
     }
@@ -692,6 +705,9 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
         strings.add(type.moduleName);
         strings.add(type.name);
         if (!type.baseTypeName.empty()) strings.add(type.baseTypeName);
+        for (const auto& bi : type.baseInterfaceNames) {
+            if (!bi.empty()) strings.add(bi);
+        }
         for (const auto& field : type.fields) {
             strings.add(field.declaringTypeName);
             strings.add(field.sourceName);
@@ -838,11 +854,19 @@ std::vector<std::uint8_t> encodeModule(const Module& module) {
         if (type.sealedType) flags |= 0x08u;
         if (type.delegateType) flags |= 0x10u;
         if (type.staticType) flags |= 0x20u;
+        if (!type.baseInterfaceNames.empty()) flags |= 0x40u;
         objectModelSection.u8(flags);
         objectModelSection.u64(type.baseTypeId);
         objectModelSection.u32(type.baseTypeName.empty()
             ? InvalidIndex
             : strings.indexOf(type.baseTypeName));
+        if (!type.baseInterfaceNames.empty()) {
+            objectModelSection.u32(static_cast<std::uint32_t>(
+                type.baseInterfaceNames.size()));
+            for (const auto& bi : type.baseInterfaceNames) {
+                objectModelSection.u32(strings.indexOf(bi));
+            }
+        }
         objectModelSection.u32(static_cast<std::uint32_t>(type.fields.size()));
         for (const auto& field : type.fields) {
             objectModelSection.u8(static_cast<std::uint8_t>(
@@ -1793,7 +1817,7 @@ bool decodeModule(
             if (!reader.valid() ||
                 accessibility > static_cast<std::uint8_t>(
                     semantic::Accessibility::Private) ||
-                (flags & 0xc0u) != 0) {
+                (flags & 0x80u) != 0) {
                 diagnostics.report("RS5004", "invalid object-model type flags", {});
                 return false;
             }
@@ -1814,6 +1838,26 @@ bool decodeModule(
                     return false;
                 }
                 type.baseTypeName = strings[baseTypeNameIndex];
+            }
+            if ((flags & 0x40u) != 0) {
+                const auto baseIfaceCount = reader.u32();
+                if (!reader.valid() || baseIfaceCount > reader.remaining() / 4) {
+                    diagnostics.report(
+                        "RS5003", "truncated base interface list", {});
+                    return false;
+                }
+                type.baseInterfaceNames.reserve(baseIfaceCount);
+                for (std::uint32_t ifaceIndex = 0;
+                     ifaceIndex < baseIfaceCount;
+                     ++ifaceIndex) {
+                    const auto ifaceNameIndex = reader.u32();
+                    if (!validStringIndex(
+                            ifaceNameIndex, strings, diagnostics,
+                            "invalid base interface string index")) {
+                        return false;
+                    }
+                    type.baseInterfaceNames.push_back(strings[ifaceNameIndex]);
+                }
             }
 
             const auto fieldMetadataCount = reader.u32();

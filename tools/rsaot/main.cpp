@@ -7,6 +7,7 @@
 #include "realscript/optimization/Optimizer.h"
 #include "realscript/Version.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -14,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 namespace {
@@ -91,6 +93,8 @@ void usage() {
         << "  --output-dir <directory>\n"
         << "  --project <file>\n"
         << "  --no-project-config\n"
+        << "  --pack <file-or-dir>\n"
+        << "  --plugin <shared-library>\n"
         << "  --cache-dir <directory>\n"
         << "  --cache-stats\n"
         << "  --program-name <identifier>\n"
@@ -103,6 +107,62 @@ void usage() {
         << "  --trusted-release\n"
         << "  --help\n"
         << "  --version\n";
+}
+
+void collectPackInputs(
+    const std::string& rawPath,
+    std::vector<std::filesystem::path>& outPacks) {
+    const std::filesystem::path p(rawPath);
+    std::error_code ec;
+    if (std::filesystem::is_directory(p, ec)) {
+        std::vector<std::filesystem::path> entries;
+        for (const auto& entry : std::filesystem::directory_iterator(p, ec)) {
+            if (ec || !entry.is_regular_file(ec)) continue;
+            const auto utf8 = entry.path().string();
+            if (endsWithIgnoreCase(utf8, ".d.rscript") ||
+                endsWithIgnoreCase(utf8, ".rscript") ||
+                endsWithIgnoreCase(utf8, ".json")) {
+                entries.push_back(entry.path());
+            }
+        }
+        std::sort(entries.begin(), entries.end());
+        outPacks.insert(outPacks.end(), entries.begin(), entries.end());
+        return;
+    }
+    outPacks.push_back(p);
+}
+
+[[nodiscard]] std::uint64_t hashPathList(
+    const std::vector<std::filesystem::path>& files,
+    const std::vector<std::filesystem::path>& plugins) {
+    std::uint64_t h = 14695981039346656037ULL;
+    const auto mixStr = [&](std::string_view s) {
+        for (const char ch : s) {
+            h ^= static_cast<unsigned char>(ch);
+            h *= 1099511628211ULL;
+        }
+    };
+    for (const auto& f : files) {
+        mixStr("pack:");
+        mixStr(f.string());
+        std::ifstream in(f, std::ios::binary);
+        if (in) {
+            std::ostringstream oss;
+            oss << in.rdbuf();
+            mixStr(oss.str());
+        }
+    }
+    for (const auto& p : plugins) {
+        mixStr("plugin:");
+        mixStr(p.string());
+        std::ifstream in(p, std::ios::binary);
+        if (in) {
+            std::ostringstream oss;
+            oss << in.rdbuf();
+            mixStr(oss.str());
+        }
+    }
+    return h == 0 ? 1ULL : h;
 }
 
 } // namespace
@@ -124,6 +184,8 @@ int main(int argc, char** argv) {
         optimizationOptions.level = realscript::optimization::Level::Aggressive;
         bool optimizationReport = false;
         std::vector<std::string> sources;
+        std::vector<std::string> cliPacks;
+        std::vector<std::string> cliPlugins;
         for (int index = 1; index < argc; ++index) {
             const std::string argument = argv[index];
             const auto requireValue = [&](const char* option) -> std::string {
@@ -155,6 +217,22 @@ int main(int argc, char** argv) {
                 }
             } else if (argument == "--no-project-config") {
                 noProjectConfig = true;
+            } else if (argument == "--pack") {
+                const auto val = requireValue("--pack");
+                if (val.empty()) throw std::runtime_error("--pack requires a value");
+                cliPacks.push_back(val);
+            } else if (argument.rfind("--pack=", 0) == 0) {
+                const auto val = argument.substr(7);
+                if (val.empty()) throw std::runtime_error("--pack requires a value");
+                cliPacks.push_back(val);
+            } else if (argument == "--plugin") {
+                const auto val = requireValue("--plugin");
+                if (val.empty()) throw std::runtime_error("--plugin requires a value");
+                cliPlugins.push_back(val);
+            } else if (argument.rfind("--plugin=", 0) == 0) {
+                const auto val = argument.substr(9);
+                if (val.empty()) throw std::runtime_error("--plugin requires a value");
+                cliPlugins.push_back(val);
             } else if (argument == "--cache-dir") {
                 cacheDirectory = requireValue("--cache-dir");
             } else if (argument.rfind("--cache-dir=", 0) == 0) {
@@ -217,6 +295,27 @@ int main(int argc, char** argv) {
             projectDiagnostics.hasErrors()) {
             printDiagnostics(projectDiagnostics);
             return 1;
+        }
+        if (!cliPacks.empty() || !cliPlugins.empty()) {
+            realscript::compiler::ProjectConfig cliConfig;
+            for (const auto& p : cliPacks) {
+                collectPackInputs(p, cliConfig.extraPackFiles);
+            }
+            for (const auto& p : cliPlugins) {
+                cliConfig.nativeMacroPluginPaths.emplace_back(p);
+            }
+            cliConfig.configFingerprint =
+                hashPathList(cliConfig.extraPackFiles, cliConfig.nativeMacroPluginPaths);
+            const std::string savedProjectPath = projectOptions.projectConfigPath;
+            if (!realscript::compiler::applyProjectConfigToOptions(
+                    cliConfig, projectOptions, &projectDiagnostics) ||
+                projectDiagnostics.hasErrors()) {
+                printDiagnostics(projectDiagnostics);
+                return 1;
+            }
+            if (!savedProjectPath.empty()) {
+                projectOptions.projectConfigPath = savedProjectPath;
+            }
         }
         printDiagnostics(projectDiagnostics);
 

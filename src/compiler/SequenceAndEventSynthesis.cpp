@@ -3392,13 +3392,46 @@ void synthesizeDeclarationsSequencesAndMembers(
                 LanguageInterfaceImplementation implementation;
                 implementation.typeName =
                     semantic::canonicalTypeName(*owner);
-                std::unordered_set<std::string> implementedNames;
+                std::unordered_set<std::string> directImplementedNames;
+                std::unordered_set<std::string> allImplementedNames;
                 std::map<
                     semantic::SymbolId,
                     std::pair<
                         const InterfaceContract*,
                         const semantic::TypeSymbol*>>
                     runtimeContracts;
+
+                const auto registerInterfaceClosure =
+                    [&](auto& self,
+                        const InterfaceContract& ifaceContract,
+                        const text::TextSpan& reportSpan) -> void {
+                        const auto canon = canonicalInterfaceName(
+                            ifaceContract.moduleName, ifaceContract.name);
+                        if (!allImplementedNames.insert(canon).second) {
+                            return;
+                        }
+                        const auto ifaceTypeId = semantic::stableTypeId(canon);
+                        const auto* ifaceDesc = findInterfaceType(ifaceTypeId);
+                        if (!ifaceDesc) {
+                            result.diagnostics.report(
+                                "RS2531",
+                                "interface type descriptor '" +
+                                    canon + "' is unavailable",
+                                reportSpan,
+                                diagnostics::DiagnosticSeverity::Error,
+                                owner->sourceName);
+                            module.invalid = true;
+                            return;
+                        }
+                        runtimeContracts[ifaceTypeId] = {&ifaceContract, ifaceDesc};
+                        implementation.interfaces.push_back(canon);
+                        for (const auto& baseName : ifaceContract.baseInterfaces) {
+                            const auto baseFound = module.visibleInterfaces.find(baseName);
+                            if (baseFound != module.visibleInterfaces.end()) {
+                                self(self, baseFound->second, reportSpan);
+                            }
+                        }
+                    };
 
                 const auto inheritRuntimeContracts =
                     [&](const semantic::TypeSymbol& source) {
@@ -3427,7 +3460,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                      ++interfaceIndex) {
                     const auto& interfaceSyntax =
                         typeSyntax.interfaces[interfaceIndex];
-                    if (interfaceIndex == 0 &&
+                    if ((interfaceIndex == 0 || owner->partialType) &&
                         !owner->baseTypeName.empty()) {
                         const auto candidate = module.visibleTypes.find(
                             interfaceSyntax.name.text);
@@ -3454,7 +3487,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                     const auto canonicalName = canonicalInterfaceName(
                         found->second.moduleName,
                         found->second.name);
-                    if (!implementedNames.insert(canonicalName).second) {
+                    if (!directImplementedNames.insert(canonicalName).second) {
                         result.diagnostics.report(
                             "RS2474",
                             "interface '" + canonicalName +
@@ -3465,24 +3498,8 @@ void synthesizeDeclarationsSequencesAndMembers(
                         module.invalid = true;
                         continue;
                     }
-                    const auto interfaceTypeId =
-                        semantic::stableTypeId(canonicalName);
-                    const auto* descriptor =
-                        findInterfaceType(interfaceTypeId);
-                    if (!descriptor) {
-                        result.diagnostics.report(
-                            "RS2531",
-                            "interface type descriptor '" +
-                                canonicalName + "' is unavailable",
-                            interfaceSyntax.span(),
-                            diagnostics::DiagnosticSeverity::Error,
-                            owner->sourceName);
-                        module.invalid = true;
-                        continue;
-                    }
-                    runtimeContracts[interfaceTypeId] = {
-                        &found->second, descriptor};
-                    implementation.interfaces.push_back(canonicalName);
+                    registerInterfaceClosure(
+                        registerInterfaceClosure, found->second, interfaceSyntax.span());
                 }
 
                 std::vector<semantic::InterfaceDispatchMap> dispatchMaps;

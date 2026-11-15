@@ -711,6 +711,229 @@ void testAotAwaitSchedulerValueLifecycleAndSpanSimd() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 5. L0 AttributeDescriptor Emission, IExecutionPolicy & Weak Delegate Defaults
+// ---------------------------------------------------------------------------
+class AotTestPolicy final : public runtime::IExecutionPolicy {
+public:
+    runtime::ManagedHeap* foreignHeap = nullptr;
+    semantic::SymbolId interceptFnId = 0;
+    bool interceptActive = true;
+    bool denyFieldWrites = false;
+    std::size_t interceptedCount = 0;
+
+    [[nodiscard]] runtime::ManagedHeap* resolveHeap(
+        runtime::ObjectRef reference,
+        runtime::ManagedHeap* defaultHeap) const noexcept override {
+        if (foreignHeap && reference.heapId == static_cast<std::uint32_t>(foreignHeap->heapId())) {
+            return foreignHeap;
+        }
+        return defaultHeap;
+    }
+
+    bool checkFieldWrite(
+        const runtime::ManagedHeap*,
+        const runtime::ManagedHeap*,
+        runtime::ObjectRef,
+        semantic::SymbolId,
+        std::size_t,
+        std::string_view,
+        const runtime::Value&,
+        runtime::RuntimeError& outError) const override {
+        if (denyFieldWrites) {
+            outError.code = runtime::ErrorCode::CapabilityDenied;
+            outError.message = "AOT policy denied field write";
+            return false;
+        }
+        return true;
+    }
+
+    bool interceptCall(
+        semantic::SymbolId functionId,
+        runtime::ValueSpan arguments,
+        bool& outIntercepted,
+        runtime::Value& outResult,
+        runtime::RuntimeError&) override {
+        if (interceptActive && functionId == interceptFnId) {
+            ++interceptedCount;
+            outIntercepted = true;
+            const std::int64_t x =
+                (!arguments.empty() && std::holds_alternative<std::int64_t>(arguments[0]))
+                    ? std::get<std::int64_t>(arguments[0])
+                    : 0;
+            outResult = runtime::Value{x + 500};
+            return true;
+        }
+        outIntercepted = false;
+        return true;
+    }
+};
+
+bool aotPolicyFnImpl(
+    aot::ExecutionContext&,
+    const runtime::Value* args,
+    std::size_t argCount,
+    runtime::Value& result) {
+    const std::int64_t x =
+        (argCount >= 1 && std::holds_alternative<std::int64_t>(args[0]))
+            ? std::get<std::int64_t>(args[0])
+            : 0;
+    result = runtime::Value{x + 1};
+    return true;
+}
+
+void testAotAttributeDescriptorsPolicyAndWeakDelegates() {
+    // A. AttributeDescriptor emission & attributed method exclusion from typed fast-path
+    {
+        const std::string src = R"RS(
+module Kernel.AttrPolicy;
+
+[MyDomainAttr]
+public class HudModel {
+    [MyDomainAttr]
+    public int hp = 10;
+
+    [MyDomainAttr]
+    public int Score { get; set; }
+
+    [MyDomainAttr]
+    public int CommandOp(int delta) {
+        hp = hp + delta;
+        return hp;
+    }
+
+    public int FastHelper(HudModel m, int x) {
+        return m.CommandOp(x);
+    }
+}
+)RS";
+        compiler::Compilation comp({{"attr_policy.rscript", src}});
+        auto build = comp.build();
+        require(!build.diagnostics.hasErrors(), "Kernel.AttrPolicy compilation failed");
+        diagnostics::DiagnosticBag optDiag;
+        auto optResult = optimization::Optimizer{}.optimize(std::move(build.modules), optDiag);
+        require(!optDiag.hasErrors(), "Kernel.AttrPolicy optimization failed");
+
+        diagnostics::DiagnosticBag genDiag;
+        aot::CppGenerator gen;
+        const auto generated = gen.generate(optResult.modules, genDiag);
+        require(!genDiag.hasErrors(), "Kernel.AttrPolicy AOT codegen failed");
+        require(generated.source.find("programAttributes[]") != std::string::npos,
+            "Expected programAttributes table in generated AOT C++");
+        require(generated.source.find("\"Kernel.AttrPolicy::HudModel\", \"MyDomainAttr\"") != std::string::npos,
+            "Missing class AttributeDescriptor target");
+        require(generated.source.find("\"Kernel.AttrPolicy::HudModel::field:hp\", \"MyDomainAttr\"") != std::string::npos,
+            "Missing field AttributeDescriptor target");
+        require(generated.source.find("\"Kernel.AttrPolicy::HudModel::property:Score\", \"MyDomainAttr\"") != std::string::npos,
+            "Missing property AttributeDescriptor target");
+        require(generated.source.find("\"Kernel.AttrPolicy::HudModel::method:CommandOp#1\", \"MyDomainAttr\"") != std::string::npos,
+            "Missing method AttributeDescriptor target");
+    }
+
+    // B. ExecutionContext::setExecutionPolicy (interceptCall, resolveHeap, checkFieldWrite) + expired weak delegate 6-arg invokeDelegate
+    {
+        static const semantic::SymbolId kModelTypeId = semantic::stableTypeId("Kernel.AotPol::Model");
+        static const semantic::SymbolId kDelTypeId = semantic::stableTypeId("Kernel.AotPol::IntFn");
+        static const semantic::SymbolId kFnId = semantic::stableTypeId("Kernel.AotPol::Op");
+
+        static const aot::FieldDescriptor kFields[] = {
+            {"hp", semantic::PrimitiveType::Int, 0u, 0u, false, false, false},
+        };
+        static const aot::TypeDescriptor kTypes[] = {
+            {kModelTypeId, semantic::TypeKind::Class, 0u, "Kernel.AotPol", "Model",
+             kFields, 1u, nullptr, 0u, nullptr, 0u, false, nullptr, 0u, false, false, false},
+            {kDelTypeId, semantic::TypeKind::Class, 0u, "Kernel.AotPol", "IntFn",
+             nullptr, 0u, nullptr, 0u, nullptr, 0u, false, nullptr, 0u, true, false, false},
+        };
+        static const semantic::PrimitiveType kParamTypes[] = {semantic::PrimitiveType::Int};
+        static const semantic::SymbolId kParamTypeIds[] = {0u};
+        static const aot::FunctionDescriptor kFns[] = {
+            {kFnId, "Kernel.AotPol::Op", semantic::PrimitiveType::Int, 0u,
+             kParamTypes, kParamTypeIds, 1u, &aotPolicyFnImpl, nullptr},
+        };
+        static const char* const kModules[] = {"Kernel.AotPol"};
+        static const aot::AttributeDescriptor kAttrs[] = {
+            {"Kernel.AotPol::Op#1", "InterceptAttr"},
+        };
+        static const aot::ProgramDescriptor kDesc{
+            aot::RuntimeAbiMajor,
+            aot::RuntimeAbiMinor,
+            "AotPolicySuite",
+            0xABCDEF01ULL,
+            kModules,
+            1u,
+            kTypes,
+            2u,
+            kFns,
+            1u,
+            nullptr,
+            0u,
+            kAttrs,
+            1u,
+        };
+
+        auto localHeap = std::make_shared<runtime::ManagedHeap>();
+        auto foreignHeap = std::make_shared<runtime::ManagedHeap>();
+        auto foreignObj = foreignHeap->allocateObject(
+            kModelTypeId, {runtime::Value{std::int64_t{42}}}, {});
+        require(foreignObj.has_value(), "Failed to allocate foreignObj");
+        auto foreignPin = foreignHeap->retain(runtime::Value{*foreignObj});
+
+        aot::ExecutionContext ctx(kDesc, localHeap, nullptr);
+        AotTestPolicy policy;
+        policy.foreignHeap = foreignHeap.get();
+        policy.interceptFnId = kFnId;
+        ctx.setExecutionPolicy(&policy);
+        require(&ctx.program() == &kDesc, "ExecutionContext::program() mismatch");
+
+        // 1. resolveHeap allows reading field on foreignHeap
+        runtime::Value loaded{};
+        require(ctx.loadField(kModelTypeId, 0u, runtime::Value{*foreignObj}, loaded) &&
+                std::holds_alternative<std::int64_t>(loaded) &&
+                std::get<std::int64_t>(loaded) == 42,
+            "AOT resolveHeap loadField failed");
+
+        // 2. checkFieldWrite denial maps to ErrorCode::CapabilityDenied
+        policy.denyFieldWrites = true;
+        require(!ctx.storeField(kModelTypeId, 0u, runtime::Value{*foreignObj}, runtime::Value{std::int64_t{99}}) &&
+                ctx.error().code == runtime::ErrorCode::CapabilityDenied,
+            "Expected CapabilityDenied from AOT checkFieldWrite");
+        policy.denyFieldWrites = false;
+
+        // 3. interceptCall overrides invoke result
+        runtime::Value outVal{};
+        const runtime::Value arg{std::int64_t{12}};
+        require(ctx.invoke(kFnId, &arg, 1u, outVal) &&
+                std::get<std::int64_t>(outVal) == 512 && policy.interceptedCount == 1u,
+            "AOT interceptCall did not return intercepted value");
+        policy.interceptActive = false;
+        require(ctx.invoke(kFnId, &arg, 1u, outVal) &&
+                std::get<std::int64_t>(outVal) == 13,
+            "AOT non-intercepted invoke expected 13");
+
+        // 4. Expired weak delegate via 6-arg invokeDelegate returns default int64_t{0}
+        auto tempTarget = localHeap->allocateObject(
+            kModelTypeId, {runtime::Value{std::int64_t{9}}}, {});
+        require(tempTarget.has_value(), "Failed to allocate tempTarget");
+        auto weakDel = localHeap->allocateWeakDelegate(kDelTypeId, *tempTarget, kFnId);
+        require(weakDel.has_value(), "allocateWeakDelegate failed in AOT test");
+        auto delPin = localHeap->retain(runtime::Value{*weakDel});
+
+        localHeap->collect(runtime::RootSet{});
+        require(!localHeap->isAlive(*tempTarget), "tempTarget should be collected");
+
+        const runtime::Value delArg{ *weakDel };
+        runtime::Value delOut{};
+        require(ctx.invokeDelegate(
+                    kDelTypeId, &delArg, 1u, semantic::PrimitiveType::Int, 0u, delOut),
+            "6-arg invokeDelegate on expired weak delegate must succeed as no-op/default: " +
+                ctx.error().message);
+        require(std::holds_alternative<std::int64_t>(delOut) &&
+                std::get<std::int64_t>(delOut) == 0,
+            "6-arg invokeDelegate on expired weak delegate must return default int64_t{0}");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -720,6 +943,7 @@ int main() {
             {"Kernel.AotTrusted TrustedRelease & scalar coroutines parity", testAotTrustedScalarCoroutinesParity},
             {"CppGenerator #line directive emission control", testAotCppLineDirectivesGeneration},
             {"Pillar 2 & 4: AotRuntime IAwaitScheduler, [ValueLifecycle] sweep & Span SIMD", testAotAwaitSchedulerValueLifecycleAndSpanSimd},
+            {"L0 AttributeDescriptor emission, IExecutionPolicy & AOT weak delegate default return", testAotAttributeDescriptorsPolicyAndWeakDelegates},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

@@ -49,6 +49,7 @@ struct FunctionView {
 
 struct TypeView {
     const semantic::TypeSymbol* type = nullptr;
+    semantic::TypeSymbol mergedType{};
     std::string cppName;
 };
 

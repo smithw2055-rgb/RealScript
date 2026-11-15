@@ -50,9 +50,23 @@ std::string attributeValueText(
     const syntax::AttributeArgumentSyntax& argument,
     const text::SourceText& source) {
     const auto span = argument.valueSpan();
-    return span.empty()
-        ? std::string{}
-        : std::string(source.view(span));
+    if (span.empty() || argument.valueTokens.empty()) {
+        return std::string{};
+    }
+    const auto& firstTok = argument.valueTokens.front();
+    const auto& lastTok = argument.valueTokens.back();
+    if (span.start + span.length <= source.size() &&
+        firstTok.span.start + firstTok.span.length <= source.size() &&
+        lastTok.span.start + lastTok.span.length <= source.size() &&
+        source.view(firstTok.span) == firstTok.text &&
+        source.view(lastTok.span) == lastTok.text) {
+        return std::string(source.view(span));
+    }
+    std::string fallback;
+    for (const auto& token : argument.valueTokens) {
+        fallback += token.text;
+    }
+    return fallback;
 }
 
 // Included in Compilation.cpp after ModuleWork and visibility helpers.
@@ -93,36 +107,42 @@ void resolveClassInheritance(
                 auto* type = findOwnClassOrType(
                     module, declaration.identifierToken.text);
                 if (!type || declaration.interfaces.empty()) continue;
-                const auto& candidate = declaration.interfaces.front();
-                const auto found = module.visibleTypes.find(candidate.name.text);
-                if (found == module.visibleTypes.end()) continue;
-                if (found->second.kind != semantic::TypeKind::Class ||
-                    found->second.interfaceType) {
-                    continue;
+                const std::size_t maxCheck = type->partialType
+                    ? declaration.interfaces.size()
+                    : 1u;
+                for (std::size_t idx = 0; idx < maxCheck; ++idx) {
+                    const auto& candidate = declaration.interfaces[idx];
+                    const auto found = module.visibleTypes.find(candidate.name.text);
+                    if (found == module.visibleTypes.end()) continue;
+                    if (found->second.kind != semantic::TypeKind::Class ||
+                        found->second.interfaceType) {
+                        continue;
+                    }
+                    if (found->second.id == type->id) {
+                        result.diagnostics.report(
+                            "RS2500", "class cannot inherit from itself",
+                            candidate.span(),
+                            diagnostics::DiagnosticSeverity::Error,
+                            unit->source->name());
+                        module.invalid = true;
+                        break;
+                    }
+                    if (found->second.sealedType) {
+                        result.diagnostics.report(
+                            "RS2501",
+                            "cannot inherit from sealed class '" +
+                                semantic::canonicalTypeName(found->second) + "'",
+                            candidate.span(),
+                            diagnostics::DiagnosticSeverity::Error,
+                            unit->source->name());
+                        module.invalid = true;
+                        break;
+                    }
+                    type->baseTypeId = found->second.id;
+                    type->baseTypeName =
+                        semantic::canonicalTypeName(found->second);
+                    break;
                 }
-                if (found->second.id == type->id) {
-                    result.diagnostics.report(
-                        "RS2500", "class cannot inherit from itself",
-                        candidate.span(),
-                        diagnostics::DiagnosticSeverity::Error,
-                        unit->source->name());
-                    module.invalid = true;
-                    continue;
-                }
-                if (found->second.sealedType) {
-                    result.diagnostics.report(
-                        "RS2501",
-                        "cannot inherit from sealed class '" +
-                            semantic::canonicalTypeName(found->second) + "'",
-                        candidate.span(),
-                        diagnostics::DiagnosticSeverity::Error,
-                        unit->source->name());
-                    module.invalid = true;
-                    continue;
-                }
-                type->baseTypeId = found->second.id;
-                type->baseTypeName =
-                    semantic::canonicalTypeName(found->second);
             }
         }
     }
@@ -1053,6 +1073,10 @@ void discoverTypesContractsAndLayouts(
                 descriptor->methods[slotOrder[slot].second].interfaceSlot =
                     static_cast<std::uint32_t>(slot);
             }
+            for (const auto& baseIface : input.syntax->interfaces) {
+                contract.baseInterfaces.push_back(baseIface.name.text);
+                contract.baseInterfaceSpans.push_back(baseIface.span());
+            }
             module.interfaces[contract.name] = std::move(contract);
         }
     }
@@ -1060,6 +1084,84 @@ void discoverTypesContractsAndLayouts(
         (void)name;
         if (module.frontendCached) continue;
         refreshVisibleInterfaces(modules, module);
+    }
+    for (auto& [moduleName, module] : modules) {
+        (void)moduleName;
+        if (module.frontendCached) continue;
+        for (auto& [ifaceName, contract] : module.interfaces) {
+            (void)ifaceName;
+            auto* descriptor = findOwnType(module, contract.name);
+            if (!descriptor || !descriptor->interfaceType) continue;
+            std::vector<std::string> resolvedBases;
+            std::unordered_set<std::string> seenBases;
+            for (std::size_t bi = 0; bi < contract.baseInterfaces.size(); ++bi) {
+                const auto& rawBase = contract.baseInterfaces[bi];
+                const auto baseSpan = bi < contract.baseInterfaceSpans.size()
+                    ? contract.baseInterfaceSpans[bi]
+                    : contract.declarationSpan;
+                const auto foundBase = module.visibleInterfaces.find(rawBase);
+                if (foundBase == module.visibleInterfaces.end()) {
+                    result.diagnostics.report(
+                        "RS2473",
+                        "unknown interface '" + rawBase + "'",
+                        baseSpan,
+                        diagnostics::DiagnosticSeverity::Error,
+                        contract.sourceName);
+                    module.invalid = true;
+                    continue;
+                }
+                const auto canonicalBase = canonicalInterfaceName(
+                    foundBase->second.moduleName, foundBase->second.name);
+                if (!seenBases.insert(canonicalBase).second) {
+                    continue;
+                }
+                resolvedBases.push_back(canonicalBase);
+            }
+            contract.baseInterfaces = resolvedBases;
+            descriptor->baseInterfaceNames = resolvedBases;
+        }
+    }
+    for (auto& [name, module] : modules) {
+        (void)name;
+        if (module.frontendCached) continue;
+        refreshVisibleInterfaces(modules, module);
+    }
+    for (auto& [moduleName, module] : modules) {
+        (void)moduleName;
+        if (module.frontendCached) continue;
+        for (const auto& [ifaceName, contract] : module.interfaces) {
+            (void)ifaceName;
+            const auto selfCanon = canonicalInterfaceName(contract.moduleName, contract.name);
+            std::unordered_set<std::string> visiting;
+            std::unordered_set<std::string> visited;
+            std::function<bool(const InterfaceContract&)> hasCycle =
+                [&](const InterfaceContract& cur) -> bool {
+                    const auto curCanon = canonicalInterfaceName(cur.moduleName, cur.name);
+                    if (!visiting.insert(curCanon).second) return true;
+                    if (visited.find(curCanon) != visited.end()) {
+                        visiting.erase(curCanon);
+                        return false;
+                    }
+                    for (const auto& bName : cur.baseInterfaces) {
+                        const auto it = module.visibleInterfaces.find(bName);
+                        if (it != module.visibleInterfaces.end() && hasCycle(it->second)) {
+                            return true;
+                        }
+                    }
+                    visiting.erase(curCanon);
+                    visited.insert(curCanon);
+                    return false;
+                };
+            if (hasCycle(contract)) {
+                result.diagnostics.report(
+                    "RS2476",
+                    "cyclic interface inheritance involving '" + selfCanon + "'",
+                    contract.declarationSpan,
+                    diagnostics::DiagnosticSeverity::Error,
+                    contract.sourceName);
+                module.invalid = true;
+            }
+        }
     }
     resolveClassInheritance(modules, result);
     for (auto& [name, module] : modules) {

@@ -1,4 +1,4 @@
-#include "realscript/game/RsBindParser.h"
+#include "realscript/bindgen/RsBindParser.h"
 
 #include <algorithm>
 #include <cctype>
@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-namespace realscript::game::rsbind_detail {
+namespace realscript::bindgen::rsbind_detail {
 namespace {
 
 inline std::string trimView(std::string_view sv) {
@@ -2982,11 +2982,11 @@ inline std::string sanitizeQualifiedCppIdent(std::string_view qName) {
 // ============================================================================
 } // namespace
 
-GameApi::HeaderBindingGenerationResult generateFromParsedHeader(
+HostApi::HeaderBindingGenerationResult generateFromParsedHeader(
     std::string_view headerContent,
     const std::string& defaultModuleName,
     const std::unordered_map<std::string, std::string>& predefinedMacros) {
-    GameApi::HeaderBindingGenerationResult res;
+    HostApi::HeaderBindingGenerationResult res;
 
     const std::string preprocessed = preprocessCppHeader(headerContent, predefinedMacros);
     const auto tokens = tokenizeCppDeclarations(preprocessed);
@@ -3434,8 +3434,9 @@ GameApi::HeaderBindingGenerationResult generateFromParsedHeader(
                 rsBodyOut << "}\n\n";
             }
 
-            cppHelpersOut << "inline bool bindEcsColumn_" << varSuffix << "(\n"
-                          << "    realscript::game::ScriptRuntime& runtime,\n"
+            cppHelpersOut << "template <typename Runtime>\n"
+                          << "inline bool bindEcsColumn_" << varSuffix << "(\n"
+                          << "    Runtime& runtime,\n"
                           << "    " << rec.qualifiedName << "* data,\n"
                           << "    std::size_t count,\n"
                           << "    realscript::runtime::RuntimeError& error,\n"
@@ -3660,11 +3661,11 @@ GameApi::HeaderBindingGenerationResult generateFromParsedHeader(
     cppOut << "#include <cstddef>\n";
     cppOut << "#include <type_traits>\n";
     cppOut << "#include <vector>\n";
-    cppOut << "#include \"realscript/game/GameScripting.h\"\n\n";
+    cppOut << "#include \"realscript/bindgen/BindGen.h\"\n\n";
     if (!cppHelpersOut.str().empty()) {
         cppOut << cppHelpersOut.str();
     }
-    cppOut << "inline void registerGeneratedHeaderBindings(realscript::game::GameApi& api) {\n";
+    cppOut << "inline void registerGeneratedHeaderBindings(realscript::bindgen::HostApi& api) {\n";
     cppOut << "    (void)api;\n";
     cppOut << cppBodyOut.str();
     cppOut << "}\n";
@@ -3689,4 +3690,4 @@ GameApi::HeaderBindingGenerationResult generateFromParsedHeader(
     return res;
 }
 
-} // namespace realscript::game::rsbind_detail
+} // namespace realscript::bindgen::rsbind_detail

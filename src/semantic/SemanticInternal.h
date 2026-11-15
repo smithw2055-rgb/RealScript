@@ -42,6 +42,12 @@ struct FlexibleCallPlan {
     const std::string& name,
     bool staticMethod);
 
+[[nodiscard]] std::vector<const FunctionSymbol*> collectInterfaceAndBaseMethods(
+    const TypeSymbol& type,
+    const std::string& name,
+    bool staticMethod,
+    const TypeSymbolMap& visibleTypes);
+
 [[nodiscard]] PrimitiveType commonNumericType(
     PrimitiveType left,
     PrimitiveType right) noexcept;
@@ -69,6 +75,44 @@ struct FlexibleCallPlan {
 
 [[nodiscard]] std::size_t visibleParameterOffset(
     const FunctionSymbol& function) noexcept;
+
+[[nodiscard]] const TypeSymbol* unwrapEnclosingOwner(
+    const TypeSymbol* owner,
+    const TypeSymbolMap& visibleTypes) noexcept;
+
+[[nodiscard]] std::pair<std::unique_ptr<BoundExpression>, const TypeSymbol*>
+buildUnwrappedCapturedThis(
+    const VariableSymbol& thisVariable,
+    const TypeSymbol& ownerType,
+    const TypeSymbolMap& visibleTypes,
+    text::TextSpan span);
+
+[[nodiscard]] bool hasAncestorMemberOrCapture(
+    const TypeSymbol& startOwner,
+    const std::string& name,
+    const TypeSymbolMap& visibleTypes) noexcept;
+
+[[nodiscard]] bool hasInstanceMemberOrThis(
+    const TypeSymbol& startOwner,
+    const std::string& name,
+    const TypeSymbolMap& visibleTypes) noexcept;
+
+struct UnwrappedCapturedField {
+    std::unique_ptr<BoundExpression> receiver;
+    TypeSymbol ownerType;
+    FieldSymbol field;
+};
+
+[[nodiscard]] std::optional<UnwrappedCapturedField> findUnwrappedCapturedField(
+    const VariableSymbol& thisVariable,
+    const TypeSymbol& ownerType,
+    const std::string& name,
+    const TypeSymbolMap& visibleTypes,
+    text::TextSpan span);
+
+void collectLambdaNamesFromStatement(
+    const syntax::StatementSyntax& statement,
+    std::vector<syntax::SyntaxToken>& names);
 
 void recordSymbolReference(
     std::vector<SymbolOccurrence>& occurrences,

@@ -1138,6 +1138,181 @@ public int Run() {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// 9. L0 C# Base Syntax Primitives (Strings, => Members, : this(...), Iface:Iface, Generics, Lambdas)
+// ---------------------------------------------------------------------------
+void testCSharpBaseSyntaxPrimitives() {
+    // A. Verbatim & verbatim-interpolated strings, => members, : this(...), interface inheritance,
+    //    arity-overloaded generics & delegates, typed/discard/block lambdas & reference capture
+    {
+        const std::string src = R"RS(
+module Kernel.CSharpBase;
+
+public delegate void Action();
+public delegate void Action<T>(T x);
+public delegate R Func<R>();
+public delegate R Func<T, R>(T x);
+
+public interface IBaseCounter {
+    int BaseValue();
+}
+
+public interface IDerivedCounter : IBaseCounter {
+    int DerivedValue();
+}
+
+public class ArityBox {
+    public int tag = 10;
+}
+
+public class ArityBox<T> {
+    public T item;
+    public ArityBox(T initial) => item = initial;
+}
+
+public class MultiCounter : IDerivedCounter {
+    public int value = 0;
+
+    public MultiCounter() : this(5) {}
+    public MultiCounter(int start) => value = start;
+
+    public int Twice => value * 2;
+
+    public int BaseValue() => value;
+    public int DerivedValue() => value + 100;
+}
+
+public class PropHolder {
+    private int inner = 3;
+    public int Doubled {
+        get => inner * 2;
+        set => inner = value;
+    }
+}
+
+public interface IArityPack {
+    int Tag();
+}
+
+public interface IArityPack<T> {
+    T Peek();
+}
+
+public class IntPack : IArityPack, IArityPack<int> {
+    public int Tag() => 1;
+    public int Peek() => 2;
+}
+
+public int TestStringsAndChaining() {
+    string raw = @"a\b""c";
+    int n = 42;
+    string interp1 = $@"v={n}\x";
+    string interp2 = @$"v={n}\y";
+    MultiCounter mc = new MultiCounter();
+    IDerivedCounter dc = mc;
+    PropHolder ph = new PropHolder();
+    ph.Doubled = 9;
+    ArityBox b0 = new ArityBox();
+    ArityBox<int> b1 = new ArityBox<int>(4);
+    int cap = 1;
+    Func<int, int> inc = (int x) => {
+        cap = cap + 2;
+        return x + cap;
+    };
+    int r1 = inc(10);
+    int r2 = inc(10);
+    Func<int, int, int> pickSecond = (_, y) => y * 2;
+    if (raw != "a\\b\"c" || interp1 != "v=42\\x" || interp2 != "v=42\\y") return -1;
+    return mc.Twice + dc.BaseValue() + dc.DerivedValue() + ph.Doubled + b0.tag + b1.item + r1 + r2 + cap + pickSecond(999, 7);
+}
+)RS";
+        const std::string srcWithOverload = [&]() {
+            std::string s = src;
+            const auto pos = s.find("public delegate R Func<T, R>(T x);");
+            s.insert(pos + std::strlen("public delegate R Func<T, R>(T x);"),
+                "\npublic delegate R Func<T1, T2, R>(T1 a, T2 b);");
+            return s;
+        }();
+        compiler::Compilation comp({{"cs_base.rscript", srcWithOverload}});
+        auto build = comp.build();
+        require(!build.diagnostics.hasErrors(),
+            "C# base syntax compile failed:\n" + diagnosticsText(build.diagnostics));
+
+        diagnostics::DiagnosticBag optDiag;
+        auto optimized = optimization::Optimizer{}.optimize(std::move(build.modules), optDiag);
+        require(!optDiag.hasErrors(), "C# base syntax optimization failed");
+        bytecode::Lowerer lowerer;
+        std::vector<bytecode::Module> bcMods;
+        for (const auto& m : optimized.modules) bcMods.push_back(lowerer.lower(m));
+        runtime::RuntimeError linkErr;
+        auto linked = runtime::ProgramImage::link(std::move(bcMods), linkErr);
+        require(linked.has_value(), "Link failed: " + linkErr.message);
+        auto prog = std::make_shared<const runtime::ProgramImage>(std::move(*linked));
+        runtime::Interpreter interp(prog);
+        const auto res = interp.invoke("Kernel.CSharpBase::TestStringsAndChaining");
+        require(res.succeeded && std::holds_alternative<std::int64_t>(res.value) &&
+                std::get<std::int64_t>(res.value) == 199,
+            "TestStringsAndChaining expected 199");
+    }
+
+    // B. : this(...) constructor cycle -> RS2535
+    {
+        compiler::Compilation cCyc({{"CtorCycle.rscript", R"RS(
+module Kernel.CtorCycle;
+public class C {
+    public C() : this(1) {}
+    public C(int x) : this() {}
+}
+)RS"}});
+        require(hasDiagnosticCode(cCyc.build().diagnostics, "RS2535"),
+            "Expected RS2535 for cyclic ': this(...)' constructors");
+    }
+
+    // C. Cyclic interface inheritance -> RS2476
+    {
+        compiler::Compilation iCyc({{"IfaceCycle.rscript", R"RS(
+module Kernel.IfaceCycle;
+public interface IA : IB { int A(); }
+public interface IB : IA { int B(); }
+)RS"}});
+        require(hasDiagnosticCode(iCyc.build().diagnostics, "RS2476"),
+            "Expected RS2476 for cyclic interface inheritance");
+    }
+
+    // D. Generic arity mismatch (RS8501) and constraint diagnostics (RS8531..RS8533)
+    {
+        compiler::Compilation badArity({{"GenArity.rscript", R"RS(
+module Kernel.GenArity;
+public class Box {}
+public class Box<T> { public T val; }
+public void Bad() { Box<int, int> x = null; }
+)RS"}});
+        require(hasDiagnosticCode(badArity.build().diagnostics, "RS8501"),
+            "Expected RS8501 for mismatched arity on arity-overloaded generic type");
+
+        compiler::Compilation c8531({{"G8531.rscript", R"RS(
+module Kernel.G8531;
+public class Bad<T> where U : class { public T v; }
+)RS"}});
+        require(hasDiagnosticCode(c8531.build().diagnostics, "RS8531"),
+            "Expected RS8531 for unknown constraint type parameter");
+
+        compiler::Compilation c8532({{"G8532.rscript", R"RS(
+module Kernel.G8532;
+public class Bad<T> where T : class, class { public T v; }
+)RS"}});
+        require(hasDiagnosticCode(c8532.build().diagnostics, "RS8532"),
+            "Expected RS8532 for duplicate constraint");
+
+        compiler::Compilation c8533({{"G8533.rscript", R"RS(
+module Kernel.G8533;
+public class Bad<T> where T : class, struct { public T v; }
+)RS"}});
+        require(hasDiagnosticCode(c8533.build().diagnostics, "RS8533"),
+            "Expected RS8533 for conflicting class/struct constraints");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1160,6 +1335,7 @@ int main() {
     run("[StackOnly] Span<T>/ReadOnlySpan<T> traps, privacy & RS2692..RS2697", testStackOnlySpanAndAllEscapeGuards);
     run("ModulePackRegistry, CompilerSession, ICompilerMacroPlugin & partial diagnostics", testPacksSessionMacrosAndPartials);
     run("[Blittable] layout, [FieldTag]/[FormerlySerializedAs] .rsbc, ProjectConfig & C11 macro cache", testBlittableSchemaEvolutionProjectConfigAndMacroCache);
+    run("C# base syntax primitives (verbatim, =>, :this, iface:iface, arity generics, lambdas)", testCSharpBaseSyntaxPrimitives);
 
     return failures == 0 ? 0 : 1;
 }

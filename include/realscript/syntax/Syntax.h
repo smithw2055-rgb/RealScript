@@ -439,13 +439,22 @@ struct NameExpressionSyntax final : ExpressionSyntax {
     }
 };
 
+struct BlockStatementSyntax;
+
 struct LambdaExpressionSyntax final : ExpressionSyntax {
+    LambdaExpressionSyntax();
+    ~LambdaExpressionSyntax() override;
+    LambdaExpressionSyntax(LambdaExpressionSyntax&&) noexcept;
+    LambdaExpressionSyntax& operator=(LambdaExpressionSyntax&&) noexcept;
+
     std::optional<SyntaxToken> openParenToken;
+    std::vector<std::optional<TypeSyntax>> parameterTypes;
     std::vector<SyntaxToken> parameterTokens;
     std::vector<SyntaxToken> commaTokens;
     std::optional<SyntaxToken> closeParenToken;
     SyntaxToken arrowToken;
     std::unique_ptr<ExpressionSyntax> body;
+    std::unique_ptr<BlockStatementSyntax> blockBody;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override {
         return SyntaxKind::LambdaExpression;
@@ -1012,6 +1021,7 @@ struct ConstructorDeclarationSyntax final : SyntaxNode {
     SyntaxToken closeParenToken;
     std::optional<SyntaxToken> initializerColonToken;
     std::optional<SyntaxToken> baseKeyword;
+    std::optional<SyntaxToken> thisKeyword;
     std::optional<SyntaxToken> initializerOpenParenToken;
     std::vector<std::unique_ptr<ExpressionSyntax>> baseArguments;
     std::vector<SyntaxToken> baseArgumentCommaTokens;
@@ -1149,6 +1159,9 @@ struct InterfaceDeclarationSyntax final : SyntaxNode {
     std::vector<SyntaxToken> typeParameterCommaTokens;
     std::optional<SyntaxToken> typeParameterGreaterToken;
     std::vector<GenericConstraintClauseSyntax> constraints;
+    std::optional<SyntaxToken> colonToken;
+    std::vector<TypeSyntax> interfaces;
+    std::vector<SyntaxToken> interfaceCommaTokens;
     SyntaxToken openBraceToken;
     std::vector<InterfaceMethodDeclarationSyntax> methods;
     SyntaxToken closeBraceToken;

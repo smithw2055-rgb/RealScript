@@ -13,7 +13,18 @@ option(REALSCRIPT_INSTALL_SDK "Generate installable RealScript SDK targets" ON)
 option(REALSCRIPT_ENABLE_DEBUG_SERVICES "Build L1 Debug & DAP application layer" ON)
 option(REALSCRIPT_ENABLE_TOOLING "Build L1 Formatter, Linter, Fuzzer & LSP application layer" ON)
 option(REALSCRIPT_ENABLE_EXTENSIBILITY "Build L1 Reflection & Sandboxed ModHost application layer" ON)
-option(REALSCRIPT_ENABLE_GAME_SDK "Build L1 Game Engine SDK & Scene Runtime application layer" ON)
+option(REALSCRIPT_ENABLE_BINDGEN "Build L1 C++ Host Binding Generator (BindGen & rsbind) application layer" ON)
+option(REALSCRIPT_SLIM_RUNTIME "Build only slim L0 runtime and AOT runtime targets (zero Compiler/L1)" OFF)
+
+if(REALSCRIPT_SLIM_RUNTIME)
+    set(REALSCRIPT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(REALSCRIPT_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+    set(REALSCRIPT_INSTALL_SDK OFF CACHE BOOL "" FORCE)
+    set(REALSCRIPT_ENABLE_DEBUG_SERVICES OFF CACHE BOOL "" FORCE)
+    set(REALSCRIPT_ENABLE_TOOLING OFF CACHE BOOL "" FORCE)
+    set(REALSCRIPT_ENABLE_EXTENSIBILITY OFF CACHE BOOL "" FORCE)
+    set(REALSCRIPT_ENABLE_BINDGEN OFF CACHE BOOL "" FORCE)
+endif()
 
 function(realscript_enable_cxx_warnings target)
     if(MSVC)
@@ -43,8 +54,6 @@ if(MSVC)
     set_source_files_properties(
         src/optimization/Optimizer.cpp
         src/runtime/ExecutionServices.cpp
-        src/game/GameProductization.cpp
-        src/game/GameplayStateCodec.cpp
         src/reflection/Reflection.cpp
         src/plugin/ModHost.cpp
         PROPERTIES COMPILE_OPTIONS "/wd4456"
@@ -116,6 +125,7 @@ realscript_add_slice_library(realscript_slice_bytecode_core Bytecode
 target_link_libraries(realscript_slice_bytecode_core PUBLIC realscript_slice_foundation_core)
 
 # 3. Compiler Core (syntax, semantic symbols/binder, MIR, optimizer, bytecode lowerer, compiler)
+if(NOT REALSCRIPT_SLIM_RUNTIME)
 realscript_add_layer_library(realscript_layer_compiler_core
     src/syntax/SyntaxFacts.cpp
     src/syntax/Lexer.cpp
@@ -149,6 +159,7 @@ realscript_add_slice_library(realscript_slice_compiler_core Compiler
     $<TARGET_OBJECTS:realscript_layer_compiler_core>
 )
 target_link_libraries(realscript_slice_compiler_core PUBLIC realscript_slice_bytecode_core)
+endif()
 
 # 4. Runtime Core (HostAbi, ABI governance, VM, GC, fibers, async)
 realscript_add_layer_library(realscript_layer_runtime_core
@@ -175,9 +186,31 @@ if(CMAKE_DL_LIBS)
     target_link_libraries(realscript_slice_runtime_core PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
-# 5. Native Backends & Hot Reload (aot_cpp, jit, hot_reload)
-realscript_add_layer_library(realscript_layer_native_backends
+# 4b. AOT Runtime Support (runtime-only generated-AOT execution helpers; zero Compiler/JIT deps)
+realscript_add_layer_library(realscript_layer_aot_runtime
     src/aot_cpp/AotRuntime.cpp
+)
+realscript_add_slice_library(realscript_slice_aot_runtime AotRuntime
+    $<TARGET_OBJECTS:realscript_layer_aot_runtime>
+)
+target_link_libraries(realscript_slice_aot_runtime PUBLIC realscript_slice_runtime_core)
+
+add_library(realscript_aot_support INTERFACE)
+target_link_libraries(realscript_aot_support INTERFACE realscript_slice_aot_runtime)
+set_target_properties(realscript_aot_support PROPERTIES EXPORT_NAME AotSupport)
+add_library(RealScript::AotSupport ALIAS realscript_aot_support)
+
+add_library(realscript_slim_runtime INTERFACE)
+target_link_libraries(realscript_slim_runtime INTERFACE
+    realscript_slice_runtime_core
+    realscript_slice_aot_runtime
+)
+set_target_properties(realscript_slim_runtime PROPERTIES EXPORT_NAME SlimRuntime)
+add_library(RealScript::SlimRuntime ALIAS realscript_slim_runtime)
+
+# 5. Native Backends & Hot Reload (aot_cpp codegen, jit, hot_reload)
+if(NOT REALSCRIPT_SLIM_RUNTIME)
+realscript_add_layer_library(realscript_layer_native_backends
     src/aot_cpp/AotRangeAnalysis.cpp
     src/aot_cpp/AotTypedAnalysis.cpp
     src/aot_cpp/AotSimdVectorizer.cpp
@@ -196,17 +229,14 @@ realscript_add_slice_library(realscript_slice_native_backends NativeBackends
 target_link_libraries(realscript_slice_native_backends PUBLIC
     realscript_slice_runtime_core
     realscript_slice_compiler_core
+    realscript_slice_aot_runtime
 )
 
 # 6. L0 INTERFACE Composition & Internal JIT Support Archive
-add_library(realscript_aot_support INTERFACE)
-target_link_libraries(realscript_aot_support INTERFACE realscript_slice_native_backends)
-set_target_properties(realscript_aot_support PROPERTIES EXPORT_NAME AotSupport)
-add_library(RealScript::AotSupport ALIAS realscript_aot_support)
-
 add_library(realscript_kernel INTERFACE)
 target_link_libraries(realscript_kernel INTERFACE
     realscript_slice_native_backends
+    realscript_slice_aot_runtime
     realscript_slice_compiler_core
     realscript_slice_runtime_core
 )
@@ -218,6 +248,7 @@ if(REALSCRIPT_BUILD_TESTS OR REALSCRIPT_BUILD_BENCHMARKS)
         $<TARGET_OBJECTS:realscript_layer_foundation>
         $<TARGET_OBJECTS:realscript_layer_bytecode_format>
         $<TARGET_OBJECTS:realscript_layer_runtime_core>
+        $<TARGET_OBJECTS:realscript_layer_aot_runtime>
         $<TARGET_OBJECTS:realscript_layer_native_backends>
     )
     set_target_properties(realscript_jit_support_archive PROPERTIES
@@ -231,6 +262,7 @@ if(REALSCRIPT_BUILD_TESTS OR REALSCRIPT_BUILD_BENCHMARKS)
     if(CMAKE_DL_LIBS)
         target_link_libraries(realscript_jit_support_archive PUBLIC ${CMAKE_DL_LIBS})
     endif()
+endif()
 endif()
 
 # ============================================================================
@@ -293,50 +325,21 @@ if(REALSCRIPT_ENABLE_EXTENSIBILITY)
     )
 endif()
 
-if(REALSCRIPT_ENABLE_GAME_SDK)
-    realscript_add_layer_library(realscript_layer_game
-        src/game/RsBindParser.cpp
-        src/game/GameApi.cpp
-        src/game/ScriptObjectRuntime.cpp
-        src/game/ScriptInvokeRuntime.cpp
-        src/game/ScriptValueRuntime.cpp
-        src/game/SceneLifecycleRuntime.cpp
-        src/game/SceneEventRuntime.cpp
-        src/game/GameProductization.cpp
-        src/game/GameplayPrimitives.cpp
-        src/game/GameplayMetadata.cpp
-        src/game/GameplayScripting.cpp
-        src/game/GameplayStateCodec.cpp
+if(REALSCRIPT_ENABLE_BINDGEN)
+    realscript_add_layer_library(realscript_layer_bindgen
+        src/bindgen/HostApi.cpp
+        src/bindgen/RsBindParser.cpp
     )
-    realscript_add_slice_library(realscript_app_game_sdk GameSdk
-        $<TARGET_OBJECTS:realscript_layer_game>
+    realscript_add_slice_library(realscript_app_bindgen BindGen
+        $<TARGET_OBJECTS:realscript_layer_bindgen>
     )
-    target_link_libraries(realscript_app_game_sdk PUBLIC
+    target_link_libraries(realscript_app_bindgen PUBLIC
         realscript_slice_runtime_core
         realscript_slice_compiler_core
-        realscript_slice_native_backends
     )
-    if(REALSCRIPT_ENABLE_DEBUG_SERVICES)
-        target_link_libraries(realscript_app_game_sdk PUBLIC realscript_app_debug)
-        target_compile_definitions(realscript_layer_game PRIVATE REALSCRIPT_HAS_DEBUG_SERVICES=1)
-        target_compile_definitions(realscript_app_game_sdk PUBLIC REALSCRIPT_HAS_DEBUG_SERVICES=1)
-    else()
-        target_compile_definitions(realscript_layer_game PRIVATE REALSCRIPT_HAS_DEBUG_SERVICES=0)
-        target_compile_definitions(realscript_app_game_sdk PUBLIC REALSCRIPT_HAS_DEBUG_SERVICES=0)
-    endif()
-
-    add_library(realscript_game_runtime INTERFACE)
-    target_link_libraries(realscript_game_runtime INTERFACE realscript_app_game_sdk)
-    set_target_properties(realscript_game_runtime PROPERTIES EXPORT_NAME GameRuntime)
-    add_library(RealScript::GameRuntime ALIAS realscript_game_runtime)
-
-    add_library(realscript_game_compiler INTERFACE)
-    target_link_libraries(realscript_game_compiler INTERFACE realscript_app_game_sdk)
-    set_target_properties(realscript_game_compiler PROPERTIES EXPORT_NAME GameCompiler)
-    add_library(RealScript::GameCompiler ALIAS realscript_game_compiler)
 
     add_executable(rsbind tools/rsbind/main.cpp)
-    target_link_libraries(rsbind PRIVATE RealScript::GameSdk)
+    target_link_libraries(rsbind PRIVATE RealScript::BindGen)
     target_compile_features(rsbind PRIVATE cxx_std_17)
     realscript_enable_cxx_warnings(rsbind)
 endif()
@@ -345,6 +348,7 @@ endif()
 # Always-Built L0 CLIs & Umbrella INTERFACE Targets
 # ============================================================================
 
+if(NOT REALSCRIPT_SLIM_RUNTIME)
 add_executable(rsc tools/rsc/main.cpp)
 target_link_libraries(rsc PRIVATE RealScript::Compiler RealScript::Runtime)
 target_compile_features(rsc PRIVATE cxx_std_17)
@@ -357,7 +361,7 @@ endif()
 realscript_enable_cxx_warnings(rsc)
 
 add_executable(rsaot tools/rsaot/main.cpp)
-target_link_libraries(rsaot PRIVATE RealScript::Compiler RealScript::AotSupport)
+target_link_libraries(rsaot PRIVATE RealScript::NativeBackends RealScript::Compiler RealScript::AotSupport)
 target_compile_features(rsaot PRIVATE cxx_std_17)
 realscript_enable_cxx_warnings(rsaot)
 
@@ -376,7 +380,7 @@ target_link_libraries(realscript_full INTERFACE realscript_kernel)
 set_target_properties(realscript_full PROPERTIES EXPORT_NAME Full)
 add_library(RealScript::Full ALIAS realscript_full)
 
-foreach(_rs_opt IN ITEMS DEBUG_SERVICES TOOLING EXTENSIBILITY GAME_SDK)
+foreach(_rs_opt IN ITEMS DEBUG_SERVICES TOOLING EXTENSIBILITY BINDGEN)
     if(REALSCRIPT_ENABLE_${_rs_opt})
         set(REALSCRIPT_HAS_${_rs_opt}_CMAKE ON)
         set(_rs_has_def 1)
@@ -402,9 +406,10 @@ if(REALSCRIPT_ENABLE_EXTENSIBILITY)
     target_link_libraries(realscript_frontend INTERFACE realscript_app_extensibility)
     target_link_libraries(realscript_full INTERFACE realscript_app_extensibility)
 endif()
-if(REALSCRIPT_ENABLE_GAME_SDK)
-    target_link_libraries(realscript_frontend INTERFACE realscript_app_game_sdk)
-    target_link_libraries(realscript_full INTERFACE realscript_app_game_sdk)
+if(REALSCRIPT_ENABLE_BINDGEN)
+    target_link_libraries(realscript_frontend INTERFACE realscript_app_bindgen)
+    target_link_libraries(realscript_full INTERFACE realscript_app_bindgen)
+endif()
 endif()
 
 include(cmake/RealScriptAot.cmake)
@@ -443,14 +448,6 @@ if(REALSCRIPT_BUILD_BENCHMARKS)
             REALSCRIPT_BENCH_JIT_CACHE_BASE="${CMAKE_CURRENT_BINARY_DIR}/jit-benchmark-cache"
     )
     realscript_enable_cxx_warnings(rsbench_jit)
-
-    if(REALSCRIPT_ENABLE_GAME_SDK)
-        add_executable(
-            rsbench_product benchmarks/product_macro_driver.cpp)
-        target_link_libraries(rsbench_product PRIVATE RealScript::Full)
-        target_compile_features(rsbench_product PRIVATE cxx_std_17)
-        realscript_enable_cxx_warnings(rsbench_product)
-    endif()
 endif()
 
 if(REALSCRIPT_BUILD_TESTS)
@@ -640,12 +637,12 @@ if(REALSCRIPT_BUILD_TESTS)
             tests/app_reflection_and_mod_host_tests.cpp)
     endif()
 
-    if(REALSCRIPT_ENABLE_GAME_SDK)
+    if(REALSCRIPT_ENABLE_BINDGEN)
         realscript_add_cpp_test(
-            realscript_app_game_sdk_and_scene_tests
-            realscript.app.game-sdk-and-scene
-            RealScript::GameSdk
-            tests/app_game_sdk_and_scene_tests.cpp)
+            realscript_app_bindgen_tests
+            realscript.app.bindgen
+            RealScript::BindGen
+            tests/app_bindgen_tests.cpp)
     endif()
 
     # CLI & SDK Consumer Verification
@@ -706,14 +703,16 @@ if(REALSCRIPT_BUILD_TESTS)
     endif()
 endif()
 
-if(REALSCRIPT_INSTALL_SDK)
+if(REALSCRIPT_INSTALL_SDK AND NOT REALSCRIPT_SLIM_RUNTIME)
     set(realscript_install_export_targets
         realscript_slice_foundation_core
         realscript_slice_bytecode_core
         realscript_slice_compiler_core
         realscript_slice_runtime_core
+        realscript_slice_aot_runtime
         realscript_slice_native_backends
         realscript_aot_support
+        realscript_slim_runtime
         realscript_kernel
         realscript_frontend
         realscript_full
@@ -732,12 +731,8 @@ if(REALSCRIPT_INSTALL_SDK)
     if(REALSCRIPT_ENABLE_EXTENSIBILITY)
         list(APPEND realscript_install_export_targets realscript_app_extensibility)
     endif()
-    if(REALSCRIPT_ENABLE_GAME_SDK)
-        list(APPEND realscript_install_export_targets
-            realscript_app_game_sdk
-            realscript_game_runtime
-            realscript_game_compiler
-        )
+    if(REALSCRIPT_ENABLE_BINDGEN)
+        list(APPEND realscript_install_export_targets realscript_app_bindgen)
         list(APPEND realscript_install_cli_targets rsbind)
     endif()
 

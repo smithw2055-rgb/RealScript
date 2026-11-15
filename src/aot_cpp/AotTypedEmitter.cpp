@@ -2089,7 +2089,7 @@ void emitTypedPrimitiveFunction(
                 source.line("            }");
                 if (instruction.resultType != semantic::PrimitiveType::Void) {
                     const TypedSlotType retSlot{instruction.resultType, instruction.resultTypeId};
-                    source.line("            " + typedCppType(retSlot) + " delCallRes_" + suffix + "{};");
+                    source.line("            " + typedCppType(retSlot) + " delCallRes_" + suffix + " = " + typedDefaultValue(retSlot) + ";");
                 }
                 source.line("            auto invokeDelLeaf_" + suffix + " = [&](const aot::ResolvedAotDelegateLeaf& leaf) -> bool {");
                 if (!delCandidates.empty()) {
@@ -2211,6 +2211,8 @@ void emitTypedPrimitiveFunction(
                 source.line("                        if (!invokeDelLeaf_" + suffix + "(mcLeaves_" + suffix + "[mcIdx_" + suffix + "])) { delCallOk_" + suffix + " = false; break; }");
                 source.line("                    }");
                 source.line("                }");
+                source.line("            } else if (delKind_" + suffix + " == 3) {");
+                source.line("                delCallOk_" + suffix + " = true;");
                 source.line("            }");
                 source.line("            if constexpr (!TrustedRelease) {");
                 source.line("                rawAccounting.resumeAfterCall();");

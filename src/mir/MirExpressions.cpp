@@ -139,7 +139,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
     auto emitStorePatternVar = [&](const semantic::VariableSymbol& var,
                                    ValueId val,
                                    text::TextSpan span) {
-        if (semantic::storageTypeOf(var) != var.type &&
+        if (semantic::hasWrappedStorage(var) &&
             var.modifier == semantic::ParameterModifier::None) {
             const auto cell = emitValue(
                 Opcode::NewObject, semantic::PrimitiveType::Object, {}, span);

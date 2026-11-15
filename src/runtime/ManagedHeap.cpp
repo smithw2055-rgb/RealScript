@@ -56,6 +56,16 @@ std::mutex& nativeHandleRegistryDirMutex() noexcept {
     return dirMutex;
 }
 
+std::mutex& externalValuePoolMarkersMutex() noexcept {
+    static std::mutex markersMutex;
+    return markersMutex;
+}
+
+std::unordered_map<const void*, std::function<void()>>& externalValuePoolMarkers() noexcept {
+    static std::unordered_map<const void*, std::function<void()>> markers;
+    return markers;
+}
+
 std::vector<NativeHandleRegistry*>& nativeHandleRegistries() noexcept {
     static std::vector<NativeHandleRegistry*> registries;
     return registries;
@@ -520,7 +530,9 @@ void transferActiveShadowStack(ShadowStack* from, ShadowStack* to) noexcept {
 
 ShadowStack::ShadowStack() noexcept
     : instanceId_(nextShadowStackId()),
-      domainId_(detail::currentThreadDomainIdFast()) {}
+      domainId_(detail::currentThreadDomainIdFast()) {
+    (void)currentThreadShadowStackShard();
+}
 
 ShadowStack::~ShadowStack() noexcept {
     if (registryShard_ != nullptr) {
@@ -629,33 +641,58 @@ void ShadowStack::setDomainId(std::uint8_t id) noexcept {
     domainId_ = masked;
 }
 
-void ShadowStack::pushFrame(
-    const std::vector<Value>* arguments,
-    const std::vector<Value>* locals,
-    const std::vector<Value>* registers,
-    const std::size_t* activeRegisterLimit) {
+void ShadowStack::pushFrameRoots(const FrameRoots& roots) {
     if (registryShard_ != nullptr) {
         auto* shard = static_cast<ThreadShadowStackShard*>(registryShard_);
         std::lock_guard<std::mutex> lock(shard->mutex);
         const std::size_t idx = frameCount_;
         if (idx < InlineFrameCapacity) {
-            inlineFrames_[idx] = {arguments, locals, registers, activeRegisterLimit};
+            inlineFrames_[idx] = roots;
         } else {
-            overflowFrames_.push_back({arguments, locals, registers, activeRegisterLimit});
+            overflowFrames_.push_back(roots);
         }
         frameCount_ = idx + 1;
         return;
     }
     const std::size_t idx = frameCount_;
     if (idx < InlineFrameCapacity) {
-        inlineFrames_[idx] = {arguments, locals, registers, activeRegisterLimit};
+        inlineFrames_[idx] = roots;
     } else {
-        overflowFrames_.push_back({arguments, locals, registers, activeRegisterLimit});
+        overflowFrames_.push_back(roots);
     }
     frameCount_ = idx + 1;
     if (idx == 0) {
         registerActiveShadowStack(this);
     }
+}
+
+void ShadowStack::pushFrame(
+    const std::vector<Value>* arguments,
+    const std::vector<Value>* locals,
+    const std::vector<Value>* registers,
+    const std::size_t* activeRegisterLimit) {
+    FrameRoots roots;
+    roots.arguments = arguments;
+    roots.locals = locals;
+    roots.registers = registers;
+    roots.activeRegisterLimit = activeRegisterLimit;
+    pushFrameRoots(roots);
+}
+
+void ShadowStack::pushSpanFrame(
+    ValueSpan arguments,
+    ValueSpan locals,
+    ValueSpan registers,
+    const std::size_t* activeRegisterLimit) {
+    FrameRoots roots;
+    roots.argumentsPtr = arguments.data();
+    roots.argumentsCount = arguments.size();
+    roots.localsPtr = locals.data();
+    roots.localsCount = locals.size();
+    roots.registersPtr = registers.data();
+    roots.registersCount = registers.size();
+    roots.activeRegisterLimit = activeRegisterLimit;
+    pushFrameRoots(roots);
 }
 
 void ShadowStack::popFrame() noexcept {
@@ -2348,6 +2385,8 @@ namespace GcFlag {
     constexpr std::uint8_t HasCardTable    = 1u << 3;
     constexpr std::uint8_t CustomSize      = 1u << 4;
     constexpr std::uint8_t IsInterned      = 1u << 5;
+    constexpr std::uint8_t HasObserver     = 1u << 6;
+    constexpr std::uint8_t InDirtyQueue    = 1u << 7;
 } // namespace GcFlag
 
 struct TypeLayoutEntry {
@@ -2725,6 +2764,10 @@ public:
         return id;
     }
 
+    [[nodiscard]] std::vector<Value>& mutableBuffer(std::uint32_t id) noexcept {
+        return buffers_[id];
+    }
+
     void release(std::uint32_t id) noexcept {
         if (id >= buffers_.size()) return;
         auto& buf = buffers_[id];
@@ -3010,6 +3053,16 @@ private:
     std::size_t totalOversizedWords_ = 0u;
 };
 
+namespace {
+[[nodiscard]] Value readNativeFieldFromBytes(
+    const std::uint8_t* elemBase,
+    const NativeFieldLayout& layout) noexcept;
+bool writeNativeFieldToBytes(
+    std::uint8_t* elemBase,
+    const NativeFieldLayout& layout,
+    const Value& val) noexcept;
+} // namespace
+
 struct ManagedHeap::Impl {
     struct LegacyHeader {
         ObjectKind kind = ObjectKind::Record;
@@ -3114,6 +3167,7 @@ struct ManagedHeap::Impl {
                 HeapSyncMutexGuard instanceLock(*syncState, /*flushDeferredOnUnlock=*/false);
                 pendingValueLifecycleSweeps.clear();
                 pendingWrapperSweeps.clear();
+                pendingObservedSlotSweeps.clear();
                 syncState->ownerImpl = nullptr;
             }
             unregisterHeapSyncFromPoolShard(*syncState);
@@ -3311,24 +3365,32 @@ struct ManagedHeap::Impl {
     std::uint32_t internTemplateRecordLayout(
         semantic::SymbolId typeId,
         const std::shared_ptr<const std::vector<std::size_t>>& referenceFields) {
-        if (typeId == lastRegisteredLayoutTypeId && lastRegisteredLayoutId != 0) {
-            return lastRegisteredLayoutId;
-        }
-        const auto it = sharedRecordLayoutByTypeId.find(typeId);
-        if (it != sharedRecordLayoutByTypeId.end()) {
-            lastRegisteredLayoutTypeId = typeId;
-            lastRegisteredLayoutId = it->second;
-            return it->second;
+        static const std::vector<std::size_t> kEmptyRefs;
+        const auto& wantedRefs = referenceFields ? *referenceFields : kEmptyRefs;
+        if (typeId != 0) {
+            if (typeId == lastRegisteredLayoutTypeId && lastRegisteredLayoutId != 0 &&
+                typeLayouts[lastRegisteredLayoutId].referenceFields == wantedRefs) {
+                return lastRegisteredLayoutId;
+            }
+            const auto it = sharedRecordLayoutByTypeId.find(typeId);
+            if (it != sharedRecordLayoutByTypeId.end() &&
+                typeLayouts[it->second].referenceFields == wantedRefs) {
+                lastRegisteredLayoutTypeId = typeId;
+                lastRegisteredLayoutId = it->second;
+                return it->second;
+            }
         }
         TypeLayoutEntry entry;
         entry.typeId = typeId;
-        if (referenceFields && !referenceFields->empty()) {
-            entry.referenceFields = *referenceFields;
+        if (!wantedRefs.empty()) {
+            entry.referenceFields = wantedRefs;
             entry.mayContainReferences = true;
         }
         const auto id = static_cast<std::uint32_t>(typeLayouts.size());
         typeLayouts.push_back(std::move(entry));
-        sharedRecordLayoutByTypeId[typeId] = id;
+        if (typeId != 0 && sharedRecordLayoutByTypeId.find(typeId) == sharedRecordLayoutByTypeId.end()) {
+            sharedRecordLayoutByTypeId[typeId] = id;
+        }
         lastRegisteredLayoutTypeId = typeId;
         lastRegisteredLayoutId = id;
         return id;
@@ -3408,6 +3470,14 @@ struct ManagedHeap::Impl {
     std::unordered_map<semantic::SymbolId, std::vector<std::uint8_t>> typeDirtyBitMaps;
     std::unordered_map<semantic::SymbolId, semantic::SymbolId> typeBaseIds;
     std::unordered_map<std::uint32_t, std::uint64_t> observerDirtyMasks;
+    std::vector<ObjectRef> dirtyObjectQueue;
+    FieldMutationCallback fieldMutationCallback = nullptr;
+    void* fieldMutationUserData = nullptr;
+    ArrayMutationCallback arrayMutationCallback = nullptr;
+    void* arrayMutationUserData = nullptr;
+    SlotSweepCallback slotSweepCallback = nullptr;
+    void* slotSweepUserData = nullptr;
+    std::vector<ObjectRef> pendingObservedSlotSweeps;
     NativeWrapperSweepCallback nativeWrapperSweepCallback;
     std::atomic<bool> hasValueLifecycleTypes{false};
     std::unordered_set<semantic::SymbolId> valueLifecycleTypes;
@@ -3609,45 +3679,70 @@ struct ManagedHeap::Impl {
         ObjectRef wrapper{};
     };
     std::vector<PendingWrapperSweep> pendingWrapperSweeps;
+    ManagedHeap* ownerHeap = nullptr;
 
     void flushPendingWrapperSweeps() {
         std::vector<PendingWrapperSweep> pending;
         NativeWrapperSweepCallback callback;
+        std::vector<ObjectRef> pendingObservedSweeps;
+        SlotSweepCallback slotCb = nullptr;
+        void* slotCbUserData = nullptr;
         {
             HeapSyncMutexGuard heapLock(syncState->mutex);
-            if (pendingWrapperSweeps.empty()) {
-                return;
+            if (!pendingWrapperSweeps.empty()) {
+                pending.swap(pendingWrapperSweeps);
+                callback = nativeWrapperSweepCallback;
             }
-            pending.swap(pendingWrapperSweeps);
-            callback = nativeWrapperSweepCallback;
+            if (!pendingObservedSlotSweeps.empty()) {
+                pendingObservedSweeps.swap(pendingObservedSlotSweeps);
+                slotCb = slotSweepCallback;
+                slotCbUserData = slotSweepUserData;
+            }
         }
-        if (!callback) {
+        if (pending.empty() && pendingObservedSweeps.empty()) {
             return;
         }
         ScopedValuePoolDomain domainScope(valuePoolDomain.get());
-        for (const auto& entry : pending) {
-            if (!NativeHandleRegistry::shouldDispatchSweepNotification(
-                    entry.handle, entry.heapId, entry.wrapper)) {
-                continue;
+        if (callback) {
+            for (const auto& entry : pending) {
+                if (!NativeHandleRegistry::shouldDispatchSweepNotification(
+                        entry.handle, entry.heapId, entry.wrapper)) {
+                    continue;
+                }
+                callback(entry.handle, entry.heapId, entry.wrapper);
             }
-            callback(entry.handle, entry.heapId, entry.wrapper);
+        }
+        if (slotCb && ownerHeap) {
+            for (const auto sweptRef : pendingObservedSweeps) {
+                slotCb(slotCbUserData, *ownerHeap, sweptRef);
+            }
         }
     }
 
-    void markDirtyForFieldUnlocked(
+    [[nodiscard]] std::uint8_t markDirtyForFieldUnlocked(
         ObjectRef reference,
         semantic::SymbolId concreteTypeId,
-        std::size_t fieldIndex) noexcept {
+        std::size_t fieldIndex,
+        bool& outHasDirtyObjects) noexcept {
         if (!hasDirtyTrackingTypes || concreteTypeId == 0) {
-            return;
+            return 0xFFu;
         }
+        std::uint8_t matchedBit = 0xFFu;
         semantic::SymbolId cur = concreteTypeId;
         for (int depth = 0; depth < 64 && cur != 0; ++depth) {
             const auto mapIt = typeDirtyBitMaps.find(cur);
             if (mapIt != typeDirtyBitMaps.end() && fieldIndex < mapIt->second.size()) {
                 const std::uint8_t bit = mapIt->second[fieldIndex];
                 if (bit < 64u) {
+                    if (matchedBit == 0xFFu) {
+                        matchedBit = bit;
+                    }
                     observerDirtyMasks[reference.slot] |= (std::uint64_t{1} << bit);
+                    if (auto* slot = getSlot(reference); slot && !slot->hasFlag(GcFlag::InDirtyQueue)) {
+                        slot->gcFlags |= GcFlag::InDirtyQueue;
+                        dirtyObjectQueue.push_back(reference);
+                    }
+                    outHasDirtyObjects = true;
                 }
             }
             const auto baseIt = typeBaseIds.find(cur);
@@ -3656,6 +3751,7 @@ struct ManagedHeap::Impl {
             }
             cur = baseIt->second;
         }
+        return matchedBit;
     }
     RootToken nextRootToken = 1;
     GcPhase phase = GcPhase::Idle;
@@ -3901,6 +3997,471 @@ struct ManagedHeap::Impl {
         return true;
     }
 
+    [[nodiscard]] static Value* emptyArrayDataPtr() noexcept {
+        static const Value kEmpty{};
+        return const_cast<Value*>(&kEmpty);
+    }
+
+    [[nodiscard]] Value readArrayElementUnlocked(
+        const CompactSlot& slot,
+        std::size_t index) const {
+        if (isPackedStorage(slot.storage())) {
+            const auto elemTid = typeLayouts[slot.payload.s.layoutId].elementTypeId;
+            return readPackedElementValue(
+                slot.payload.s.data,
+                index,
+                unpackPackedEncoding(slot.auxMeta),
+                elemTid,
+                slot.payload.s.cardHandle);
+        }
+        if (slot.storage() == SlotStorage::FlatStruct) {
+            const auto* sc = getFlatStructSchema(slot.auxMeta);
+            if (!sc) return Value{};
+            return reconstructDetachedStructFromLeaves(
+                *sc,
+                slot.payload.s.data + index * static_cast<std::size_t>(sc->flatSlotCount));
+        }
+        if (slot.storage() == SlotStorage::RawColumn) {
+            const auto& view = rawColumns.get(slot.payload.s.handle);
+            const auto* elemBase =
+                static_cast<const std::uint8_t*>(view.basePtr) + index * view.strideBytes;
+            if (view.mode == RawColumnMode::ScalarPacked) {
+                return readPackedElementValue(
+                    elemBase,
+                    0u,
+                    view.packedEncoding,
+                    view.elementTypeId,
+                    view.blittableSchemaId);
+            }
+            std::vector<Value> fields(view.fields.size());
+            for (std::size_t i = 0; i < view.fields.size(); ++i) {
+                fields[i] = readNativeFieldFromBytes(elemBase, view.fields[i]);
+            }
+            return Value{makeStructValueFromFields(view.structTypeId, std::move(fields))};
+        }
+        return slot.payload.s.data[index];
+    }
+
+    std::vector<Value>* ensureMutableHeapArrayVectorUnlocked(
+        std::uint32_t slotIndex,
+        CompactSlot& slot,
+        std::size_t minCapacity,
+        bool exactReserve = false,
+        bool* outOom = nullptr) {
+        if (outOom) *outOom = false;
+        const auto storage = slot.storage();
+        if (storage == SlotStorage::RawColumn || storage == SlotStorage::Empty) {
+            return nullptr;
+        }
+        const auto computeTargetCapacity = [&](std::size_t currentCap, std::size_t curLen) noexcept -> std::size_t {
+            if (exactReserve) return minCapacity;
+            const std::size_t half = currentCap >> 1u;
+            std::size_t grown = (currentCap > std::numeric_limits<std::size_t>::max() - half - 4u)
+                ? minCapacity
+                : (currentCap + half + 4u);
+            if (config.maximumHeapBytes > statistics.liveBytes) {
+                const std::size_t maxExtraElems =
+                    (config.maximumHeapBytes - statistics.liveBytes) / sizeof(Value);
+                const std::size_t maxTotalCap =
+                    (curLen > std::numeric_limits<std::size_t>::max() - maxExtraElems)
+                        ? std::numeric_limits<std::size_t>::max()
+                        : (curLen + maxExtraElems);
+                if (grown > maxTotalCap) {
+                    grown = maxTotalCap;
+                }
+            } else {
+                grown = minCapacity;
+            }
+            return std::max(minCapacity, grown);
+        };
+        if (storage == SlotStorage::HeapValues) {
+            auto& vec = largeBuffers.mutableBuffer(slot.payload.s.handle);
+            if (minCapacity > vec.capacity()) {
+                vec.reserve(computeTargetCapacity(vec.capacity(), vec.size()));
+                slot.payload.s.data = vec.empty() ? emptyArrayDataPtr() : vec.data();
+                gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
+            }
+            return &vec;
+        }
+        const std::size_t len = slot.payload.s.length;
+        const std::uint32_t layoutId = slot.payload.s.layoutId;
+        if (storage == SlotStorage::SlabValues) {
+            std::vector<Value> elems;
+            elems.reserve(std::max(minCapacity, len));
+            for (std::size_t i = 0; i < len; ++i) {
+                elems.push_back(std::move(slot.payload.s.data[i]));
+            }
+            slabPool.deallocate(slot.auxMeta, slot.payload.s.handle, slot.payload.s.length);
+            Value* ptr = nullptr;
+            const std::uint32_t newHandle = largeBuffers.acquireMove(std::move(elems), ptr);
+            auto& vec = largeBuffers.mutableBuffer(newHandle);
+            if (minCapacity > vec.capacity()) {
+                vec.reserve(computeTargetCapacity(vec.capacity(), len));
+            }
+            slot.setKindAndStorage(ObjectKind::Array, SlotStorage::HeapValues);
+            slot.auxMeta = 0;
+            slot.payload.s.handle = newHandle;
+            slot.payload.s.cardHandle = CompactSlot::kInvalidHandle;
+            slot.payload.s.data = vec.empty() ? emptyArrayDataPtr() : vec.data();
+            gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
+            return &vec;
+        }
+        if (isPackedStorage(storage)) {
+            const std::size_t valStorage = estimateValueStorage(len);
+            if (valStorage == std::numeric_limits<std::size_t>::max()) {
+                if (outOom) *outOom = true;
+                return nullptr;
+            }
+            const std::size_t oldTotalBytes = slotSizeBytes(slotIndex, slot);
+            const std::size_t newTotalBytes = BaseObjectSizeBytes + valStorage;
+            if (!slot.hasFlag(GcFlag::CustomSize) && newTotalBytes > oldTotalBytes) {
+                const std::size_t delta = newTotalBytes - oldTotalBytes;
+                const std::size_t budget = config.maximumHeapBytes > statistics.liveBytes
+                    ? (config.maximumHeapBytes - statistics.liveBytes)
+                    : 0u;
+                if (delta > budget) {
+                    if (outOom) *outOom = true;
+                    requested = true;
+                    return nullptr;
+                }
+            }
+            const auto enc = unpackPackedEncoding(slot.auxMeta);
+            const auto elemTid = typeLayouts[layoutId].elementTypeId;
+            const std::uint32_t oldSchemaId = slot.payload.s.cardHandle;
+            std::vector<Value> elems;
+            elems.reserve(std::max(minCapacity, len));
+            for (std::size_t i = 0; i < len; ++i) {
+                elems.push_back(
+                    readPackedElementValue(slot.payload.s.data, i, enc, elemTid, oldSchemaId));
+                pinHeapValueIfNeededUnlocked(elems.back());
+            }
+            packedBuffers.release(slot.payload.s.handle);
+            Value* ptr = nullptr;
+            const std::uint32_t newHandle = largeBuffers.acquireMove(std::move(elems), ptr);
+            auto& vec = largeBuffers.mutableBuffer(newHandle);
+            if (minCapacity > vec.capacity()) {
+                vec.reserve(computeTargetCapacity(vec.capacity(), len));
+            }
+            std::uint32_t cardHandle = CompactSlot::kInvalidHandle;
+            if (!slot.hasFlag(GcFlag::InNursery) &&
+                len >= ManagedHeap::kCardTableMinLength &&
+                typeLayouts[layoutId].mayContainReferences) {
+                cardHandle = cardArena.allocate(len);
+                slot.gcFlags |= GcFlag::HasCardTable;
+            }
+            slot.setKindAndStorage(ObjectKind::Array, SlotStorage::HeapValues);
+            slot.auxMeta = 0;
+            slot.payload.s.handle = newHandle;
+            slot.payload.s.cardHandle = cardHandle;
+            slot.payload.s.data = vec.empty() ? emptyArrayDataPtr() : vec.data();
+            if (!slot.hasFlag(GcFlag::CustomSize)) {
+                if (newTotalBytes >= oldTotalBytes) {
+                    const std::size_t delta = newTotalBytes - oldTotalBytes;
+                    statistics.bytesAllocated += delta;
+                    statistics.liveBytes += delta;
+                    statistics.peakLiveBytes = std::max(statistics.peakLiveBytes, statistics.liveBytes);
+                    if (statistics.liveBytes >= nextCollectionThreshold) requested = true;
+                } else {
+                    const std::size_t delta = oldTotalBytes - newTotalBytes;
+                    statistics.liveBytes = (statistics.liveBytes >= delta) ? (statistics.liveBytes - delta) : 0u;
+                    statistics.bytesReclaimed += delta;
+                }
+            }
+            gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
+            return &vec;
+        }
+        if (storage == SlotStorage::FlatStruct) {
+            const auto* sc = getFlatStructSchema(slot.auxMeta);
+            if (!sc) return nullptr;
+            const std::size_t oldTotalBytes = slotSizeBytes(slotIndex, slot);
+            const std::size_t newTotalBytes = BaseObjectSizeBytes + len * sizeof(Value);
+            std::vector<Value> elems;
+            elems.reserve(std::max(minCapacity, len));
+            for (std::size_t i = 0; i < len; ++i) {
+                elems.push_back(reconstructDetachedStructFromLeaves(
+                    *sc,
+                    slot.payload.s.data + i * static_cast<std::size_t>(sc->flatSlotCount)));
+                pinHeapValueIfNeededUnlocked(elems.back());
+            }
+            const std::uint32_t oldBufHandle = slot.payload.s.handle;
+            if (oldBufHandle != CompactSlot::kInvalidHandle) {
+                largeBuffers.release(oldBufHandle);
+            }
+            Value* ptr = nullptr;
+            const std::uint32_t newHandle = largeBuffers.acquireMove(std::move(elems), ptr);
+            auto& vec = largeBuffers.mutableBuffer(newHandle);
+            if (minCapacity > vec.capacity()) {
+                vec.reserve(computeTargetCapacity(vec.capacity(), len));
+            }
+            slot.setKindAndStorage(ObjectKind::Array, SlotStorage::HeapValues);
+            slot.auxMeta = 0;
+            slot.payload.s.handle = newHandle;
+            slot.payload.s.data = vec.empty() ? emptyArrayDataPtr() : vec.data();
+            if (!slot.hasFlag(GcFlag::InNursery) &&
+                slot.hasFlag(GcFlag::HasCardTable) &&
+                slot.hasFlag(GcFlag::InRememberedSet) &&
+                slot.payload.s.cardHandle != CompactSlot::kInvalidHandle) {
+                cardArena.get(slot.payload.s.cardHandle).markAllDirty();
+            }
+            if (!slot.hasFlag(GcFlag::CustomSize)) {
+                if (newTotalBytes >= oldTotalBytes) {
+                    const std::size_t delta = newTotalBytes - oldTotalBytes;
+                    statistics.bytesAllocated += delta;
+                    statistics.liveBytes += delta;
+                    statistics.peakLiveBytes = std::max(statistics.peakLiveBytes, statistics.liveBytes);
+                    if (statistics.liveBytes >= nextCollectionThreshold) requested = true;
+                } else {
+                    const std::size_t delta = oldTotalBytes - newTotalBytes;
+                    statistics.liveBytes = (statistics.liveBytes >= delta) ? (statistics.liveBytes - delta) : 0u;
+                    statistics.bytesReclaimed += delta;
+                }
+            }
+            gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
+            return &vec;
+        }
+        return nullptr;
+    }
+
+    void syncOldGenArrayCardsAfterResizeUnlocked(CompactSlot& slot) {
+        if (slot.hasFlag(GcFlag::InNursery)) return;
+        const auto& layout = typeLayouts[slot.payload.s.layoutId];
+        if (!layout.mayContainReferences) return;
+        const std::size_t len = slot.payload.s.length;
+        if (len < ManagedHeap::kCardTableMinLength) {
+            if (slot.hasFlag(GcFlag::HasCardTable) &&
+                slot.payload.s.cardHandle != CompactSlot::kInvalidHandle) {
+                cardArena.deallocate(slot.payload.s.cardHandle);
+                slot.payload.s.cardHandle = CompactSlot::kInvalidHandle;
+                slot.gcFlags &= static_cast<std::uint8_t>(~GcFlag::HasCardTable);
+            }
+            return;
+        }
+        const std::size_t cardCount =
+            (len + ManagedHeap::kCardElements - 1u) >> ManagedHeap::kCardElementShift;
+        const auto neededWords = static_cast<std::uint32_t>((cardCount + 7u) >> 3u);
+        if (!slot.hasFlag(GcFlag::HasCardTable) ||
+            slot.payload.s.cardHandle == CompactSlot::kInvalidHandle) {
+            slot.payload.s.cardHandle = cardArena.allocate(len);
+            slot.gcFlags |= GcFlag::HasCardTable;
+            if (slot.hasFlag(GcFlag::InRememberedSet)) {
+                cardArena.get(slot.payload.s.cardHandle).markAllDirty();
+            }
+            return;
+        }
+        const auto& curSlice = cardArena.get(slot.payload.s.cardHandle);
+        if (curSlice.wordCount < neededWords) {
+            const std::uint32_t newHandle = cardArena.allocate(len);
+            auto& newSlice = cardArena.get(newHandle);
+            if (slot.hasFlag(GcFlag::InRememberedSet)) {
+                newSlice.markAllDirty();
+            } else {
+                const std::uint32_t copyWords = std::min(curSlice.wordCount, newSlice.wordCount);
+                if (copyWords > 0 && curSlice.words && newSlice.words) {
+                    std::memcpy(
+                        newSlice.words,
+                        curSlice.words,
+                        static_cast<std::size_t>(copyWords) * sizeof(std::uint64_t));
+                }
+            }
+            cardArena.deallocate(slot.payload.s.cardHandle);
+            slot.payload.s.cardHandle = newHandle;
+        }
+    }
+
+    [[nodiscard]] bool validateArrayElementUnlocked(
+        const TypeLayoutEntry& layout,
+        Value& value,
+        ArrayStoreTypePolicy typePolicy,
+        RuntimeError* error) const {
+        const auto expected = layout.elementType;
+        const auto expectedTypeId = layout.elementTypeId;
+        if (expected != semantic::PrimitiveType::Error && valueType(value) != expected) {
+            setHeapError(error, ErrorCode::TypeMismatch,
+                "managed array element type mismatch");
+            return false;
+        }
+        if (expected == semantic::PrimitiveType::Object &&
+            !std::holds_alternative<NullObject>(value)) {
+            const auto* child = std::get_if<ObjectRef>(&value);
+            const auto actual = child ? objectTypeIdUnlocked(*child) : std::nullopt;
+            if (!actual ||
+                (typePolicy == ArrayStoreTypePolicy::Exact &&
+                 *actual != expectedTypeId)) {
+                setHeapError(error, ErrorCode::TypeMismatch,
+                    "managed array object element type mismatch");
+                return false;
+            }
+        } else if (expected == semantic::PrimitiveType::Array &&
+                   !std::holds_alternative<NullArray>(value)) {
+            const auto* child = std::get_if<ObjectRef>(&value);
+            const auto actual = child ? arrayTypeIdUnlocked(*child) : std::nullopt;
+            if (!actual || *actual != expectedTypeId) {
+                setHeapError(error, ErrorCode::TypeMismatch,
+                    "managed array nested array type mismatch");
+                return false;
+            }
+        } else if (expected == semantic::PrimitiveType::Struct) {
+            const auto actualTypeId = structValueTypeId(value);
+            const auto* structure = std::get_if<StructValue>(&value);
+            if (!actualTypeId || *actualTypeId != expectedTypeId ||
+                (structure && !structure->valid())) {
+                setHeapError(error, ErrorCode::TypeMismatch,
+                    "managed array struct element type mismatch");
+                return false;
+            }
+        } else if (expected == semantic::PrimitiveType::Enum) {
+            EnumValue enumeration{};
+            if (!value.tryGetEnum(enumeration) ||
+                enumeration.typeId != expectedTypeId) {
+                setHeapError(error, ErrorCode::TypeMismatch,
+                    "managed array enum element type mismatch");
+                return false;
+            }
+        } else if (expected == semantic::PrimitiveType::Handle) {
+            NativeHandle handle{};
+            if (!value.tryGetNativeHandle(handle) ||
+                (expectedTypeId != 0 &&
+                 handle.typeId != expectedTypeId)) {
+                setHeapError(error, ErrorCode::TypeMismatch,
+                    "managed array native handle type mismatch");
+                return false;
+            }
+        }
+        if (value.rawTag() == ValueTag::Struct && value.asStructUnchecked().isFrameSlice()) {
+            value = detachFrameSliceValue(value);
+        }
+        return true;
+    }
+
+    bool writeValidatedArrayElementUnlocked(
+        ObjectRef reference,
+        CompactSlot& slot,
+        std::size_t index,
+        Value value,
+        RuntimeError* error) {
+        if (slot.storage() == SlotStorage::RawColumn) {
+            const auto& view = rawColumns.get(slot.payload.s.handle);
+            if (index >= view.count) {
+                setHeapError(error, ErrorCode::IndexOutOfRange,
+                    "managed array index is out of range");
+                return false;
+            }
+            if (view.readOnly || !view.basePtr) {
+                setHeapError(error, ErrorCode::CapabilityDenied,
+                    view.mode == RawColumnMode::ScalarPacked
+                        ? "cannot write to a read-only native buffer view"
+                        : "cannot write to a read-only native ECS column view");
+                return false;
+            }
+            auto* elemBase = static_cast<std::uint8_t*>(view.basePtr) + index * view.strideBytes;
+            if (view.mode == RawColumnMode::ScalarPacked) {
+                bool needsWiden = false;
+                if (!writePackedElementValue(
+                        elemBase,
+                        0u,
+                        view.packedEncoding,
+                        view.elementTypeId,
+                        value,
+                        needsWiden,
+                        view.blittableSchemaId)) {
+                    setHeapError(error, ErrorCode::TypeMismatch,
+                        needsWiden
+                            ? "value exceeds native buffer view scalar element width"
+                            : "managed array element type mismatch for native buffer view");
+                    return false;
+                }
+                return true;
+            }
+            const auto* s = std::get_if<StructValue>(&value);
+            if (!s || !s->valid() || s->typeId != view.structTypeId ||
+                s->fieldCount() != view.fields.size()) {
+                setHeapError(error, ErrorCode::TypeMismatch,
+                    "managed array struct element type mismatch for raw ECS column");
+                return false;
+            }
+            for (std::size_t i = 0; i < view.fields.size(); ++i) {
+                const auto fieldVal = structValueFieldAt(*s, i);
+                if (!fieldVal || !writeNativeFieldToBytes(elemBase, view.fields[i], *fieldVal)) {
+                    setHeapError(error, ErrorCode::TypeMismatch,
+                        "raw ECS column field type mismatch during in-place write");
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (isPackedStorage(slot.storage())) {
+            const auto expectedTypeId = typeLayouts[slot.payload.s.layoutId].elementTypeId;
+            bool needsWiden = false;
+            if (writePackedElementValue(
+                    slot.payload.s.data,
+                    index,
+                    unpackPackedEncoding(slot.auxMeta),
+                    expectedTypeId,
+                    value,
+                    needsWiden,
+                    slot.payload.s.cardHandle)) {
+                return true;
+            }
+            if (needsWiden) {
+                if (slot.storage() == SlotStorage::PackedStruct) {
+                    if (demotePackedStructSlotToValuesUnlocked(reference.slot, slot)) {
+                        pinHeapValueIfNeededUnlocked(value);
+                        writeBarrierArrayElement(reference, index, value);
+                        slot.payload.s.data[index] = std::move(value);
+                        return true;
+                    }
+                } else if (widenPackedSlotTo64Unlocked(reference.slot, slot)) {
+                    if (writePackedElementValue(
+                            slot.payload.s.data,
+                            index,
+                            unpackPackedEncoding(slot.auxMeta),
+                            expectedTypeId,
+                            value,
+                            needsWiden,
+                            slot.payload.s.cardHandle)) {
+                        return true;
+                    }
+                }
+                setHeapError(error, ErrorCode::OutOfMemory,
+                    "managed packed array widening exceeded heap budget");
+                return false;
+            }
+            setHeapError(error, ErrorCode::TypeMismatch,
+                "managed array element type mismatch");
+            return false;
+        }
+        if (slot.storage() == SlotStorage::FlatStruct) {
+            const auto* sc = getFlatStructSchema(slot.auxMeta);
+            if (!sc) {
+                setHeapError(error, ErrorCode::InvalidProgram, "missing flat struct schema for array");
+                return false;
+            }
+            Value* elemDst = slot.payload.s.data + index * static_cast<std::size_t>(sc->flatSlotCount);
+            if (!extractStructLeavesToBuffer(value, *sc, elemDst)) {
+                setHeapError(error, ErrorCode::TypeMismatch, "managed array flat struct element mismatch");
+                return false;
+            }
+            if (sc->containsPoolValues) {
+                for (std::uint16_t k = 0; k < sc->flatSlotCount; ++k) {
+                    pinHeapValueIfNeededUnlocked(elemDst[k]);
+                }
+            }
+            if (sc->containsManagedReferences) {
+                writeBarrierFlatStructElement(reference, index);
+            }
+            return true;
+        }
+        if (value.rawTag() == ValueTag::Struct && value.asStructUnchecked().isFrameSlice()) {
+            value = detachFrameSliceValue(value);
+        }
+        if (valueMayContainReferences(value)) {
+            writeBarrierArrayElement(reference, index, value);
+        }
+        pinHeapValueIfNeededUnlocked(value);
+        slot.payload.s.data[index] = std::move(value);
+        return true;
+    }
+
     [[nodiscard]] std::optional<ObjectRef> allocateArraySlot(
         semantic::SymbolId arrayTypeId,
         semantic::PrimitiveType elementType,
@@ -4133,8 +4694,23 @@ struct ManagedHeap::Impl {
                 internedStrings.erase(it);
             }
         }
+        slot.gcFlags &= static_cast<std::uint8_t>(~GcFlag::InDirtyQueue);
         if (hasDirtyTrackingTypes && !observerDirtyMasks.empty()) {
             observerDirtyMasks.erase(slotIdx);
+        }
+        if (slotSweepCallback && slot.hasFlag(GcFlag::HasObserver)) {
+            const ObjectRef observedRef(
+                slotIdx,
+                slot.generation,
+                slot.kind(),
+                heapId);
+            const bool dupObs = std::any_of(
+                pendingObservedSlotSweeps.begin(),
+                pendingObservedSlotSweeps.end(),
+                [&](const ObjectRef& existing) { return existing == observedRef; });
+            if (!dupObs) {
+                pendingObservedSlotSweeps.push_back(observedRef);
+            }
         }
         if (nativeWrapperSweepCallback && slot.kind() == ObjectKind::Record &&
             slot.payload.s.data != nullptr) {
@@ -4643,11 +5219,28 @@ struct ManagedHeap::Impl {
 };
 
 ManagedHeap::ManagedHeap(HeapConfig config)
-    : impl_(std::make_unique<Impl>(config)) {}
+    : impl_(std::make_unique<Impl>(std::move(config))) {
+    impl_->ownerHeap = this;
+}
 
 ManagedHeap::~ManagedHeap() = default;
-ManagedHeap::ManagedHeap(ManagedHeap&&) noexcept = default;
-ManagedHeap& ManagedHeap::operator=(ManagedHeap&&) noexcept = default;
+
+ManagedHeap::ManagedHeap(ManagedHeap&& other) noexcept
+    : impl_(std::move(other.impl_)),
+      hasDirtyTracking_(std::exchange(other.hasDirtyTracking_, false)),
+      hasDirtyObjects_(std::exchange(other.hasDirtyObjects_, false)) {
+    if (impl_) impl_->ownerHeap = this;
+}
+
+ManagedHeap& ManagedHeap::operator=(ManagedHeap&& other) noexcept {
+    if (this != &other) {
+        impl_ = std::move(other.impl_);
+        hasDirtyTracking_ = std::exchange(other.hasDirtyTracking_, false);
+        hasDirtyObjects_ = std::exchange(other.hasDirtyObjects_, false);
+        if (impl_) impl_->ownerHeap = this;
+    }
+    return *this;
+}
 
 const std::shared_ptr<ValuePoolDomain>& ManagedHeap::valuePoolDomain() const noexcept {
     return impl_->valuePoolDomain;
@@ -4687,7 +5280,7 @@ std::size_t ManagedHeap::trimExcessCapacity() noexcept {
         for (auto it = impl_->observerDirtyMasks.begin();
              it != impl_->observerDirtyMasks.end();) {
             const std::uint32_t idx = it->first;
-            if (idx >= impl_->slots.size() || !impl_->slots[idx].occupied()) {
+            if (idx >= impl_->slots.size() || !impl_->slots[idx].occupied() || it->second == 0u) {
                 it = impl_->observerDirtyMasks.erase(it);
                 ++deadMasks;
             } else {
@@ -4699,6 +5292,30 @@ std::size_t ManagedHeap::trimExcessCapacity() noexcept {
             reclaimed += impl_->observerDirtyMasks.bucket_count() * sizeof(void*);
             std::unordered_map<std::uint32_t, std::uint64_t>().swap(impl_->observerDirtyMasks);
         }
+        impl_->hasDirtyTrackingTypes =
+            !impl_->typeDirtyBitMaps.empty() ||
+            impl_->fieldMutationCallback != nullptr ||
+            !impl_->observerDirtyMasks.empty();
+        hasDirtyTracking_ = impl_->hasDirtyTrackingTypes;
+    }
+    if (!impl_->dirtyObjectQueue.empty()) {
+        const std::size_t beforeCap = impl_->dirtyObjectQueue.capacity();
+        impl_->dirtyObjectQueue.erase(
+            std::remove_if(
+                impl_->dirtyObjectQueue.begin(),
+                impl_->dirtyObjectQueue.end(),
+                [&](const ObjectRef& ref) {
+                    return impl_->getSlot(ref) == nullptr;
+                }),
+            impl_->dirtyObjectQueue.end());
+        if (impl_->dirtyObjectQueue.empty()) {
+            hasDirtyObjects_ = false;
+            std::vector<ObjectRef>().swap(impl_->dirtyObjectQueue);
+            reclaimed += beforeCap * sizeof(ObjectRef);
+        }
+    } else if (impl_->dirtyObjectQueue.capacity() > 0u) {
+        reclaimed += impl_->dirtyObjectQueue.capacity() * sizeof(ObjectRef);
+        std::vector<ObjectRef>().swap(impl_->dirtyObjectQueue);
     }
     if (impl_->phase == GcPhase::Idle) {
         if (impl_->markStack.empty() && impl_->markStack.capacity() > 64u) {
@@ -4991,6 +5608,74 @@ std::optional<ObjectRef> ManagedHeap::allocateObjectFromTemplate(
 bool ManagedHeap::isAlive(ObjectRef reference) const noexcept {
     HeapReadOrDisjointGuard heapLock(*impl_->syncState);
     return impl_->getSlot(reference) != nullptr;
+}
+
+std::optional<ObjectRef> ManagedHeap::allocateWeakDelegate(
+    semantic::SymbolId delegateTypeId,
+    ObjectRef target,
+    semantic::SymbolId functionId,
+    std::int64_t baseFlags,
+    RuntimeError* error) {
+    if (delegateTypeId == 0) {
+        setHeapError(
+            error,
+            ErrorCode::InvalidArguments,
+            "delegate type ID must be non-zero");
+        return std::nullopt;
+    }
+    const auto loWord = static_cast<std::int64_t>(static_cast<std::uint32_t>(functionId));
+    const auto hiWord = static_cast<std::int64_t>(static_cast<std::uint32_t>(functionId >> 32u));
+    std::vector<Value> fields{
+        Value{target},
+        Value{loWord},
+        Value{hiWord},
+        Value{(baseFlags & 3) | DelegateWeakTargetFlag},
+        Value{std::int64_t{0}},
+        Value{std::int64_t{0}},
+        Value{std::int64_t{0}},
+        Value{NullObject{}},
+    };
+    return allocateObject(
+        delegateTypeId,
+        std::move(fields),
+        std::vector<std::size_t>{7u},
+        error);
+}
+
+Value ManagedHeap::pruneDelegateChain(const Value& delegateVal) {
+    if (std::holds_alternative<NullObject>(delegateVal)) return delegateVal;
+    const auto* ref = std::get_if<ObjectRef>(&delegateVal);
+    if (!ref || !isAlive(*ref) || fieldCount(*ref) != 8u) {
+        return Value{NullObject{}};
+    }
+    const auto* flagsVal = fieldGetFast(*ref, 3u);
+    const auto* flags = flagsVal ? std::get_if<std::int64_t>(flagsVal) : nullptr;
+    if (!flags) return Value{NullObject{}};
+    const std::int64_t mode = (*flags & 7);
+    const bool isWeak = ((*flags & DelegateWeakTargetFlag) != 0);
+    if (mode != 4) {
+        if (isWeak) {
+            const auto* targetVal = fieldGetFast(*ref, 0u);
+            if (const auto* targetRef = targetVal ? std::get_if<ObjectRef>(targetVal) : nullptr) {
+                if (!isAlive(*targetRef)) {
+                    return Value{NullObject{}};
+                }
+            }
+        }
+        return delegateVal;
+    }
+    const Value leftVal = fieldGet(*ref, 0u).value_or(Value{NullObject{}});
+    const Value rightVal = fieldGet(*ref, 7u).value_or(Value{NullObject{}});
+    const Value prunedLeft = pruneDelegateChain(leftVal);
+    const Value prunedRight = pruneDelegateChain(rightVal);
+    const bool leftNull = std::holds_alternative<NullObject>(prunedLeft);
+    const bool rightNull = std::holds_alternative<NullObject>(prunedRight);
+    if (leftNull && rightNull) return Value{NullObject{}};
+    if (leftNull) return prunedRight;
+    if (rightNull) return prunedLeft;
+    if (!(prunedLeft == leftVal)) (void)fieldSet(*ref, 0u, prunedLeft);
+    if (!(prunedRight == rightVal)) (void)fieldSet(*ref, 7u, prunedRight);
+    return delegateVal;
 }
 
 std::optional<std::string_view> ManagedHeap::stringView(ObjectRef reference) const {
@@ -5661,7 +6346,9 @@ bool ManagedHeap::tryBindPackedArrayFastView(
     PackedArrayFastView& outView) const noexcept {
     HeapReadOrDisjointGuard heapLock(*impl_->syncState);
     auto* slot = impl_->getSlot(reference);
-    if (!slot || slot->kind() != ObjectKind::Array || !isPackedStorage(slot->storage())) {
+    if (!slot || slot->kind() != ObjectKind::Array ||
+        !isPackedStorage(slot->storage()) ||
+        slot->hasFlag(GcFlag::HasObserver)) {
         outView = {};
         return false;
     }
@@ -5692,7 +6379,9 @@ bool ManagedHeap::tryBindPackedInt32Array(
     std::uint32_t& outLength) const noexcept {
     HeapReadOrDisjointGuard heapLock(*impl_->syncState);
     auto* slot = impl_->getSlot(reference);
-    if (!slot || slot->kind() != ObjectKind::Array || slot->storage() != SlotStorage::PackedI32) {
+    if (!slot || slot->kind() != ObjectKind::Array ||
+        slot->storage() != SlotStorage::PackedI32 ||
+        slot->hasFlag(GcFlag::HasObserver)) {
         outData = nullptr;
         outLength = 0;
         return false;
@@ -5714,7 +6403,9 @@ bool ManagedHeap::tryBindPackedDoubleArray(
     std::uint32_t& outLength) const noexcept {
     HeapReadOrDisjointGuard heapLock(*impl_->syncState);
     auto* slot = impl_->getSlot(reference);
-    if (!slot || slot->kind() != ObjectKind::Array || slot->storage() != SlotStorage::PackedI64 ||
+    if (!slot || slot->kind() != ObjectKind::Array ||
+        slot->storage() != SlotStorage::PackedI64 ||
+        slot->hasFlag(GcFlag::HasObserver) ||
         unpackPackedEncoding(slot->auxMeta) != PackedElemEncoding::Float64) {
         outData = nullptr;
         outLength = 0;
@@ -5730,7 +6421,9 @@ bool ManagedHeap::tryBindFlatStructArrayFastView(
     FlatStructArrayFastView& outView) const noexcept {
     HeapReadOrDisjointGuard heapLock(*impl_->syncState);
     auto* slot = impl_->getSlot(reference);
-    if (!slot || slot->kind() != ObjectKind::Array || slot->storage() != SlotStorage::FlatStruct) {
+    if (!slot || slot->kind() != ObjectKind::Array ||
+        slot->storage() != SlotStorage::FlatStruct ||
+        slot->hasFlag(GcFlag::HasObserver)) {
         outView = {};
         return false;
     }
@@ -5793,7 +6486,8 @@ bool ManagedHeap::tryBindArrayFastView(ObjectRef reference, ArrayFastView& outVi
     if (!slot || slot->kind() != ObjectKind::Array ||
         slot->storage() == SlotStorage::RawColumn ||
         slot->storage() == SlotStorage::FlatStruct ||
-        isPackedStorage(slot->storage())) {
+        isPackedStorage(slot->storage()) ||
+        slot->hasFlag(GcFlag::HasObserver)) {
         return false;
     }
     const std::uint32_t count = slot->payload.s.length;
@@ -5879,6 +6573,7 @@ bool ManagedHeap::arraySetPrevalidated(
     if (impl_->syncState->parallelLockFreeDepth.load(std::memory_order_acquire) > 0u) {
         auto* slot = impl_->getSlot(reference);
         if (slot && slot->kind() == ObjectKind::Array &&
+            !slot->hasFlag(GcFlag::HasObserver) &&
             isPackedStorage(slot->storage()) &&
             index < slot->payload.s.length) {
             const auto elemTid = impl_->typeLayouts[slot->payload.s.layoutId].elementTypeId;
@@ -5893,105 +6588,133 @@ bool ManagedHeap::arraySetPrevalidated(
                 slot->payload.s.cardHandle);
         }
     }
-    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
-    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
-    auto* slot = impl_->getSlot(reference);
-    if (!slot || slot->kind() != ObjectKind::Array) {
-        return false;
-    }
-    if (slot->storage() == SlotStorage::RawColumn) {
-        const auto& view = impl_->rawColumns.get(slot->payload.s.handle);
-        if (view.readOnly || index >= view.count || !view.basePtr) return false;
-        auto* elemBase = static_cast<std::uint8_t*>(view.basePtr) + index * view.strideBytes;
-        if (view.mode == RawColumnMode::ScalarPacked) {
-            bool needsWiden = false;
-            return writePackedElementValue(
-                elemBase,
-                0u,
-                view.packedEncoding,
-                view.elementTypeId,
-                value,
-                needsWiden,
-                view.blittableSchemaId);
-        }
-        const auto* s = std::get_if<StructValue>(&value);
-        if (!s || !s->valid() || s->typeId != view.structTypeId ||
-            s->fieldCount() != view.fields.size()) {
+    ArrayMutationCallback obsCb = nullptr;
+    void* obsUserData = nullptr;
+    Value obsOldVal{};
+    Value obsNewVal{};
+    bool obsNotify = false;
+    bool ok = false;
+    {
+        ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
+        HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+        auto* slot = impl_->getSlot(reference);
+        if (!slot || slot->kind() != ObjectKind::Array) {
             return false;
         }
-        for (std::size_t i = 0; i < view.fields.size(); ++i) {
-            const auto fieldVal = structValueFieldAt(*s, i);
-            if (!fieldVal || !writeNativeFieldToBytes(elemBase, view.fields[i], *fieldVal)) {
-                return false;
+        const bool observed =
+            slot->hasFlag(GcFlag::HasObserver) && impl_->arrayMutationCallback != nullptr;
+        if (slot->storage() == SlotStorage::RawColumn) {
+            const auto& view = impl_->rawColumns.get(slot->payload.s.handle);
+            if (view.readOnly || index >= view.count || !view.basePtr) return false;
+            if (observed) {
+                obsCb = impl_->arrayMutationCallback;
+                obsUserData = impl_->arrayMutationUserData;
+                obsOldVal = impl_->readArrayElementUnlocked(*slot, index);
+                obsNewVal = value;
+                obsNotify = true;
             }
-        }
-        return true;
-    }
-    if (index >= slot->payload.s.length) {
-        return false;
-    }
-    if (isPackedStorage(slot->storage())) {
-        const auto elemTid = impl_->typeLayouts[slot->payload.s.layoutId].elementTypeId;
-        bool needsWiden = false;
-        if (writePackedElementValue(
-                slot->payload.s.data,
-                index,
-                unpackPackedEncoding(slot->auxMeta),
-                elemTid,
-                value,
-                needsWiden,
-                slot->payload.s.cardHandle)) {
-            return true;
-        }
-        if (needsWiden) {
-            if (slot->storage() == SlotStorage::PackedStruct) {
-                if (impl_->demotePackedStructSlotToValuesUnlocked(reference.slot, *slot)) {
-                    if (mayBeReference) {
-                        impl_->writeBarrierArrayElement(reference, index, value);
-                    }
-                    impl_->pinHeapValueIfNeededUnlocked(value);
-                    slot->payload.s.data[index] = value;
-                    return true;
-                }
-            } else if (impl_->widenPackedSlotTo64Unlocked(reference.slot, *slot)) {
-                return writePackedElementValue(
-                    slot->payload.s.data,
-                    index,
-                    unpackPackedEncoding(slot->auxMeta),
-                    elemTid,
+            auto* elemBase = static_cast<std::uint8_t*>(view.basePtr) + index * view.strideBytes;
+            if (view.mode == RawColumnMode::ScalarPacked) {
+                bool needsWiden = false;
+                ok = writePackedElementValue(
+                    elemBase,
+                    0u,
+                    view.packedEncoding,
+                    view.elementTypeId,
                     value,
                     needsWiden,
-                    slot->payload.s.cardHandle);
+                    view.blittableSchemaId);
+            } else {
+                const auto* s = std::get_if<StructValue>(&value);
+                if (!s || !s->valid() || s->typeId != view.structTypeId ||
+                    s->fieldCount() != view.fields.size()) {
+                    return false;
+                }
+                for (std::size_t i = 0; i < view.fields.size(); ++i) {
+                    const auto fieldVal = structValueFieldAt(*s, i);
+                    if (!fieldVal || !writeNativeFieldToBytes(elemBase, view.fields[i], *fieldVal)) {
+                        return false;
+                    }
+                }
+                ok = true;
+            }
+        } else {
+            if (index >= slot->payload.s.length) {
+                return false;
+            }
+            Value stored = (value.rawTag() == ValueTag::Struct && value.asStructUnchecked().isFrameSlice())
+                ? detachFrameSliceValue(value)
+                : value;
+            if (observed) {
+                obsCb = impl_->arrayMutationCallback;
+                obsUserData = impl_->arrayMutationUserData;
+                obsOldVal = impl_->readArrayElementUnlocked(*slot, index);
+                obsNewVal = stored;
+                obsNotify = true;
+            }
+            if (isPackedStorage(slot->storage())) {
+                const auto elemTid = impl_->typeLayouts[slot->payload.s.layoutId].elementTypeId;
+                bool needsWiden = false;
+                if (writePackedElementValue(
+                        slot->payload.s.data,
+                        index,
+                        unpackPackedEncoding(slot->auxMeta),
+                        elemTid,
+                        stored,
+                        needsWiden,
+                        slot->payload.s.cardHandle)) {
+                    ok = true;
+                } else if (needsWiden) {
+                    if (slot->storage() == SlotStorage::PackedStruct) {
+                        if (impl_->demotePackedStructSlotToValuesUnlocked(reference.slot, *slot)) {
+                            if (mayBeReference) {
+                                impl_->writeBarrierArrayElement(reference, index, stored);
+                            }
+                            impl_->pinHeapValueIfNeededUnlocked(stored);
+                            slot->payload.s.data[index] = std::move(stored);
+                            ok = true;
+                        }
+                    } else if (impl_->widenPackedSlotTo64Unlocked(reference.slot, *slot)) {
+                        ok = writePackedElementValue(
+                            slot->payload.s.data,
+                            index,
+                            unpackPackedEncoding(slot->auxMeta),
+                            elemTid,
+                            stored,
+                            needsWiden,
+                            slot->payload.s.cardHandle);
+                    }
+                }
+            } else if (slot->storage() == SlotStorage::FlatStruct) {
+                const auto* sc = getFlatStructSchema(slot->auxMeta);
+                if (!sc) return false;
+                Value* elemDst = slot->payload.s.data + index * static_cast<std::size_t>(sc->flatSlotCount);
+                if (!extractStructLeavesToBuffer(stored, *sc, elemDst)) {
+                    return false;
+                }
+                if (sc->containsPoolValues) {
+                    for (std::uint16_t k = 0; k < sc->flatSlotCount; ++k) {
+                        impl_->pinHeapValueIfNeededUnlocked(elemDst[k]);
+                    }
+                }
+                if (sc->containsManagedReferences) {
+                    impl_->writeBarrierFlatStructElement(reference, index);
+                }
+                ok = true;
+            } else {
+                if (mayBeReference) {
+                    impl_->writeBarrierArrayElement(reference, index, stored);
+                }
+                impl_->pinHeapValueIfNeededUnlocked(stored);
+                slot->payload.s.data[index] = std::move(stored);
+                ok = true;
             }
         }
-        return false;
     }
-    if (slot->storage() == SlotStorage::FlatStruct) {
-        const auto* sc = getFlatStructSchema(slot->auxMeta);
-        if (!sc) return false;
-        Value* elemDst = slot->payload.s.data + index * static_cast<std::size_t>(sc->flatSlotCount);
-        if (!extractStructLeavesToBuffer(value, *sc, elemDst)) {
-            return false;
-        }
-        if (sc->containsPoolValues) {
-            for (std::uint16_t k = 0; k < sc->flatSlotCount; ++k) {
-                impl_->pinHeapValueIfNeededUnlocked(elemDst[k]);
-            }
-        }
-        if (sc->containsManagedReferences) {
-            impl_->writeBarrierFlatStructElement(reference, index);
-        }
-        return true;
+    if (ok && obsNotify && obsCb) {
+        obsCb(obsUserData, *this, reference, ArrayMutationOp::Set, index, obsOldVal, obsNewVal);
     }
-    Value stored = (value.rawTag() == ValueTag::Struct && value.asStructUnchecked().isFrameSlice())
-        ? detachFrameSliceValue(value)
-        : value;
-    if (mayBeReference) {
-        impl_->writeBarrierArrayElement(reference, index, stored);
-    }
-    impl_->pinHeapValueIfNeededUnlocked(stored);
-    slot->payload.s.data[index] = std::move(stored);
-    return true;
+    return ok;
 }
 
 bool ManagedHeap::arraySet(
@@ -6003,6 +6726,7 @@ bool ManagedHeap::arraySet(
     if (impl_->syncState->parallelLockFreeDepth.load(std::memory_order_acquire) > 0u) {
         auto* slot = impl_->getSlot(reference);
         if (slot && slot->kind() == ObjectKind::Array &&
+            !slot->hasFlag(GcFlag::HasObserver) &&
             isPackedStorage(slot->storage())) {
             const auto valueLen = static_cast<std::size_t>(slot->payload.s.length);
             if (index >= valueLen) {
@@ -6044,6 +6768,68 @@ bool ManagedHeap::arraySet(
             return false;
         }
     }
+    ArrayMutationCallback obsCb = nullptr;
+    void* obsUserData = nullptr;
+    Value obsOldVal{};
+    Value obsNewVal{};
+    bool obsNotify = false;
+    bool ok = false;
+    {
+        ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
+        HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+        auto* slot = impl_->getSlot(reference);
+        if (!slot || slot->kind() != ObjectKind::Array) {
+            setHeapError(error, ErrorCode::InvalidObjectReference,
+                "managed array reference is invalid");
+            return false;
+        }
+        const bool observed =
+            slot->hasFlag(GcFlag::HasObserver) && impl_->arrayMutationCallback != nullptr;
+        if (slot->storage() == SlotStorage::RawColumn) {
+            if (observed) {
+                const auto& view = impl_->rawColumns.get(slot->payload.s.handle);
+                if (index < view.count && !view.readOnly && view.basePtr) {
+                    obsCb = impl_->arrayMutationCallback;
+                    obsUserData = impl_->arrayMutationUserData;
+                    obsOldVal = impl_->readArrayElementUnlocked(*slot, index);
+                    obsNewVal = value;
+                    obsNotify = true;
+                }
+            }
+            ok = impl_->writeValidatedArrayElementUnlocked(
+                reference, *slot, index, std::move(value), error);
+        } else {
+            const auto valueLen = static_cast<std::size_t>(slot->payload.s.length);
+            if (index >= valueLen) {
+                setHeapError(error, ErrorCode::IndexOutOfRange,
+                    "managed array index is out of range");
+                return false;
+            }
+            const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+            if (!impl_->validateArrayElementUnlocked(layout, value, typePolicy, error)) {
+                return false;
+            }
+            if (observed) {
+                obsCb = impl_->arrayMutationCallback;
+                obsUserData = impl_->arrayMutationUserData;
+                obsOldVal = impl_->readArrayElementUnlocked(*slot, index);
+                obsNewVal = value;
+                obsNotify = true;
+            }
+            ok = impl_->writeValidatedArrayElementUnlocked(
+                reference, *slot, index, std::move(value), error);
+        }
+    }
+    if (ok && obsNotify && obsCb) {
+        obsCb(obsUserData, *this, reference, ArrayMutationOp::Set, index, obsOldVal, obsNewVal);
+    }
+    return ok;
+}
+
+bool ManagedHeap::arrayReserve(
+    ObjectRef reference,
+    std::size_t capacity,
+    RuntimeError* error) {
     ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     auto* slot = impl_->getSlot(reference);
@@ -6053,186 +6839,614 @@ bool ManagedHeap::arraySet(
         return false;
     }
     if (slot->storage() == SlotStorage::RawColumn) {
-        const auto& view = impl_->rawColumns.get(slot->payload.s.handle);
-        if (index >= view.count) {
-            setHeapError(error, ErrorCode::IndexOutOfRange,
-                "managed array index is out of range");
+        setHeapError(error, ErrorCode::CapabilityDenied,
+            "cannot resize native raw column view");
+        return false;
+    }
+    if (capacity <= slot->payload.s.length) {
+        return true;
+    }
+    const std::size_t totalCapBytes = estimateValueStorage(capacity);
+    const std::size_t extraElems = capacity - static_cast<std::size_t>(slot->payload.s.length);
+    const std::size_t extraBytes = estimateValueStorage(extraElems);
+    const std::size_t budget = impl_->config.maximumHeapBytes > impl_->statistics.liveBytes
+        ? (impl_->config.maximumHeapBytes - impl_->statistics.liveBytes)
+        : 0u;
+    if (totalCapBytes == std::numeric_limits<std::size_t>::max() ||
+        extraBytes == std::numeric_limits<std::size_t>::max() ||
+        extraBytes > budget) {
+        setHeapError(error, ErrorCode::OutOfMemory, "managed array reserve exceeds heap limit");
+        impl_->requested = true;
+        return false;
+    }
+    if (slot->storage() == SlotStorage::HeapValues) {
+        const auto& curVec = impl_->largeBuffers.mutableBuffer(slot->payload.s.handle);
+        if (capacity <= curVec.capacity()) {
+            return true;
+        }
+    }
+    bool oom = false;
+    if (!impl_->ensureMutableHeapArrayVectorUnlocked(reference.slot, *slot, capacity, true, &oom)) {
+        setHeapError(
+            error,
+            oom ? ErrorCode::OutOfMemory : ErrorCode::InvalidObjectReference,
+            oom ? "managed array reserve exceeds heap limit" : "managed array storage is not mutable");
+        return false;
+    }
+    return true;
+}
+
+bool ManagedHeap::arrayPush(
+    ObjectRef reference,
+    Value value,
+    RuntimeError* error,
+    ArrayStoreTypePolicy typePolicy) {
+    ArrayMutationCallback obsCb = nullptr;
+    void* obsUserData = nullptr;
+    Value obsNewVal{};
+    std::size_t pushIndex = 0;
+    bool obsNotify = false;
+    {
+        ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
+        HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+        auto* slot = impl_->getSlot(reference);
+        if (!slot || slot->kind() != ObjectKind::Array) {
+            setHeapError(error, ErrorCode::InvalidObjectReference,
+                "managed array reference is invalid");
             return false;
         }
-        if (view.readOnly || !view.basePtr) {
+        if (slot->storage() == SlotStorage::RawColumn) {
             setHeapError(error, ErrorCode::CapabilityDenied,
-                view.mode == RawColumnMode::ScalarPacked
-                    ? "cannot write to a read-only native buffer view"
-                    : "cannot write to a read-only native ECS column view");
+                "cannot append to native raw column view");
             return false;
         }
-        auto* elemBase = static_cast<std::uint8_t*>(view.basePtr) + index * view.strideBytes;
-        if (view.mode == RawColumnMode::ScalarPacked) {
-            bool needsWiden = false;
-            if (!writePackedElementValue(
-                    elemBase,
-                    0u,
-                    view.packedEncoding,
-                    view.elementTypeId,
-                    value,
-                    needsWiden,
-                    view.blittableSchemaId)) {
-                setHeapError(error, ErrorCode::TypeMismatch,
-                    needsWiden
-                        ? "value exceeds native buffer view scalar element width"
-                        : "managed array element type mismatch for native buffer view");
+        const std::size_t oldLen = slot->payload.s.length;
+        if (oldLen >= static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+            setHeapError(error, ErrorCode::OutOfMemory, "managed array length limit exceeded");
+            return false;
+        }
+        const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+        if (!impl_->validateArrayElementUnlocked(layout, value, typePolicy, error)) {
+            return false;
+        }
+        if (impl_->config.maximumHeapBytes < sizeof(Value) ||
+            impl_->statistics.liveBytes > impl_->config.maximumHeapBytes - sizeof(Value)) {
+            setHeapError(error, ErrorCode::OutOfMemory, "managed array push exceeds heap limit");
+            impl_->requested = true;
+            return false;
+        }
+        bool oom = false;
+        auto* vec = impl_->ensureMutableHeapArrayVectorUnlocked(
+            reference.slot, *slot, oldLen + 1u, false, &oom);
+        if (!vec) {
+            setHeapError(
+                error,
+                oom ? ErrorCode::OutOfMemory : ErrorCode::InvalidObjectReference,
+                oom ? "managed array push exceeds heap limit" : "managed array storage is not mutable");
+            return false;
+        }
+        if (impl_->config.maximumHeapBytes < sizeof(Value) ||
+            impl_->statistics.liveBytes > impl_->config.maximumHeapBytes - sizeof(Value)) {
+            setHeapError(error, ErrorCode::OutOfMemory, "managed array push exceeds heap limit");
+            impl_->requested = true;
+            return false;
+        }
+        impl_->pinHeapValueIfNeededUnlocked(value);
+        if (slot->hasFlag(GcFlag::HasObserver) && impl_->arrayMutationCallback != nullptr) {
+            obsCb = impl_->arrayMutationCallback;
+            obsUserData = impl_->arrayMutationUserData;
+            obsNewVal = value;
+            pushIndex = oldLen;
+            obsNotify = true;
+        }
+        vec->push_back(std::move(value));
+        slot->payload.s.data = vec->empty() ? Impl::emptyArrayDataPtr() : vec->data();
+        slot->payload.s.length = static_cast<std::uint32_t>(oldLen + 1u);
+        impl_->gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
+        impl_->statistics.bytesAllocated += sizeof(Value);
+        impl_->statistics.liveBytes += sizeof(Value);
+        impl_->statistics.peakLiveBytes = std::max(impl_->statistics.peakLiveBytes, impl_->statistics.liveBytes);
+        if (slot->hasFlag(GcFlag::CustomSize)) {
+            auto csIt = impl_->customSlotSizes.find(reference.slot);
+            if (csIt != impl_->customSlotSizes.end()) {
+                csIt->second += sizeof(Value);
+            }
+        }
+        if (impl_->statistics.liveBytes >= impl_->nextCollectionThreshold) {
+            impl_->requested = true;
+        }
+        impl_->syncOldGenArrayCardsAfterResizeUnlocked(*slot);
+        impl_->writeBarrierArrayElement(reference, oldLen, vec->back());
+    }
+    if (obsNotify && obsCb) {
+        obsCb(obsUserData, *this, reference, ArrayMutationOp::Push, pushIndex, Value{}, obsNewVal);
+    }
+    return true;
+}
+
+bool ManagedHeap::arrayInsert(
+    ObjectRef reference,
+    std::size_t index,
+    Value value,
+    RuntimeError* error,
+    ArrayStoreTypePolicy typePolicy) {
+    ArrayMutationCallback obsCb = nullptr;
+    void* obsUserData = nullptr;
+    Value obsNewVal{};
+    bool obsNotify = false;
+    {
+        ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
+        HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+        auto* slot = impl_->getSlot(reference);
+        if (!slot || slot->kind() != ObjectKind::Array) {
+            setHeapError(error, ErrorCode::InvalidObjectReference,
+                "managed array reference is invalid");
+            return false;
+        }
+        if (slot->storage() == SlotStorage::RawColumn) {
+            setHeapError(error, ErrorCode::CapabilityDenied,
+                "cannot insert into native raw column view");
+            return false;
+        }
+        const std::size_t oldLen = slot->payload.s.length;
+        if (index > oldLen) {
+            setHeapError(error, ErrorCode::IndexOutOfRange,
+                "managed array insert index is out of range");
+            return false;
+        }
+        if (oldLen >= static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+            setHeapError(error, ErrorCode::OutOfMemory, "managed array length limit exceeded");
+            return false;
+        }
+        const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+        if (!impl_->validateArrayElementUnlocked(layout, value, typePolicy, error)) {
+            return false;
+        }
+        if (impl_->config.maximumHeapBytes < sizeof(Value) ||
+            impl_->statistics.liveBytes > impl_->config.maximumHeapBytes - sizeof(Value)) {
+            setHeapError(error, ErrorCode::OutOfMemory, "managed array insert exceeds heap limit");
+            impl_->requested = true;
+            return false;
+        }
+        bool oom = false;
+        auto* vec = impl_->ensureMutableHeapArrayVectorUnlocked(
+            reference.slot, *slot, oldLen + 1u, false, &oom);
+        if (!vec) {
+            setHeapError(
+                error,
+                oom ? ErrorCode::OutOfMemory : ErrorCode::InvalidObjectReference,
+                oom ? "managed array insert exceeds heap limit" : "managed array storage is not mutable");
+            return false;
+        }
+        if (impl_->config.maximumHeapBytes < sizeof(Value) ||
+            impl_->statistics.liveBytes > impl_->config.maximumHeapBytes - sizeof(Value)) {
+            setHeapError(error, ErrorCode::OutOfMemory, "managed array insert exceeds heap limit");
+            impl_->requested = true;
+            return false;
+        }
+        impl_->pinHeapValueIfNeededUnlocked(value);
+        if (slot->hasFlag(GcFlag::HasObserver) && impl_->arrayMutationCallback != nullptr) {
+            obsCb = impl_->arrayMutationCallback;
+            obsUserData = impl_->arrayMutationUserData;
+            obsNewVal = value;
+            obsNotify = true;
+        }
+        vec->insert(vec->begin() + static_cast<std::ptrdiff_t>(index), std::move(value));
+        slot->payload.s.data = vec->empty() ? Impl::emptyArrayDataPtr() : vec->data();
+        slot->payload.s.length = static_cast<std::uint32_t>(oldLen + 1u);
+        impl_->gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
+        impl_->statistics.bytesAllocated += sizeof(Value);
+        impl_->statistics.liveBytes += sizeof(Value);
+        impl_->statistics.peakLiveBytes = std::max(impl_->statistics.peakLiveBytes, impl_->statistics.liveBytes);
+        if (slot->hasFlag(GcFlag::CustomSize)) {
+            auto csIt = impl_->customSlotSizes.find(reference.slot);
+            if (csIt != impl_->customSlotSizes.end()) {
+                csIt->second += sizeof(Value);
+            }
+        }
+        if (impl_->statistics.liveBytes >= impl_->nextCollectionThreshold) {
+            impl_->requested = true;
+        }
+        impl_->syncOldGenArrayCardsAfterResizeUnlocked(*slot);
+        if (layout.mayContainReferences && !slot->hasFlag(GcFlag::InNursery) &&
+            slot->hasFlag(GcFlag::HasCardTable)) {
+            impl_->cardArena.get(slot->payload.s.cardHandle).markAllDirty();
+        }
+        impl_->writeBarrierArrayElement(reference, index, (*vec)[index]);
+    }
+    if (obsNotify && obsCb) {
+        obsCb(obsUserData, *this, reference, ArrayMutationOp::Insert, index, Value{}, obsNewVal);
+    }
+    return true;
+}
+
+bool ManagedHeap::arrayRemoveAt(
+    ObjectRef reference,
+    std::size_t index,
+    Value* outRemoved,
+    RuntimeError* error) {
+    ArrayMutationCallback obsCb = nullptr;
+    void* obsUserData = nullptr;
+    Value obsRemovedVal{};
+    bool obsNotify = false;
+    {
+        ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
+        HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+        auto* slot = impl_->getSlot(reference);
+        if (!slot || slot->kind() != ObjectKind::Array) {
+            setHeapError(error, ErrorCode::InvalidObjectReference,
+                "managed array reference is invalid");
+            return false;
+        }
+        if (slot->storage() == SlotStorage::RawColumn) {
+            setHeapError(error, ErrorCode::CapabilityDenied,
+                "cannot remove elements from native raw column view");
+            return false;
+        }
+        const std::size_t oldLen = slot->payload.s.length;
+        if (index >= oldLen) {
+            setHeapError(error, ErrorCode::IndexOutOfRange,
+                "managed array removeAt index is out of range");
+            return false;
+        }
+        bool oom = false;
+        auto* vec = impl_->ensureMutableHeapArrayVectorUnlocked(
+            reference.slot, *slot, oldLen, false, &oom);
+        if (!vec) {
+            setHeapError(
+                error,
+                oom ? ErrorCode::OutOfMemory : ErrorCode::InvalidObjectReference,
+                oom ? "managed array removeAt exceeds heap limit" : "managed array storage is not mutable");
+            return false;
+        }
+        Value removed = std::move((*vec)[index]);
+        impl_->pinHeapValueIfNeededUnlocked(removed);
+        vec->erase(vec->begin() + static_cast<std::ptrdiff_t>(index));
+        slot->payload.s.data = vec->empty() ? Impl::emptyArrayDataPtr() : vec->data();
+        slot->payload.s.length = static_cast<std::uint32_t>(oldLen - 1u);
+        impl_->gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
+        if (impl_->statistics.liveBytes >= sizeof(Value)) {
+            impl_->statistics.liveBytes -= sizeof(Value);
+        }
+        if (slot->hasFlag(GcFlag::CustomSize)) {
+            auto csIt = impl_->customSlotSizes.find(reference.slot);
+            if (csIt != impl_->customSlotSizes.end()) {
+                csIt->second = (csIt->second >= sizeof(Value)) ? (csIt->second - sizeof(Value)) : 0u;
+            }
+        }
+        impl_->statistics.bytesReclaimed += sizeof(Value);
+        impl_->syncOldGenArrayCardsAfterResizeUnlocked(*slot);
+        const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+        if (layout.mayContainReferences && !slot->hasFlag(GcFlag::InNursery)) {
+            if (slot->hasFlag(GcFlag::HasCardTable)) {
+                impl_->cardArena.get(slot->payload.s.cardHandle).markAllDirty();
+            }
+            if (!slot->hasFlag(GcFlag::InRememberedSet)) {
+                slot->gcFlags |= GcFlag::InRememberedSet;
+                impl_->rememberedSet.push_back(reference);
+            }
+        }
+        if (impl_->phase != GcPhase::Idle && slot->hasFlag(GcFlag::Marked) &&
+            Impl::valueMayContainReferences(removed)) {
+            impl_->markValue(removed);
+            if (!impl_->markStack.empty()) {
+                impl_->reopenMarkFromSweep();
+            }
+        }
+        if (outRemoved) {
+            *outRemoved = removed;
+        }
+        if (slot->hasFlag(GcFlag::HasObserver) && impl_->arrayMutationCallback != nullptr) {
+            obsCb = impl_->arrayMutationCallback;
+            obsUserData = impl_->arrayMutationUserData;
+            obsRemovedVal = std::move(removed);
+            obsNotify = true;
+        }
+    }
+    if (obsNotify && obsCb) {
+        obsCb(obsUserData, *this, reference, ArrayMutationOp::RemoveAt, index, obsRemovedVal, Value{});
+    }
+    return true;
+}
+
+bool ManagedHeap::arrayClear(
+    ObjectRef reference,
+    RuntimeError* error) {
+    ArrayMutationCallback obsCb = nullptr;
+    void* obsUserData = nullptr;
+    bool obsNotify = false;
+    {
+        ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
+        HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+        auto* slot = impl_->getSlot(reference);
+        if (!slot || slot->kind() != ObjectKind::Array) {
+            setHeapError(error, ErrorCode::InvalidObjectReference,
+                "managed array reference is invalid");
+            return false;
+        }
+        if (slot->storage() == SlotStorage::RawColumn) {
+            setHeapError(error, ErrorCode::CapabilityDenied,
+                "cannot clear native raw column view");
+            return false;
+        }
+        const std::size_t oldSlotBytes = impl_->slotSizeBytes(reference.slot, *slot);
+        const std::size_t freedBytes = oldSlotBytes > Impl::BaseObjectSizeBytes
+            ? (oldSlotBytes - Impl::BaseObjectSizeBytes)
+            : 0u;
+        const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+        if (impl_->phase != GcPhase::Idle && slot->hasFlag(GcFlag::Marked)) {
+            if (slot->storage() == SlotStorage::FlatStruct) {
+                const auto* sc = getFlatStructSchema(slot->auxMeta);
+                if (sc && sc->containsManagedReferences && slot->payload.s.data) {
+                    const std::size_t stride = sc->flatSlotCount;
+                    for (std::uint32_t e = 0; e < slot->payload.s.length; ++e) {
+                        const Value* elemBase = slot->payload.s.data + static_cast<std::size_t>(e) * stride;
+                        for (const auto refOff : sc->referenceLeafOffsets) {
+                            impl_->markValue(elemBase[refOff]);
+                        }
+                    }
+                    if (!impl_->markStack.empty()) {
+                        impl_->reopenMarkFromSweep();
+                    }
+                }
+            } else if (layout.mayContainReferences &&
+                       (slot->storage() == SlotStorage::HeapValues ||
+                        slot->storage() == SlotStorage::SlabValues) &&
+                       slot->payload.s.data) {
+                for (std::uint32_t i = 0; i < slot->payload.s.length; ++i) {
+                    impl_->markValue(slot->payload.s.data[i]);
+                }
+                if (!impl_->markStack.empty()) {
+                    impl_->reopenMarkFromSweep();
+                }
+            }
+        }
+        const auto storage = slot->storage();
+        if (storage == SlotStorage::HeapValues) {
+            auto& vec = impl_->largeBuffers.mutableBuffer(slot->payload.s.handle);
+            vec.clear();
+            slot->payload.s.data = Impl::emptyArrayDataPtr();
+            slot->payload.s.length = 0u;
+            impl_->syncOldGenArrayCardsAfterResizeUnlocked(*slot);
+        } else {
+            if (storage == SlotStorage::SlabValues) {
+                impl_->slabPool.deallocate(slot->auxMeta, slot->payload.s.handle, slot->payload.s.length);
+            } else if (isPackedStorage(storage)) {
+                impl_->packedBuffers.release(slot->payload.s.handle);
+            } else if (storage == SlotStorage::FlatStruct) {
+                if (slot->payload.s.handle != CompactSlot::kInvalidHandle) {
+                    impl_->largeBuffers.release(slot->payload.s.handle);
+                }
+            }
+            if (slot->hasFlag(GcFlag::HasCardTable) &&
+                slot->payload.s.cardHandle != CompactSlot::kInvalidHandle) {
+                impl_->cardArena.deallocate(slot->payload.s.cardHandle);
+                slot->payload.s.cardHandle = CompactSlot::kInvalidHandle;
+                slot->gcFlags &= static_cast<std::uint8_t>(~GcFlag::HasCardTable);
+            }
+            slot->setKindAndStorage(ObjectKind::Array, SlotStorage::SlabValues);
+            slot->auxMeta = PagedValueSlabPool::kZeroClass;
+            slot->payload.s.handle = CompactSlot::kInvalidHandle;
+            slot->payload.s.cardHandle = CompactSlot::kInvalidHandle;
+            slot->payload.s.data = Impl::emptyArrayDataPtr();
+            slot->payload.s.length = 0u;
+        }
+        impl_->gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
+        impl_->statistics.liveBytes = (impl_->statistics.liveBytes >= freedBytes)
+            ? (impl_->statistics.liveBytes - freedBytes)
+            : 0u;
+        if (slot->hasFlag(GcFlag::CustomSize)) {
+            auto csIt = impl_->customSlotSizes.find(reference.slot);
+            if (csIt != impl_->customSlotSizes.end()) {
+                csIt->second = (csIt->second >= freedBytes) ? (csIt->second - freedBytes) : 0u;
+            }
+        }
+        impl_->statistics.bytesReclaimed += freedBytes;
+        if (slot->hasFlag(GcFlag::HasObserver) && impl_->arrayMutationCallback != nullptr) {
+            obsCb = impl_->arrayMutationCallback;
+            obsUserData = impl_->arrayMutationUserData;
+            obsNotify = true;
+        }
+    }
+    if (obsNotify && obsCb) {
+        obsCb(obsUserData, *this, reference, ArrayMutationOp::Clear, 0u, Value{}, Value{});
+    }
+    return true;
+}
+
+bool ManagedHeap::arrayReverse(
+    ObjectRef reference,
+    RuntimeError* error) {
+    ArrayMutationCallback obsCb = nullptr;
+    void* obsUserData = nullptr;
+    bool obsNotify = false;
+    {
+        ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
+        HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+        auto* slot = impl_->getSlot(reference);
+        if (!slot || slot->kind() != ObjectKind::Array) {
+            setHeapError(error, ErrorCode::InvalidObjectReference,
+                "managed array reference is invalid");
+            return false;
+        }
+        if (slot->storage() == SlotStorage::RawColumn) {
+            const auto& view = impl_->rawColumns.get(slot->payload.s.handle);
+            if (view.readOnly || (!view.basePtr && view.count > 0)) {
+                setHeapError(error, ErrorCode::CapabilityDenied,
+                    "cannot reverse read-only native ECS column view");
                 return false;
             }
-            return true;
+            const std::size_t len = view.count;
+            if (len <= 1u) {
+                return true;
+            }
+            const std::size_t half = len / 2u;
+            for (std::size_t i = 0; i < half; ++i) {
+                const std::size_t j = len - 1u - i;
+                auto leftVal = impl_->readArrayElementUnlocked(*slot, i);
+                auto rightVal = impl_->readArrayElementUnlocked(*slot, j);
+                if (!impl_->writeValidatedArrayElementUnlocked(reference, *slot, i, std::move(rightVal), error) ||
+                    !impl_->writeValidatedArrayElementUnlocked(reference, *slot, j, std::move(leftVal), error)) {
+                    return false;
+                }
+            }
+            if (slot->hasFlag(GcFlag::HasObserver) && impl_->arrayMutationCallback != nullptr) {
+                obsCb = impl_->arrayMutationCallback;
+                obsUserData = impl_->arrayMutationUserData;
+                obsNotify = true;
+            }
+        } else {
+            const std::size_t len = slot->payload.s.length;
+            if (len <= 1u) {
+                return true;
+            }
+            const std::size_t half = len / 2u;
+            if (isPackedStorage(slot->storage())) {
+                const std::size_t stride = packedElementStride(
+                    unpackPackedEncoding(slot->auxMeta),
+                    unpackPackedShift(slot->auxMeta),
+                    slot->payload.s.cardHandle);
+                if (stride == 0u || !slot->payload.s.data) {
+                    setHeapError(error, ErrorCode::InvalidProgram,
+                        "managed packed array storage stride is invalid");
+                    return false;
+                }
+                auto* bytes = reinterpret_cast<std::uint8_t*>(slot->payload.s.data);
+                std::vector<std::uint8_t> tmp(stride);
+                for (std::size_t i = 0; i < half; ++i) {
+                    const std::size_t j = len - 1u - i;
+                    std::uint8_t* left = bytes + i * stride;
+                    std::uint8_t* right = bytes + j * stride;
+                    std::memcpy(tmp.data(), left, stride);
+                    std::memcpy(left, right, stride);
+                    std::memcpy(right, tmp.data(), stride);
+                }
+            } else if (slot->storage() == SlotStorage::FlatStruct) {
+                const auto* sc = getFlatStructSchema(slot->auxMeta);
+                if (!sc || sc->flatSlotCount == 0u || !slot->payload.s.data) {
+                    setHeapError(error, ErrorCode::InvalidProgram,
+                        "missing flat struct schema for array reverse");
+                    return false;
+                }
+                const std::size_t stride = sc->flatSlotCount;
+                Value* values = slot->payload.s.data;
+                for (std::size_t i = 0; i < half; ++i) {
+                    const std::size_t j = len - 1u - i;
+                    Value* left = values + i * stride;
+                    Value* right = values + j * stride;
+                    for (std::size_t k = 0; k < stride; ++k) {
+                        std::swap(left[k], right[k]);
+                    }
+                }
+            } else {
+                Value* values = slot->payload.s.data;
+                for (std::size_t i = 0; i < half; ++i) {
+                    std::swap(values[i], values[len - 1u - i]);
+                }
+            }
+            const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+            if (layout.mayContainReferences && !slot->hasFlag(GcFlag::InNursery) &&
+                slot->hasFlag(GcFlag::HasCardTable) && slot->hasFlag(GcFlag::InRememberedSet)) {
+                impl_->cardArena.get(slot->payload.s.cardHandle).markAllDirty();
+            }
+            if (slot->hasFlag(GcFlag::HasObserver) && impl_->arrayMutationCallback != nullptr) {
+                obsCb = impl_->arrayMutationCallback;
+                obsUserData = impl_->arrayMutationUserData;
+                obsNotify = true;
+            }
         }
-        const auto* s = std::get_if<StructValue>(&value);
-        if (!s || !s->valid() || s->typeId != view.structTypeId ||
-            s->fieldCount() != view.fields.size()) {
-            setHeapError(error, ErrorCode::TypeMismatch,
-                "managed array struct element type mismatch for raw ECS column");
+    }
+    if (obsNotify && obsCb) {
+        obsCb(obsUserData, *this, reference, ArrayMutationOp::Reset, 0u, Value{}, Value{});
+    }
+    return true;
+}
+
+bool ManagedHeap::arrayWritePrefixWithReset(
+    ObjectRef reference,
+    const Value* values,
+    std::size_t count,
+    RuntimeError* error) {
+    ArrayMutationCallback obsCb = nullptr;
+    void* obsUserData = nullptr;
+    bool obsNotify = false;
+    {
+        ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
+        HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+        auto* slot = impl_->getSlot(reference);
+        if (!slot || slot->kind() != ObjectKind::Array) {
+            setHeapError(error, ErrorCode::InvalidObjectReference,
+                "managed array reference is invalid");
             return false;
         }
-        for (std::size_t i = 0; i < view.fields.size(); ++i) {
-            const auto fieldVal = structValueFieldAt(*s, i);
-            if (!fieldVal || !writeNativeFieldToBytes(elemBase, view.fields[i], *fieldVal)) {
-                setHeapError(error, ErrorCode::TypeMismatch,
-                    "raw ECS column field type mismatch during in-place write");
+        if (count == 0u) {
+            return true;
+        }
+        if (!values) {
+            setHeapError(error, ErrorCode::InvalidArguments,
+                "managed array source buffer is null");
+            return false;
+        }
+        if (slot->storage() == SlotStorage::RawColumn) {
+            const auto& view = impl_->rawColumns.get(slot->payload.s.handle);
+            if (count > view.count) {
+                setHeapError(error, ErrorCode::IndexOutOfRange,
+                    "managed array write count exceeds length");
                 return false;
             }
-        }
-        return true;
-    }
-    const auto valueLen = static_cast<std::size_t>(slot->payload.s.length);
-    Value* values = slot->payload.s.data;
-    if (index >= valueLen) {
-        setHeapError(error, ErrorCode::IndexOutOfRange,
-            "managed array index is out of range");
-        return false;
-    }
-    const auto layoutId = slot->payload.s.layoutId;
-    const auto expected = impl_->typeLayouts[layoutId].elementType;
-    const auto expectedTypeId = impl_->typeLayouts[layoutId].elementTypeId;
-    if (expected != semantic::PrimitiveType::Error && valueType(value) != expected) {
-        setHeapError(error, ErrorCode::TypeMismatch,
-            "managed array element type mismatch");
-        return false;
-    }
-    if (expected == semantic::PrimitiveType::Object &&
-        !std::holds_alternative<NullObject>(value)) {
-        const auto* child = std::get_if<ObjectRef>(&value);
-        const auto actual = child ? impl_->objectTypeIdUnlocked(*child) : std::nullopt;
-        if (!actual ||
-            (typePolicy == ArrayStoreTypePolicy::Exact &&
-             *actual != expectedTypeId)) {
-            setHeapError(error, ErrorCode::TypeMismatch,
-                "managed array object element type mismatch");
-            return false;
-        }
-    } else if (expected == semantic::PrimitiveType::Array &&
-               !std::holds_alternative<NullArray>(value)) {
-        const auto* child = std::get_if<ObjectRef>(&value);
-        const auto actual = child ? impl_->arrayTypeIdUnlocked(*child) : std::nullopt;
-        if (!actual || *actual != expectedTypeId) {
-            setHeapError(error, ErrorCode::TypeMismatch,
-                "managed array nested array type mismatch");
-            return false;
-        }
-    } else if (expected == semantic::PrimitiveType::Struct) {
-        const auto actualTypeId = structValueTypeId(value);
-        const auto* structure = std::get_if<StructValue>(&value);
-        if (!actualTypeId || *actualTypeId != expectedTypeId ||
-            (structure && !structure->valid())) {
-            setHeapError(error, ErrorCode::TypeMismatch,
-                "managed array struct element type mismatch");
-            return false;
-        }
-    } else if (expected == semantic::PrimitiveType::Enum) {
-        EnumValue enumeration{};
-        if (!value.tryGetEnum(enumeration) ||
-            enumeration.typeId != expectedTypeId) {
-            setHeapError(error, ErrorCode::TypeMismatch,
-                "managed array enum element type mismatch");
-            return false;
-        }
-    } else if (expected == semantic::PrimitiveType::Handle) {
-        NativeHandle handle{};
-        if (!value.tryGetNativeHandle(handle) ||
-            (expectedTypeId != 0 &&
-             handle.typeId != expectedTypeId)) {
-            setHeapError(error, ErrorCode::TypeMismatch,
-                "managed array native handle type mismatch");
-            return false;
-        }
-    }
-    if (isPackedStorage(slot->storage())) {
-        bool needsWiden = false;
-        if (writePackedElementValue(
-                slot->payload.s.data,
-                index,
-                unpackPackedEncoding(slot->auxMeta),
-                expectedTypeId,
-                value,
-                needsWiden,
-                slot->payload.s.cardHandle)) {
-            return true;
-        }
-        if (needsWiden) {
-            if (slot->storage() == SlotStorage::PackedStruct) {
-                if (impl_->demotePackedStructSlotToValuesUnlocked(reference.slot, *slot)) {
-                    impl_->pinHeapValueIfNeededUnlocked(value);
-                    impl_->writeBarrierArrayElement(reference, index, value);
-                    slot->payload.s.data[index] = std::move(value);
-                    return true;
-                }
-            } else if (impl_->widenPackedSlotTo64Unlocked(reference.slot, *slot)) {
-                if (writePackedElementValue(
-                        slot->payload.s.data,
-                        index,
-                        unpackPackedEncoding(slot->auxMeta),
-                        expectedTypeId,
-                        value,
-                        needsWiden,
-                        slot->payload.s.cardHandle)) {
-                    return true;
+            if (view.readOnly || !view.basePtr) {
+                setHeapError(error, ErrorCode::CapabilityDenied,
+                    view.mode == RawColumnMode::ScalarPacked
+                        ? "cannot write to a read-only native buffer view"
+                        : "cannot write to a read-only native ECS column view");
+                return false;
+            }
+            for (std::size_t i = 0; i < count; ++i) {
+                if (!impl_->writeValidatedArrayElementUnlocked(reference, *slot, i, values[i], error)) {
+                    return false;
                 }
             }
-            setHeapError(error, ErrorCode::OutOfMemory,
-                "managed packed array widening exceeded heap budget");
-            return false;
-        }
-        setHeapError(error, ErrorCode::TypeMismatch,
-            "managed array element type mismatch");
-        return false;
-    }
-    if (slot->storage() == SlotStorage::FlatStruct) {
-        const auto* sc = getFlatStructSchema(slot->auxMeta);
-        if (!sc) {
-            setHeapError(error, ErrorCode::InvalidProgram, "missing flat struct schema for array");
-            return false;
-        }
-        Value* elemDst = values + index * static_cast<std::size_t>(sc->flatSlotCount);
-        if (!extractStructLeavesToBuffer(value, *sc, elemDst)) {
-            setHeapError(error, ErrorCode::TypeMismatch, "managed array flat struct element mismatch");
-            return false;
-        }
-        if (sc->containsPoolValues) {
-            for (std::uint16_t k = 0; k < sc->flatSlotCount; ++k) {
-                impl_->pinHeapValueIfNeededUnlocked(elemDst[k]);
+        } else {
+            if (count > slot->payload.s.length) {
+                setHeapError(error, ErrorCode::IndexOutOfRange,
+                    "managed array write count exceeds length");
+                return false;
+            }
+            const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+            std::vector<Value> validated;
+            validated.reserve(count);
+            for (std::size_t i = 0; i < count; ++i) {
+                Value tmp = values[i];
+                if (!impl_->validateArrayElementUnlocked(
+                        layout, tmp, ArrayStoreTypePolicy::PrevalidatedAssignableObject, error)) {
+                    return false;
+                }
+                validated.push_back(std::move(tmp));
+            }
+            if (impl_->phase != GcPhase::Idle && slot->hasFlag(GcFlag::Marked) &&
+                layout.mayContainReferences &&
+                (slot->storage() == SlotStorage::SlabValues ||
+                 slot->storage() == SlotStorage::HeapValues)) {
+                for (std::size_t i = 0; i < count; ++i) {
+                    impl_->markValue(slot->payload.s.data[i]);
+                }
+            }
+            for (std::size_t i = 0; i < count; ++i) {
+                if (!impl_->writeValidatedArrayElementUnlocked(
+                        reference, *slot, i, std::move(validated[i]), error)) {
+                    return false;
+                }
             }
         }
-        if (sc->containsManagedReferences) {
-            impl_->writeBarrierFlatStructElement(reference, index);
+        if (slot->hasFlag(GcFlag::HasObserver) && impl_->arrayMutationCallback != nullptr) {
+            obsCb = impl_->arrayMutationCallback;
+            obsUserData = impl_->arrayMutationUserData;
+            obsNotify = true;
         }
-        return true;
     }
-    if (value.rawTag() == ValueTag::Struct && value.asStructUnchecked().isFrameSlice()) {
-        value = detachFrameSliceValue(value);
+    if (obsNotify && obsCb) {
+        obsCb(obsUserData, *this, reference, ArrayMutationOp::Reset, 0u, Value{}, Value{});
     }
-    if (Impl::valueMayContainReferences(value)) {
-        impl_->writeBarrierArrayElement(reference, index, value);
-    }
-    impl_->pinHeapValueIfNeededUnlocked(value);
-    values[index] = std::move(value);
     return true;
 }
 
@@ -6288,33 +7502,51 @@ bool ManagedHeap::fieldSet(
     std::size_t index,
     Value value,
     RuntimeError* error) {
-    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
-    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
-    auto* slot = impl_->getSlot(reference);
-    if (!slot || slot->kind() != ObjectKind::Record) {
-        setHeapError(error, ErrorCode::InvalidObjectReference,
-            "managed record reference is invalid");
-        return false;
+    FieldMutationCallback fieldCb = nullptr;
+    void* fieldUserData = nullptr;
+    std::uint8_t dirtyBit = 0xFFu;
+    bool invokeCb = false;
+    {
+        ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
+        HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+        auto* slot = impl_->getSlot(reference);
+        if (!slot || slot->kind() != ObjectKind::Record) {
+            setHeapError(error, ErrorCode::InvalidObjectReference,
+                "managed record reference is invalid");
+            return false;
+        }
+        if (index >= slot->payload.s.length) {
+            setHeapError(error, ErrorCode::InvalidArguments,
+                "managed field index is out of range");
+            return false;
+        }
+        if (value.rawTag() == ValueTag::Struct && value.asStructUnchecked().isFrameSlice()) {
+            value = detachFrameSliceValue(value);
+        }
+        const auto& refFields = impl_->typeLayouts[slot->payload.s.layoutId].referenceFields;
+        const bool checkDirty = impl_->hasDirtyTrackingTypes;
+        const bool valueChanged = !checkDirty || !(slot->payload.s.data[index] == value);
+        if (Impl::valueMayContainReferences(value) &&
+            !refFields.empty() &&
+            std::binary_search(refFields.begin(), refFields.end(), index)) {
+            impl_->writeBarrierObject(reference, value);
+        }
+        impl_->pinHeapValueIfNeededUnlocked(value);
+        slot->payload.s.data[index] = std::move(value);
+        if (checkDirty && valueChanged) {
+            const auto tid = impl_->typeLayouts[slot->payload.s.layoutId].typeId;
+            dirtyBit = impl_->markDirtyForFieldUnlocked(
+                reference, tid, index, hasDirtyObjects_);
+            if (impl_->fieldMutationCallback != nullptr &&
+                (dirtyBit != 0xFFu || slot->hasFlag(GcFlag::HasObserver))) {
+                fieldCb = impl_->fieldMutationCallback;
+                fieldUserData = impl_->fieldMutationUserData;
+                invokeCb = true;
+            }
+        }
     }
-    if (index >= slot->payload.s.length) {
-        setHeapError(error, ErrorCode::InvalidArguments,
-            "managed field index is out of range");
-        return false;
-    }
-    if (value.rawTag() == ValueTag::Struct && value.asStructUnchecked().isFrameSlice()) {
-        value = detachFrameSliceValue(value);
-    }
-    const auto& refFields = impl_->typeLayouts[slot->payload.s.layoutId].referenceFields;
-    if (Impl::valueMayContainReferences(value) &&
-        !refFields.empty() &&
-        std::binary_search(refFields.begin(), refFields.end(), index)) {
-        impl_->writeBarrierObject(reference, value);
-    }
-    impl_->pinHeapValueIfNeededUnlocked(value);
-    slot->payload.s.data[index] = std::move(value);
-    if (impl_->hasDirtyTrackingTypes) {
-        const auto tid = impl_->typeLayouts[slot->payload.s.layoutId].typeId;
-        impl_->markDirtyForFieldUnlocked(reference, tid, index);
+    if (invokeCb && fieldCb) {
+        fieldCb(fieldUserData, *this, reference, index, dirtyBit);
     }
     return true;
 }
@@ -6325,34 +7557,169 @@ bool ManagedHeap::fieldSetFast(
     const Value& value,
     semantic::SymbolId expectedTypeId,
     semantic::PrimitiveType expectedFieldType) noexcept {
-    ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
-    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
-    auto* slot = impl_->getSlot(reference);
-    if (!slot || slot->kind() != ObjectKind::Record ||
-        index >= slot->payload.s.length ||
-        valueType(value) != expectedFieldType) {
-        return false;
+    FieldMutationCallback fieldCb = nullptr;
+    void* fieldUserData = nullptr;
+    std::uint8_t dirtyBit = 0xFFu;
+    bool invokeCb = false;
+    {
+        ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
+        HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+        auto* slot = impl_->getSlot(reference);
+        if (!slot || slot->kind() != ObjectKind::Record ||
+            index >= slot->payload.s.length ||
+            valueType(value) != expectedFieldType) {
+            return false;
+        }
+        const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+        if (layout.typeId != expectedTypeId) return false;
+        if (const auto* childRef = std::get_if<ObjectRef>(&value);
+            childRef && !impl_->getSlot(*childRef)) {
+            return false;
+        }
+        const Value stored = (value.rawTag() == ValueTag::Struct && value.asStructUnchecked().isFrameSlice())
+            ? detachFrameSliceValue(value)
+            : value;
+        const bool checkDirty = impl_->hasDirtyTrackingTypes;
+        const bool valueChanged = !checkDirty || !(slot->payload.s.data[index] == stored);
+        if (Impl::valueMayContainReferences(stored) &&
+            !layout.referenceFields.empty() &&
+            std::binary_search(layout.referenceFields.begin(), layout.referenceFields.end(), index)) {
+            impl_->writeBarrierObject(reference, stored);
+        }
+        impl_->pinHeapValueIfNeededUnlocked(stored);
+        slot->payload.s.data[index] = stored;
+        if (checkDirty && valueChanged) {
+            dirtyBit = impl_->markDirtyForFieldUnlocked(
+                reference, expectedTypeId, index, hasDirtyObjects_);
+            if (impl_->fieldMutationCallback != nullptr &&
+                (dirtyBit != 0xFFu || slot->hasFlag(GcFlag::HasObserver))) {
+                fieldCb = impl_->fieldMutationCallback;
+                fieldUserData = impl_->fieldMutationUserData;
+                invokeCb = true;
+            }
+        }
     }
-    const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
-    if (layout.typeId != expectedTypeId) return false;
-    if (const auto* childRef = std::get_if<ObjectRef>(&value);
-        childRef && !impl_->getSlot(*childRef)) {
-        return false;
-    }
-    const Value stored = (value.rawTag() == ValueTag::Struct && value.asStructUnchecked().isFrameSlice())
-        ? detachFrameSliceValue(value)
-        : value;
-    if (Impl::valueMayContainReferences(stored) &&
-        !layout.referenceFields.empty() &&
-        std::binary_search(layout.referenceFields.begin(), layout.referenceFields.end(), index)) {
-        impl_->writeBarrierObject(reference, stored);
-    }
-    impl_->pinHeapValueIfNeededUnlocked(stored);
-    slot->payload.s.data[index] = stored;
-    if (impl_->hasDirtyTrackingTypes) {
-        impl_->markDirtyForFieldUnlocked(reference, expectedTypeId, index);
+    if (invokeCb && fieldCb) {
+        fieldCb(fieldUserData, *this, reference, index, dirtyBit);
     }
     return true;
+}
+
+void ManagedHeap::consumeDirtyObjects(std::vector<ObjectRef>& outObjects) {
+    outObjects.clear();
+    if (!hasDirtyObjects_) {
+        return;
+    }
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    hasDirtyObjects_ = false;
+    outObjects.reserve(impl_->dirtyObjectQueue.size());
+    for (const auto ref : impl_->dirtyObjectQueue) {
+        if (auto* slot = impl_->getSlot(ref)) {
+            slot->gcFlags &= static_cast<std::uint8_t>(~GcFlag::InDirtyQueue);
+            outObjects.push_back(ref);
+        }
+    }
+    impl_->dirtyObjectQueue.clear();
+}
+
+std::vector<ObjectRef> ManagedHeap::consumeDirtyObjects() {
+    std::vector<ObjectRef> out;
+    consumeDirtyObjects(out);
+    return out;
+}
+
+void ManagedHeap::setFieldMutationCallback(
+    FieldMutationCallback callback,
+    void* userData) noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    impl_->fieldMutationCallback = callback;
+    impl_->fieldMutationUserData = userData;
+    impl_->hasDirtyTrackingTypes =
+        !impl_->typeDirtyBitMaps.empty() ||
+        impl_->fieldMutationCallback != nullptr ||
+        !impl_->observerDirtyMasks.empty();
+    hasDirtyTracking_ = impl_->hasDirtyTrackingTypes;
+}
+
+void ManagedHeap::setArrayMutationCallback(
+    ArrayMutationCallback callback,
+    void* userData) noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    impl_->arrayMutationCallback = callback;
+    impl_->arrayMutationUserData = userData;
+}
+
+void ManagedHeap::setSlotSweepCallback(
+    SlotSweepCallback callback,
+    void* userData) noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    impl_->slotSweepCallback = callback;
+    impl_->slotSweepUserData = userData;
+}
+
+bool ManagedHeap::setObjectObserved(ObjectRef reference, bool observed) noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Record) {
+        return false;
+    }
+    if (observed) {
+        slot->gcFlags |= GcFlag::HasObserver;
+        impl_->gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
+    } else {
+        slot->gcFlags &= static_cast<std::uint8_t>(~GcFlag::HasObserver);
+        impl_->gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
+    }
+    return true;
+}
+
+bool ManagedHeap::isObjectObserved(ObjectRef reference) const noexcept {
+    HeapReadOrDisjointGuard heapLock(*impl_->syncState);
+    const auto* slot = impl_->getSlot(reference);
+    return slot && slot->kind() == ObjectKind::Record &&
+        slot->hasFlag(GcFlag::HasObserver);
+}
+
+bool ManagedHeap::setArrayObserved(ObjectRef reference, bool observed) noexcept {
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Array) {
+        return false;
+    }
+    if (observed) {
+        slot->gcFlags |= GcFlag::HasObserver;
+        impl_->gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
+    } else {
+        slot->gcFlags &= static_cast<std::uint8_t>(~GcFlag::HasObserver);
+        impl_->gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
+    }
+    return true;
+}
+
+bool ManagedHeap::isArrayObserved(ObjectRef reference) const noexcept {
+    HeapReadOrDisjointGuard heapLock(*impl_->syncState);
+    const auto* slot = impl_->getSlot(reference);
+    return slot && slot->kind() == ObjectKind::Array &&
+        slot->hasFlag(GcFlag::HasObserver);
+}
+
+void ManagedHeap::recordArrayReset(ObjectRef reference) {
+    ArrayMutationCallback obsCb = nullptr;
+    void* obsUserData = nullptr;
+    {
+        HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+        const auto* slot = impl_->getSlot(reference);
+        if (!slot || slot->kind() != ObjectKind::Array ||
+            !slot->hasFlag(GcFlag::HasObserver) ||
+            impl_->arrayMutationCallback == nullptr) {
+            return;
+        }
+        obsCb = impl_->arrayMutationCallback;
+        obsUserData = impl_->arrayMutationUserData;
+    }
+    if (obsCb) {
+        obsCb(obsUserData, *this, reference, ArrayMutationOp::Reset, 0u, Value{}, Value{});
+    }
 }
 
 void ManagedHeap::registerTypeParent(
@@ -6376,15 +7743,31 @@ void ManagedHeap::notifyFieldMutated(
     ObjectRef reference,
     std::size_t fieldIndex) noexcept {
     if (!hasDirtyTracking_) return;
-    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
-    if (!impl_->hasDirtyTrackingTypes) return;
-    auto* slot = impl_->getSlot(reference);
-    if (!slot || slot->kind() != ObjectKind::Record ||
-        fieldIndex >= slot->payload.s.length) {
-        return;
+    FieldMutationCallback fieldCb = nullptr;
+    void* fieldUserData = nullptr;
+    std::uint8_t dirtyBit = 0xFFu;
+    bool invokeCb = false;
+    {
+        HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+        if (!impl_->hasDirtyTrackingTypes) return;
+        auto* slot = impl_->getSlot(reference);
+        if (!slot || slot->kind() != ObjectKind::Record ||
+            fieldIndex >= slot->payload.s.length) {
+            return;
+        }
+        const auto tid = impl_->typeLayouts[slot->payload.s.layoutId].typeId;
+        dirtyBit = impl_->markDirtyForFieldUnlocked(
+            reference, tid, fieldIndex, hasDirtyObjects_);
+        if (impl_->fieldMutationCallback != nullptr &&
+            (dirtyBit != 0xFFu || slot->hasFlag(GcFlag::HasObserver))) {
+            fieldCb = impl_->fieldMutationCallback;
+            fieldUserData = impl_->fieldMutationUserData;
+            invokeCb = true;
+        }
     }
-    const auto tid = impl_->typeLayouts[slot->payload.s.layoutId].typeId;
-    impl_->markDirtyForFieldUnlocked(reference, tid, fieldIndex);
+    if (invokeCb && fieldCb) {
+        fieldCb(fieldUserData, *this, reference, fieldIndex, dirtyBit);
+    }
 }
 
 void ManagedHeap::enableTypeDirtyTracking(
@@ -6393,17 +7776,26 @@ void ManagedHeap::enableTypeDirtyTracking(
     if (typeId == 0) return;
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     impl_->typeDirtyBitMaps[typeId] = std::move(fieldToBitMap);
-    impl_->hasDirtyTrackingTypes = !impl_->typeDirtyBitMaps.empty();
+    impl_->hasDirtyTrackingTypes =
+        !impl_->typeDirtyBitMaps.empty() ||
+        impl_->fieldMutationCallback != nullptr ||
+        !impl_->observerDirtyMasks.empty();
     hasDirtyTracking_ = impl_->hasDirtyTrackingTypes;
 }
 
 bool ManagedHeap::markDirtyBit(ObjectRef reference, std::uint8_t bitIndex) noexcept {
     if (bitIndex >= 64u) return false;
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
-    if (!impl_->getSlot(reference)) return false;
+    auto* slot = impl_->getSlot(reference);
+    if (!slot) return false;
     impl_->hasDirtyTrackingTypes = true;
     hasDirtyTracking_ = true;
     impl_->observerDirtyMasks[reference.slot] |= (std::uint64_t{1} << bitIndex);
+    if (!slot->hasFlag(GcFlag::InDirtyQueue)) {
+        slot->gcFlags |= GcFlag::InDirtyQueue;
+        impl_->dirtyObjectQueue.push_back(reference);
+    }
+    hasDirtyObjects_ = true;
     return true;
 }
 
@@ -6420,7 +7812,7 @@ std::uint64_t ManagedHeap::consumeDirtyMask(ObjectRef reference) noexcept {
     const auto it = impl_->observerDirtyMasks.find(reference.slot);
     if (it == impl_->observerDirtyMasks.end()) return 0u;
     const std::uint64_t mask = it->second;
-    impl_->observerDirtyMasks.erase(it);
+    it->second = 0u;
     return mask;
 }
 
@@ -8233,6 +9625,15 @@ bool ManagedHeap::restore(
     impl_->rawColumns.clear();
     impl_->cardArena.clear();
     impl_->customSlotSizes.clear();
+    impl_->observerDirtyMasks.clear();
+    impl_->dirtyObjectQueue.clear();
+    impl_->pendingObservedSlotSweeps.clear();
+    impl_->hasDirtyTrackingTypes =
+        !impl_->typeDirtyBitMaps.empty() ||
+        impl_->fieldMutationCallback != nullptr;
+    hasDirtyTracking_ = impl_->hasDirtyTrackingTypes;
+    hasDirtyObjects_ = false;
+    impl_->gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
     impl_->typeLayouts.assign(1, TypeLayoutEntry{});
     impl_->sharedRecordLayoutByTypeId.clear();
     impl_->arrayLayoutByKey.clear();
@@ -8643,6 +10044,7 @@ PersistentRoot::PersistentRoot(
 
 NativeHandleRegistry::NativeHandleRegistry()
     : registryId_(nextRegistryId()) {
+    slots_.reserve(256);
     std::lock_guard<std::mutex> dirLock(nativeHandleRegistryDirMutex());
     nativeHandleRegistries().push_back(this);
 }
@@ -8683,6 +10085,37 @@ NativeHandle NativeHandleRegistry::create(
     slot.cachedWrapperHeapIds.clear();
     if (rawPtr) {
         activeSlotByPointer_[PointerTypeKey{rawPtr, typeId}] = slotIndex;
+    }
+    return {slotIndex, slot.generation, typeId, registryId_};
+}
+
+NativeHandle NativeHandleRegistry::createBorrowed(
+    semantic::SymbolId typeId,
+    void* rawPointer,
+    bool indexPointer) {
+    if (typeId == 0 || !rawPointer) return {};
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::uint32_t slotIndex = 0;
+    if (!freeSlots_.empty()) {
+        slotIndex = freeSlots_.back();
+        freeSlots_.pop_back();
+    } else {
+        if (slots_.size() >= static_cast<std::size_t>(NativeHandle::InvalidSlot)) {
+            return {};
+        }
+        slotIndex = static_cast<std::uint32_t>(slots_.size());
+        slots_.push_back({});
+    }
+    auto& slot = slots_[slotIndex];
+    if (slot.generation == 0 || slot.generation > 0xFFFFu) slot.generation = 1;
+    slot.resource = std::shared_ptr<void>(std::shared_ptr<void>{}, rawPointer);
+    slot.rawPointer = rawPointer;
+    slot.typeId = typeId;
+    slot.debugName.clear();
+    slot.cachedWrappers.clear();
+    slot.cachedWrapperHeapIds.clear();
+    if (indexPointer) {
+        activeSlotByPointer_[PointerTypeKey{rawPointer, typeId}] = slotIndex;
     }
     return {slotIndex, slot.generation, typeId, registryId_};
 }
@@ -8797,6 +10230,64 @@ std::shared_ptr<void> NativeHandleRegistry::resolve(
         return {};
     }
     return slot.resource;
+}
+
+void* NativeHandleRegistry::resolveRawFast(
+    NativeHandle handle,
+    semantic::SymbolId expectedTypeId) const noexcept {
+    if (!handle.valid() ||
+        handle.registryId != compactNativeRegistryId(registryId_)) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (handle.slot >= slots_.size()) {
+        return nullptr;
+    }
+    const auto& slot = slots_[handle.slot];
+    if (!slot.resource || !slot.rawPointer ||
+        slot.generation != handle.generation ||
+        slot.typeId != handle.typeId) {
+        return nullptr;
+    }
+    if (expectedTypeId != 0 && slot.typeId != expectedTypeId) {
+        return nullptr;
+    }
+    return const_cast<void*>(slot.rawPointer);
+}
+
+void NativeHandleRegistry::visitCachedWrappers(
+    std::uint64_t heapId,
+    const std::function<void(NativeHandle, ObjectRef, const void*)>& visitor) const {
+    if (!visitor) return;
+    struct Entry {
+        NativeHandle handle;
+        ObjectRef wrapper;
+        const void* rawPointer = nullptr;
+    };
+    std::vector<Entry> matches;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        matches.reserve(slots_.size());
+        for (std::size_t i = 0; i < slots_.size(); ++i) {
+            const auto& slot = slots_[i];
+            if (!slot.resource || !slot.rawPointer) continue;
+            for (const auto& [entryHeapId, wrapper] : slot.cachedWrappers) {
+                if (wrapper.valid() && (heapId == 0 || entryHeapId == heapId)) {
+                    matches.push_back(Entry{
+                        NativeHandle{
+                            static_cast<std::uint32_t>(i),
+                            slot.generation,
+                            slot.typeId,
+                            registryId_},
+                        wrapper,
+                        slot.rawPointer});
+                }
+            }
+        }
+    }
+    for (const auto& match : matches) {
+        visitor(match.handle, match.wrapper, match.rawPointer);
+    }
 }
 
 bool NativeHandleRegistry::isAliveUnlocked(NativeHandle handle) const noexcept {
@@ -9289,6 +10780,15 @@ std::size_t reclaimPoolValuesForDomainImpl(
             HeapSyncMutexGuard instanceLock(*sync, /*flushDeferredOnUnlock=*/false);
             if (sync->ownerImpl && sync->markPoolFn) {
                 (void)sync->markPoolFn(sync->ownerImpl);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> markersLock(externalValuePoolMarkersMutex());
+            for (const auto& [ownerKey, marker] : externalValuePoolMarkers()) {
+                (void)ownerKey;
+                if (marker) {
+                    marker();
+                }
             }
         }
 
@@ -10303,6 +11803,29 @@ void* localLiveStringHeapShardsPtr() noexcept {
 }
 
 } // namespace detail
+
+void registerExternalValuePoolRootMarker(
+    const void* ownerKey,
+    std::function<void()> markerCallback) {
+    if (!ownerKey) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(externalValuePoolMarkersMutex());
+    auto& markers = externalValuePoolMarkers();
+    if (!markerCallback) {
+        markers.erase(ownerKey);
+        return;
+    }
+    markers[ownerKey] = std::move(markerCallback);
+}
+
+void unregisterExternalValuePoolRootMarker(const void* ownerKey) noexcept {
+    if (!ownerKey) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(externalValuePoolMarkersMutex());
+    externalValuePoolMarkers().erase(ownerKey);
+}
 
 std::size_t reclaimUnreferencedPoolValues(
     const ShadowStack* activeShadowStack) noexcept {

@@ -2,10 +2,11 @@
 
 #include "realscript/runtime/FiberScheduler.h"
 
+#include <array>
 #include <cstdint>
 #include <string>
 
-namespace realscript::game {
+namespace realscript::bindgen {
 
 using Fixed = runtime::Fixed24_8;
 using Fixed16 = runtime::Fixed16_16;
@@ -806,4 +807,4 @@ struct Quatf {
     friend constexpr bool operator!=(Quatf a, Quatf b) noexcept { return !(a == b); }
 };
 
-} // namespace realscript::game
+} // namespace realscript::bindgen

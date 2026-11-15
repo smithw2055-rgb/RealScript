@@ -631,6 +631,7 @@ struct StringValue {
     StringValue(std::string_view value);
 
     [[nodiscard]] const std::string& str() const noexcept;
+    [[nodiscard]] std::string_view view() const noexcept { return str(); }
     operator const std::string&() const noexcept { return str(); }
     operator std::string_view() const noexcept { return str(); }
     [[nodiscard]] const char* c_str() const noexcept { return str().c_str(); }
@@ -639,6 +640,13 @@ struct StringValue {
     [[nodiscard]] bool empty() const noexcept { return str().empty(); }
     [[nodiscard]] auto begin() const noexcept { return str().begin(); }
     [[nodiscard]] auto end() const noexcept { return str().end(); }
+    [[nodiscard]] bool isAsciiFast() const noexcept;
+    [[nodiscard]] std::size_t codePointLength() const noexcept;
+    [[nodiscard]] std::string_view codePointSlice(
+        std::size_t startCodePoint,
+        std::size_t codePointCount = std::string_view::npos) const noexcept;
+    [[nodiscard]] std::int64_t codePointIndexOf(std::string_view needle) const noexcept;
+    [[nodiscard]] std::int64_t codePointLastIndexOf(std::string_view needle) const noexcept;
 
     friend bool operator==(const StringValue& left, const StringValue& right) noexcept {
         if (left.id != 0 && left.id == right.id) return true;
@@ -1876,6 +1884,76 @@ public:
     }
 };
 
+class ManagedHeap;
+
+class IExecutionPolicy {
+public:
+    virtual ~IExecutionPolicy() = default;
+
+    [[nodiscard]] virtual ManagedHeap* resolveHeap(
+        ObjectRef reference,
+        ManagedHeap* defaultHeap) const noexcept {
+        (void)reference;
+        return defaultHeap;
+    }
+
+    [[nodiscard]] virtual CrossHeapAccessPolicy crossHeapAccessPolicy(
+        const ManagedHeap* activeHeap,
+        const ManagedHeap* targetHeap) const noexcept {
+        (void)activeHeap;
+        (void)targetHeap;
+        return CrossHeapAccessPolicy::AllowReadWrite;
+    }
+
+    virtual bool checkFieldWrite(
+        const ManagedHeap* activeHeap,
+        const ManagedHeap* targetHeap,
+        ObjectRef target,
+        semantic::SymbolId declaringTypeId,
+        std::size_t fieldIndex,
+        std::string_view fieldName,
+        const Value& newValue,
+        RuntimeError& outError) const {
+        (void)activeHeap;
+        (void)targetHeap;
+        (void)target;
+        (void)declaringTypeId;
+        (void)fieldIndex;
+        (void)fieldName;
+        (void)newValue;
+        (void)outError;
+        return true;
+    }
+
+    virtual bool checkArrayWrite(
+        const ManagedHeap* activeHeap,
+        const ManagedHeap* targetHeap,
+        ObjectRef target,
+        const Value& newValue,
+        RuntimeError& outError) const {
+        (void)activeHeap;
+        (void)targetHeap;
+        (void)target;
+        (void)newValue;
+        (void)outError;
+        return true;
+    }
+
+    virtual bool interceptCall(
+        semantic::SymbolId functionId,
+        ValueSpan arguments,
+        bool& outIntercepted,
+        Value& outResult,
+        RuntimeError& outError) {
+        (void)functionId;
+        (void)arguments;
+        (void)outResult;
+        (void)outError;
+        outIntercepted = false;
+        return true;
+    }
+};
+
 using NativeWrapperSweepCallback = std::function<void(
     NativeHandle handle,
     std::uint64_t heapId,
@@ -2151,17 +2229,25 @@ public:
         const std::vector<Value>* locals,
         const std::vector<Value>* registers,
         const std::size_t* activeRegisterLimit = nullptr);
+    void pushSpanFrame(
+        ValueSpan arguments,
+        ValueSpan locals,
+        ValueSpan registers,
+        const std::size_t* activeRegisterLimit = nullptr);
     void popFrame() noexcept;
     void visitRoots(const std::function<void(const Value&)>& visitor) const;
 
     template <typename Visitor>
     void visitRoots(Visitor&& visitor) const {
-        const auto visitValues = [&](const std::vector<Value>* values, const std::size_t* limit) {
-            if (!values) return;
-            const std::size_t count = limit
-                ? std::min(*limit, values->size())
-                : values->size();
-            const Value* data = values->data();
+        const auto visitValues = [&](
+                                     const std::vector<Value>* values,
+                                     const Value* rawPtr,
+                                     std::size_t rawCount,
+                                     const std::size_t* limit) {
+            const Value* data = values ? values->data() : rawPtr;
+            const std::size_t total = values ? values->size() : rawCount;
+            if (!data || total == 0) return;
+            const std::size_t count = limit ? std::min(*limit, total) : total;
             for (std::size_t index = 0; index < count; ++index) {
                 const Value& v = data[index];
                 if (!std::holds_alternative<std::monostate>(v)) {
@@ -2172,25 +2258,36 @@ public:
         const std::size_t inlineCount = std::min(frameCount_, InlineFrameCapacity);
         for (std::size_t i = 0; i < inlineCount; ++i) {
             const auto& frame = inlineFrames_[i];
-            visitValues(frame.arguments, nullptr);
-            visitValues(frame.locals, nullptr);
-            visitValues(frame.registers, frame.activeRegisterLimit);
+            visitValues(frame.arguments, frame.argumentsPtr, frame.argumentsCount, nullptr);
+            visitValues(frame.locals, frame.localsPtr, frame.localsCount, nullptr);
+            visitValues(
+                frame.registers,
+                frame.registersPtr,
+                frame.registersCount,
+                frame.activeRegisterLimit);
         }
         for (const auto& frame : overflowFrames_) {
-            visitValues(frame.arguments, nullptr);
-            visitValues(frame.locals, nullptr);
-            visitValues(frame.registers, frame.activeRegisterLimit);
+            visitValues(frame.arguments, frame.argumentsPtr, frame.argumentsCount, nullptr);
+            visitValues(frame.locals, frame.localsPtr, frame.localsCount, nullptr);
+            visitValues(
+                frame.registers,
+                frame.registersPtr,
+                frame.registersCount,
+                frame.activeRegisterLimit);
         }
     }
 
     template <typename Visitor>
     void visitTraceableRoots(Visitor&& visitor) const {
-        const auto visitValues = [&](const std::vector<Value>* values, const std::size_t* limit) {
-            if (!values) return;
-            const std::size_t count = limit
-                ? std::min(*limit, values->size())
-                : values->size();
-            const Value* data = values->data();
+        const auto visitValues = [&](
+                                     const std::vector<Value>* values,
+                                     const Value* rawPtr,
+                                     std::size_t rawCount,
+                                     const std::size_t* limit) {
+            const Value* data = values ? values->data() : rawPtr;
+            const std::size_t total = values ? values->size() : rawCount;
+            if (!data || total == 0) return;
+            const std::size_t count = limit ? std::min(*limit, total) : total;
             for (std::size_t index = 0; index < count; ++index) {
                 const Value& v = data[index];
                 if (v.isTraceable()) {
@@ -2201,14 +2298,22 @@ public:
         const std::size_t inlineCount = std::min(frameCount_, InlineFrameCapacity);
         for (std::size_t i = 0; i < inlineCount; ++i) {
             const auto& frame = inlineFrames_[i];
-            visitValues(frame.arguments, nullptr);
-            visitValues(frame.locals, nullptr);
-            visitValues(frame.registers, frame.activeRegisterLimit);
+            visitValues(frame.arguments, frame.argumentsPtr, frame.argumentsCount, nullptr);
+            visitValues(frame.locals, frame.localsPtr, frame.localsCount, nullptr);
+            visitValues(
+                frame.registers,
+                frame.registersPtr,
+                frame.registersCount,
+                frame.activeRegisterLimit);
         }
         for (const auto& frame : overflowFrames_) {
-            visitValues(frame.arguments, nullptr);
-            visitValues(frame.locals, nullptr);
-            visitValues(frame.registers, frame.activeRegisterLimit);
+            visitValues(frame.arguments, frame.argumentsPtr, frame.argumentsCount, nullptr);
+            visitValues(frame.locals, frame.localsPtr, frame.localsCount, nullptr);
+            visitValues(
+                frame.registers,
+                frame.registersPtr,
+                frame.registersCount,
+                frame.activeRegisterLimit);
         }
     }
 
@@ -2221,10 +2326,17 @@ public:
         const std::vector<Value>* arguments = nullptr;
         const std::vector<Value>* locals = nullptr;
         const std::vector<Value>* registers = nullptr;
+        const Value* argumentsPtr = nullptr;
+        std::size_t argumentsCount = 0;
+        const Value* localsPtr = nullptr;
+        std::size_t localsCount = 0;
+        const Value* registersPtr = nullptr;
+        std::size_t registersCount = 0;
         const std::size_t* activeRegisterLimit = nullptr;
     };
 
 private:
+    void pushFrameRoots(const FrameRoots& roots);
     friend void registerActiveShadowStack(ShadowStack* stack) noexcept;
     friend void unregisterActiveShadowStack(ShadowStack* stack) noexcept;
     friend void transferActiveShadowStack(ShadowStack* from, ShadowStack* to) noexcept;
@@ -2423,11 +2535,44 @@ struct LayoutMigrationStats {
 };
 
 class ProgramImage;
+class ManagedHeap;
+
+enum class ArrayMutationOp : std::uint8_t {
+    Set = 0,
+    Push = 1,
+    Insert = 2,
+    RemoveAt = 3,
+    Clear = 4,
+    Reset = 5,
+};
+
+using FieldMutationCallback = void (*)(
+    void* userData,
+    ManagedHeap& heap,
+    ObjectRef object,
+    std::size_t fieldIndex,
+    std::uint8_t dirtyBit);
+using ArrayMutationCallback = void (*)(
+    void* userData,
+    ManagedHeap& heap,
+    ObjectRef array,
+    ArrayMutationOp op,
+    std::size_t index,
+    const Value& oldValue,
+    const Value& newValue);
+using SlotSweepCallback = void (*)(
+    void* userData,
+    ManagedHeap& heap,
+    ObjectRef sweptRef);
 
 class ManagedHeap {
 public:
     using RootToken = std::uint64_t;
     using RootSet = ShadowStack;
+    using ArrayMutationOp = realscript::runtime::ArrayMutationOp;
+    using FieldMutationCallback = realscript::runtime::FieldMutationCallback;
+    using ArrayMutationCallback = realscript::runtime::ArrayMutationCallback;
+    using SlotSweepCallback = realscript::runtime::SlotSweepCallback;
     static constexpr std::size_t kCardElementShift = 6;
     static constexpr std::size_t kCardElements = std::size_t{1} << kCardElementShift;
     static constexpr std::size_t kCardTableMinLength = kCardElements + 1;
@@ -2491,6 +2636,25 @@ public:
     [[nodiscard]] bool hasDirtyTracking() const noexcept {
         return hasDirtyTracking_;
     }
+    [[nodiscard]] bool hasDirtyObjects() const noexcept {
+        return hasDirtyObjects_;
+    }
+    void consumeDirtyObjects(std::vector<ObjectRef>& outObjects);
+    [[nodiscard]] std::vector<ObjectRef> consumeDirtyObjects();
+    void setFieldMutationCallback(
+        FieldMutationCallback callback,
+        void* userData = nullptr) noexcept;
+    void setArrayMutationCallback(
+        ArrayMutationCallback callback,
+        void* userData = nullptr) noexcept;
+    void setSlotSweepCallback(
+        SlotSweepCallback callback,
+        void* userData = nullptr) noexcept;
+    bool setObjectObserved(ObjectRef reference, bool observed) noexcept;
+    [[nodiscard]] bool isObjectObserved(ObjectRef reference) const noexcept;
+    bool setArrayObserved(ObjectRef reference, bool observed) noexcept;
+    [[nodiscard]] bool isArrayObserved(ObjectRef reference) const noexcept;
+    void recordArrayReset(ObjectRef reference);
     void registerTypeParent(
         semantic::SymbolId typeId,
         semantic::SymbolId baseTypeId);
@@ -2564,6 +2728,37 @@ public:
         Value value,
         RuntimeError* error = nullptr,
         ArrayStoreTypePolicy typePolicy = ArrayStoreTypePolicy::Exact);
+    bool arrayReserve(
+        ObjectRef reference,
+        std::size_t capacity,
+        RuntimeError* error = nullptr);
+    bool arrayPush(
+        ObjectRef reference,
+        Value value,
+        RuntimeError* error = nullptr,
+        ArrayStoreTypePolicy typePolicy = ArrayStoreTypePolicy::Exact);
+    bool arrayInsert(
+        ObjectRef reference,
+        std::size_t index,
+        Value value,
+        RuntimeError* error = nullptr,
+        ArrayStoreTypePolicy typePolicy = ArrayStoreTypePolicy::Exact);
+    bool arrayRemoveAt(
+        ObjectRef reference,
+        std::size_t index,
+        Value* outRemoved = nullptr,
+        RuntimeError* error = nullptr);
+    bool arrayClear(
+        ObjectRef reference,
+        RuntimeError* error = nullptr);
+    bool arrayReverse(
+        ObjectRef reference,
+        RuntimeError* error = nullptr);
+    bool arrayWritePrefixWithReset(
+        ObjectRef reference,
+        const Value* values,
+        std::size_t count,
+        RuntimeError* error = nullptr);
     [[nodiscard]] std::optional<std::size_t> fieldCount(ObjectRef reference) const;
     [[nodiscard]] bool isInlineRecordObject(ObjectRef reference) const noexcept;
     [[nodiscard]] std::optional<semantic::SymbolId> objectTypeId(
@@ -2584,6 +2779,15 @@ public:
         const Value& value,
         semantic::SymbolId expectedTypeId,
         semantic::PrimitiveType expectedFieldType) noexcept;
+
+    static constexpr std::int64_t DelegateWeakTargetFlag = 8;
+    [[nodiscard]] std::optional<ObjectRef> allocateWeakDelegate(
+        semantic::SymbolId delegateTypeId,
+        ObjectRef target,
+        semantic::SymbolId functionId,
+        std::int64_t baseFlags = 0,
+        RuntimeError* error = nullptr);
+    [[nodiscard]] Value pruneDelegateChain(const Value& delegateVal);
 
     [[nodiscard]] RootToken addPersistentRoot(ObjectRef reference);
     [[nodiscard]] RootToken addPersistentRoot(Value value);
@@ -2857,6 +3061,7 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     bool hasDirtyTracking_ = false;
+    bool hasDirtyObjects_ = false;
 };
 
 #if defined(_MSC_VER)
@@ -2891,6 +3096,20 @@ private:
 #pragma warning(pop)
 #endif
 
+struct WeakRef {
+    ObjectRef ref{};
+
+    constexpr WeakRef() noexcept = default;
+    constexpr explicit WeakRef(ObjectRef target) noexcept : ref(target) {}
+
+    [[nodiscard]] constexpr bool empty() const noexcept { return !ref.valid(); }
+    void reset() noexcept { ref = ObjectRef{}; }
+    [[nodiscard]] std::optional<ObjectRef> lock(const ManagedHeap& heap) const noexcept {
+        if (!ref.valid() || !heap.isAlive(ref)) return std::nullopt;
+        return ref;
+    }
+};
+
 class NativeHandleRegistry {
 public:
     NativeHandleRegistry();
@@ -2904,6 +3123,10 @@ public:
         semantic::SymbolId typeId,
         std::shared_ptr<void> resource,
         std::string debugName = {});
+    [[nodiscard]] NativeHandle createBorrowed(
+        semantic::SymbolId typeId,
+        void* rawPointer,
+        bool indexPointer = false);
     [[nodiscard]] std::optional<NativeHandle> findHandle(
         semantic::SymbolId typeId,
         const void* rawPointer) const noexcept;
@@ -2925,6 +3148,12 @@ public:
         NativeHandle handle,
         semantic::SymbolId expectedTypeId = 0,
         RuntimeError* error = nullptr) const;
+    [[nodiscard]] void* resolveRawFast(
+        NativeHandle handle,
+        semantic::SymbolId expectedTypeId = 0) const noexcept;
+    void visitCachedWrappers(
+        std::uint64_t heapId,
+        const std::function<void(NativeHandle, ObjectRef, const void*)>& visitor) const;
     [[nodiscard]] bool isAlive(NativeHandle handle) const noexcept;
     bool release(NativeHandle handle) noexcept;
     void clear() noexcept;
@@ -3271,6 +3500,7 @@ struct ExecutionOptions {
     bool trustedRelease = false;
     IAwaitScheduler* awaitScheduler = nullptr;
     CrossHeapAccessPolicy crossHeapPolicy = CrossHeapAccessPolicy::AllowReadWrite;
+    IExecutionPolicy* executionPolicy = nullptr;
 };
 
 #if defined(_MSC_VER)
@@ -3467,6 +3697,8 @@ public:
     void setBindingRegistry(std::shared_ptr<const BindingRegistry> bindings);
     void setHeap(std::shared_ptr<ManagedHeap> heap);
     [[nodiscard]] std::shared_ptr<ManagedHeap> heap() const noexcept;
+    void setExecutionPolicy(IExecutionPolicy* policy) noexcept;
+    [[nodiscard]] IExecutionPolicy* executionPolicy() const noexcept;
     void setAsyncRuntime(std::shared_ptr<AsyncRuntimeContext> asyncRuntime);
     [[nodiscard]] std::shared_ptr<AsyncRuntimeContext> asyncRuntime() const noexcept;
 
@@ -3510,6 +3742,7 @@ private:
     ExternalFunction externalResolver_;
     std::shared_ptr<const BindingRegistry> bindings_;
     std::shared_ptr<ManagedHeap> heap_;
+    IExecutionPolicy* executionPolicy_ = nullptr;
     std::shared_ptr<AsyncRuntimeContext> asyncRuntime_;
     mutable std::shared_ptr<void> resumeEnv_;
     std::shared_ptr<DispatchTarget> dispatchTarget_;
@@ -3584,6 +3817,18 @@ private:
     bool checkedArithmetic = true) noexcept;
 [[nodiscard]] std::string valueToString(const Value& value);
 [[nodiscard]] std::string valueToString(const Value& value, const ManagedHeap* heap);
+[[nodiscard]] bool utf8IsAsciiFast(std::string_view text) noexcept;
+[[nodiscard]] std::size_t utf8CodePointLength(std::string_view text) noexcept;
+[[nodiscard]] std::string_view utf8CodePointSlice(
+    std::string_view text,
+    std::size_t startCodePoint,
+    std::size_t codePointCount = std::string_view::npos) noexcept;
+[[nodiscard]] std::int64_t utf8CodePointIndexOf(
+    std::string_view text,
+    std::string_view needle) noexcept;
+[[nodiscard]] std::int64_t utf8CodePointLastIndexOf(
+    std::string_view text,
+    std::string_view needle) noexcept;
 [[nodiscard]] std::uint64_t stableValueHash(const Value& value) noexcept;
 [[nodiscard]] bool isReplayStableValue(const Value& value) noexcept;
 [[nodiscard]] const char* determinismModeName(DeterminismMode mode) noexcept;
@@ -3740,6 +3985,10 @@ void markStackRootValueInPools(const Value& value) noexcept;
 std::size_t finishValuePoolGcSweep() noexcept;
 std::size_t reclaimUnreferencedPoolValues(
     const ShadowStack* activeShadowStack = nullptr) noexcept;
+void registerExternalValuePoolRootMarker(
+    const void* ownerKey,
+    std::function<void()> markerCallback);
+void unregisterExternalValuePoolRootMarker(const void* ownerKey) noexcept;
 [[nodiscard]] RuntimeValuePoolStatistics getRuntimeValuePoolStatistics() noexcept;
 
 [[nodiscard]] bool tryExecuteRuntimeIntrinsic(
@@ -3748,5 +3997,12 @@ std::size_t reclaimUnreferencedPoolValues(
     ManagedHeap* heap,
     Value& result,
     std::string& errorMessage);
+
+[[nodiscard]] bool tryExecuteRuntimeIntrinsic(
+    std::string_view name,
+    ValueSpan arguments,
+    ManagedHeap* heap,
+    Value& result,
+    RuntimeError& error);
 
 } // namespace realscript::runtime

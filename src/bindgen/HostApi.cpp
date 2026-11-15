@@ -1,6 +1,5 @@
-#include "realscript/game/RsBindParser.h"
+#include "realscript/bindgen/RsBindParser.h"
 #include "realscript/Version.h"
-#include "realscript/game/GameScripting.h"
 
 #include "realscript/diagnostics/Diagnostic.h"
 
@@ -12,7 +11,7 @@
 #include <unordered_set>
 #include <utility>
 
-namespace realscript::game {
+namespace realscript::bindgen {
 namespace {
 
 std::string sanitizeFileName(std::string value) {
@@ -82,7 +81,7 @@ void writeFunction(
 }
 
 std::vector<std::size_t> orderModuleNativeTypesBaseFirst(
-    const detail::GameApiState& state,
+    const detail::HostApiState& state,
     const std::vector<std::size_t>& nativeTypes) {
     std::unordered_set<std::size_t> inModule(nativeTypes.begin(), nativeTypes.end());
     std::unordered_set<std::size_t> visited;
@@ -108,18 +107,18 @@ std::vector<std::size_t> orderModuleNativeTypesBaseFirst(
 
 } // namespace
 
-GameApi::GameApi()
-    : state_(std::make_shared<detail::GameApiState>()) {}
+HostApi::HostApi()
+    : state_(std::make_shared<detail::HostApiState>()) {}
 
-GameApi::GameApi(
+HostApi::HostApi(
     std::shared_ptr<runtime::ManagedHeap> heap,
     std::shared_ptr<runtime::NativeHandleRegistry> nativeHandles)
-    : state_(std::make_shared<detail::GameApiState>()) {
+    : state_(std::make_shared<detail::HostApiState>()) {
     if (heap) state_->heap = std::move(heap);
     if (nativeHandles) state_->nativeHandles = std::move(nativeHandles);
 }
 
-std::vector<compiler::SourceFile> GameApi::generatedSources() const {
+std::vector<compiler::SourceFile> HostApi::generatedSources() const {
     std::vector<compiler::SourceFile> result;
     result.reserve(state_->modules.size());
     for (const auto& [moduleName, module] : state_->modules) {
@@ -201,12 +200,12 @@ std::vector<compiler::SourceFile> GameApi::generatedSources() const {
     return result;
 }
 
-std::vector<compiler::SourceFile> GameApi::exportDeclarationStubs() const {
+std::vector<compiler::SourceFile> HostApi::exportDeclarationStubs() const {
     std::vector<compiler::SourceFile> result;
     result.reserve(state_->modules.size());
     for (const auto& [moduleName, module] : state_->modules) {
         std::ostringstream out;
-        out << "// Auto-generated RealScript Engine API Stub\n";
+        out << "// Auto-generated RealScript Host API Stub\n";
         out << "module " << moduleName << ";\n";
         std::set<std::string> emittedImports = module.imports;
         for (const auto typeIndex : module.nativeTypes) {
@@ -281,7 +280,7 @@ std::vector<compiler::SourceFile> GameApi::exportDeclarationStubs() const {
     return result;
 }
 
-std::string GameApi::exportProjectConfigJson(
+std::string HostApi::exportProjectConfigJson(
     const std::string& projectName,
     const std::vector<std::string>& sourcePaths) const {
     const auto escapeJson = [](const std::string& text) {
@@ -332,29 +331,29 @@ std::string GameApi::exportProjectConfigJson(
     return out.str();
 }
 
-std::set<std::string> GameApi::nativeModules() const {
+std::set<std::string> HostApi::nativeModules() const {
     std::set<std::string> result;
     for (const auto& entry : state_->modules) result.insert(entry.first);
     return result;
 }
 
-const std::unordered_set<std::string>& GameApi::nativeBindingNames() const noexcept {
+const std::unordered_set<std::string>& HostApi::nativeBindingNames() const noexcept {
     return state_->bindingNames;
 }
 
-bool GameApi::valid() const noexcept { return state_->errors.empty(); }
-const std::vector<std::string>& GameApi::errors() const noexcept { return state_->errors; }
-std::shared_ptr<runtime::BindingRegistry> GameApi::bindings() const noexcept {
+bool HostApi::valid() const noexcept { return state_->errors.empty(); }
+const std::vector<std::string>& HostApi::errors() const noexcept { return state_->errors; }
+std::shared_ptr<runtime::BindingRegistry> HostApi::bindings() const noexcept {
     return state_->bindings;
 }
-std::shared_ptr<runtime::ManagedHeap> GameApi::heap() const noexcept {
+std::shared_ptr<runtime::ManagedHeap> HostApi::heap() const noexcept {
     return state_->heap;
 }
-std::shared_ptr<runtime::NativeHandleRegistry> GameApi::nativeHandles() const noexcept {
+std::shared_ptr<runtime::NativeHandleRegistry> HostApi::nativeHandles() const noexcept {
     return state_->nativeHandles;
 }
 
-GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
+HostApi::HeaderBindingGenerationResult HostApi::generateBindingsFromCppHeader(
     std::string_view headerContent,
     const std::string& defaultModuleName,
     const std::unordered_map<std::string, std::string>& predefinedMacros) {
@@ -364,127 +363,4 @@ GameApi::HeaderBindingGenerationResult GameApi::generateBindingsFromCppHeader(
         predefinedMacros);
 }
 
-GameCompileResult GameScriptCompiler::compile(
-    const std::vector<compiler::SourceFile>& sources) const {
-    GameCompileResult result;
-    for (const auto& message : api_.errors()) {
-        result.diagnostics.report("RS7000", message, {});
-    }
-    if (result.diagnostics.hasErrors()) return result;
-
-    compiler::Compilation compilation;
-    for (auto source : api_.generatedSources()) {
-        compilation.addSource(std::move(source));
-    }
-    for (const auto& source : sources) compilation.addSource(source);
-    auto build = compilation.build();
-    result.languageMetadata.genericInstantiations.insert(
-        result.languageMetadata.genericInstantiations.end(),
-        build.nativeGenericInstantiations.begin(),
-        build.nativeGenericInstantiations.end());
-    std::sort(
-        result.languageMetadata.genericInstantiations.begin(),
-        result.languageMetadata.genericInstantiations.end(),
-        [](const auto& left, const auto& right) {
-            if (left.generatedName != right.generatedName) {
-                return left.generatedName < right.generatedName;
-            }
-            if (left.genericName != right.genericName) {
-                return left.genericName < right.genericName;
-            }
-            return left.arguments < right.arguments;
-        });
-    result.languageMetadata.genericInstantiations.erase(
-        std::unique(
-            result.languageMetadata.genericInstantiations.begin(),
-            result.languageMetadata.genericInstantiations.end(),
-            [](const auto& left, const auto& right) {
-                return left.generatedName == right.generatedName &&
-                    left.genericName == right.genericName &&
-                    left.arguments == right.arguments;
-            }),
-        result.languageMetadata.genericInstantiations.end());
-    result.languageMetadata.attributes.insert(
-        result.languageMetadata.attributes.end(),
-        build.nativeAttributes.begin(),
-        build.nativeAttributes.end());
-    std::stable_sort(
-        result.languageMetadata.attributes.begin(),
-        result.languageMetadata.attributes.end(),
-        [](const auto& left, const auto& right) {
-            if (left.target != right.target) {
-                return left.target < right.target;
-            }
-            if (left.name != right.name) {
-                return left.name < right.name;
-            }
-            if (left.sourceName != right.sourceName) {
-                return left.sourceName < right.sourceName;
-            }
-            return left.offset < right.offset;
-        });
-    result.languageMetadata.sequences.insert(
-        result.languageMetadata.sequences.end(),
-        build.nativeSequences.begin(),
-        build.nativeSequences.end());
-    std::stable_sort(
-        result.languageMetadata.sequences.begin(),
-        result.languageMetadata.sequences.end(),
-        [](const auto& left, const auto& right) {
-            if (left.typeName != right.typeName) {
-                return left.typeName < right.typeName;
-            }
-            return left.name < right.name;
-        });
-    result.languageMetadata.interfaces.insert(
-        result.languageMetadata.interfaces.end(),
-        build.nativeInterfaces.begin(),
-        build.nativeInterfaces.end());
-    std::stable_sort(
-        result.languageMetadata.interfaces.begin(),
-        result.languageMetadata.interfaces.end(),
-        [](const auto& left, const auto& right) {
-            return left.typeName < right.typeName;
-        });
-    result.diagnostics.append(build.diagnostics);
-    if (result.diagnostics.hasErrors()) return result;
-
-    const auto nativeModules = api_.nativeModules();
-    const auto& nativeBindings = api_.nativeBindingNames();
-    bytecode::Lowerer lowerer;
-    std::vector<bytecode::Module> modules;
-    modules.reserve(build.modules.size());
-    for (const auto& mirModule : build.modules) {
-        auto module = lowerer.lower(mirModule);
-        if (nativeModules.find(module.name) != nativeModules.end()) {
-            module.functions.erase(
-                std::remove_if(
-                    module.functions.begin(),
-                    module.functions.end(),
-                    [&](const bytecode::Function& function) {
-                        return nativeBindings.find(
-                            module.name + "::" + function.name) != nativeBindings.end();
-                    }),
-                module.functions.end());
-        }
-        modules.push_back(std::move(module));
-    }
-
-    runtime::RuntimeError linkError;
-    auto image = runtime::ProgramImage::link(modules, linkError);
-    if (!image) {
-        result.diagnostics.report("RS7001", linkError.message, {});
-        return result;
-    }
-
-    result.modules = std::move(modules);
-    result.program.program_ =
-        std::make_shared<runtime::ProgramImage>(std::move(*image));
-    result.program.bindings_ = api_.bindings();
-    result.program.heap_ = api_.heap();
-    result.program.nativeHandles_ = api_.nativeHandles();
-    result.program.languageMetadata_ = result.languageMetadata;
-    return result;
-}
-
-} // namespace realscript::game
+} // namespace realscript::bindgen

@@ -411,6 +411,7 @@ struct TypeDescriptor {
     std::uint32_t interfaceDispatchMapCount = 0;
     bool delegateType = false;
     bool hasValueLifecycle = false;
+    bool partialType = false;
 };
 
 class ExecutionContext;
@@ -441,6 +442,11 @@ struct SourceMapEntry {
     std::uint32_t sourceColumn = 0;
 };
 
+struct AttributeDescriptor {
+    const char* target = nullptr;
+    const char* name = nullptr;
+};
+
 struct ProgramDescriptor {
     std::uint32_t abiMajor = RuntimeAbiMajor;
     std::uint32_t abiMinor = RuntimeAbiMinor;
@@ -454,6 +460,8 @@ struct ProgramDescriptor {
     std::uint32_t functionCount = 0;
     const SourceMapEntry* sourceMap = nullptr;
     std::uint32_t sourceMapCount = 0;
+    const AttributeDescriptor* attributes = nullptr;
+    std::uint32_t attributeCount = 0;
 };
 
 #if defined(_MSC_VER)
@@ -529,6 +537,12 @@ public:
         const std::vector<runtime::Value>& arguments,
         const std::vector<runtime::Value>& locals,
         const std::vector<runtime::Value>& registers,
+        bool allowTransientStackSlices = true);
+    FrameScope(
+        ExecutionContext& context,
+        runtime::ValueSpan arguments,
+        runtime::ValueSpan locals,
+        runtime::ValueSpan registers,
         bool allowTransientStackSlices = true);
     ~FrameScope();
     FrameScope(const FrameScope&) = delete;
@@ -785,16 +799,26 @@ public:
         const runtime::Value* arguments,
         std::size_t argumentCount,
         runtime::Value& result);
+    [[nodiscard]] bool invokeDelegate(
+        semantic::SymbolId delegateTypeId,
+        const runtime::Value* arguments,
+        std::size_t argumentCount,
+        semantic::PrimitiveType expectedReturnType,
+        semantic::SymbolId expectedReturnTypeId,
+        runtime::Value& result);
     [[nodiscard]] bool combineDelegates(
         semantic::SymbolId delegateTypeId,
         const runtime::Value& left,
         const runtime::Value& right,
         bool remove,
         runtime::Value& result);
+    // Returns: 0 = error, 1 = single live leaf (outSingle populated),
+    // 2 = multicast, 3 = single weak leaf with expired target (no-op).
     [[nodiscard]] int inspectDelegateSlow(
         semantic::SymbolId delegateTypeId,
         const runtime::Value& delValue,
         ResolvedAotDelegateLeaf& outSingle);
+    // Same return contract as inspectDelegateSlow; cache only stores live local entries.
     [[nodiscard]] inline int inspectSingleOrMulticastDelegate(
         semantic::SymbolId delegateTypeId,
         const runtime::Value& delValue,
@@ -1271,7 +1295,9 @@ public:
         const runtime::Value& receiver,
         std::int64_t index,
         const T& value) {
-        if (RS_AOT_LIKELY(receiver.rawTag() == runtime::ValueTag::ObjectRef && heap_ != nullptr)) {
+        if (RS_AOT_LIKELY(executionPolicy_ == nullptr &&
+                         receiver.rawTag() == runtime::ValueTag::ObjectRef &&
+                         heap_ != nullptr)) {
             const auto ref = receiver.asObjectRefUnchecked();
             runtime::FlatStructArrayFastView fView{};
             if (heap_->tryBindFlatStructArrayFastView(ref, fView) && fView.elementTypeId == elementTypeId) {
@@ -1339,13 +1365,19 @@ public:
                     stackRefSlots_[ref.slot].storeInt64(value);
                     return true;
                 }
-            } else if (heap_) {
+            } else if (executionPolicy_ == nullptr && heap_) {
                 runtime::ObjectFastView view{};
                 if (heap_->tryBindObjectFastView(ref, view) &&
                     fieldIndex < view.fieldCount &&
                     (view.typeId == typeId || isAssignable(view.typeId, typeId)) &&
                     view.fields[fieldIndex].rawTag() == runtime::ValueTag::Int64) {
+                    const bool dirtyTracked = heap_->hasDirtyTracking();
+                    const bool changed = dirtyTracked &&
+                        !(view.fields[fieldIndex] == runtime::Value{value});
                     view.fields[fieldIndex].storeInt64(value);
+                    if (RS_AOT_UNLIKELY(changed)) {
+                        heap_->notifyFieldMutated(ref, fieldIndex);
+                    }
                     return true;
                 }
             }
@@ -1356,7 +1388,9 @@ public:
         const runtime::Value& arrayValue,
         std::int32_t*& outData,
         std::uint32_t& outLength) const noexcept {
-        if (RS_AOT_LIKELY(arrayValue.rawTag() == runtime::ValueTag::ObjectRef && heap_ != nullptr)) {
+        if (RS_AOT_LIKELY(executionPolicy_ == nullptr &&
+                         arrayValue.rawTag() == runtime::ValueTag::ObjectRef &&
+                         heap_ != nullptr)) {
             const auto ref = arrayValue.asObjectRefUnchecked();
             if (RS_AOT_LIKELY(
                     heap_->tryBindPackedInt32Array(ref, outData, outLength) &&
@@ -1377,7 +1411,9 @@ public:
         const runtime::Value& arrayValue,
         double*& outData,
         std::uint32_t& outLength) const noexcept {
-        if (RS_AOT_LIKELY(arrayValue.rawTag() == runtime::ValueTag::ObjectRef && heap_ != nullptr)) {
+        if (RS_AOT_LIKELY(executionPolicy_ == nullptr &&
+                         arrayValue.rawTag() == runtime::ValueTag::ObjectRef &&
+                         heap_ != nullptr)) {
             const auto ref = arrayValue.asObjectRefUnchecked();
             if (RS_AOT_LIKELY(
                     heap_->tryBindPackedDoubleArray(ref, outData, outLength) &&
@@ -1418,7 +1454,9 @@ public:
         semantic::SymbolId elementTypeId,
         const runtime::Value& arrayValue) const noexcept {
         TypedStructArrayCache cache{};
-        if (arrayValue.rawTag() != runtime::ValueTag::ObjectRef || heap_ == nullptr) {
+        if (executionPolicy_ != nullptr ||
+            arrayValue.rawTag() != runtime::ValueTag::ObjectRef ||
+            heap_ == nullptr) {
             return cache;
         }
         const auto ref = arrayValue.asObjectRefUnchecked();
@@ -1543,21 +1581,32 @@ public:
             outResult = Negate ? !eq : eq;
             return true;
         }
-        const auto extractText = [&](const runtime::Value& value)
+        const auto extractText = [&](const runtime::Value& value, bool& accessDenied)
             -> std::optional<std::string_view> {
+            accessDenied = false;
             const auto tag = value.rawTag();
             if (tag == runtime::ValueTag::String) {
                 return std::string_view(value.asStringUnchecked().str());
             }
             if (tag == runtime::ValueTag::ObjectRef) {
-                return heap_
-                    ? heap_->stringView(value.asObjectRefUnchecked())
+                const auto ref = value.asObjectRefUnchecked();
+                if (!checkCrossHeapRefAccess(ref, false, "string equality")) {
+                    accessDenied = true;
+                    return std::nullopt;
+                }
+                auto* targetHeap = resolveHeap(ref);
+                return targetHeap
+                    ? targetHeap->stringView(ref)
                     : std::nullopt;
             }
             return std::nullopt;
         };
-        const auto a = extractText(left);
-        const auto b = extractText(right);
+        bool leftDenied = false;
+        bool rightDenied = false;
+        const auto a = extractText(left, leftDenied);
+        if (leftDenied) return false;
+        const auto b = extractText(right, rightDenied);
+        if (rightDenied) return false;
         if (RS_AOT_UNLIKELY(!a || !b)) {
             if constexpr (TrustedRelease) {
                 outResult = Negate;
@@ -1579,16 +1628,23 @@ public:
         const runtime::Value& right,
         bool& outResult) {
         if constexpr (!TrustedRelease) {
-            const auto isValidRefOperand = [&](const runtime::Value& value) noexcept {
+            const auto checkOperand = [&](const runtime::Value& value) -> bool {
                 if (value.rawTag() != runtime::ValueTag::ObjectRef) return true;
                 const auto& ref = value.asObjectRefUnchecked();
                 if (ref.isStackSlotRef()) return true;
-                return heap_ != nullptr && heap_->isAlive(ref);
+                if (!checkCrossHeapRefAccess(ref, false, "reference equality")) {
+                    return false;
+                }
+                auto* targetHeap = resolveHeap(ref);
+                if (RS_AOT_UNLIKELY(!targetHeap || !targetHeap->isAlive(ref))) {
+                    return fail(
+                        runtime::ErrorCode::InvalidObjectReference,
+                        "reference equality encountered an invalid managed reference");
+                }
+                return true;
             };
-            if (RS_AOT_UNLIKELY(!isValidRefOperand(left) || !isValidRefOperand(right))) {
-                return fail(
-                    runtime::ErrorCode::InvalidObjectReference,
-                    "reference equality encountered an invalid managed reference");
+            if (RS_AOT_UNLIKELY(!checkOperand(left) || !checkOperand(right))) {
+                return false;
             }
         }
         const bool eq = (left == right);
@@ -1779,6 +1835,12 @@ public:
     void setAwaitScheduler(runtime::IAwaitScheduler* awaitScheduler) noexcept;
     [[nodiscard]] runtime::IAwaitScheduler* awaitScheduler() const noexcept {
         return options_.awaitScheduler;
+    }
+    void setExecutionPolicy(runtime::IExecutionPolicy* policy) noexcept {
+        executionPolicy_ = policy;
+    }
+    [[nodiscard]] runtime::IExecutionPolicy* executionPolicy() const noexcept {
+        return executionPolicy_;
     }
     [[nodiscard]] bool tryEnterResumingCoroutine(
         semantic::SymbolId functionSymbolId,
@@ -2195,6 +2257,26 @@ private:
 
     const ProgramDescriptor* program_ = nullptr;
     std::shared_ptr<runtime::ManagedHeap> heap_;
+    runtime::IExecutionPolicy* executionPolicy_ = nullptr;
+
+    [[nodiscard]] runtime::CrossHeapAccessPolicy effectiveCrossHeapPolicy(
+        const runtime::ManagedHeap* targetHeap) const noexcept;
+    [[nodiscard]] bool checkCrossHeapRefAccess(
+        runtime::ObjectRef reference,
+        bool isWrite,
+        std::string_view context);
+    [[nodiscard]] runtime::ManagedHeap* resolveHeap(
+        runtime::ObjectRef reference) const noexcept {
+        if (executionPolicy_) {
+            if (auto* h = executionPolicy_->resolveHeap(reference, heap_.get())) {
+                return h;
+            }
+        }
+        return heap_.get();
+    }
+    [[nodiscard]] runtime::Value sanitizeCrossHeapValue(
+        runtime::ManagedHeap* sourceHeap,
+        runtime::Value val);
     std::shared_ptr<const runtime::BindingRegistry> bindings_;
     runtime::ExecutionOptions options_;
     bool traceEventsEnabled_ = false;
@@ -2287,6 +2369,8 @@ public:
     void setBindings(std::shared_ptr<const runtime::BindingRegistry> bindings);
     void setHeap(std::shared_ptr<runtime::ManagedHeap> heap);
     [[nodiscard]] std::shared_ptr<runtime::ManagedHeap> heap() const noexcept;
+    void setExecutionPolicy(runtime::IExecutionPolicy* policy) noexcept;
+    [[nodiscard]] runtime::IExecutionPolicy* executionPolicy() const noexcept;
     void setAsyncRuntime(std::shared_ptr<runtime::AsyncRuntimeContext> asyncRuntime);
     [[nodiscard]] std::shared_ptr<runtime::AsyncRuntimeContext> asyncRuntime() const noexcept;
     [[nodiscard]] const ProgramDescriptor& descriptor() const noexcept;
@@ -2322,6 +2406,7 @@ private:
     const ProgramDescriptor* descriptor_ = nullptr;
     std::shared_ptr<const runtime::BindingRegistry> bindings_;
     std::shared_ptr<runtime::ManagedHeap> heap_;
+    runtime::IExecutionPolicy* executionPolicy_ = nullptr;
     std::shared_ptr<runtime::AsyncRuntimeContext> asyncRuntime_;
     mutable std::shared_ptr<void> resumeEnv_;
     std::shared_ptr<LifecycleTarget> lifecycleTarget_;
@@ -2469,6 +2554,7 @@ runtime::ExternalFunction makeNativeThunk(Result (*function)(Args...)) {
         const bytecode::FunctionReference&,
         runtime::ValueSpan arguments,
         runtime::RuntimeError& error) -> std::optional<runtime::Value> {
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
         try {
             return invokeNativeTypedImpl(
                 function,
@@ -2484,6 +2570,13 @@ runtime::ExternalFunction makeNativeThunk(Result (*function)(Args...)) {
             error.message = "native thunk threw an unknown exception";
             return std::nullopt;
         }
+#else
+        return invokeNativeTypedImpl(
+            function,
+            arguments,
+            error,
+            std::index_sequence_for<Args...>{});
+#endif
     };
 }
 
@@ -2747,7 +2840,9 @@ inline void retainTypedGcSlot(
         return std::holds_alternative<runtime::NullString>(left) &&
             std::holds_alternative<runtime::NullString>(right);
     }
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
     try {
+#endif
         const auto extractText = [&](const runtime::Value& value)
             -> std::optional<std::string_view> {
             const auto tag = value.rawTag();
@@ -2764,9 +2859,11 @@ inline void retainTypedGcSlot(
         const auto a = extractText(left);
         const auto b = extractText(right);
         return a && b && (*a == *b);
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
     } catch (...) {
         return false;
     }
+#endif
 }
 
 struct UnboxedCustomStruct {

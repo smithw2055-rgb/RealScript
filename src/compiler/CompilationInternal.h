@@ -42,6 +42,8 @@ struct InterfaceContract {
     std::string name;
     std::string sourceName;
     text::TextSpan declarationSpan;
+    std::vector<std::string> baseInterfaces;
+    std::vector<text::TextSpan> baseInterfaceSpans;
     std::vector<InterfaceMethodContract> methods;
 };
 

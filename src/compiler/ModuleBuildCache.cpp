@@ -2149,6 +2149,9 @@ bool mirModuleReferencesBuiltin(const mir::Module& mod, const std::string& built
     for (const auto& t : mod.types) {
         if (t.moduleName == builtinName) return true;
         if (t.baseTypeName.rfind(prefix, 0) == 0) return true;
+        for (const auto& bi : t.baseInterfaceNames) {
+            if (bi.rfind(prefix, 0) == 0) return true;
+        }
     }
     for (const auto& fn : mod.functions) {
         for (const auto& blk : fn.blocks) {
@@ -2667,9 +2670,25 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
                 }
                 std::ostringstream sig;
                 sig << "interface:" << formatAttributesCanonical(iface.attributes, *u.sourceText)
-                    << ':' << modName << "::" << iface.identifierToken.text << '{';
+                    << ':' << modName << "::" << iface.identifierToken.text;
                 stubBody << renderAttributesForStub(iface.attributes, *u.sourceText, "");
-                stubBody << "public interface " << iface.identifierToken.text << " {\n";
+                stubBody << "public interface " << iface.identifierToken.text;
+                if (!iface.interfaces.empty()) {
+                    sig << ":bases[";
+                    stubBody << " : ";
+                    for (std::size_t bi = 0; bi < iface.interfaces.size(); ++bi) {
+                        collectReferencedTypeNames(iface.interfaces[bi], neededLayoutPrivateTypes);
+                        if (bi != 0) {
+                            sig << ',';
+                            stubBody << ", ";
+                        }
+                        sig << canonicalizeTypeSyntax(iface.interfaces[bi], visibleTypes);
+                        stubBody << renderTypeSyntaxForStub(iface.interfaces[bi]);
+                    }
+                    sig << ']';
+                }
+                sig << '{';
+                stubBody << " {\n";
                 for (std::size_t mi = 0; mi < iface.methods.size(); ++mi) {
                     const auto& m = iface.methods[mi];
                     sig << "slot#" << mi << ':'
@@ -3356,8 +3375,24 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
                 const auto& ts = ownTypes.at(tName);
                 const auto* declUnit = privateDeclUnits.at(tName);
                 std::ostringstream ls;
-                ls << "layout-private-iface:" << tName << '{';
-                privateLayoutStubs << accessibilityLabel(ts.accessibility) << " interface " << tName << " {\n";
+                ls << "layout-private-iface:" << tName;
+                privateLayoutStubs << accessibilityLabel(ts.accessibility) << " interface " << tName;
+                if (!pi->second->interfaces.empty()) {
+                    ls << ":bases[";
+                    privateLayoutStubs << " : ";
+                    for (std::size_t bi = 0; bi < pi->second->interfaces.size(); ++bi) {
+                        enqueueLayoutDeps(pi->second->interfaces[bi]);
+                        if (bi != 0) {
+                            ls << ',';
+                            privateLayoutStubs << ", ";
+                        }
+                        ls << canonicalizeTypeSyntax(pi->second->interfaces[bi], visibleTypes);
+                        privateLayoutStubs << renderTypeSyntaxForStub(pi->second->interfaces[bi]);
+                    }
+                    ls << ']';
+                }
+                ls << '{';
+                privateLayoutStubs << " {\n";
                 for (std::size_t mi = 0; mi < pi->second->methods.size(); ++mi) {
                     const auto& m = pi->second->methods[mi];
                     enqueueLayoutDeps(m.returnType);

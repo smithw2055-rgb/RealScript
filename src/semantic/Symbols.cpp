@@ -872,11 +872,13 @@ bool isAssignable(
     const auto targetTypeId = stableTypeId(targetTypeName);
     auto currentName = sourceTypeName;
     std::unordered_set<SymbolId> visited;
+    std::vector<std::string> pendingInterfaces;
+    std::unordered_set<std::string> visitedInterfaces;
     while (!currentName.empty()) {
         const auto found = visibleTypes.find(currentName);
         if (found == visibleTypes.end() ||
             !visited.insert(found->second.id).second) {
-            return false;
+            break;
         }
         for (const auto& interfaceMap :
              found->second.interfaceDispatchMaps) {
@@ -884,8 +886,30 @@ bool isAssignable(
                 return true;
             }
         }
+        for (const auto& baseIface : found->second.baseInterfaceNames) {
+            if (baseIface == targetTypeName || stableTypeId(baseIface) == targetTypeId) {
+                return true;
+            }
+            if (visitedInterfaces.insert(baseIface).second) {
+                pendingInterfaces.push_back(baseIface);
+            }
+        }
         if (found->second.baseTypeName == targetTypeName) return true;
         currentName = found->second.baseTypeName;
+    }
+    while (!pendingInterfaces.empty()) {
+        auto ifaceName = std::move(pendingInterfaces.back());
+        pendingInterfaces.pop_back();
+        const auto found = visibleTypes.find(ifaceName);
+        if (found == visibleTypes.end()) continue;
+        for (const auto& baseIface : found->second.baseInterfaceNames) {
+            if (baseIface == targetTypeName || stableTypeId(baseIface) == targetTypeId) {
+                return true;
+            }
+            if (visitedInterfaces.insert(baseIface).second) {
+                pendingInterfaces.push_back(baseIface);
+            }
+        }
     }
     return false;
 }
@@ -1508,11 +1532,14 @@ FunctionSymbol declareConstructorSymbol(
                 "a static constructor must be parameterless",
                 syntaxTree.identifierToken.span);
         }
-        if (syntaxTree.baseKeyword) {
+        if (syntaxTree.baseKeyword || syntaxTree.thisKeyword) {
+            const auto& initKeyword = syntaxTree.baseKeyword
+                ? *syntaxTree.baseKeyword
+                : *syntaxTree.thisKeyword;
             diagnostics.report(
                 "RS2497",
-                "a static constructor cannot have a base constructor initializer",
-                syntaxTree.baseKeyword->span);
+                "a static constructor cannot have a constructor initializer",
+                initKeyword.span);
         }
     }
     appendImplicitThis(result, owner);

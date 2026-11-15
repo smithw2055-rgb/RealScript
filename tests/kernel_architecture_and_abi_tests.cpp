@@ -77,11 +77,13 @@ void testCMakeSliceTopology() {
         "realscript_layer_bytecode_format",
         "realscript_layer_compiler_core",
         "realscript_layer_runtime_core",
+        "realscript_layer_aot_runtime",
         "realscript_layer_native_backends",
         "realscript_slice_foundation_core",
         "realscript_slice_bytecode_core",
         "realscript_slice_compiler_core",
         "realscript_slice_runtime_core",
+        "realscript_slice_aot_runtime",
         "realscript_slice_native_backends",
         "add_library(RealScript::Kernel ALIAS realscript_kernel)",
         "src/debug/DebugInfo.cpp",
@@ -97,11 +99,11 @@ void testCMakeSliceTopology() {
         "REALSCRIPT_ENABLE_DEBUG_SERVICES",
         "REALSCRIPT_ENABLE_TOOLING",
         "REALSCRIPT_ENABLE_EXTENSIBILITY",
-        "REALSCRIPT_ENABLE_GAME_SDK",
+        "REALSCRIPT_ENABLE_BINDGEN",
         "realscript_app_debug",
         "realscript_app_tooling",
         "realscript_app_extensibility",
-        "realscript_app_game_sdk",
+        "realscript_app_bindgen",
         "EXPORT RealScriptTargets",
     };
     for (const auto& token : requiredTokens) {
@@ -149,6 +151,20 @@ void testCMakeSliceTopology() {
             runtimeLink.find("realscript_slice_compiler_core") == std::string::npos,
         "runtime slice must depend on bytecode slice and NOT compiler slice");
 
+    const std::string aotRuntimeLink = findSection("target_link_libraries(realscript_slice_aot_runtime");
+    require(
+        aotRuntimeLink.find("realscript_slice_runtime_core") != std::string::npos &&
+            aotRuntimeLink.find("realscript_slice_compiler_core") == std::string::npos &&
+            aotRuntimeLink.find("realscript_slice_native_backends") == std::string::npos,
+        "AOT runtime slice must depend only on runtime slice and NOT compiler or native backends");
+
+    const std::string aotSupportLink = findSection("target_link_libraries(realscript_aot_support");
+    require(
+        aotSupportLink.find("realscript_slice_aot_runtime") != std::string::npos &&
+            aotSupportLink.find("realscript_slice_compiler_core") == std::string::npos &&
+            aotSupportLink.find("realscript_slice_native_backends") == std::string::npos,
+        "RealScript::AotSupport must link realscript_slice_aot_runtime with zero compiler/JIT deps");
+
     const std::string nativeLink = findSection("target_link_libraries(realscript_slice_native_backends");
     require(
         nativeLink.find("realscript_slice_runtime_core") != std::string::npos &&
@@ -168,6 +184,7 @@ void testZeroUpwardL1DependencyLeaksInKernelSources() {
     };
     const std::vector<std::string> forbiddenL1Prefixes = {
         "realscript/game/",
+        "realscript/bindgen/",
         "realscript/tooling/",
         "realscript/debug/Debugger",
         "realscript/debug/DapServer",

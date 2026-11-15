@@ -59,6 +59,7 @@ PrimitiveType resolvePrimitiveType(const std::string& name) noexcept {
     if (name == "double") return PrimitiveType::Double;
     if (name == "char") return PrimitiveType::Char;
     if (name == "string") return PrimitiveType::String;
+    if (name == "object") return PrimitiveType::Object;
     if (name == "handle") return PrimitiveType::Handle;
     return PrimitiveType::Error;
 }

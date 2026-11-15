@@ -16,8 +16,12 @@ bool sameExactType(
     const TypeSymbolMap& visibleTypes) {
     if (expression.type != targetType) return false;
     if (!isExactType(targetType)) return true;
-    return targetTypeName.empty() || expression.typeName.empty() ||
-        expression.typeName == targetTypeName ||
+    if (targetTypeName.empty()) return true;
+    if (expression.typeName.empty()) {
+        return expression.kind() == BoundNodeKind::ConversionExpression ||
+            expression.kind() == BoundNodeKind::ErrorExpression;
+    }
+    return expression.typeName == targetTypeName ||
         (targetType == PrimitiveType::Object &&
          isAssignable(visibleTypes, expression.typeName, targetTypeName));
 }
@@ -51,6 +55,36 @@ std::vector<const FunctionSymbol*> findMethods(
     for (const auto& method : type.methods) {
         if (method.name == name && method.staticMethod == staticMethod) {
             result.push_back(&method);
+        }
+    }
+    return result;
+}
+
+std::vector<const FunctionSymbol*> collectInterfaceAndBaseMethods(
+    const TypeSymbol& type,
+    const std::string& name,
+    bool staticMethod,
+    const TypeSymbolMap& visibleTypes) {
+    auto result = findMethods(type, name, staticMethod);
+    if (!type.interfaceType || staticMethod) return result;
+    std::unordered_set<SymbolId> visited;
+    visited.insert(type.id);
+    std::vector<std::string> queue = type.baseInterfaceNames;
+    while (!queue.empty()) {
+        const auto baseName = std::move(queue.back());
+        queue.pop_back();
+        const auto found = visibleTypes.find(baseName);
+        if (found == visibleTypes.end() ||
+            !visited.insert(found->second.id).second) {
+            continue;
+        }
+        for (const auto& method : found->second.methods) {
+            if (method.name == name && !method.staticMethod) {
+                result.push_back(&method);
+            }
+        }
+        for (const auto& nextBase : found->second.baseInterfaceNames) {
+            queue.push_back(nextBase);
         }
     }
     return result;
@@ -200,6 +234,155 @@ std::unique_ptr<BoundVariableExpression> storageVariableExpression(
 
 std::size_t visibleParameterOffset(const FunctionSymbol& function) noexcept {
     return function.method && !function.staticMethod ? 1u : 0u;
+}
+
+const TypeSymbol* unwrapEnclosingOwner(
+    const TypeSymbol* owner,
+    const TypeSymbolMap& visibleTypes) noexcept {
+    const TypeSymbol* cur = owner;
+    for (int depth = 0; depth < 16 && cur && cur->synthetic; ++depth) {
+        const FieldSymbol* capturedThis = findField(*cur, "this");
+        const std::string outerName =
+            (capturedThis && !capturedThis->typeName.empty())
+                ? capturedThis->typeName
+                : cur->enclosingOwnerTypeName;
+        if (outerName.empty()) {
+            break;
+        }
+        const auto outerIt = visibleTypes.find(outerName);
+        if (outerIt == visibleTypes.end()) {
+            break;
+        }
+        cur = &outerIt->second;
+    }
+    return cur;
+}
+
+std::pair<std::unique_ptr<BoundExpression>, const TypeSymbol*>
+buildUnwrappedCapturedThis(
+    const VariableSymbol& thisVariable,
+    const TypeSymbol& ownerType,
+    const TypeSymbolMap& visibleTypes,
+    text::TextSpan span) {
+    std::unique_ptr<BoundExpression> expr = variableExpression(thisVariable, span);
+    const TypeSymbol* cur = &ownerType;
+    for (int depth = 0; depth < 16 && cur && cur->synthetic; ++depth) {
+        const FieldSymbol* capturedThis = findField(*cur, "this");
+        if (!capturedThis || capturedThis->typeName.empty()) {
+            break;
+        }
+        const auto outerIt = visibleTypes.find(capturedThis->typeName);
+        if (outerIt == visibleTypes.end()) {
+            break;
+        }
+        auto step = std::make_unique<BoundMemberAccessExpression>();
+        step->span = span;
+        step->type = capturedThis->type;
+        step->typeName = capturedThis->typeName;
+        step->receiver = std::move(expr);
+        step->ownerType = *cur;
+        step->field = *capturedThis;
+        expr = std::move(step);
+        cur = &outerIt->second;
+    }
+    return {std::move(expr), cur};
+}
+
+bool hasAncestorMemberOrCapture(
+    const TypeSymbol& startOwner,
+    const std::string& name,
+    const TypeSymbolMap& visibleTypes) noexcept {
+    const TypeSymbol* cur = &startOwner;
+    for (int depth = 0; depth < 16 && cur; ++depth) {
+        if (name == "this") {
+            if (cur == &startOwner || !cur->synthetic) return true;
+        } else if (findField(*cur, name) ||
+                   findProperty(*cur, name) ||
+                   !findMethods(*cur, name, false).empty()) {
+            return true;
+        }
+        if (!cur->synthetic) {
+            break;
+        }
+        const FieldSymbol* capturedThis = findField(*cur, "this");
+        if (!capturedThis || capturedThis->typeName.empty()) {
+            break;
+        }
+        const auto outerIt = visibleTypes.find(capturedThis->typeName);
+        if (outerIt == visibleTypes.end()) {
+            break;
+        }
+        cur = &outerIt->second;
+    }
+    return false;
+}
+
+bool hasInstanceMemberOrThis(
+    const TypeSymbol& startOwner,
+    const std::string& name,
+    const TypeSymbolMap& visibleTypes) noexcept {
+    if (name == "this" || name == "base") return true;
+    const TypeSymbol* cur = &startOwner;
+    for (int depth = 0; depth < 16 && cur; ++depth) {
+        if (const auto* f = findField(*cur, name);
+            f && !f->staticField && !f->constField) {
+            return true;
+        }
+        if (const auto* p = findProperty(*cur, name);
+            p && !p->staticProperty) {
+            return true;
+        }
+        if (!findMethods(*cur, name, false).empty()) {
+            return true;
+        }
+        if (!cur->synthetic) break;
+        const FieldSymbol* capturedThis = findField(*cur, "this");
+        if (!capturedThis || capturedThis->typeName.empty()) break;
+        const auto outerIt = visibleTypes.find(capturedThis->typeName);
+        if (outerIt == visibleTypes.end()) break;
+        cur = &outerIt->second;
+    }
+    return false;
+}
+
+std::optional<UnwrappedCapturedField> findUnwrappedCapturedField(
+    const VariableSymbol& thisVariable,
+    const TypeSymbol& ownerType,
+    const std::string& name,
+    const TypeSymbolMap& visibleTypes,
+    text::TextSpan span) {
+    if (!ownerType.synthetic || name == "this") {
+        return std::nullopt;
+    }
+    std::unique_ptr<BoundExpression> expr = variableExpression(thisVariable, span);
+    const TypeSymbol* cur = &ownerType;
+    for (int depth = 0; depth < 16 && cur && cur->synthetic; ++depth) {
+        const FieldSymbol* capturedThis = findField(*cur, "this");
+        if (!capturedThis || capturedThis->typeName.empty()) {
+            break;
+        }
+        const auto outerIt = visibleTypes.find(capturedThis->typeName);
+        if (outerIt == visibleTypes.end()) {
+            break;
+        }
+        auto step = std::make_unique<BoundMemberAccessExpression>();
+        step->span = span;
+        step->type = capturedThis->type;
+        step->typeName = capturedThis->typeName;
+        step->receiver = std::move(expr);
+        step->ownerType = *cur;
+        step->field = *capturedThis;
+        expr = std::move(step);
+        cur = &outerIt->second;
+        if (const FieldSymbol* found = findField(*cur, name)) {
+            UnwrappedCapturedField out;
+            out.receiver = std::move(expr);
+            out.ownerType = *cur;
+            out.field = *found;
+            return out;
+        }
+    }
+    return std::nullopt;
 }
 
 void recordSymbolReference(
@@ -658,20 +841,34 @@ bool isShadowedLambdaParameter(
     return false;
 }
 
+void collectLambdaNamesFromStatementImpl(
+    const syntax::StatementSyntax& statement,
+    std::vector<std::unordered_set<std::string>>& lambdaParamScopes,
+    std::vector<std::unordered_set<std::string>>& localScopes,
+    std::vector<syntax::SyntaxToken>& names);
+
 void collectLambdaNamesImpl(
     const syntax::ExpressionSyntax& expression,
     std::vector<std::unordered_set<std::string>>& lambdaParamScopes,
+    std::vector<std::unordered_set<std::string>>& localScopes,
     std::vector<syntax::SyntaxToken>& names) {
+    const auto isShadowed = [&](const std::string& text) noexcept {
+        return isShadowedLambdaParameter(lambdaParamScopes, text) ||
+            isShadowedLambdaParameter(localScopes, text);
+    };
     const auto visit = [&](const auto& values) {
         for (const auto& value : values) {
-            if (value) collectLambdaNamesImpl(*value, lambdaParamScopes, names);
+            if (value) {
+                collectLambdaNamesImpl(
+                    *value, lambdaParamScopes, localScopes, names);
+            }
         }
     };
     switch (expression.kind()) {
     case syntax::SyntaxKind::NameExpression: {
         const auto& tok = static_cast<const
             syntax::NameExpressionSyntax&>(expression).identifierToken;
-        if (!isShadowedLambdaParameter(lambdaParamScopes, tok.text)) {
+        if (!isShadowed(tok.text)) {
             names.push_back(tok);
         }
         return;
@@ -679,40 +876,39 @@ void collectLambdaNamesImpl(
     case syntax::SyntaxKind::UnaryExpression:
         collectLambdaNamesImpl(*static_cast<const
             syntax::UnaryExpressionSyntax&>(expression).operand,
-            lambdaParamScopes, names);
+            lambdaParamScopes, localScopes, names);
         return;
     case syntax::SyntaxKind::BinaryExpression: {
         const auto& value = static_cast<const
             syntax::BinaryExpressionSyntax&>(expression);
-        collectLambdaNamesImpl(*value.left, lambdaParamScopes, names);
-        collectLambdaNamesImpl(*value.right, lambdaParamScopes, names);
+        collectLambdaNamesImpl(*value.left, lambdaParamScopes, localScopes, names);
+        collectLambdaNamesImpl(*value.right, lambdaParamScopes, localScopes, names);
         return;
     }
     case syntax::SyntaxKind::AssignmentExpression: {
         const auto& value = static_cast<const
             syntax::AssignmentExpressionSyntax&>(expression);
-        if (!isShadowedLambdaParameter(
-                lambdaParamScopes, value.identifierToken.text)) {
+        if (!isShadowed(value.identifierToken.text)) {
             names.push_back(value.identifierToken);
         }
-        collectLambdaNamesImpl(*value.expression, lambdaParamScopes, names);
+        collectLambdaNamesImpl(
+            *value.expression, lambdaParamScopes, localScopes, names);
         return;
     }
     case syntax::SyntaxKind::ParenthesizedExpression:
         collectLambdaNamesImpl(*static_cast<const
             syntax::ParenthesizedExpressionSyntax&>(expression).expression,
-            lambdaParamScopes, names);
+            lambdaParamScopes, localScopes, names);
         return;
     case syntax::SyntaxKind::CastExpression:
         collectLambdaNamesImpl(*static_cast<const
             syntax::CastExpressionSyntax&>(expression).expression,
-            lambdaParamScopes, names);
+            lambdaParamScopes, localScopes, names);
         return;
     case syntax::SyntaxKind::CallExpression: {
         const auto& value = static_cast<const
             syntax::CallExpressionSyntax&>(expression);
-        if (!isShadowedLambdaParameter(
-                lambdaParamScopes, value.identifierToken.text)) {
+        if (!isShadowed(value.identifierToken.text)) {
             names.push_back(value.identifierToken);
         }
         visit(value.arguments);
@@ -721,35 +917,43 @@ void collectLambdaNamesImpl(
     case syntax::SyntaxKind::MemberCallExpression: {
         const auto& value = static_cast<const
             syntax::MemberCallExpressionSyntax&>(expression);
-        collectLambdaNamesImpl(*value.receiver, lambdaParamScopes, names);
+        collectLambdaNamesImpl(
+            *value.receiver, lambdaParamScopes, localScopes, names);
         visit(value.arguments);
         return;
     }
     case syntax::SyntaxKind::MemberAccessExpression:
         collectLambdaNamesImpl(*static_cast<const
             syntax::MemberAccessExpressionSyntax&>(expression).receiver,
-            lambdaParamScopes, names);
+            lambdaParamScopes, localScopes, names);
         return;
     case syntax::SyntaxKind::ElementAccessExpression: {
         const auto& value = static_cast<const
             syntax::ElementAccessExpressionSyntax&>(expression);
-        collectLambdaNamesImpl(*value.receiver, lambdaParamScopes, names);
-        collectLambdaNamesImpl(*value.index, lambdaParamScopes, names);
+        collectLambdaNamesImpl(
+            *value.receiver, lambdaParamScopes, localScopes, names);
+        collectLambdaNamesImpl(
+            *value.index, lambdaParamScopes, localScopes, names);
         return;
     }
     case syntax::SyntaxKind::ElementAssignmentExpression: {
         const auto& value = static_cast<const
             syntax::ElementAssignmentExpressionSyntax&>(expression);
-        collectLambdaNamesImpl(*value.receiver, lambdaParamScopes, names);
-        collectLambdaNamesImpl(*value.index, lambdaParamScopes, names);
-        collectLambdaNamesImpl(*value.expression, lambdaParamScopes, names);
+        collectLambdaNamesImpl(
+            *value.receiver, lambdaParamScopes, localScopes, names);
+        collectLambdaNamesImpl(
+            *value.index, lambdaParamScopes, localScopes, names);
+        collectLambdaNamesImpl(
+            *value.expression, lambdaParamScopes, localScopes, names);
         return;
     }
     case syntax::SyntaxKind::MemberAssignmentExpression: {
         const auto& value = static_cast<const
             syntax::MemberAssignmentExpressionSyntax&>(expression);
-        collectLambdaNamesImpl(*value.receiver, lambdaParamScopes, names);
-        collectLambdaNamesImpl(*value.expression, lambdaParamScopes, names);
+        collectLambdaNamesImpl(
+            *value.receiver, lambdaParamScopes, localScopes, names);
+        collectLambdaNamesImpl(
+            *value.expression, lambdaParamScopes, localScopes, names);
         return;
     }
     case syntax::SyntaxKind::NewObjectExpression: {
@@ -765,7 +969,8 @@ void collectLambdaNamesImpl(
         const auto& arr = static_cast<const
             syntax::NewArrayExpressionSyntax&>(expression);
         if (arr.length) {
-            collectLambdaNamesImpl(*arr.length, lambdaParamScopes, names);
+            collectLambdaNamesImpl(
+                *arr.length, lambdaParamScopes, localScopes, names);
         }
         visit(arr.initialValues);
         return;
@@ -773,29 +978,36 @@ void collectLambdaNamesImpl(
     case syntax::SyntaxKind::TypeBinaryExpression:
         collectLambdaNamesImpl(*static_cast<const
             syntax::TypeBinaryExpressionSyntax&>(expression).expression,
-            lambdaParamScopes, names);
+            lambdaParamScopes, localScopes, names);
         return;
     case syntax::SyntaxKind::ConditionalExpression: {
         const auto& cond = static_cast<const
             syntax::ConditionalExpressionSyntax&>(expression);
-        collectLambdaNamesImpl(*cond.condition, lambdaParamScopes, names);
-        collectLambdaNamesImpl(*cond.whenTrue, lambdaParamScopes, names);
-        collectLambdaNamesImpl(*cond.whenFalse, lambdaParamScopes, names);
+        collectLambdaNamesImpl(
+            *cond.condition, lambdaParamScopes, localScopes, names);
+        collectLambdaNamesImpl(
+            *cond.whenTrue, lambdaParamScopes, localScopes, names);
+        collectLambdaNamesImpl(
+            *cond.whenFalse, lambdaParamScopes, localScopes, names);
         return;
     }
     case syntax::SyntaxKind::SwitchExpression: {
         const auto& sw = static_cast<const
             syntax::SwitchExpressionSyntax&>(expression);
-        collectLambdaNamesImpl(*sw.expression, lambdaParamScopes, names);
+        collectLambdaNamesImpl(
+            *sw.expression, lambdaParamScopes, localScopes, names);
         for (const auto& arm : sw.arms) {
             if (arm.label) {
-                collectLambdaNamesImpl(*arm.label, lambdaParamScopes, names);
+                collectLambdaNamesImpl(
+                    *arm.label, lambdaParamScopes, localScopes, names);
             }
             if (arm.guard) {
-                collectLambdaNamesImpl(*arm.guard, lambdaParamScopes, names);
+                collectLambdaNamesImpl(
+                    *arm.guard, lambdaParamScopes, localScopes, names);
             }
             if (arm.value) {
-                collectLambdaNamesImpl(*arm.value, lambdaParamScopes, names);
+                collectLambdaNamesImpl(
+                    *arm.value, lambdaParamScopes, localScopes, names);
             }
         }
         return;
@@ -808,8 +1020,12 @@ void collectLambdaNamesImpl(
             params.insert(tok.text);
         }
         lambdaParamScopes.push_back(std::move(params));
-        if (nested.body) {
-            collectLambdaNamesImpl(*nested.body, lambdaParamScopes, names);
+        if (nested.blockBody) {
+            collectLambdaNamesFromStatementImpl(
+                *nested.blockBody, lambdaParamScopes, localScopes, names);
+        } else if (nested.body) {
+            collectLambdaNamesImpl(
+                *nested.body, lambdaParamScopes, localScopes, names);
         }
         lambdaParamScopes.pop_back();
         return;
@@ -818,11 +1034,158 @@ void collectLambdaNamesImpl(
         names.push_back(static_cast<const
             syntax::ThisExpressionSyntax&>(expression).thisKeyword);
         return;
+    case syntax::SyntaxKind::BaseExpression:
+        names.push_back(static_cast<const
+            syntax::BaseExpressionSyntax&>(expression).baseKeyword);
+        return;
     case syntax::SyntaxKind::TaggedStringExpression:
     case syntax::SyntaxKind::TypeOfExpression:
     case syntax::SyntaxKind::LiteralExpression:
-    case syntax::SyntaxKind::BaseExpression:
         return;
+    default:
+        return;
+    }
+}
+
+void collectLambdaNamesFromStatementImpl(
+    const syntax::StatementSyntax& statement,
+    std::vector<std::unordered_set<std::string>>& lambdaParamScopes,
+    std::vector<std::unordered_set<std::string>>& localScopes,
+    std::vector<syntax::SyntaxToken>& names) {
+    const auto visitExpr = [&](const auto& exprPtr) {
+        if (exprPtr) {
+            collectLambdaNamesImpl(
+                *exprPtr, lambdaParamScopes, localScopes, names);
+        }
+    };
+    switch (statement.kind()) {
+    case syntax::SyntaxKind::BlockStatement:
+        localScopes.emplace_back();
+        for (const auto& s :
+             static_cast<const syntax::BlockStatementSyntax&>(statement).statements) {
+            if (s) {
+                collectLambdaNamesFromStatementImpl(
+                    *s, lambdaParamScopes, localScopes, names);
+            }
+        }
+        localScopes.pop_back();
+        return;
+    case syntax::SyntaxKind::ExpressionStatement:
+        visitExpr(static_cast<const syntax::ExpressionStatementSyntax&>(statement).expression);
+        return;
+    case syntax::SyntaxKind::VariableDeclarationStatement: {
+        const auto& vd = static_cast<const syntax::VariableDeclarationStatementSyntax&>(statement);
+        visitExpr(vd.initializer);
+        if (!localScopes.empty()) {
+            localScopes.back().insert(vd.identifierToken.text);
+        }
+        return;
+    }
+    case syntax::SyntaxKind::ReturnStatement:
+        visitExpr(static_cast<const syntax::ReturnStatementSyntax&>(statement).expression);
+        return;
+    case syntax::SyntaxKind::ThrowStatement:
+        visitExpr(static_cast<const syntax::ThrowStatementSyntax&>(statement).expression);
+        return;
+    case syntax::SyntaxKind::IfStatement: {
+        const auto& ifs = static_cast<const syntax::IfStatementSyntax&>(statement);
+        visitExpr(ifs.condition);
+        if (ifs.thenStatement) {
+            collectLambdaNamesFromStatementImpl(
+                *ifs.thenStatement, lambdaParamScopes, localScopes, names);
+        }
+        if (ifs.elseStatement) {
+            collectLambdaNamesFromStatementImpl(
+                *ifs.elseStatement, lambdaParamScopes, localScopes, names);
+        }
+        return;
+    }
+    case syntax::SyntaxKind::WhileStatement: {
+        const auto& ws = static_cast<const syntax::WhileStatementSyntax&>(statement);
+        visitExpr(ws.condition);
+        if (ws.body) {
+            collectLambdaNamesFromStatementImpl(
+                *ws.body, lambdaParamScopes, localScopes, names);
+        }
+        return;
+    }
+    case syntax::SyntaxKind::DoWhileStatement: {
+        const auto& dws = static_cast<const syntax::DoWhileStatementSyntax&>(statement);
+        if (dws.body) {
+            collectLambdaNamesFromStatementImpl(
+                *dws.body, lambdaParamScopes, localScopes, names);
+        }
+        visitExpr(dws.condition);
+        return;
+    }
+    case syntax::SyntaxKind::ForStatement: {
+        const auto& fs = static_cast<const syntax::ForStatementSyntax&>(statement);
+        localScopes.emplace_back();
+        if (fs.initializer) {
+            collectLambdaNamesFromStatementImpl(
+                *fs.initializer, lambdaParamScopes, localScopes, names);
+        }
+        visitExpr(fs.condition);
+        visitExpr(fs.increment);
+        if (fs.body) {
+            collectLambdaNamesFromStatementImpl(
+                *fs.body, lambdaParamScopes, localScopes, names);
+        }
+        localScopes.pop_back();
+        return;
+    }
+    case syntax::SyntaxKind::ForeachStatement: {
+        const auto& fes = static_cast<const syntax::ForeachStatementSyntax&>(statement);
+        visitExpr(fes.collection);
+        localScopes.push_back({fes.identifierToken.text});
+        if (fes.body) {
+            collectLambdaNamesFromStatementImpl(
+                *fes.body, lambdaParamScopes, localScopes, names);
+        }
+        localScopes.pop_back();
+        return;
+    }
+    case syntax::SyntaxKind::SwitchStatement: {
+        const auto& sw = static_cast<const syntax::SwitchStatementSyntax&>(statement);
+        visitExpr(sw.expression);
+        for (const auto& sec : sw.sections) {
+            visitExpr(sec.label);
+            localScopes.emplace_back();
+            for (const auto& st : sec.statements) {
+                if (st) {
+                    collectLambdaNamesFromStatementImpl(
+                        *st, lambdaParamScopes, localScopes, names);
+                }
+            }
+            localScopes.pop_back();
+        }
+        return;
+    }
+    case syntax::SyntaxKind::EventSubscriptionStatement: {
+        const auto& evs = static_cast<const syntax::EventSubscriptionStatementSyntax&>(statement);
+        visitExpr(evs.receiver);
+        visitExpr(evs.handler);
+        return;
+    }
+    case syntax::SyntaxKind::TryStatement: {
+        const auto& ts = static_cast<const syntax::TryStatementSyntax&>(statement);
+        collectLambdaNamesFromStatementImpl(
+            ts.body, lambdaParamScopes, localScopes, names);
+        for (const auto& cc : ts.catches) {
+            localScopes.emplace_back();
+            if (cc.identifierToken && !cc.identifierToken->text.empty()) {
+                localScopes.back().insert(cc.identifierToken->text);
+            }
+            collectLambdaNamesFromStatementImpl(
+                cc.body, lambdaParamScopes, localScopes, names);
+            localScopes.pop_back();
+        }
+        if (ts.finallyBody) {
+            collectLambdaNamesFromStatementImpl(
+                *ts.finallyBody, lambdaParamScopes, localScopes, names);
+        }
+        return;
+    }
     default:
         return;
     }
@@ -834,7 +1197,16 @@ void collectLambdaNames(
     const syntax::ExpressionSyntax& expression,
     std::vector<syntax::SyntaxToken>& names) {
     std::vector<std::unordered_set<std::string>> scopes;
-    collectLambdaNamesImpl(expression, scopes, names);
+    std::vector<std::unordered_set<std::string>> localScopes;
+    collectLambdaNamesImpl(expression, scopes, localScopes, names);
+}
+
+void collectLambdaNamesFromStatement(
+    const syntax::StatementSyntax& statement,
+    std::vector<syntax::SyntaxToken>& names) {
+    std::vector<std::unordered_set<std::string>> scopes;
+    std::vector<std::unordered_set<std::string>> localScopes;
+    collectLambdaNamesFromStatementImpl(statement, scopes, localScopes, names);
 }
 
 bool isReadonlyFieldWritable(

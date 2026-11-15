@@ -76,6 +76,92 @@ bool executeFunction(
         }
     }
 
+    if (state.executionPolicy != nullptr) {
+        std::array<Value, 8> policyStackArgs{};
+        std::vector<Value> policyHeapArgs;
+        ValueSpan policyArgSpan;
+        if (arguments.empty()) {
+            policyArgSpan = ValueSpan(nullptr, 0);
+        } else if (!arguments.indices) {
+            policyArgSpan = ValueSpan(
+                arguments.values->data() + arguments.offset,
+                arguments.count);
+        } else if (arguments.count == 1) {
+            policyArgSpan = ValueSpan(
+                arguments.values->data() + arguments.offset + arguments.indices[0],
+                1);
+        } else {
+            bool contiguous = true;
+            const auto firstIndex = arguments.indices[0];
+            for (std::size_t index = 1; index < arguments.count; ++index) {
+                if (arguments.indices[index] != firstIndex + index) {
+                    contiguous = false;
+                    break;
+                }
+            }
+            if (contiguous) {
+                policyArgSpan = ValueSpan(
+                    arguments.values->data() + arguments.offset + firstIndex,
+                    arguments.count);
+            } else if (arguments.count <= policyStackArgs.size()) {
+                for (std::size_t index = 0; index < arguments.count; ++index) {
+                    policyStackArgs[index] = arguments[index];
+                }
+                policyArgSpan = ValueSpan(policyStackArgs.data(), arguments.count);
+            } else {
+                policyHeapArgs.reserve(arguments.count);
+                for (std::size_t index = 0; index < arguments.count; ++index) {
+                    policyHeapArgs.push_back(arguments[index]);
+                }
+                policyArgSpan = ValueSpan(policyHeapArgs);
+            }
+        }
+
+        bool intercepted = false;
+        Value interceptedResult{};
+        RuntimeError policyError{};
+        if (!state.executionPolicy->interceptCall(
+                function.symbolId,
+                policyArgSpan,
+                intercepted,
+                interceptedResult,
+                policyError)) {
+            state.stack.push_back(&location.qualifiedName);
+            state.error = std::move(policyError);
+            if (state.error.code == ErrorCode::None) {
+                state.error.code = ErrorCode::CapabilityDenied;
+            }
+            if (state.error.message.empty()) {
+                state.error.message = "call intercepted and rejected by execution policy";
+            }
+            state.error.stackTrace = materializeStack(state.stack);
+            std::reverse(state.error.stackTrace.begin(), state.error.stackTrace.end());
+            populateInterpreterSourceLocations(state);
+            state.stack.pop_back();
+            return false;
+        }
+        if (intercepted) {
+            if (function.returnType == semantic::PrimitiveType::Void) {
+                result = std::monostate{};
+            } else if (std::holds_alternative<std::monostate>(interceptedResult)) {
+                result = location.module
+                    ? defaultValue(*location.module, function.returnType, function.returnTypeId)
+                    : Value{std::monostate{}};
+            } else {
+                if (!expectSignatureType(
+                        state,
+                        interceptedResult,
+                        function.returnType,
+                        function.returnTypeId,
+                        "intercepted return value")) {
+                    return false;
+                }
+                result = std::move(interceptedResult);
+            }
+            return true;
+        }
+    }
+
     if (state.fastAccounting && execution->directNativeReference != nullptr) {
         const std::uint64_t cost = execution->nativeForwarderInstructionCost;
         if (state.executed > state.limits.instructionBudget ||
@@ -184,7 +270,7 @@ bool executeFunction(
         return true;
     }
 
-    if (state.fastAccounting && execution->canUseFlatFastPath) {
+    if (state.fastAccounting && state.executionPolicy == nullptr && execution->canUseFlatFastPath) {
 #if defined(__GNUC__) || defined(__clang__)
         #define RS_FLAT_LIKELY(x) __builtin_expect(!!(x), 1)
         #define RS_FLAT_UNLIKELY(x) __builtin_expect(!!(x), 0)
@@ -1569,8 +1655,11 @@ bool executeFunction(
                                             const Value& rhs = frameBase[ip->src1Slot];
                                             if (RS_FLAT_LIKELY(static_cast<std::uint8_t>(rhs.rawTag()) ==
                                                                calleeExec->trivialFieldTag0)) {
+                                                const bool changed =
+                                                    RS_FLAT_UNLIKELY(state.heap->hasDirtyTracking()) &&
+                                                    !(oce.view.fields[f0] == rhs);
                                                 oce.view.fields[f0] = rhs;
-                                                if (RS_FLAT_UNLIKELY(state.heap->hasDirtyTracking())) {
+                                                if (RS_FLAT_UNLIKELY(changed)) {
                                                     state.heap->notifyFieldMutated(oce.ref, f0);
                                                 }
                                                 trivialHandled = true;
@@ -1943,8 +2032,11 @@ bool executeFunction(
                                                    static_cast<std::uint8_t>(ip->binaryOpcode1))) {
                                     RS_FLAT_SPAN_CHECK();
                                     localExecuted += spanCost;
+                                    const bool changed =
+                                        RS_FLAT_UNLIKELY(state.heap->hasDirtyTracking()) &&
+                                        !(oce.view.fields[fIdx] == rhs);
                                     oce.view.fields[fIdx] = rhs;
-                                    if (RS_FLAT_UNLIKELY(state.heap->hasDirtyTracking())) {
+                                    if (RS_FLAT_UNLIKELY(changed)) {
                                         state.heap->notifyFieldMutated(ref, fIdx);
                                     }
                                     RS_FLAT_DISPATCH_NEXT();
@@ -2053,8 +2145,11 @@ bool executeFunction(
                                             oce.view.needsRememberedBarrier = false;
                                         }
                                         localExecuted += spanCost;
+                                        const bool changed =
+                                            RS_FLAT_UNLIKELY(state.heap->hasDirtyTracking()) &&
+                                            !(oce.view.fields[fIdx] == detached);
                                         oce.view.fields[fIdx] = std::move(detached);
-                                        if (RS_FLAT_UNLIKELY(state.heap->hasDirtyTracking())) {
+                                        if (RS_FLAT_UNLIKELY(changed)) {
                                             state.heap->notifyFieldMutated(ref, fIdx);
                                         }
                                         RS_FLAT_DISPATCH_NEXT();
@@ -2066,8 +2161,11 @@ bool executeFunction(
                                         oce.view.needsRememberedBarrier = false;
                                     }
                                     localExecuted += spanCost;
+                                    const bool changed =
+                                        RS_FLAT_UNLIKELY(state.heap->hasDirtyTracking()) &&
+                                        !(oce.view.fields[fIdx] == rhs);
                                     oce.view.fields[fIdx] = rhs;
-                                    if (RS_FLAT_UNLIKELY(state.heap->hasDirtyTracking())) {
+                                    if (RS_FLAT_UNLIKELY(changed)) {
                                         state.heap->notifyFieldMutated(ref, fIdx);
                                     }
                                     RS_FLAT_DISPATCH_NEXT();
@@ -5046,8 +5144,11 @@ bool executeFunction(
                                     goto L_FlatBudgetExceeded;
                                 }
                                 localExecuted += spanCost;
+                                const bool changed =
+                                    RS_FLAT_UNLIKELY(state.heap->hasDirtyTracking()) &&
+                                    !(oce.view.fields[fIdx] == rhs);
                                 oce.view.fields[fIdx] = rhs;
-                                if (RS_FLAT_UNLIKELY(state.heap->hasDirtyTracking())) {
+                                if (RS_FLAT_UNLIKELY(changed)) {
                                     state.heap->notifyFieldMutated(ref, fIdx);
                                 }
                                 RS_FLAT_DISPATCH_NEXT();
@@ -5476,8 +5577,11 @@ bool executeFunction(
                                 const Value& rhs = userArgsPtr[pIdx - bias];
                                 if (RS_FLAT_LIKELY(static_cast<std::uint8_t>(rhs.rawTag()) ==
                                                    calleeExec->trivialFieldTag0)) {
+                                    const bool changed =
+                                        RS_FLAT_UNLIKELY(state.heap->hasDirtyTracking()) &&
+                                        !(rOce.view.fields[f0] == rhs);
                                     rOce.view.fields[f0] = rhs;
-                                    if (RS_FLAT_UNLIKELY(state.heap->hasDirtyTracking())) {
+                                    if (RS_FLAT_UNLIKELY(changed)) {
                                         state.heap->notifyFieldMutated(leaf.receiverRef, f0);
                                     }
                                     handled = true;

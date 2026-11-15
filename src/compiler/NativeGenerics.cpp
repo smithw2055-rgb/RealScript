@@ -24,6 +24,7 @@ struct NativeGenericTemplate {
     Kind kind = Kind::Class;
     std::string moduleName;
     std::string ownerName;
+    std::size_t ownerArity = 0;
     std::string name;
     std::string sourceName;
     text::TextSpan span;
@@ -33,6 +34,7 @@ struct NativeGenericTemplate {
     std::optional<syntax::TypeSyntax> returnTypeSyntax;
     bool isExtension = false;
     std::map<std::string, std::vector<std::string>> constraints;
+    std::vector<syntax::GenericConstraintClauseSyntax> rawConstraints;
     const ParsedUnit* unit = nullptr;
     std::shared_ptr<syntax::ClassDeclarationSyntax> classSyntax;
     std::shared_ptr<syntax::StructDeclarationSyntax> structSyntax;
@@ -106,6 +108,10 @@ std::string nativeGenericTypeText(const syntax::TypeSyntax& type) {
 std::string stripCanonicalModulePrefix(const std::string& typeName) {
     const auto sep = typeName.find("::");
     return sep == std::string::npos ? typeName : typeName.substr(sep + 2);
+}
+
+std::string nativeGenericTypeKey(const std::string& name, std::size_t arity) {
+    return name + "#" + std::to_string(arity);
 }
 
 std::map<std::string, std::vector<std::string>> nativeGenericConstraints(
@@ -645,6 +651,12 @@ inline void substituteExpression(
     const std::set<std::string>& shadowedValueNames,
     bool& hasGenericSyntax);
 
+inline void substituteStatement(
+    syntax::StatementSyntax& statement,
+    const SubstitutionMap& subs,
+    std::set<std::string>& shadowedValueNames,
+    bool& hasGenericSyntax);
+
 inline void substitutePattern(
     syntax::PatternSyntax& pattern,
     const SubstitutionMap& subs,
@@ -736,9 +748,20 @@ inline void substituteExpression(
     }
     case syntax::SyntaxKind::LambdaExpression: {
         auto& expr = static_cast<syntax::LambdaExpressionSyntax&>(expression);
+        for (auto& paramType : expr.parameterTypes) {
+            if (paramType) {
+                substituteType(*paramType, subs, hasGenericSyntax);
+            }
+        }
         auto innerShadowed = shadowedValueNames;
-        for (const auto& p : expr.parameterTokens) innerShadowed.insert(p.text);
-        if (expr.body) substituteExpression(*expr.body, subs, innerShadowed, hasGenericSyntax);
+        for (const auto& p : expr.parameterTokens) {
+            if (p.text != "_") innerShadowed.insert(p.text);
+        }
+        if (expr.blockBody) {
+            substituteStatement(*expr.blockBody, subs, innerShadowed, hasGenericSyntax);
+        } else if (expr.body) {
+            substituteExpression(*expr.body, subs, innerShadowed, hasGenericSyntax);
+        }
         return;
     }
     case syntax::SyntaxKind::UnaryExpression: {
@@ -1221,6 +1244,7 @@ public:
             if (u) detachSyntaxTree(*u);
         }
         collectTemplates();
+        validateTemplateDeclarationConstraints();
         std::vector<ParsedUnit*> queue;
         for (auto& unit : units_) queue.push_back(unit.get());
         for (std::size_t index = 0; index < queue.size(); ++index) {
@@ -1374,9 +1398,11 @@ private:
         for (const auto& parameter : parameters) {
             declaration.parameters.push_back(parameter.text);
         }
+        declaration.rawConstraints = constraints;
         declaration.constraints = nativeGenericConstraints(constraints);
         auto& table = registry_.types[moduleName];
-        if (!table.emplace(name, std::move(declaration)).second) {
+        if (!table.emplace(nativeGenericTypeKey(name, declaration.parameters.size()),
+                std::move(declaration)).second) {
             result_.diagnostics.report(
                 "RS8502",
                 "duplicate generic type template '" + name + "'",
@@ -1527,27 +1553,75 @@ private:
         return nullptr;
     }
 
+    bool hasAnyTypeTemplateNamed(
+        const std::string& moduleName,
+        const std::string& name) const {
+        const auto sep = name.find("::");
+        if (sep != std::string::npos) {
+            const auto explicitMod = name.substr(0, sep);
+            const auto simple = name.substr(sep + 2);
+            const auto modIt = registry_.types.find(explicitMod);
+            if (modIt == registry_.types.end()) return false;
+            for (const auto& [key, tmpl] : modIt->second) {
+                (void)key;
+                if (tmpl.name == simple) return true;
+            }
+            return false;
+        }
+        auto moduleHasName = [&](const std::string& modName) {
+            const auto modIt = registry_.types.find(modName);
+            if (modIt == registry_.types.end()) return false;
+            for (const auto& [key, tmpl] : modIt->second) {
+                (void)key;
+                if (tmpl.name == name) return true;
+            }
+            return false;
+        };
+        if (moduleHasName(moduleName)) return true;
+        if (const auto mod = modules_.find(moduleName); mod != modules_.end()) {
+            for (const auto& imp : mod->second.imports) {
+                if (moduleHasName(imp)) return true;
+            }
+        }
+        if (currentRewritingUnit_) {
+            for (const auto& hyg : currentRewritingUnit_->unitHygienicModules) {
+                if (moduleHasName(hyg)) return true;
+            }
+        }
+        for (const auto& hyg : currentMethodHygienicModules_) {
+            if (moduleHasName(hyg)) return true;
+        }
+        return false;
+    }
+
     const NativeGenericTemplate* resolve(
         const std::string& moduleName,
         const std::string& name,
         bool function,
         text::TextSpan span,
-        const std::string& sourceName) {
+        const std::string& sourceName,
+        std::optional<std::size_t> typeArity = std::nullopt) {
         const auto& tables = function ? registry_.functions : registry_.types;
         const auto sep = name.find("::");
         if (sep != std::string::npos) {
             const auto explicitMod = name.substr(0, sep);
             const auto simple = name.substr(sep + 2);
+            const std::string lookupKey = (!function && typeArity.has_value())
+                ? nativeGenericTypeKey(simple, *typeArity)
+                : simple;
             const auto modIt = tables.find(explicitMod);
             if (modIt != tables.end()) {
-                const auto found = modIt->second.find(simple);
+                const auto found = modIt->second.find(lookupKey);
                 if (found != modIt->second.end()) return &found->second;
             }
             return nullptr;
         }
+        const std::string lookupKey = (!function && typeArity.has_value())
+            ? nativeGenericTypeKey(name, *typeArity)
+            : name;
         const auto own = tables.find(moduleName);
         if (own != tables.end()) {
-            const auto found = own->second.find(name);
+            const auto found = own->second.find(lookupKey);
             if (found != own->second.end()) return &found->second;
         }
         std::vector<const NativeGenericTemplate*> candidates;
@@ -1569,7 +1643,7 @@ private:
             if (importedName == moduleName) continue;
             const auto imported = tables.find(importedName);
             if (imported == tables.end()) continue;
-            const auto found = imported->second.find(name);
+            const auto found = imported->second.find(lookupKey);
             if (found != imported->second.end()) {
                 candidates.push_back(&found->second);
             }
@@ -1914,12 +1988,14 @@ private:
 
     const NativeGenericTemplate* findDelegateTemplateByName(
         const std::string& consumerModule,
-        const std::string& rawName) const {
+        const std::string& rawName,
+        std::size_t arity) const {
         const auto simple = stripCanonicalModulePrefix(rawName);
+        const auto lookupKey = nativeGenericTypeKey(simple, arity);
         const auto checkMod = [&](const std::string& modName) -> const NativeGenericTemplate* {
             const auto modIt = registry_.types.find(modName);
             if (modIt == registry_.types.end()) return nullptr;
-            const auto found = modIt->second.find(simple);
+            const auto found = modIt->second.find(lookupKey);
             if (found != modIt->second.end() &&
                 found->second.kind == NativeGenericTemplate::Kind::Delegate &&
                 found->second.delegateSyntax) {
@@ -1980,7 +2056,8 @@ private:
             if (!formal.isGeneric()) continue;
             const auto* delTmpl = findDelegateTemplateByName(
                 declaration.moduleName.empty() ? consumerModule : declaration.moduleName,
-                formal.name.text);
+                formal.name.text,
+                formal.typeArguments.size());
             if (!delTmpl || !delTmpl->delegateSyntax) continue;
             const auto& delSyn = *delTmpl->delegateSyntax;
             if (delSyn.parameters.size() != lambda.parameterTokens.size() ||
@@ -2012,7 +2089,13 @@ private:
 
             const auto savedLocal = localTypes_;
             for (std::size_t pi = 0; pi < lambda.parameterTokens.size(); ++pi) {
-                const auto pType = resolveDelFormalType(delSyn.parameters[pi].type);
+                if (lambda.parameterTokens[pi].text == "_") continue;
+                std::string pType;
+                if (pi < lambda.parameterTypes.size() && lambda.parameterTypes[pi].has_value()) {
+                    pType = typeText(*lambda.parameterTypes[pi]);
+                } else {
+                    pType = resolveDelFormalType(delSyn.parameters[pi].type);
+                }
                 if (!pType.empty()) {
                     localTypes_[lambda.parameterTokens[pi].text] = pType;
                 }
@@ -2276,11 +2359,20 @@ private:
             ? std::size_t{0}
             : nativeBuiltinGenericArity(simpleGenericName);
         const auto* declaration = resolve(
-            consumerModule, name, function, span, sourceName);
+            consumerModule,
+            name,
+            function,
+            span,
+            sourceName,
+            function ? std::nullopt : std::optional<std::size_t>(arguments.size()));
         if (!declaration && builtinArity == 0) {
+            const bool wrongArity =
+                !function && hasAnyTypeTemplateNamed(consumerModule, simpleGenericName);
             result_.diagnostics.report(
-                "RS8500",
-                "unknown generic declaration '" + name + "'",
+                wrongArity ? "RS8501" : "RS8500",
+                wrongArity
+                    ? ("generic arity mismatch for '" + simpleGenericName + "'")
+                    : ("unknown generic declaration '" + name + "'"),
                 span,
                 diagnostics::DiagnosticSeverity::Error,
                 sourceName);
@@ -2529,6 +2621,9 @@ private:
                     cloned.typeParameterCommaTokens.clear();
                     cloned.typeParameterGreaterToken.reset();
                     cloned.constraints.clear();
+                    for (auto& baseIface : cloned.interfaces) {
+                        ast_monomorphizer::substituteType(baseIface, subs, hasRemainingGenerics);
+                    }
                     std::set<std::string> ifaceMethodNames;
                     for (const auto& m : cloned.methods) {
                         ifaceMethodNames.insert(m.identifierToken.text);
@@ -2713,6 +2808,595 @@ private:
         return returnReferenceName;
     }
 
+    enum class ConstraintTypeKind { Invalid, Interface, Class, NonInheritable };
+
+    static bool isConstraintNullable(
+        const std::string& rawText,
+        const syntax::TypeSyntax& type) {
+        if (!rawText.empty() && rawText.back() == '?') return true;
+        if (rawText.rfind("Nullable__", 0) == 0 ||
+            rawText.rfind("Nullable<", 0) == 0) {
+            return true;
+        }
+        return type.name.text == "Nullable" && type.isGeneric();
+    }
+
+    template <typename Fn>
+    void forEachVisibleUnit(const std::string& moduleName, Fn&& fn) const {
+        const auto visitModule = [&](const std::string& modName) {
+            const auto modIt = modules_.find(modName);
+            if (modIt == modules_.end()) return;
+            for (const auto* unitPtr : modIt->second.units) {
+                if (unitPtr && unitPtr->syntaxTree) fn(modName, *unitPtr);
+            }
+        };
+        visitModule(moduleName);
+        const auto selfIt = modules_.find(moduleName);
+        if (selfIt != modules_.end()) {
+            for (const auto& imported : selfIt->second.imports) {
+                visitModule(imported);
+            }
+        }
+    }
+
+    const NativeGenericTemplate* findTypeTemplateInScope(
+        const std::string& moduleName,
+        const std::string& typeName,
+        std::size_t arity) const {
+        const auto key = nativeGenericTypeKey(typeName, arity);
+        const auto ownTable = registry_.types.find(moduleName);
+        if (ownTable != registry_.types.end()) {
+            const auto hit = ownTable->second.find(key);
+            if (hit != ownTable->second.end()) return &hit->second;
+        }
+        const auto selfIt = modules_.find(moduleName);
+        if (selfIt != modules_.end()) {
+            for (const auto& imported : selfIt->second.imports) {
+                const auto impTable = registry_.types.find(imported);
+                if (impTable == registry_.types.end()) continue;
+                const auto hit = impTable->second.find(key);
+                if (hit != impTable->second.end()) return &hit->second;
+            }
+        }
+        return nullptr;
+    }
+
+    bool validateNestedConstraintTypeArg(
+        const syntax::TypeSyntax& type,
+        const std::string& moduleName,
+        const std::set<std::string>& ownParams,
+        const std::set<std::string>& enclosingParams) const {
+        if (!type.isGeneric()) {
+            const auto& name = type.name.text;
+            if (ownParams.find(name) != ownParams.end() ||
+                enclosingParams.find(name) != enclosingParams.end() ||
+                isPrimitiveOrKeywordTypeName(name)) {
+                return true;
+            }
+            bool found = false;
+            forEachVisibleUnit(moduleName, [&](const std::string&, const ParsedUnit& u) {
+                if (found) return;
+                for (const auto& c : u.syntaxTree->classes) {
+                    if (c.typeParameters.empty() && c.identifierToken.text == name) { found = true; return; }
+                }
+                for (const auto& s : u.syntaxTree->structs) {
+                    if (s.typeParameters.empty() && s.identifierToken.text == name) { found = true; return; }
+                }
+                for (const auto& i : u.syntaxTree->interfaces) {
+                    if (i.typeParameters.empty() && i.identifierToken.text == name) { found = true; return; }
+                }
+                for (const auto& e : u.syntaxTree->enums) {
+                    if (e.identifierToken.text == name) { found = true; return; }
+                }
+                for (const auto& d : u.syntaxTree->delegates) {
+                    if (d.typeParameters.empty() && d.identifierToken.text == name) { found = true; return; }
+                }
+            });
+            return found;
+        }
+
+        const auto* tmpl = findTypeTemplateInScope(
+            moduleName, type.name.text, type.typeArguments.size());
+        const auto builtinArity = nativeBuiltinGenericArity(type.name.text);
+        const std::size_t expectedArity = tmpl ? tmpl->parameters.size() : builtinArity;
+        if (expectedArity == 0 || type.typeArguments.size() != expectedArity) {
+            return false;
+        }
+        for (const auto& arg : type.typeArguments) {
+            if (!validateNestedConstraintTypeArg(arg, moduleName, ownParams, enclosingParams)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    ConstraintTypeKind classifyTopLevelConstraintType(
+        const std::string& rawText,
+        const syntax::TypeSyntax& type,
+        const std::string& moduleName,
+        const std::set<std::string>& ownParams,
+        const std::set<std::string>& enclosingParams) const {
+        if (type.isArray() || isConstraintNullable(rawText, type)) {
+            return ConstraintTypeKind::NonInheritable;
+        }
+        const auto& name = type.name.text;
+        if (isPrimitiveOrKeywordTypeName(name)) {
+            return ConstraintTypeKind::NonInheritable;
+        }
+        if (type.isGeneric()) {
+            for (const auto& arg : type.typeArguments) {
+                if (!validateNestedConstraintTypeArg(arg, moduleName, ownParams, enclosingParams)) {
+                    return ConstraintTypeKind::Invalid;
+                }
+            }
+            if (const auto* tmpl = findTypeTemplateInScope(
+                    moduleName, name, type.typeArguments.size())) {
+                if (type.typeArguments.size() != tmpl->parameters.size()) {
+                    return ConstraintTypeKind::Invalid;
+                }
+                if (tmpl->kind == NativeGenericTemplate::Kind::Interface) {
+                    return ConstraintTypeKind::Interface;
+                }
+                if (tmpl->kind == NativeGenericTemplate::Kind::Class) {
+                    bool isSealed = false;
+                    if (tmpl->unit && tmpl->unit->syntaxTree) {
+                        for (const auto& cls : tmpl->unit->syntaxTree->classes) {
+                            if (cls.identifierToken.text == name &&
+                                cls.typeParameters.size() == tmpl->parameters.size() &&
+                                semantic::hasModifier(cls.modifiers, syntax::SyntaxKind::SealedKeyword)) {
+                                isSealed = true;
+                                break;
+                            }
+                        }
+                    }
+                    return isSealed ? ConstraintTypeKind::NonInheritable : ConstraintTypeKind::Class;
+                }
+                return ConstraintTypeKind::NonInheritable;
+            }
+            const auto builtinArity = nativeBuiltinGenericArity(name);
+            if (builtinArity > 0 && type.typeArguments.size() == builtinArity) {
+                return ConstraintTypeKind::Class;
+            }
+            return ConstraintTypeKind::Invalid;
+        }
+
+        ConstraintTypeKind resultKind = ConstraintTypeKind::Invalid;
+        forEachVisibleUnit(moduleName, [&](const std::string&, const ParsedUnit& u) {
+            if (resultKind != ConstraintTypeKind::Invalid) return;
+            for (const auto& iface : u.syntaxTree->interfaces) {
+                if (iface.typeParameters.empty() && iface.identifierToken.text == name) {
+                    resultKind = ConstraintTypeKind::Interface;
+                    return;
+                }
+            }
+            for (const auto& cls : u.syntaxTree->classes) {
+                if (cls.typeParameters.empty() && cls.identifierToken.text == name) {
+                    resultKind = semantic::hasModifier(cls.modifiers, syntax::SyntaxKind::SealedKeyword)
+                        ? ConstraintTypeKind::NonInheritable
+                        : ConstraintTypeKind::Class;
+                    return;
+                }
+            }
+            for (const auto& st : u.syntaxTree->structs) {
+                if (st.typeParameters.empty() && st.identifierToken.text == name) {
+                    resultKind = ConstraintTypeKind::NonInheritable;
+                    return;
+                }
+            }
+            for (const auto& en : u.syntaxTree->enums) {
+                if (en.identifierToken.text == name) {
+                    resultKind = ConstraintTypeKind::NonInheritable;
+                    return;
+                }
+            }
+            for (const auto& del : u.syntaxTree->delegates) {
+                if (del.typeParameters.empty() && del.identifierToken.text == name) {
+                    resultKind = ConstraintTypeKind::NonInheritable;
+                    return;
+                }
+            }
+        });
+        return resultKind;
+    }
+
+    void validateSingleTemplateConstraints(const NativeGenericTemplate& decl) {
+        if (decl.rawConstraints.empty()) return;
+        std::set<std::string> ownParams(decl.parameters.begin(), decl.parameters.end());
+        std::set<std::string> enclosingParams;
+        if (!decl.ownerName.empty()) {
+            const auto ownTable = registry_.types.find(decl.moduleName);
+            if (ownTable != registry_.types.end()) {
+                const auto ownerIt = ownTable->second.find(
+                    nativeGenericTypeKey(decl.ownerName, decl.ownerArity));
+                if (ownerIt != ownTable->second.end()) {
+                    enclosingParams.insert(
+                        ownerIt->second.parameters.begin(),
+                        ownerIt->second.parameters.end());
+                }
+            }
+        }
+
+        struct ConstraintItem {
+            std::string text;
+            text::TextSpan span;
+        };
+        struct ParamState {
+            bool hasClass = false;
+            bool hasStruct = false;
+            bool hasNew = false;
+            std::vector<std::string> baseClasses;
+            std::set<std::string> seenItems;
+        };
+        std::map<std::string, ParamState> paramStates;
+        std::map<std::string, std::set<std::string>> nakedEdges;
+
+        const auto reportDeclError = [&](const std::string& code,
+                                         const std::string& msg,
+                                         text::TextSpan diagSpan) {
+            result_.diagnostics.report(
+                code, msg, diagSpan,
+                diagnostics::DiagnosticSeverity::Error,
+                decl.sourceName);
+            modules_[decl.moduleName].invalid = true;
+        };
+
+        for (const auto& clause : decl.rawConstraints) {
+            const auto& paramName = clause.typeParameter.text;
+            if (ownParams.find(paramName) == ownParams.end()) {
+                reportDeclError(
+                    "RS8531",
+                    "unknown generic type parameter '" + paramName +
+                        "' in where constraint on '" + decl.name + "'",
+                    clause.typeParameter.span);
+                continue;
+            }
+
+            std::vector<ConstraintItem> items;
+            std::string currentText;
+            text::TextSpan currentSpan{};
+            bool hasSpan = false;
+            int angleDepth = 0;
+            const auto flushItem = [&]() {
+                if (!currentText.empty()) {
+                    items.push_back(ConstraintItem{currentText, currentSpan});
+                }
+                currentText.clear();
+                hasSpan = false;
+            };
+            for (const auto& tok : clause.constraints) {
+                if (tok.kind == syntax::SyntaxKind::LessToken) ++angleDepth;
+                if (tok.kind == syntax::SyntaxKind::GreaterToken) --angleDepth;
+                if (tok.kind == syntax::SyntaxKind::CommaToken && angleDepth == 0) {
+                    flushItem();
+                    continue;
+                }
+                currentText += tok.text;
+                if (!hasSpan) {
+                    currentSpan = tok.span;
+                    hasSpan = true;
+                } else if (tok.span.start >= currentSpan.start) {
+                    currentSpan.length =
+                        (tok.span.start + tok.span.length) - currentSpan.start;
+                }
+            }
+            flushItem();
+
+            auto& state = paramStates[paramName];
+            for (std::size_t itemIdx = 0; itemIdx < items.size(); ++itemIdx) {
+                const auto& item = items[itemIdx];
+                if (!state.seenItems.insert(item.text).second) {
+                    reportDeclError(
+                        "RS8532",
+                        "duplicate generic constraint '" + item.text +
+                            "' for type parameter '" + paramName + "'",
+                        item.span);
+                    continue;
+                }
+                if (item.text == "class") {
+                    if (itemIdx != 0) {
+                        reportDeclError(
+                            "RS8533",
+                            "the 'class' constraint must come first in where clause for '" +
+                                paramName + "'",
+                            item.span);
+                    }
+                    if (state.hasStruct) {
+                        reportDeclError(
+                            "RS8533",
+                            "type parameter '" + paramName +
+                                "' cannot combine 'class' and 'struct' constraints",
+                            item.span);
+                    }
+                    if (!state.baseClasses.empty()) {
+                        reportDeclError(
+                            "RS8533",
+                            "type parameter '" + paramName +
+                                "' cannot combine 'class' constraint with a base class constraint",
+                            item.span);
+                    }
+                    state.hasClass = true;
+                    continue;
+                }
+                if (item.text == "struct") {
+                    if (itemIdx != 0) {
+                        reportDeclError(
+                            "RS8533",
+                            "the 'struct' constraint must come first in where clause for '" +
+                                paramName + "'",
+                            item.span);
+                    }
+                    if (state.hasClass) {
+                        reportDeclError(
+                            "RS8533",
+                            "type parameter '" + paramName +
+                                "' cannot combine 'class' and 'struct' constraints",
+                            item.span);
+                    }
+                    if (state.hasNew) {
+                        reportDeclError(
+                            "RS8533",
+                            "type parameter '" + paramName +
+                                "' cannot combine 'struct' and 'new()' constraints",
+                            item.span);
+                    }
+                    if (!state.baseClasses.empty()) {
+                        reportDeclError(
+                            "RS8533",
+                            "type parameter '" + paramName +
+                                "' cannot combine 'struct' constraint with a base class constraint",
+                            item.span);
+                    }
+                    state.hasStruct = true;
+                    continue;
+                }
+                if (item.text == "new()") {
+                    if (itemIdx + 1 != items.size()) {
+                        reportDeclError(
+                            "RS8533",
+                            "the 'new()' constraint must be the last constraint for '" +
+                                paramName + "'",
+                            item.span);
+                    }
+                    if (state.hasStruct) {
+                        reportDeclError(
+                            "RS8533",
+                            "type parameter '" + paramName +
+                                "' cannot combine 'struct' and 'new()' constraints",
+                            item.span);
+                    }
+                    state.hasNew = true;
+                    continue;
+                }
+                if (ownParams.find(item.text) != ownParams.end() ||
+                    enclosingParams.find(item.text) != enclosingParams.end()) {
+                    if (item.text == paramName) {
+                        reportDeclError(
+                            "RS8533",
+                            "circular constraint dependency involving type parameter '" +
+                                paramName + "'",
+                            item.span);
+                    } else if (ownParams.find(item.text) != ownParams.end()) {
+                        nakedEdges[paramName].insert(item.text);
+                    }
+                    continue;
+                }
+
+                text::SourceText holderSource(
+                    "class __RsConstraintHolder { " + item.text + " f; }",
+                    decl.sourceName);
+                diagnostics::DiagnosticBag holderDiags;
+                syntax::Parser holderParser(holderSource, holderDiags);
+                const auto holderUnit = holderParser.parseCompilationUnit();
+                if (holderDiags.hasErrors() ||
+                    holderUnit.classes.empty() ||
+                    holderUnit.classes.front().fields.empty()) {
+                    reportDeclError(
+                        "RS8533",
+                        "invalid constraint '" + item.text + "' for type parameter '" +
+                            paramName + "'",
+                        item.span);
+                    continue;
+                }
+                const auto& parsedType = holderUnit.classes.front().fields.front().type;
+                const auto ctKind = classifyTopLevelConstraintType(
+                    item.text, parsedType, decl.moduleName, ownParams, enclosingParams);
+                if (ctKind == ConstraintTypeKind::Invalid) {
+                    reportDeclError(
+                        "RS8533",
+                        "unknown or malformed constraint type '" + item.text +
+                            "' for type parameter '" + paramName + "'",
+                        item.span);
+                } else if (ctKind == ConstraintTypeKind::NonInheritable) {
+                    reportDeclError(
+                        "RS8533",
+                        "constraint '" + item.text + "' for type parameter '" +
+                            paramName + "' is not a valid class or interface constraint",
+                        item.span);
+                } else if (ctKind == ConstraintTypeKind::Class) {
+                    if (state.hasClass || state.hasStruct) {
+                        reportDeclError(
+                            "RS8533",
+                            "type parameter '" + paramName +
+                                "' cannot combine base class constraint '" + item.text +
+                                "' with 'class' or 'struct'",
+                            item.span);
+                    }
+                    if (!state.baseClasses.empty()) {
+                        reportDeclError(
+                            "RS8533",
+                            "type parameter '" + paramName +
+                                "' cannot specify multiple base class constraints ('" +
+                                item.text + "')",
+                            item.span);
+                    }
+                    state.baseClasses.push_back(item.text);
+                }
+            }
+        }
+
+        // 3-color DFS cycle check on naked type parameter constraints among decl.parameters
+        std::map<std::string, int> color; // 0=unvisited, 1=visiting, 2=done
+        std::function<bool(const std::string&)> hasCycle = [&](const std::string& node) -> bool {
+            color[node] = 1;
+            const auto edgeIt = nakedEdges.find(node);
+            if (edgeIt != nakedEdges.end()) {
+                for (const auto& next : edgeIt->second) {
+                    const int nextColor = color[next];
+                    if (nextColor == 1) return true;
+                    if (nextColor == 0 && hasCycle(next)) return true;
+                }
+            }
+            color[node] = 2;
+            return false;
+        };
+        for (const auto& param : decl.parameters) {
+            if (color[param] == 0 && hasCycle(param)) {
+                reportDeclError(
+                    "RS8533",
+                    "circular generic type parameter constraint on '" + decl.name + "'",
+                    decl.span);
+                break;
+            }
+        }
+    }
+
+    void validateTemplateDeclarationConstraints() {
+        for (const auto& [modName, table] : registry_.types) {
+            (void)modName;
+            for (const auto& [declName, decl] : table) {
+                (void)declName;
+                validateSingleTemplateConstraints(decl);
+            }
+        }
+        for (const auto& [modName, table] : registry_.functions) {
+            (void)modName;
+            for (const auto& [declName, decl] : table) {
+                (void)declName;
+                validateSingleTemplateConstraints(decl);
+            }
+        }
+        for (const auto& [modName, table] : registry_.members) {
+            (void)modName;
+            for (const auto& [memberName, declList] : table) {
+                (void)memberName;
+                for (const auto& decl : declList) {
+                    validateSingleTemplateConstraints(decl);
+                }
+            }
+        }
+    }
+
+    static std::string substituteTypeText(
+        const syntax::TypeSyntax& type,
+        const std::map<std::string, std::string>* subs) {
+        if (!type.isGeneric()) {
+            std::string base = type.name.text;
+            if (subs) {
+                const auto it = subs->find(base);
+                if (it != subs->end()) base = it->second;
+            }
+            if (type.isArray()) base += "[]";
+            return base;
+        }
+        std::string result = type.name.text + "<";
+        for (std::size_t i = 0; i < type.typeArguments.size(); ++i) {
+            if (i != 0) result.push_back(',');
+            result += substituteTypeText(type.typeArguments[i], subs);
+        }
+        result.push_back('>');
+        if (type.isArray()) result += "[]";
+        return result;
+    }
+
+    static std::string canonicalGenericTypeName(
+        const syntax::TypeSyntax& type,
+        const std::map<std::string, std::string>* subs = nullptr) {
+        if (!type.isGeneric()) {
+            std::string base = type.name.text;
+            if (subs) {
+                const auto it = subs->find(base);
+                if (it != subs->end()) base = it->second;
+            }
+            if (type.isArray()) base += "[]";
+            return base;
+        }
+        std::vector<std::string> args;
+        args.reserve(type.typeArguments.size());
+        for (const auto& arg : type.typeArguments) {
+            args.push_back(canonicalGenericTypeName(arg, subs));
+        }
+        auto result = nativeGenericGeneratedName(type.name.text, args);
+        if (type.isArray()) result += "[]";
+        return result;
+    }
+
+    void collectTemplateSupertypes(
+        const std::string& templateName,
+        const std::vector<std::string>& args,
+        std::set<std::string>& outSupertypes,
+        std::set<std::string>& visited) const {
+        for (const auto& u : units_) {
+            if (!u || !u->syntaxTree) continue;
+            const auto handleBases = [&](const std::vector<syntax::SyntaxToken>& typeParams,
+                                         const std::vector<syntax::TypeSyntax>& bases) {
+                if (typeParams.size() != args.size() || typeParams.empty()) return;
+                std::map<std::string, std::string> subs;
+                for (std::size_t i = 0; i < typeParams.size(); ++i) {
+                    subs.emplace(typeParams[i].text, args[i]);
+                }
+                for (const auto& base : bases) {
+                    const auto rawText = substituteTypeText(base, &subs);
+                    const auto resolvedParent = resolveHygienicArgument(u->moduleName, rawText);
+                    outSupertypes.insert(rawText);
+                    outSupertypes.insert(resolvedParent.simpleBaseName);
+                    if (!resolvedParent.ownerModule.empty()) {
+                        outSupertypes.insert(resolvedParent.canonicalBaseName);
+                    }
+                    collectSupertypes(
+                        resolvedParent.ownerModule,
+                        resolvedParent.simpleBaseName,
+                        outSupertypes,
+                        visited);
+                    if (base.isGeneric()) {
+                        const auto canon = canonicalGenericTypeName(base, &subs);
+                        const auto resolvedSpec = resolveHygienicArgument(u->moduleName, canon);
+                        outSupertypes.insert(canon);
+                        outSupertypes.insert(resolvedSpec.simpleBaseName);
+                        if (!resolvedSpec.ownerModule.empty()) {
+                            outSupertypes.insert(resolvedSpec.canonicalBaseName);
+                        }
+                        collectSupertypes(
+                            resolvedSpec.ownerModule,
+                            resolvedSpec.simpleBaseName,
+                            outSupertypes,
+                            visited);
+                        std::vector<std::string> nextArgs;
+                        nextArgs.reserve(base.typeArguments.size());
+                        for (const auto& a : base.typeArguments) {
+                            nextArgs.push_back(canonicalGenericTypeName(a, &subs));
+                        }
+                        collectTemplateSupertypes(base.name.text, nextArgs, outSupertypes, visited);
+                    }
+                }
+            };
+            for (const auto& cls : u->syntaxTree->classes) {
+                if (cls.identifierToken.text == templateName) {
+                    handleBases(cls.typeParameters, cls.interfaces);
+                }
+            }
+            for (const auto& st : u->syntaxTree->structs) {
+                if (st.identifierToken.text == templateName) {
+                    handleBases(st.typeParameters, st.interfaces);
+                }
+            }
+            for (const auto& iface : u->syntaxTree->interfaces) {
+                if (iface.identifierToken.text == templateName) {
+                    handleBases(iface.typeParameters, iface.interfaces);
+                }
+            }
+        }
+    }
+
     struct ConcreteTypeFacts {
         bool known = false;
         bool valueType = false;
@@ -2734,81 +3418,62 @@ private:
         if (!ownerModule.empty()) {
             outSupertypes.insert(ownerModule + "::" + simpleTypeName);
         }
+        auto recordBases = [&](const ParsedUnit* unit,
+                               const std::vector<syntax::TypeSyntax>& interfaces) {
+            for (const auto& iface : interfaces) {
+                const auto parentRaw = nativeGenericTypeText(iface);
+                const auto resolvedParent = resolveHygienicArgument(unit->moduleName, parentRaw);
+                outSupertypes.insert(parentRaw);
+                outSupertypes.insert(resolvedParent.simpleBaseName);
+                if (!resolvedParent.ownerModule.empty()) {
+                    outSupertypes.insert(resolvedParent.canonicalBaseName);
+                }
+                if (iface.isGeneric()) {
+                    auto ifaceCopy = iface;
+                    const auto savedLocal = localTypes_;
+                    std::vector<ParsedUnit*> dummyQueue;
+                    const_cast<NativeGenericSpecializer*>(this)->rewriteType(
+                        ifaceCopy, unit->moduleName, unit->source->name(), dummyQueue);
+                    for (std::size_t qIdx = 0; qIdx < dummyQueue.size(); ++qIdx) {
+                        auto* du = dummyQueue[qIdx];
+                        if (!du || !const_cast<NativeGenericSpecializer*>(this)->processed_.insert(du).second) continue;
+                        const_cast<NativeGenericSpecializer*>(this)->rewriteUnit(*du, dummyQueue);
+                    }
+                    const_cast<NativeGenericSpecializer*>(this)->localTypes_ = savedLocal;
+                    const auto specText = nativeGenericTypeText(ifaceCopy);
+                    const auto resolvedSpec = resolveHygienicArgument(unit->moduleName, specText);
+                    outSupertypes.insert(specText);
+                    outSupertypes.insert(resolvedSpec.simpleBaseName);
+                    if (!resolvedSpec.ownerModule.empty()) {
+                        outSupertypes.insert(resolvedSpec.canonicalBaseName);
+                    }
+                    std::vector<std::string> subArgs;
+                    subArgs.reserve(iface.typeArguments.size());
+                    for (const auto& arg : iface.typeArguments) {
+                        subArgs.push_back(canonicalGenericTypeName(arg));
+                    }
+                    collectTemplateSupertypes(iface.name.text, subArgs, outSupertypes, visited);
+                }
+                collectSupertypes(
+                    resolvedParent.ownerModule,
+                    resolvedParent.simpleBaseName,
+                    outSupertypes,
+                    visited);
+            }
+        };
         auto scanUnit = [&](const ParsedUnit* unit) {
             if (!unit || !unit->syntaxTree) return;
             for (const auto& value : unit->syntaxTree->classes) {
-                if (value.identifierToken.text != simpleTypeName) continue;
-                for (const auto& iface : value.interfaces) {
-                    const auto parentRaw = nativeGenericTypeText(iface);
-                    const auto resolvedParent = resolveHygienicArgument(unit->moduleName, parentRaw);
-                    outSupertypes.insert(parentRaw);
-                    outSupertypes.insert(resolvedParent.simpleBaseName);
-                    if (!resolvedParent.ownerModule.empty()) {
-                        outSupertypes.insert(resolvedParent.canonicalBaseName);
-                    }
-                    if (iface.isGeneric()) {
-                        auto ifaceCopy = iface;
-                        const auto savedLocal = localTypes_;
-                        std::vector<ParsedUnit*> dummyQueue;
-                        const_cast<NativeGenericSpecializer*>(this)->rewriteType(
-                            ifaceCopy, unit->moduleName, unit->source->name(), dummyQueue);
-                        for (std::size_t qIdx = 0; qIdx < dummyQueue.size(); ++qIdx) {
-                            auto* du = dummyQueue[qIdx];
-                            if (!du || !const_cast<NativeGenericSpecializer*>(this)->processed_.insert(du).second) continue;
-                            const_cast<NativeGenericSpecializer*>(this)->rewriteUnit(*du, dummyQueue);
-                        }
-                        const_cast<NativeGenericSpecializer*>(this)->localTypes_ = savedLocal;
-                        const auto specText = nativeGenericTypeText(ifaceCopy);
-                        const auto resolvedSpec = resolveHygienicArgument(unit->moduleName, specText);
-                        outSupertypes.insert(specText);
-                        outSupertypes.insert(resolvedSpec.simpleBaseName);
-                        if (!resolvedSpec.ownerModule.empty()) {
-                            outSupertypes.insert(resolvedSpec.canonicalBaseName);
-                        }
-                    }
-                    collectSupertypes(
-                        resolvedParent.ownerModule,
-                        resolvedParent.simpleBaseName,
-                        outSupertypes,
-                        visited);
-                }
+                if (!value.typeParameters.empty() || value.identifierToken.text != simpleTypeName) continue;
+                recordBases(unit, value.interfaces);
             }
             for (const auto& value : unit->syntaxTree->structs) {
-                if (value.identifierToken.text != simpleTypeName) continue;
-                for (const auto& iface : value.interfaces) {
-                    const auto parentRaw = nativeGenericTypeText(iface);
-                    const auto resolvedParent = resolveHygienicArgument(unit->moduleName, parentRaw);
-                    outSupertypes.insert(parentRaw);
-                    outSupertypes.insert(resolvedParent.simpleBaseName);
-                    if (!resolvedParent.ownerModule.empty()) {
-                        outSupertypes.insert(resolvedParent.canonicalBaseName);
-                    }
-                    if (iface.isGeneric()) {
-                        auto ifaceCopy = iface;
-                        const auto savedLocal = localTypes_;
-                        std::vector<ParsedUnit*> dummyQueue;
-                        const_cast<NativeGenericSpecializer*>(this)->rewriteType(
-                            ifaceCopy, unit->moduleName, unit->source->name(), dummyQueue);
-                        for (std::size_t qIdx = 0; qIdx < dummyQueue.size(); ++qIdx) {
-                            auto* du = dummyQueue[qIdx];
-                            if (!du || !const_cast<NativeGenericSpecializer*>(this)->processed_.insert(du).second) continue;
-                            const_cast<NativeGenericSpecializer*>(this)->rewriteUnit(*du, dummyQueue);
-                        }
-                        const_cast<NativeGenericSpecializer*>(this)->localTypes_ = savedLocal;
-                        const auto specText = nativeGenericTypeText(ifaceCopy);
-                        const auto resolvedSpec = resolveHygienicArgument(unit->moduleName, specText);
-                        outSupertypes.insert(specText);
-                        outSupertypes.insert(resolvedSpec.simpleBaseName);
-                        if (!resolvedSpec.ownerModule.empty()) {
-                            outSupertypes.insert(resolvedSpec.canonicalBaseName);
-                        }
-                    }
-                    collectSupertypes(
-                        resolvedParent.ownerModule,
-                        resolvedParent.simpleBaseName,
-                        outSupertypes,
-                        visited);
-                }
+                if (!value.typeParameters.empty() || value.identifierToken.text != simpleTypeName) continue;
+                recordBases(unit, value.interfaces);
+            }
+            for (const auto& value : unit->syntaxTree->interfaces) {
+                if (!value.typeParameters.empty() || value.identifierToken.text != simpleTypeName) continue;
+                recordBases(unit, value.interfaces);
             }
         };
         if (!ownerModule.empty()) {
@@ -2834,7 +3499,7 @@ private:
             "long", "ulong", "float", "double", "char", "fixed", "fixed16",
             "fixed32", "fixed64", "vec2", "vec3", "vec4", "quat", "handle"};
         if (primitiveValues.find(name) != primitiveValues.end()) {
-            return {true, true, false, true, {name}};
+            return {true, true, false, true, {name, "object"}};
         }
         if (name == "string" || name == "object") {
             return {true, false, true, false, {name, "object"}};
@@ -2995,12 +3660,34 @@ private:
             const auto facts = concreteTypeFacts(resolvedArgs[index]);
             for (const auto& constraint : found->second) {
                 bool satisfied = true;
+                std::size_t nakedIdx = declaration.parameters.size();
+                for (std::size_t j = 0; j < declaration.parameters.size(); ++j) {
+                    if (declaration.parameters[j] == constraint) {
+                        nakedIdx = j;
+                        break;
+                    }
+                }
                 if (constraint == "class") {
                     satisfied = facts.referenceType;
                 } else if (constraint == "struct") {
                     satisfied = facts.valueType;
                 } else if (constraint == "new()") {
                     satisfied = facts.defaultConstructor;
+                } else if (nakedIdx < resolvedArgs.size()) {
+                    const auto& targetArg = resolvedArgs[nakedIdx];
+                    const bool sameArg =
+                        resolvedArgs[index].simpleBaseName == targetArg.simpleBaseName &&
+                        resolvedArgs[index].ownerModule == targetArg.ownerModule &&
+                        resolvedArgs[index].isArray == targetArg.isArray &&
+                        resolvedArgs[index].isNullable == targetArg.isNullable;
+                    const bool targetIsObj =
+                        targetArg.simpleBaseName == "object" &&
+                        !targetArg.isArray && !targetArg.isNullable;
+                    satisfied = sameArg ||
+                        (facts.known &&
+                         (targetIsObj ||
+                          facts.supertypes.find(targetArg.canonicalBaseName) != facts.supertypes.end() ||
+                          facts.supertypes.find(targetArg.simpleBaseName) != facts.supertypes.end()));
                 } else {
                     std::string substitutedType;
                     const auto expectedType = resolveConstraintTypeName(
@@ -3445,11 +4132,26 @@ private:
         const std::string& sourceName,
         std::vector<ParsedUnit*>& queue) {
         switch (expression.kind()) {
-        case syntax::SyntaxKind::LambdaExpression:
-            rewriteExpression(
-                *static_cast<syntax::LambdaExpressionSyntax&>(expression).body,
-                moduleName, sourceName, queue);
+        case syntax::SyntaxKind::LambdaExpression: {
+            auto& lam = static_cast<syntax::LambdaExpressionSyntax&>(expression);
+            const auto prevLocals = localTypes_;
+            for (std::size_t idx = 0; idx < lam.parameterTypes.size(); ++idx) {
+                if (!lam.parameterTypes[idx].has_value()) continue;
+                rewriteType(*lam.parameterTypes[idx], moduleName, sourceName, queue);
+                if (idx < lam.parameterTokens.size() &&
+                    lam.parameterTokens[idx].text != "_") {
+                    localTypes_[lam.parameterTokens[idx].text] =
+                        typeText(*lam.parameterTypes[idx]);
+                }
+            }
+            if (lam.blockBody) {
+                rewriteStatement(*lam.blockBody, moduleName, sourceName, queue);
+            } else if (lam.body) {
+                rewriteExpression(*lam.body, moduleName, sourceName, queue);
+            }
+            localTypes_ = prevLocals;
             return;
+        }
         case syntax::SyntaxKind::UnaryExpression:
             rewriteExpression(
                 *static_cast<syntax::UnaryExpressionSyntax&>(expression).operand,
@@ -3556,6 +4258,17 @@ private:
             for (auto& argument : call.arguments) {
                 rewriteExpression(*argument, moduleName, sourceName, queue);
             }
+            const NativeGenericTemplate* memberDecl = !currentOwnerTypeName_.empty()
+                ? resolveMember(
+                      moduleName,
+                      call.identifierToken.text,
+                      currentOwnerTypeName_,
+                      call.span(),
+                      sourceName)
+                : nullptr;
+            if (memberDecl && memberDecl->isExtension) {
+                memberDecl = nullptr;
+            }
             if (call.lessToken) {
                 for (auto& argument : call.typeArguments) {
                     rewriteType(argument, moduleName, sourceName, queue);
@@ -3564,18 +4277,47 @@ private:
                 for (const auto& argument : call.typeArguments) {
                     arguments.push_back(typeText(argument));
                 }
-                call.identifierToken.text = request(
-                    moduleName,
-                    call.identifierToken.text,
-                    std::move(arguments),
-                    true,
-                    call.span(),
-                    sourceName,
-                    queue);
+                if (memberDecl) {
+                    call.identifierToken.text = requestMember(
+                        moduleName,
+                        *memberDecl,
+                        arguments,
+                        call.span(),
+                        sourceName);
+                } else {
+                    call.identifierToken.text = request(
+                        moduleName,
+                        call.identifierToken.text,
+                        std::move(arguments),
+                        true,
+                        call.span(),
+                        sourceName,
+                        queue);
+                }
                 call.lessToken.reset();
                 call.typeArguments.clear();
                 call.typeArgumentCommaTokens.clear();
                 call.greaterToken.reset();
+            } else if (memberDecl) {
+                const auto inferred = inferArguments(*memberDecl, call.arguments, moduleName);
+                if (inferred) {
+                    call.identifierToken.text = requestMember(
+                        moduleName,
+                        *memberDecl,
+                        *inferred,
+                        call.span(),
+                        sourceName);
+                } else {
+                    result_.diagnostics.report(
+                        "RS8520",
+                        "generic type arguments for '" +
+                            call.identifierToken.text +
+                            "' could not be inferred",
+                        call.span(),
+                        diagnostics::DiagnosticSeverity::Error,
+                        sourceName);
+                    modules_[moduleName].invalid = true;
+                }
             } else if (const auto* declaration = resolve(
                            moduleName,
                            call.identifierToken.text,
@@ -4057,7 +4799,18 @@ private:
         }
         for (auto& event : declaration.events) rewriteType(event.delegateType, moduleName, sourceName, queue);
         for (auto& method : declaration.methods) rewriteFunction(method, moduleName, sourceName, queue);
+        auto hasStaticModifier = [](const std::vector<syntax::SyntaxToken>& modifiers) noexcept {
+            for (const auto& modifier : modifiers) {
+                if (modifier.text == "static") return true;
+            }
+            return false;
+        };
         for (auto& sequence : declaration.sequences) {
+            const auto previousLocalTypes = localTypes_;
+            localTypes_.clear();
+            if (!currentOwnerTypeName_.empty() && !hasStaticModifier(sequence.modifiers)) {
+                localTypes_["this"] = currentOwnerTypeName_;
+            }
             if (sequence.resultType) {
                 rewriteType(
                     *sequence.resultType,
@@ -4065,20 +4818,47 @@ private:
                     sourceName,
                     queue);
             }
-            for (auto& parameter : sequence.parameters) rewriteParameter(parameter, moduleName, sourceName, queue);
+            for (auto& parameter : sequence.parameters) {
+                rewriteParameter(parameter, moduleName, sourceName, queue);
+                localTypes_[parameter.identifierToken.text] = typeText(parameter.type);
+            }
             rewriteStatement(sequence.body, moduleName, sourceName, queue);
+            localTypes_ = previousLocalTypes;
         }
         for (auto& constructor : declaration.constructors) {
-            for (auto& parameter : constructor.parameters) rewriteParameter(parameter, moduleName, sourceName, queue);
+            const auto previousLocalTypes = localTypes_;
+            localTypes_.clear();
+            if (!currentOwnerTypeName_.empty() && !hasStaticModifier(constructor.modifiers)) {
+                localTypes_["this"] = currentOwnerTypeName_;
+            }
+            for (auto& parameter : constructor.parameters) {
+                rewriteParameter(parameter, moduleName, sourceName, queue);
+                localTypes_[parameter.identifierToken.text] = typeText(parameter.type);
+            }
             for (auto& baseArg : constructor.baseArguments) {
                 if (baseArg) rewriteExpression(*baseArg, moduleName, sourceName, queue);
             }
             rewriteStatement(constructor.body, moduleName, sourceName, queue);
+            localTypes_ = previousLocalTypes;
         }
         for (auto& property : declaration.properties) {
             rewriteType(property.type, moduleName, sourceName, queue);
-            if (property.getter && property.getter->body) rewriteStatement(*property.getter->body, moduleName, sourceName, queue);
-            if (property.setter && property.setter->body) rewriteStatement(*property.setter->body, moduleName, sourceName, queue);
+            const auto previousLocalTypes = localTypes_;
+            localTypes_.clear();
+            const bool isStaticProperty =
+                property.staticKeyword.has_value() || hasStaticModifier(property.modifiers);
+            if (!currentOwnerTypeName_.empty() && !isStaticProperty) {
+                localTypes_["this"] = currentOwnerTypeName_;
+            }
+            if (property.getter && property.getter->body) {
+                rewriteStatement(*property.getter->body, moduleName, sourceName, queue);
+            }
+            if (property.setter && property.setter->body) {
+                localTypes_["value"] = typeText(property.type);
+                rewriteStatement(*property.setter->body, moduleName, sourceName, queue);
+                localTypes_.erase("value");
+            }
+            localTypes_ = previousLocalTypes;
             if (property.initializer) rewriteExpression(*property.initializer, moduleName, sourceName, queue);
         }
         currentOwnerTypeName_ = savedOwnerName;
@@ -4110,6 +4890,9 @@ private:
             if (!declaration.typeParameters.empty()) continue;
             const auto savedOwner = currentOwnerTypeName_;
             currentOwnerTypeName_ = declaration.identifierToken.text;
+            for (auto& interfaceType : declaration.interfaces) {
+                rewriteType(interfaceType, moduleName, sourceName, queue);
+            }
             for (auto& method : declaration.methods) {
                 const auto savedLocal = localTypes_;
                 localTypes_.clear();

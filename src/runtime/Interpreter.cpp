@@ -175,6 +175,7 @@ void resumeInterpreterCoroutineCallback(
     state.asyncRuntime = &asyncContext;
     state.awaitScheduler = resumeOpts.awaitScheduler;
     state.crossHeapPolicy = resumeOpts.crossHeapPolicy;
+    state.executionPolicy = resumeOpts.executionPolicy;
     const std::shared_ptr<const void> keepAlive = frame.runnerOwner;
     state.resumeEnvRaw = env;
     state.resumeEnvOwner = &keepAlive;
@@ -577,6 +578,14 @@ void Interpreter::setHeap(std::shared_ptr<ManagedHeap> heap) {
 
 std::shared_ptr<ManagedHeap> Interpreter::heap() const noexcept { return heap_; }
 
+void Interpreter::setExecutionPolicy(IExecutionPolicy* policy) noexcept {
+    executionPolicy_ = policy;
+}
+
+IExecutionPolicy* Interpreter::executionPolicy() const noexcept {
+    return executionPolicy_;
+}
+
 void Interpreter::setAsyncRuntime(std::shared_ptr<AsyncRuntimeContext> asyncRuntime) {
     asyncRuntime_ = asyncRuntime
         ? std::move(asyncRuntime)
@@ -746,6 +755,13 @@ ExecutionResult Interpreter::invoke(
     state.asyncRuntime = asyncRuntime_.get();
     state.awaitScheduler = options.awaitScheduler;
     state.crossHeapPolicy = options.crossHeapPolicy;
+    state.executionPolicy = options.executionPolicy
+        ? options.executionPolicy
+        : executionPolicy_;
+    if (resumeEnv_) {
+        static_cast<InterpreterResumeEnv*>(resumeEnv_.get())->options.executionPolicy =
+            state.executionPolicy;
+    }
     if (state.asyncRuntime && state.heap && state.asyncRuntime->awaitables().heap() == nullptr) {
         state.asyncRuntime->setHeap(state.heap);
     }

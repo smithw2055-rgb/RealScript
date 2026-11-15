@@ -1,17 +1,17 @@
 #pragma once
 
-#include "realscript/game/BindingTypes.h"
+#include "realscript/bindgen/BindingTypes.h"
 
-namespace realscript::game::detail {
+namespace realscript::bindgen::detail {
 
 template <typename T>
 std::optional<std::shared_ptr<T>> readNativeObject(
-    const std::shared_ptr<GameApiState>& state,
+    const std::shared_ptr<HostApiState>& state,
     const runtime::Value& value,
     runtime::RuntimeError& error) {
     const auto* type = findNativeType(state, std::type_index(typeid(T)));
     if (!type) {
-        setTypeMismatch(error, "native C++ type is not registered with the game script API");
+        setTypeMismatch(error, "native C++ type is not registered with the host binding API");
         return std::nullopt;
     }
     if (std::holds_alternative<runtime::NullObject>(value)) {
@@ -121,12 +121,12 @@ inline std::optional<Fixed16> extractFixed16StructValue(const runtime::Value& va
 
 template <typename T>
 std::optional<runtime::Value> writeNativeObject(
-    const std::shared_ptr<GameApiState>& state,
+    const std::shared_ptr<HostApiState>& state,
     std::shared_ptr<T> value,
     runtime::RuntimeError& error) {
     const auto* type = findNativeType(state, std::type_index(typeid(T)));
     if (!type) {
-        setTypeMismatch(error, "native C++ type is not registered with the game script API");
+        setTypeMismatch(error, "native C++ type is not registered with the host binding API");
         return std::nullopt;
     }
     if (!value) return runtime::Value{runtime::NullObject{}};
@@ -160,7 +160,7 @@ std::optional<runtime::Value> writeNativeObject(
 
 template <typename Element>
 [[nodiscard]] std::optional<semantic::SymbolId> resolveTypedAwaitableTypeId(
-    const std::shared_ptr<GameApiState>& state) {
+    const std::shared_ptr<HostApiState>& state) {
     auto elemRef = resolveScriptType<Element>(state);
     if (!elemRef || elemRef->category == ScriptTypeCategory::Void) {
         return std::nullopt;
@@ -185,7 +185,7 @@ template <typename Element>
 
 template <typename T>
 std::optional<RemoveCvRef<T>> readValue(
-    const std::shared_ptr<GameApiState>& state,
+    const std::shared_ptr<HostApiState>& state,
     const runtime::Value& value,
     runtime::RuntimeError& error) {
     using ValueType = RemoveCvRef<T>;
@@ -451,7 +451,7 @@ std::optional<RemoveCvRef<T>> readValue(
     } else if constexpr (std::is_class_v<ValueType> && std::is_default_constructible_v<ValueType>) {
         const auto found = state->nativeStructByCppType.find(std::type_index(typeid(ValueType)));
         if (found == state->nativeStructByCppType.end()) {
-            setTypeMismatch(error, "native C++ struct type is not registered with the game script API");
+            setTypeMismatch(error, "native C++ struct type is not registered with the host binding API");
             return std::nullopt;
         }
         const auto& st = state->nativeStructs[found->second];
@@ -469,14 +469,14 @@ std::optional<RemoveCvRef<T>> readValue(
         }
         return out;
     } else {
-        static_assert(!sizeof(T), "unsupported C++ argument type for RealScript game binding");
+        static_assert(!sizeof(T), "unsupported C++ argument type for RealScript host binding");
         return std::nullopt;
     }
 }
 
 template <typename T>
 std::optional<runtime::Value> writeValue(
-    const std::shared_ptr<GameApiState>& state,
+    const std::shared_ptr<HostApiState>& state,
     T&& value,
     runtime::RuntimeError& error) {
     using ValueType = RemoveCvRef<T>;
@@ -618,7 +618,7 @@ std::optional<runtime::Value> writeValue(
     } else if constexpr (std::is_class_v<ValueType> && std::is_default_constructible_v<ValueType>) {
         const auto found = state->nativeStructByCppType.find(std::type_index(typeid(ValueType)));
         if (found == state->nativeStructByCppType.end()) {
-            setTypeMismatch(error, "native C++ struct type is not registered with the game script API");
+            setTypeMismatch(error, "native C++ struct type is not registered with the host binding API");
             return std::nullopt;
         }
         const auto& st = state->nativeStructs[found->second];
@@ -641,7 +641,7 @@ std::optional<runtime::Value> writeValue(
         }
         return runtime::Value{runtime::makeStructValueFromFields(st.typeId, std::move(heapFields))};
     } else {
-        static_assert(!sizeof(T), "unsupported C++ return type for RealScript game binding");
+        static_assert(!sizeof(T), "unsupported C++ return type for RealScript host binding");
     }
 }
 
@@ -658,7 +658,7 @@ decltype(auto) passArgument(Storage& value) {
 
 template <typename Callable, typename Traits, std::size_t... Indices>
 std::optional<runtime::Value> invokeFree(
-    const std::shared_ptr<GameApiState>& state,
+    const std::shared_ptr<HostApiState>& state,
     Callable& callable,
     runtime::ValueSpan arguments,
     runtime::RuntimeError& error,
@@ -691,7 +691,7 @@ std::optional<runtime::Value> invokeFree(
 
 template <typename ReceiverType, auto Method, typename Traits, std::size_t... Indices>
 std::optional<runtime::Value> invokeMethod(
-    const std::shared_ptr<GameApiState>& state,
+    const std::shared_ptr<HostApiState>& state,
     runtime::ValueSpan arguments,
     runtime::RuntimeError& error,
     std::index_sequence<Indices...>) {
@@ -736,7 +736,7 @@ std::optional<runtime::Value> invokeMethod(
 
 template <typename Tuple, std::size_t... Indices>
 std::optional<std::vector<ParameterDeclaration>> makeParameters(
-    const std::shared_ptr<GameApiState>& state,
+    const std::shared_ptr<HostApiState>& state,
     std::index_sequence<Indices...>) {
     std::vector<ParameterDeclaration> result;
     result.reserve(sizeof...(Indices));
@@ -768,4 +768,4 @@ inline void collectImports(
     }
 }
 
-} // namespace realscript::game::detail
+} // namespace realscript::bindgen::detail

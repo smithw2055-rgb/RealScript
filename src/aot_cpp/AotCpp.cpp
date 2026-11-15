@@ -85,6 +85,7 @@ std::string canonicalInput(
                 ":sealed=" + (type.sealedType ? "1" : "0") +
                 ":delegate=" + (type.delegateType ? "1" : "0") +
                 ":interface=" + (type.interfaceType ? "1" : "0") +
+                ":partial=" + (type.partialType ? "1" : "0") +
                 ":lifecycle=" + (type.hasValueLifecycle ? "1" : "0") + ":";
             for (const auto& field : type.fields) {
                 value += field.name +
@@ -255,11 +256,63 @@ GeneratedProgram CppGenerator::generate(
         for (const auto& type : module.types) {
             const auto inserted = types.emplace(
                 type.id,
-                TypeView{&type, "type_" + hexId(type.id)});
-            if (!inserted.second &&
-                semantic::canonicalTypeName(*inserted.first->second.type) !=
+                TypeView{nullptr, type, "type_" + hexId(type.id)});
+            inserted.first->second.type = &inserted.first->second.mergedType;
+            if (!inserted.second) {
+                auto& dst = inserted.first->second.mergedType;
+                if (semantic::canonicalTypeName(dst) !=
                     semantic::canonicalTypeName(type)) {
-                diagnostics.report("RS7003", "duplicate AOT TypeId has incompatible names", {});
+                    diagnostics.report("RS7003", "duplicate AOT TypeId has incompatible names", {});
+                } else {
+                    const bool prevPartial = dst.partialType;
+                    const bool prevAbstract = dst.abstractType;
+                    const bool prevSealed = dst.sealedType;
+                    const bool prevLifecycle = dst.hasValueLifecycle;
+                    const auto prevFields = dst.fields;
+                    bool swappedToIncoming = false;
+                    if (type.fields.size() > dst.fields.size() ||
+                        type.virtualDispatchTable.size() >
+                            dst.virtualDispatchTable.size()) {
+                        dst = type;
+                        swappedToIncoming = true;
+                    }
+                    dst.partialType = prevPartial || type.partialType;
+                    dst.abstractType = prevAbstract || type.abstractType;
+                    dst.sealedType = prevSealed || type.sealedType;
+                    dst.hasValueLifecycle = prevLifecycle || type.hasValueLifecycle;
+                    if (dst.baseTypeId == 0 && type.baseTypeId != 0) {
+                        dst.baseTypeId = type.baseTypeId;
+                        dst.baseTypeName = type.baseTypeName;
+                    }
+                    const auto& extraFields = swappedToIncoming ? prevFields : type.fields;
+                    for (const auto& extra : extraFields) {
+                        const auto foundIt = std::find_if(
+                            dst.fields.begin(),
+                            dst.fields.end(),
+                            [&](const semantic::FieldSymbol& f) {
+                                return f.name == extra.name;
+                            });
+                        if (foundIt == dst.fields.end()) {
+                            auto added = extra;
+                            added.index = dst.fields.size();
+                            dst.fields.push_back(std::move(added));
+                        }
+                    }
+                    if (type.virtualDispatchTable.size() > dst.virtualDispatchTable.size()) {
+                        dst.virtualDispatchTable = type.virtualDispatchTable;
+                    }
+                    for (const auto& iface : type.interfaceDispatchMaps) {
+                        const bool hasIface = std::any_of(
+                            dst.interfaceDispatchMaps.begin(),
+                            dst.interfaceDispatchMaps.end(),
+                            [&](const auto& existing) {
+                                return existing.interfaceTypeId == iface.interfaceTypeId;
+                            });
+                        if (!hasIface) {
+                            dst.interfaceDispatchMaps.push_back(iface);
+                        }
+                    }
+                }
             }
         }
         for (const auto& function : module.functions) {
@@ -354,6 +407,7 @@ GeneratedProgram CppGenerator::generate(
     }
     source.line("#include \"realscript_aot_generated.h\"");
     source.line();
+    source.line("#include <array>");
     source.line("#include <limits>");
     if (options.trustedRelease) {
         source.line();
@@ -467,7 +521,8 @@ GeneratedProgram CppGenerator::generate(
                     : view.cppName + "_interfaceMaps") +
                 ", " + std::to_string(type.interfaceDispatchMaps.size()) +
                 "u, " + (type.delegateType ? "true" : "false") +
-                ", " + (hasLifecycle ? "true" : "false") + "},");
+                ", " + (hasLifecycle ? "true" : "false") +
+                ", " + (type.partialType ? "true" : "false") + "},");
         }
         source.line("};");
     }
@@ -762,10 +817,73 @@ GeneratedProgram CppGenerator::generate(
         std::vector<SharedGenericMemberSpec> members;
     };
 
+    std::unordered_set<std::string> exactAttrTargets;
+    std::unordered_set<std::string> methodOrFnAttrStems;
+    std::unordered_set<std::string> ctorOwnerAttrStems;
+    for (const auto& module : modules) {
+        for (const auto& attr : module.languageMetadata.attributes) {
+            if (attr.target.empty()) continue;
+            exactAttrTargets.insert(attr.target);
+            if (const auto hashPos = attr.target.find('#');
+                hashPos != std::string::npos) {
+                methodOrFnAttrStems.insert(attr.target.substr(0, hashPos + 1u));
+            }
+            if (const auto ctorPos = attr.target.find("::ctor:");
+                ctorPos != std::string::npos) {
+                ctorOwnerAttrStems.insert(attr.target.substr(0, ctorPos + 7u));
+            }
+        }
+    }
+    const auto isAttributedFunction = [&](const mir::Function& fn) -> bool {
+        if (exactAttrTargets.empty()) return false;
+        const std::string& name = fn.name;
+        std::string owner;
+        std::string member;
+        if (name.size() >= 6 && name.compare(name.size() - 6, 6, "..ctor") == 0) {
+            owner = name.substr(0, name.size() - 6);
+            member = ".ctor";
+        } else if (name.size() >= 7 && name.compare(name.size() - 7, 7, "..cctor") == 0) {
+            owner = name.substr(0, name.size() - 7);
+            member = ".cctor";
+        } else {
+            std::size_t angleDepth = 0;
+            std::size_t lastDot = std::string::npos;
+            for (std::size_t i = 0; i < name.size(); ++i) {
+                if (name[i] == '<') ++angleDepth;
+                else if (name[i] == '>' && angleDepth > 0) --angleDepth;
+                else if (name[i] == '.' && angleDepth == 0) lastDot = i;
+            }
+            if (lastDot != std::string::npos) {
+                owner = name.substr(0, lastDot);
+                member = name.substr(lastDot + 1u);
+            }
+        }
+        if (owner.empty()) {
+            return methodOrFnAttrStems.count(
+                fn.moduleName + "::function:" + name + "#") > 0;
+        }
+        const std::string ownerPrefix = fn.moduleName + "::" + owner + "::";
+        if (methodOrFnAttrStems.count(ownerPrefix + "method:" + member + "#") > 0) {
+            return true;
+        }
+        if ((member == ".ctor" || member == owner) &&
+            ctorOwnerAttrStems.count(ownerPrefix + "ctor:") > 0) {
+            return true;
+        }
+        if ((member.rfind("get_", 0) == 0 || member.rfind("set_", 0) == 0) &&
+            exactAttrTargets.count(ownerPrefix + "property:" + member.substr(4u)) > 0) {
+            return true;
+        }
+        return false;
+    };
+
     std::unordered_map<semantic::SymbolId, const FunctionView*> typedFunctions;
     for (const auto& view : functions) {
         if (view.module->name == "RealScript.Async" &&
             view.function->name.rfind("Async.__", 0) == 0) {
+            continue;
+        }
+        if (isAttributedFunction(*view.function)) {
             continue;
         }
         if (supportsTypedPrimitiveAot(*view.function, unboxableCustomStructs)) {
@@ -925,12 +1043,17 @@ GeneratedProgram CppGenerator::generate(
                     case mir::Opcode::CheckNotNull:
                     case mir::Opcode::LoadField:
                     case mir::Opcode::StoreField:
-                    case mir::Opcode::InvokeDelegate:
                     case mir::Opcode::CombineDelegate:
                     case mir::Opcode::RemoveDelegate:
                     case mir::Opcode::AsyncResolve:
                         outSpec.typeIds.push_back(inst.typeId);
                         usesReferenceSlot = true;
+                        break;
+                    case mir::Opcode::InvokeDelegate:
+                        outSpec.typeIds.push_back(inst.typeId);
+                        usesReferenceSlot = true;
+                        sig << "delret=";
+                        recordSlot(inst.resultType, inst.resultTypeId, true);
                         break;
                     case mir::Opcode::LoadStructField:
                     case mir::Opcode::StoreStructField:
@@ -1145,10 +1268,17 @@ GeneratedProgram CppGenerator::generate(
             source.line("    const SharedRefGenericSpec& spec) {");
             source.line("    (void)result;");
             source.line("    (void)spec;");
-            source.line("    std::vector<runtime::Value> argumentValues;");
-            source.line("    if (argumentCount != 0) {");
-            source.line("        argumentValues.assign(arguments, arguments + argumentCount);");
-            source.line("    }");
+            const bool isAsyncFunction = !function.blocks.empty() &&
+                !function.blocks.front().instructions.empty() &&
+                function.blocks.front().instructions.front().opcode == mir::Opcode::AsyncEnter;
+            if (isAsyncFunction) {
+                source.line("    std::vector<runtime::Value> argumentValues;");
+                source.line("    if (argumentCount != 0) {");
+                source.line("        argumentValues.assign(arguments, arguments + argumentCount);");
+                source.line("    }");
+            } else {
+                source.line("    const runtime::ValueSpan argumentValues(arguments, argumentCount);");
+            }
 
             std::size_t specTypeCursor = 0;
             std::size_t specCallCursor = 0;
@@ -1159,9 +1289,15 @@ GeneratedProgram CppGenerator::generate(
                 return "(*spec.calls[" + std::to_string(specCallCursor++) + "u])";
             };
 
-            source.line("    std::vector<runtime::Value> locals(" +
-                std::to_string(function.localTypes.size()) + ");");
-            for (std::size_t index = 0; index < function.localTypes.size(); ++index) {
+            const std::size_t localCount = function.localTypes.size();
+            if (!isAsyncFunction && localCount <= 32) {
+                source.line("    std::array<runtime::Value, " +
+                    std::to_string(std::max<std::size_t>(1, localCount)) + "> locals{};");
+            } else {
+                source.line("    std::vector<runtime::Value> locals(" +
+                    std::to_string(localCount) + ");");
+            }
+            for (std::size_t index = 0; index < localCount; ++index) {
                 const auto tidExpr = nextSpecTypeExpr();
                 source.line("    locals[" + std::to_string(index) +
                     "] = context.defaultValue(" +
@@ -1174,13 +1310,21 @@ GeneratedProgram CppGenerator::generate(
                 handlerCatchExprs.push_back(nextSpecTypeExpr());
             }
 
-            source.line("    std::vector<runtime::Value> registers(" +
-                std::to_string(registerCount(function)) + ");");
-            const bool isAsyncFunction = !function.blocks.empty() &&
-                !function.blocks.front().instructions.empty() &&
-                function.blocks.front().instructions.front().opcode == mir::Opcode::AsyncEnter;
-            source.line("    FrameScope frame(context, argumentValues, locals, registers, " +
-                std::string(!isAsyncFunction ? "true" : "false") + ");");
+            const std::size_t regCount = registerCount(function);
+            if (!isAsyncFunction && regCount <= 64) {
+                source.line("    std::array<runtime::Value, " +
+                    std::to_string(std::max<std::size_t>(1, regCount)) + "> registers{};");
+            } else {
+                source.line("    std::vector<runtime::Value> registers(" +
+                    std::to_string(regCount) + ");");
+            }
+            if (!isAsyncFunction) {
+                source.line("    FrameScope frame(context, argumentValues, runtime::ValueSpan(locals.data(), " +
+                    std::to_string(localCount) + "u), runtime::ValueSpan(registers.data(), " +
+                    std::to_string(regCount) + "u), true);");
+            } else {
+                source.line("    FrameScope frame(context, argumentValues, locals, registers, false);");
+            }
             const auto allMembersNonEscapingStackRef =
                 [&](std::size_t bIdx, std::size_t iIdx) noexcept -> bool {
                 if (isAsyncFunction) return false;
@@ -1515,6 +1659,7 @@ GeneratedProgram CppGenerator::generate(
                     }
                     case mir::Opcode::InvokeDelegate: {
                         const auto delTidExpr = nextSpecTypeExpr();
+                        const auto delRetTidExpr = nextSpecTypeExpr();
                         const auto callIndex = functionCallIndex++;
                         const auto name = "delegateArguments_" + std::to_string(callIndex);
                         const auto resultName = "delegateResult_" + std::to_string(callIndex);
@@ -1524,7 +1669,8 @@ GeneratedProgram CppGenerator::generate(
                         source.line("            if (!context.invokeDelegate(" +
                             delTidExpr + ", " + pointer + ", " +
                             std::to_string(instruction.operands.size()) +
-                            "u, " + resultName + ")) {");
+                            "u, " + primitiveExpression(instruction.resultType) +
+                            ", " + delRetTidExpr + ", " + resultName + ")) {");
                         source.line("                if (context.hasPendingException()) {");
                         emitExceptionRoute("                    ");
                         if (isAsyncFunction) {
@@ -1807,13 +1953,26 @@ GeneratedProgram CppGenerator::generate(
         source.line("    std::size_t argumentCount,");
         source.line("    runtime::Value& result) {");
         source.line("    (void)result;");
-        source.line("    std::vector<runtime::Value> argumentValues;");
-        source.line("    if (argumentCount != 0) {");
-        source.line("        argumentValues.assign(arguments, arguments + argumentCount);");
-        source.line("    }");
-        source.line("    std::vector<runtime::Value> locals(" +
-            std::to_string(function.localTypes.size()) + ");");
-        for (std::size_t index = 0; index < function.localTypes.size(); ++index) {
+        const bool isAsyncFunction = !function.blocks.empty() &&
+            !function.blocks.front().instructions.empty() &&
+            function.blocks.front().instructions.front().opcode == mir::Opcode::AsyncEnter;
+        if (isAsyncFunction) {
+            source.line("    std::vector<runtime::Value> argumentValues;");
+            source.line("    if (argumentCount != 0) {");
+            source.line("        argumentValues.assign(arguments, arguments + argumentCount);");
+            source.line("    }");
+        } else {
+            source.line("    const runtime::ValueSpan argumentValues(arguments, argumentCount);");
+        }
+        const std::size_t localCount = function.localTypes.size();
+        if (!isAsyncFunction && localCount <= 32) {
+            source.line("    std::array<runtime::Value, " +
+                std::to_string(std::max<std::size_t>(1, localCount)) + "> locals{};");
+        } else {
+            source.line("    std::vector<runtime::Value> locals(" +
+                std::to_string(localCount) + ");");
+        }
+        for (std::size_t index = 0; index < localCount; ++index) {
             const auto typeId = index < function.localTypeIds.size()
                 ? function.localTypeIds[index]
                 : 0;
@@ -1822,13 +1981,21 @@ GeneratedProgram CppGenerator::generate(
                 primitiveExpression(function.localTypes[index]) + ", 0x" +
                 hexId(typeId) + "ULL);");
         }
-        source.line("    std::vector<runtime::Value> registers(" +
-            std::to_string(registerCount(function)) + ");");
-        const bool isAsyncFunction = !function.blocks.empty() &&
-            !function.blocks.front().instructions.empty() &&
-            function.blocks.front().instructions.front().opcode == mir::Opcode::AsyncEnter;
-        source.line("    FrameScope frame(context, argumentValues, locals, registers, " +
-            std::string(!isAsyncFunction ? "true" : "false") + ");");
+        const std::size_t regCount = registerCount(function);
+        if (!isAsyncFunction && regCount <= 64) {
+            source.line("    std::array<runtime::Value, " +
+                std::to_string(std::max<std::size_t>(1, regCount)) + "> registers{};");
+        } else {
+            source.line("    std::vector<runtime::Value> registers(" +
+                std::to_string(regCount) + ");");
+        }
+        if (!isAsyncFunction) {
+            source.line("    FrameScope frame(context, argumentValues, runtime::ValueSpan(locals.data(), " +
+                std::to_string(localCount) + "u), runtime::ValueSpan(registers.data(), " +
+                std::to_string(regCount) + "u), true);");
+        } else {
+            source.line("    FrameScope frame(context, argumentValues, locals, registers, false);");
+        }
         if (!isAsyncFunction) {
             bool hasNonEscapingStackRef = false;
             for (const auto& blk : function.blocks) {
@@ -2126,7 +2293,9 @@ GeneratedProgram CppGenerator::generate(
                     source.line("            if (!context.invokeDelegate(0x" +
                         hexId(instruction.typeId) + "ULL, " + pointer + ", " +
                         std::to_string(instruction.operands.size()) +
-                        "u, " + resultName + ")) {");
+                        "u, " + primitiveExpression(instruction.resultType) +
+                        ", 0x" + hexId(instruction.resultTypeId) + "ULL, " +
+                        resultName + ")) {");
                     source.line("                if (context.hasPendingException()) {");
                     emitExceptionRoute("                    ");
                     if (isAsyncFunction) {
@@ -2416,6 +2585,27 @@ GeneratedProgram CppGenerator::generate(
     }
     source.line("};");
 
+    std::vector<const mir::Module*> orderedModules;
+    orderedModules.reserve(modules.size());
+    for (const auto& module : modules) orderedModules.push_back(&module);
+    std::sort(orderedModules.begin(), orderedModules.end(), [](const auto* lhs, const auto* rhs) {
+        return lhs->name < rhs->name;
+    });
+    std::vector<std::pair<std::string, std::string>> emittedAttributes;
+    for (const auto* module : orderedModules) {
+        for (const auto& attr : module->languageMetadata.attributes) {
+            emittedAttributes.emplace_back(attr.target, attr.name);
+        }
+    }
+    if (!emittedAttributes.empty()) {
+        source.line("static constexpr AttributeDescriptor programAttributes[] = {");
+        for (const auto& [attrTarget, attrName] : emittedAttributes) {
+            source.line("    {\"" + escapeCppString(attrTarget) + "\", \"" +
+                escapeCppString(attrName) + "\"},");
+        }
+        source.line("};");
+    }
+
     source.line("static constexpr ProgramDescriptor programDescriptor{");
     source.line("    RuntimeAbiMajor,");
     source.line("    RuntimeAbiMinor,");
@@ -2431,6 +2621,10 @@ GeneratedProgram CppGenerator::generate(
         ? std::string("nullptr")
         : "programSourceMap") + ",");
     source.line("    " + std::to_string(sourceMap.size()) + "u,");
+    source.line("    " + (emittedAttributes.empty()
+        ? std::string("nullptr")
+        : std::string("programAttributes")) + ",");
+    source.line("    " + std::to_string(emittedAttributes.size()) + "u,");
     source.line("};");
     source.line();
     source.line("const ProgramDescriptor& " + options.programName +

@@ -131,6 +131,12 @@ struct VariableSymbol {
         : variable.storageTypeName;
 }
 
+[[nodiscard]] inline bool hasWrappedStorage(
+    const VariableSymbol& variable) noexcept {
+    return storageTypeOf(variable) != variable.type ||
+        storageTypeNameOf(variable) != variable.typeName;
+}
+
 struct FieldSymbol {
     std::string name;
     Accessibility accessibility = Accessibility::Public;
@@ -299,6 +305,8 @@ struct TypeSymbol {
     bool deterministic = false;
     SymbolId baseTypeId = 0;
     std::string baseTypeName;
+    std::vector<std::string> baseInterfaceNames;
+    std::string enclosingOwnerTypeName;
     std::string moduleName;
     std::string name;
     std::vector<FieldSymbol> fields;
@@ -508,6 +516,7 @@ struct FunctionBindingInput {
     std::optional<FunctionSymbol> sequenceNextCallback;
     const syntax::LambdaExpressionSyntax* eventLambda = nullptr;
     std::unordered_set<std::string> hygienicAccessibleModules;
+    bool inConstructorInitializer = false;
 };
 
 struct ObsoleteInfo {
@@ -1585,8 +1594,15 @@ private:
     std::size_t breakableDepth_ = 0;
     bool checkedArithmetic_ = true;
     bool currentDeterministicContext_ = false;
+    bool bindingConstructorInitializer_ = false;
     bool currentFunctionIsSynthetic_ = false;
     std::unordered_set<SymbolId> bindingStaticFields_;
+    struct CtorDelegationEdge {
+        SymbolId targetCtor = 0;
+        text::TextSpan span{};
+        std::string ctorDisplayName;
+    };
+    std::unordered_map<SymbolId, CtorDelegationEdge> ctorThisEdges_;
     std::unordered_map<SymbolId, ObsoleteInfo> obsoleteSymbols_;
 };
 

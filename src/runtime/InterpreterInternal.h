@@ -136,6 +136,7 @@ struct State {
     AsyncRuntimeContext* asyncRuntime = nullptr;
     IAwaitScheduler* awaitScheduler = nullptr;
     CrossHeapAccessPolicy crossHeapPolicy = CrossHeapAccessPolicy::AllowReadWrite;
+    IExecutionPolicy* executionPolicy = nullptr;
     void* resumeEnvRaw = nullptr;
     const std::shared_ptr<const void>* resumeEnvOwner = nullptr;
     CoroutineFrameHandle resumingCoroutine{};
@@ -147,6 +148,37 @@ struct State {
     std::uint64_t telemetryChildExecuted = 0;
     std::uint8_t flatBankId = 0;
 };
+
+[[nodiscard]] inline ManagedHeap* resolveHeap(
+    const State& state,
+    ObjectRef ref) noexcept {
+    if (state.executionPolicy) {
+        if (auto* h = state.executionPolicy->resolveHeap(ref, state.heap)) {
+            return h;
+        }
+    }
+    return state.heap;
+}
+
+[[nodiscard]] inline Value sanitizeCrossHeapValue(
+    State& state,
+    ManagedHeap* sourceHeap,
+    Value val) {
+    if (sourceHeap && state.heap && sourceHeap != state.heap) {
+        if (const auto* strRef = std::get_if<ObjectRef>(&val)) {
+            if (strRef->kind == ObjectKind::String) {
+                if (const auto sv = sourceHeap->stringView(*strRef)) {
+                    RuntimeError err;
+                    if (const auto interned = state.heap->internString(*sv, &err)) {
+                        return Value{*interned};
+                    }
+                    return Value{StringValue(std::string(*sv))};
+                }
+            }
+        }
+    }
+    return val;
+}
 
 struct FlatStackBankScope {
     State& state;

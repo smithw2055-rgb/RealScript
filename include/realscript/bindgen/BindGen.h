@@ -1,6 +1,6 @@
 #pragma once
 
-#include "realscript/game/BindingMarshal.h"
+#include "realscript/bindgen/BindingMarshal.h"
 
 #if !defined(RS_EXPORT_CLASS)
 #define RS_EXPORT_CLASS(...)
@@ -33,7 +33,7 @@
 #define RS_EXPORT_CONSTRUCTOR(...)
 #endif
 
-namespace realscript::game {
+namespace realscript::bindgen {
 
 namespace detail {
 
@@ -82,7 +82,7 @@ inline std::string allocateOverloadNativeName(
 
 } // namespace detail
 
-class GameApi;
+class HostApi;
 
 template <typename S>
 class NativeStructBuilder {
@@ -91,11 +91,11 @@ public:
     NativeStructBuilder& field(std::string name);
 
 private:
-    friend class GameApi;
-    NativeStructBuilder(std::shared_ptr<detail::GameApiState> state, std::size_t index)
+    friend class HostApi;
+    NativeStructBuilder(std::shared_ptr<detail::HostApiState> state, std::size_t index)
         : state_(std::move(state)), index_(index) {}
 
-    std::shared_ptr<detail::GameApiState> state_;
+    std::shared_ptr<detail::HostApiState> state_;
     std::size_t index_ = 0;
 };
 
@@ -163,18 +163,18 @@ public:
             runtime::BindingDeterminism::Deterministic);
 
 private:
-    friend class GameApi;
-    NativeTypeBuilder(std::shared_ptr<detail::GameApiState> state, std::size_t index)
+    friend class HostApi;
+    NativeTypeBuilder(std::shared_ptr<detail::HostApiState> state, std::size_t index)
         : state_(std::move(state)), index_(index) {}
 
-    std::shared_ptr<detail::GameApiState> state_;
+    std::shared_ptr<detail::HostApiState> state_;
     std::size_t index_ = 0;
 };
 
-class GameApi {
+class HostApi {
 public:
-    GameApi();
-    GameApi(
+    HostApi();
+    HostApi(
         std::shared_ptr<runtime::ManagedHeap> heap,
         std::shared_ptr<runtime::NativeHandleRegistry> nativeHandles);
 
@@ -364,7 +364,7 @@ private:
     friend class NativeStructBuilder;
     template <typename T>
     friend class NativeTypeBuilder;
-    std::shared_ptr<detail::GameApiState> state_;
+    std::shared_ptr<detail::HostApiState> state_;
 };
 
 template <typename T>
@@ -508,7 +508,7 @@ namespace detail {
 
 template <typename T, typename... Args>
 struct ConstructorBindingCallable {
-    std::shared_ptr<GameApiState> state;
+    std::shared_ptr<HostApiState> state;
 
     static std::shared_ptr<T> create(Args... args) {
         return std::make_shared<T>(std::forward<Args>(args)...);
@@ -931,13 +931,13 @@ NativeStructBuilder<S>& NativeStructBuilder<S>::field(std::string name) {
     detail::NativeStructFieldDeclaration decl;
     decl.name = std::move(name);
     decl.type = *fieldType;
-    decl.readField = [](const std::shared_ptr<detail::GameApiState>& stState,
+    decl.readField = [](const std::shared_ptr<detail::HostApiState>& stState,
                         const void* rawStruct,
                         runtime::RuntimeError& error) -> std::optional<runtime::Value> {
         const auto* typed = static_cast<const S*>(rawStruct);
         return detail::writeValue(stState, typed->*FieldPtr, error);
     };
-    decl.writeField = [](const std::shared_ptr<detail::GameApiState>& stState,
+    decl.writeField = [](const std::shared_ptr<detail::HostApiState>& stState,
                          void* rawStruct,
                          const runtime::Value& val,
                          runtime::RuntimeError& error) -> bool {
@@ -951,4 +951,4 @@ NativeStructBuilder<S>& NativeStructBuilder<S>::field(std::string name) {
     return *this;
 }
 
-} // namespace realscript::game
+} // namespace realscript::bindgen

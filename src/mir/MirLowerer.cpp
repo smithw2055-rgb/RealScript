@@ -682,8 +682,7 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
         const auto& value = static_cast<const semantic::BoundVariableDeclarationStatement&>(statement);
         if (value.initializer) {
             const auto initializer = lowerExpression(*value.initializer);
-            if (semantic::storageTypeOf(value.variable) !=
-                    value.variable.type &&
+            if (semantic::hasWrappedStorage(value.variable) &&
                 value.variable.modifier ==
                     semantic::ParameterModifier::None) {
                 const auto cell = emitValue(
@@ -714,7 +713,7 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
                     value.variable.index, initializer, statement.span);
             }
         } else if (value.variable.modifier == semantic::ParameterModifier::None) {
-            if (semantic::storageTypeOf(value.variable) != value.variable.type) {
+            if (semantic::hasWrappedStorage(value.variable)) {
                 const auto cell = emitValue(
                     Opcode::NewObject,
                     semantic::PrimitiveType::Object,
@@ -1093,7 +1092,7 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
         const auto storeSwitchPatternVar = [&](const semantic::VariableSymbol& var,
                                                ValueId val,
                                                text::TextSpan span) {
-            if (semantic::storageTypeOf(var) != var.type &&
+            if (semantic::hasWrappedStorage(var) &&
                 var.modifier == semantic::ParameterModifier::None) {
                 const auto cell = emitValue(
                     Opcode::NewObject, semantic::PrimitiveType::Object, {}, span);

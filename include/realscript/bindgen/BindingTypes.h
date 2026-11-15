@@ -2,7 +2,7 @@
 
 #include "realscript/bytecode/Bytecode.h"
 #include "realscript/compiler/Compilation.h"
-#include "realscript/game/DeterministicMath.h"
+#include "realscript/bindgen/DeterministicMath.h"
 #include "realscript/runtime/AsyncRuntime.h"
 #include "realscript/runtime/Runtime.h"
 
@@ -24,7 +24,7 @@
 #include <utility>
 #include <vector>
 
-namespace realscript::game {
+namespace realscript::bindgen {
 
 template <typename T>
 struct TypedAwaitable {
@@ -96,11 +96,11 @@ struct NativeStructFieldDeclaration {
     std::string name;
     ScriptTypeRef type;
     std::function<std::optional<runtime::Value>(
-        const std::shared_ptr<struct GameApiState>&,
+        const std::shared_ptr<struct HostApiState>&,
         const void*,
         runtime::RuntimeError&)> readField;
     std::function<bool(
-        const std::shared_ptr<struct GameApiState>&,
+        const std::shared_ptr<struct HostApiState>&,
         void*,
         const runtime::Value&,
         runtime::RuntimeError&)> writeField;
@@ -122,7 +122,7 @@ struct ModuleDeclaration {
     std::set<std::string> imports;
 };
 
-struct GameApiState {
+struct HostApiState {
     std::shared_ptr<runtime::BindingRegistry> bindings =
         std::make_shared<runtime::BindingRegistry>();
     std::shared_ptr<runtime::ManagedHeap> heap =
@@ -199,7 +199,7 @@ struct FunctionTraits : FunctionTraits<decltype(&F::operator())> {};
 
 template <typename T>
 std::optional<ScriptTypeRef> resolveScriptType(
-    const std::shared_ptr<GameApiState>& state) {
+    const std::shared_ptr<HostApiState>& state) {
     using ValueType = RemoveCvRef<T>;
     if constexpr (std::is_void_v<ValueType>) {
         return ScriptTypeRef{"void", {}, ScriptTypeCategory::Void};
@@ -323,7 +323,7 @@ inline void setTypeMismatch(
 }
 
 inline const NativeTypeDeclaration* findNativeType(
-    const std::shared_ptr<GameApiState>& state,
+    const std::shared_ptr<HostApiState>& state,
     std::type_index type) {
     const auto found = state->nativeTypeByCppType.find(type);
     return found == state->nativeTypeByCppType.end()
@@ -332,4 +332,4 @@ inline const NativeTypeDeclaration* findNativeType(
 }
 
 } // namespace detail
-} // namespace realscript::game
+} // namespace realscript::bindgen

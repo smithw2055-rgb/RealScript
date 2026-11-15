@@ -122,16 +122,39 @@ std::unique_ptr<BoundExpression> Binder::bindLiteralExpression(
 
 std::unique_ptr<BoundExpression> Binder::bindThisExpression(
     const syntax::ThisExpressionSyntax& syntaxTree) {
+    if (bindingConstructorInitializer_) {
+        diagnostics_.report(
+            "RS2536",
+            "keyword 'this' is not available in a constructor initializer",
+            syntaxTree.span());
+        return makeError(syntaxTree.span());
+    }
     const auto* variable = lookupVariable("this");
     if (!variable || currentStaticMethod_) {
         diagnostics_.report("RS2470", "'this' is not available in a static context", syntaxTree.span());
         return makeError(syntaxTree.span());
+    }
+    if (currentOwnerType_ && currentOwnerType_->synthetic) {
+        if (findField(*currentOwnerType_, "this")) {
+            auto [capturedReceiver, outerType] = buildUnwrappedCapturedThis(
+                *variable, *currentOwnerType_, visibleTypes_, syntaxTree.span());
+            if (outerType && !outerType->synthetic) {
+                return std::move(capturedReceiver);
+            }
+        }
     }
     return makeVariableAccess(*variable, syntaxTree.span());
 }
 
 std::unique_ptr<BoundExpression> Binder::bindBaseExpression(
     const syntax::BaseExpressionSyntax& syntaxTree) {
+    if (bindingConstructorInitializer_) {
+        diagnostics_.report(
+            "RS2536",
+            "keyword 'base' is not available in a constructor initializer",
+            syntaxTree.span());
+        return makeError(syntaxTree.span());
+    }
     const auto* variable = lookupVariable("this");
     if (!variable || currentStaticMethod_ || !currentOwnerType_ ||
         currentOwnerType_->baseTypeName.empty()) {
@@ -875,6 +898,21 @@ std::unique_ptr<BoundExpression> Binder::bindCastExpression(
             call->argumentEvaluationOrder = {0};
             return call;
         }
+    }
+    if (expression->type == PrimitiveType::Object &&
+        target == PrimitiveType::Object &&
+        !targetTypeName.empty() &&
+        !sameExactType(*expression, target, targetTypeName, visibleTypes_)) {
+        auto cast = std::make_unique<BoundTypeBinaryExpression>();
+        cast->span = syntaxTree.span();
+        cast->expression = std::move(expression);
+        cast->targetType = target;
+        cast->targetTypeName = targetTypeName;
+        cast->targetTypeId = stableTypeId(targetTypeName);
+        cast->safeCast = true;
+        cast->type = target;
+        cast->typeName = std::move(targetTypeName);
+        return cast;
     }
     if (conversion == ConversionKind::None) {
         diagnostics_.report(
