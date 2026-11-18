@@ -51,6 +51,8 @@ struct BuildResult {
     std::vector<LanguageGenericInstantiation> nativeGenericInstantiations;
     std::vector<LanguageSequenceRecord> nativeSequences;
     BuildSnapshot snapshot;
+    std::size_t prunedFrontendTypes = 0;
+    std::size_t prunedFrontendFunctions = 0;
 };
 
 struct MacroAstUnitView {
@@ -128,6 +130,11 @@ struct CompilationOptions {
     std::vector<std::shared_ptr<const ICompilerMacroPlugin>> macroPlugins;
     std::uint64_t projectConfigFingerprint = 0;
     std::string projectConfigPath;
+    bool populateSnapshot = true;
+    bool collectSymbolOccurrences = true;
+    bool emitDebugInfo = true;
+    std::unordered_set<std::string> pruneUnreachableModules;
+    std::unordered_set<std::string> reachabilityRootSymbols;
 };
 
 class Compilation {

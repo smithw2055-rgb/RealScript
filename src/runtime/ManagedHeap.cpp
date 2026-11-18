@@ -92,6 +92,15 @@ struct alignas(64) HeapSyncState {
     std::mutex mutex;
     void* ownerImpl = nullptr;
     bool (*markPoolFn)(void*) = nullptr;
+    bool (*isStringAliveIdleFn)(const void*, ObjectRef) noexcept = nullptr;
+    bool (*stringsEqualFn)(const void*, ObjectRef, ObjectRef, bool&) noexcept = nullptr;
+    bool (*stringLenFn)(const void*, ObjectRef, std::int64_t&) noexcept = nullptr;
+    const std::atomic<std::uint64_t>* stringInternEpochPtr = nullptr;
+    const std::atomic<std::uint64_t>* objectViewEpochPtr = nullptr;
+    const std::atomic<std::uint64_t>* layoutEpochPtr = nullptr;
+    bool (*isObjectAliveFn)(const void*, ObjectRef) noexcept = nullptr;
+    bool (*bindObjectFastViewDirtyFn)(const void*, ObjectRef, ObjectFastView&, bool&) noexcept = nullptr;
+    bool (*asciiSlice1Fn)(const void*, ObjectRef, std::size_t, ObjectRef&) noexcept = nullptr;
     std::uint64_t heapIdValue = 0;
     std::uint32_t shardIndex = 0;
     std::uint8_t domainId = 0;
@@ -699,6 +708,8 @@ void ShadowStack::popFrame() noexcept {
     if (frameCount_ == 0) return;
     if (registryShard_ != nullptr) {
         auto* shard = static_cast<ThreadShadowStackShard*>(registryShard_);
+        const auto* bridge = detail::externalValuePoolBridge();
+        const bool hasExtUnreg = (bridge != nullptr && bridge->unregisterShadowStackFn != nullptr);
         bool becameEmpty = false;
         {
             std::lock_guard<std::mutex> lock(shard->mutex);
@@ -711,9 +722,20 @@ void ShadowStack::popFrame() noexcept {
                 }
                 frameCount_ = newCount;
                 becameEmpty = (newCount == 0);
+                if (becameEmpty && !hasExtUnreg) {
+                    const std::uint32_t slot = registrySlot_;
+                    if (slot < shard->stacks.size() && shard->stacks[slot] == this) {
+                        ShadowStack* last = shard->stacks.back();
+                        shard->stacks[slot] = last;
+                        last->registrySlot_ = slot;
+                        shard->stacks.pop_back();
+                    }
+                    registryShard_ = nullptr;
+                    registrySlot_ = ShadowStack::InvalidRegistrySlot;
+                }
             }
         }
-        if (becameEmpty) {
+        if (becameEmpty && hasExtUnreg) {
             unregisterActiveShadowStack(this);
         }
         return;
@@ -2394,7 +2416,11 @@ struct TypeLayoutEntry {
     semantic::SymbolId elementTypeId = 0;
     semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
     bool mayContainReferences = false;
+    bool hasAnyTypeDirtyBit = false;
+    std::uint64_t resolvedDirtyEpoch = 0;
     std::vector<std::size_t> referenceFields;
+    std::vector<std::uint8_t> flattenedFieldDirtyBits;
+    std::vector<std::uint64_t> flattenedFieldDirtyMasks;
 };
 
 struct ArrayLayoutKey {
@@ -3132,6 +3158,159 @@ struct ManagedHeap::Impl {
         return foundAny;
     }
 
+    static bool isStringAliveIdleCallback(const void* rawImpl, ObjectRef ref) noexcept {
+        const auto* self = static_cast<const Impl*>(rawImpl);
+        if (!self || self->phase != GcPhase::Idle) {
+            return false;
+        }
+        const auto* slot = self->getSlot(ref);
+        return slot != nullptr && slot->kind() == ObjectKind::String;
+    }
+
+    static bool stringsEqualCallback(
+        const void* rawImpl,
+        ObjectRef left,
+        ObjectRef right,
+        bool& outEqual) noexcept {
+        const auto* self = static_cast<const Impl*>(rawImpl);
+        if (!self) {
+            return false;
+        }
+        const auto* sL = self->getSlot(left);
+        const auto* sR = self->getSlot(right);
+        if (!sL || !sR || sL->kind() != ObjectKind::String || sR->kind() != ObjectKind::String) {
+            return false;
+        }
+        if (left == right) {
+            outEqual = true;
+            return true;
+        }
+        if (sL->hasFlag(GcFlag::IsInterned) && sR->hasFlag(GcFlag::IsInterned)) {
+            outEqual = false;
+            return true;
+        }
+        outEqual = (self->slotStringView(*sL) == self->slotStringView(*sR));
+        return true;
+    }
+
+    static bool stringLenCallback(
+        const void* rawImpl,
+        ObjectRef ref,
+        std::int64_t& outLen) noexcept {
+        const auto* self = static_cast<const Impl*>(rawImpl);
+        if (!self) {
+            return false;
+        }
+        const auto* slot = self->getSlot(ref);
+        if (!slot || slot->kind() != ObjectKind::String) {
+            return false;
+        }
+        const std::string_view sv = self->slotStringView(*slot);
+        std::size_t count = 0;
+        bool allAscii = true;
+        for (const unsigned char ch : sv) {
+            if (ch >= 0x80u) {
+                allAscii = false;
+                break;
+            }
+        }
+        if (allAscii) {
+            outLen = static_cast<std::int64_t>(sv.size());
+            return true;
+        }
+        for (const unsigned char ch : sv) {
+            if ((ch & 0xC0u) != 0x80u) {
+                ++count;
+            }
+        }
+        outLen = static_cast<std::int64_t>(count);
+        return true;
+    }
+
+    static bool isObjectAliveCallback(const void* rawImpl, ObjectRef ref) noexcept {
+        const auto* self = static_cast<const Impl*>(rawImpl);
+        return self != nullptr && self->getSlot(ref) != nullptr;
+    }
+
+    static bool bindObjectFastViewDirtyCallback(
+        const void* rawImpl,
+        ObjectRef ref,
+        ObjectFastView& outView,
+        bool& outMayNotifyDirty) noexcept {
+        auto* self = static_cast<Impl*>(const_cast<void*>(rawImpl));
+        if (!self) {
+            return false;
+        }
+        const auto* slot = self->getSlot(ref);
+        if (!slot || slot->kind() != ObjectKind::Record) {
+            return false;
+        }
+        const auto& layout = self->typeLayouts[slot->payload.s.layoutId];
+        if (layout.typeId == 0) {
+            return false;
+        }
+        if (!self->mayContainPoolValues.load(std::memory_order_relaxed)) {
+            self->noteMaybePoolBackedUnlocked();
+        }
+        outView.fields = slot->payload.s.data;
+        outView.fieldCount = slot->payload.s.length;
+        outView.typeId = layout.typeId;
+        outView.needsRememberedBarrier =
+            (!slot->hasFlag(GcFlag::InNursery) && !slot->hasFlag(GcFlag::InRememberedSet));
+        outMayNotifyDirty = self->hasDirtyTrackingTypes &&
+            (slot->hasFlag(GcFlag::HasObserver) ||
+             layout.resolvedDirtyEpoch != self->dirtyConfigEpoch ||
+             layout.hasAnyTypeDirtyBit);
+        return true;
+    }
+
+    static bool asciiSlice1Callback(
+        const void* rawImpl,
+        ObjectRef strRef,
+        std::size_t index,
+        ObjectRef& outRef) noexcept {
+        const auto* self = static_cast<const Impl*>(rawImpl);
+        if (!self || self->phase != GcPhase::Idle) {
+            return false;
+        }
+        const auto* slot = self->getSlot(strRef);
+        if (!slot || slot->kind() != ObjectKind::String) {
+            return false;
+        }
+        const std::string_view sv = self->slotStringView(*slot);
+        if (sv.size() > 128u) {
+            return false;
+        }
+        for (const unsigned char ch : sv) {
+            if (ch >= 0x80u) {
+                return false;
+            }
+        }
+        if (index >= sv.size()) {
+            if (sv.empty()) {
+                outRef = strRef;
+                return true;
+            }
+            if (self->emptyStringIntern.valid() &&
+                self->getSlot(self->emptyStringIntern) != nullptr) {
+                outRef = self->emptyStringIntern;
+                return true;
+            }
+            return false;
+        }
+        if (sv.size() == 1u) {
+            outRef = strRef;
+            return true;
+        }
+        const ObjectRef chRef =
+            self->asciiCharInterns[static_cast<unsigned char>(sv[index])];
+        if (chRef.valid() && self->getSlot(chRef) != nullptr) {
+            outRef = chRef;
+            return true;
+        }
+        return false;
+    }
+
     static std::shared_ptr<HeapSyncState> makeSyncState(
         Impl* implPtr,
         bool (*markFn)(void*),
@@ -3140,8 +3319,18 @@ struct ManagedHeap::Impl {
         auto* domImpl = detail::ValuePoolDomainAccess::impl(domain);
         const std::uint8_t domId = domain ? domain->domainId() : 0u;
         auto gcState = getOrCreateDomainGcState(domImpl);
-        return std::make_shared<HeapSyncState>(
+        auto sync = std::make_shared<HeapSyncState>(
             implPtr, markFn, id, domId, std::move(gcState));
+        sync->isStringAliveIdleFn = &Impl::isStringAliveIdleCallback;
+        sync->stringsEqualFn = &Impl::stringsEqualCallback;
+        sync->stringLenFn = &Impl::stringLenCallback;
+        sync->stringInternEpochPtr = &implPtr->stringInternEpoch;
+        sync->objectViewEpochPtr = &implPtr->objectViewEpoch;
+        sync->layoutEpochPtr = &implPtr->gcAndLayoutEpoch;
+        sync->isObjectAliveFn = &Impl::isObjectAliveCallback;
+        sync->bindObjectFastViewDirtyFn = &Impl::bindObjectFastViewDirtyCallback;
+        sync->asciiSlice1Fn = &Impl::asciiSlice1Callback;
+        return sync;
     }
 
     explicit Impl(HeapConfig value)
@@ -3169,6 +3358,12 @@ struct ManagedHeap::Impl {
                 pendingWrapperSweeps.clear();
                 pendingObservedSlotSweeps.clear();
                 syncState->ownerImpl = nullptr;
+                syncState->stringInternEpochPtr = nullptr;
+                syncState->objectViewEpochPtr = nullptr;
+                syncState->layoutEpochPtr = nullptr;
+                syncState->isObjectAliveFn = nullptr;
+                syncState->bindObjectFastViewDirtyFn = nullptr;
+                syncState->asciiSlice1Fn = nullptr;
             }
             unregisterHeapSyncFromPoolShard(*syncState);
             unregisterHeapSyncFromStringShard(*syncState);
@@ -3356,6 +3551,7 @@ struct ManagedHeap::Impl {
         entry.referenceFields = refFields;
         const auto id = static_cast<std::uint32_t>(typeLayouts.size());
         typeLayouts.push_back(std::move(entry));
+        ensureLayoutDirtyMetadataUnlocked(typeLayouts.back());
         sharedRecordLayoutByTypeId[typeId] = id;
         lastRegisteredLayoutTypeId = typeId;
         lastRegisteredLayoutId = id;
@@ -3388,6 +3584,7 @@ struct ManagedHeap::Impl {
         }
         const auto id = static_cast<std::uint32_t>(typeLayouts.size());
         typeLayouts.push_back(std::move(entry));
+        ensureLayoutDirtyMetadataUnlocked(typeLayouts.back());
         if (typeId != 0 && sharedRecordLayoutByTypeId.find(typeId) == sharedRecordLayoutByTypeId.end()) {
             sharedRecordLayoutByTypeId[typeId] = id;
         }
@@ -3434,6 +3631,9 @@ struct ManagedHeap::Impl {
     std::shared_ptr<HeapSyncState> syncState;
     std::atomic<bool> mayContainPoolValues{false};
     std::atomic<std::uint64_t> gcAndLayoutEpoch{1};
+    std::atomic<std::uint64_t> stringInternEpoch{1};
+    std::atomic<std::uint64_t> objectViewEpoch{1};
+    std::uint64_t dirtyConfigEpoch = 1;
     std::vector<CompactSlot> slots;
     std::vector<std::uint32_t> freeSlots;
     std::vector<ObjectRef> markStack;
@@ -3491,6 +3691,8 @@ struct ManagedHeap::Impl {
     std::atomic<bool> allocationProfilingEnabled{false};
     std::unordered_map<AllocationSiteKey, AllocationSiteCounters, AllocationSiteKeyHash> allocationProfile;
     std::unordered_map<std::string, ObjectRef> internedStrings;
+    std::array<ObjectRef, 128> asciiCharInterns{};
+    ObjectRef emptyStringIntern{};
     bool hasDirtyTrackingTypes = false;
     std::unordered_map<semantic::SymbolId, std::vector<std::uint8_t>> typeDirtyBitMaps;
     std::unordered_map<semantic::SymbolId, semantic::SymbolId> typeBaseIds;
@@ -3758,6 +3960,86 @@ struct ManagedHeap::Impl {
         }
     }
 
+    void ensureLayoutDirtyMetadataUnlocked(TypeLayoutEntry& layout) noexcept {
+        if (layout.resolvedDirtyEpoch == dirtyConfigEpoch) {
+            return;
+        }
+        layout.flattenedFieldDirtyBits.clear();
+        layout.flattenedFieldDirtyMasks.clear();
+        layout.hasAnyTypeDirtyBit = false;
+        if (!typeDirtyBitMaps.empty() && layout.typeId != 0) {
+            semantic::SymbolId cur = layout.typeId;
+            for (int depth = 0; depth < 64 && cur != 0; ++depth) {
+                const auto mapIt = typeDirtyBitMaps.find(cur);
+                if (mapIt != typeDirtyBitMaps.end()) {
+                    const auto& mapVec = mapIt->second;
+                    if (mapVec.size() > layout.flattenedFieldDirtyBits.size()) {
+                        layout.flattenedFieldDirtyBits.resize(mapVec.size(), 0xFFu);
+                        layout.flattenedFieldDirtyMasks.resize(mapVec.size(), 0ULL);
+                    }
+                    for (std::size_t f = 0; f < mapVec.size(); ++f) {
+                        const std::uint8_t bit = mapVec[f];
+                        if (bit < 64u) {
+                            if (layout.flattenedFieldDirtyBits[f] == 0xFFu) {
+                                layout.flattenedFieldDirtyBits[f] = bit;
+                            }
+                            layout.flattenedFieldDirtyMasks[f] |= (std::uint64_t{1} << bit);
+                            layout.hasAnyTypeDirtyBit = true;
+                        }
+                    }
+                }
+                const auto baseIt = typeBaseIds.find(cur);
+                if (baseIt == typeBaseIds.end() || baseIt->second == cur) {
+                    break;
+                }
+                cur = baseIt->second;
+            }
+        }
+        layout.resolvedDirtyEpoch = dirtyConfigEpoch;
+    }
+
+    void refreshAllLayoutDirtyMetadataUnlocked() noexcept {
+        ++dirtyConfigEpoch;
+        if (dirtyConfigEpoch == 0u) {
+            ++dirtyConfigEpoch;
+        }
+        for (std::size_t i = 1; i < typeLayouts.size(); ++i) {
+            if (typeLayouts[i].typeId != 0) {
+                ensureLayoutDirtyMetadataUnlocked(typeLayouts[i]);
+            }
+        }
+    }
+
+    [[nodiscard]] std::uint8_t markDirtyFromLayoutUnlocked(
+        ObjectRef reference,
+        TypeLayoutEntry& layout,
+        CompactSlot* slot,
+        std::size_t fieldIndex,
+        bool& outHasDirtyObjects) noexcept {
+        if (!hasDirtyTrackingTypes || layout.typeId == 0) {
+            return 0xFFu;
+        }
+        ensureLayoutDirtyMetadataUnlocked(layout);
+        if (!layout.hasAnyTypeDirtyBit ||
+            fieldIndex >= layout.flattenedFieldDirtyBits.size()) {
+            return 0xFFu;
+        }
+        const std::uint8_t matchedBit = layout.flattenedFieldDirtyBits[fieldIndex];
+        const std::uint64_t dirtyMask = layout.flattenedFieldDirtyMasks[fieldIndex];
+        if (dirtyMask != 0ULL) {
+            observerDirtyMasks[reference.slot] |= dirtyMask;
+            if (!slot) {
+                slot = getSlot(reference);
+            }
+            if (slot && !slot->hasFlag(GcFlag::InDirtyQueue)) {
+                slot->gcFlags |= GcFlag::InDirtyQueue;
+                dirtyObjectQueue.push_back(reference);
+            }
+            outHasDirtyObjects = true;
+        }
+        return matchedBit;
+    }
+
     [[nodiscard]] std::uint8_t markDirtyForFieldUnlocked(
         ObjectRef reference,
         semantic::SymbolId concreteTypeId,
@@ -3867,6 +4149,7 @@ struct ManagedHeap::Impl {
                 freeSlots.reserve(64);
                 nurserySlots.reserve(64);
             }
+            objectViewEpoch.fetch_add(1, std::memory_order_release);
         }
         const auto slotIndex = static_cast<std::uint32_t>(slots.size());
         slots.emplace_back();
@@ -4735,13 +5018,30 @@ struct ManagedHeap::Impl {
 
     void sweepReclaimSlot(std::uint32_t slotIdx, CompactSlot& slot, bool isYoung) {
         if (slot.kind() == ObjectKind::String && slot.hasFlag(GcFlag::IsInterned)) {
-            const std::string key(slotStringView(slot));
+            const std::string_view sv = slotStringView(slot);
+            if (sv.empty()) {
+                if (emptyStringIntern.slot == slotIdx &&
+                    emptyStringIntern.generation == slot.generation) {
+                    emptyStringIntern = ObjectRef{};
+                }
+            } else if (sv.size() == 1u && static_cast<unsigned char>(sv[0]) < 128u) {
+                auto& entry = asciiCharInterns[static_cast<unsigned char>(sv[0])];
+                if (entry.slot == slotIdx && entry.generation == slot.generation) {
+                    entry = ObjectRef{};
+                }
+            }
+            const std::string key(sv);
             const auto it = internedStrings.find(key);
             if (it != internedStrings.end() &&
                 it->second.slot == slotIdx &&
                 it->second.generation == slot.generation) {
                 internedStrings.erase(it);
             }
+            gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
+            stringInternEpoch.fetch_add(1, std::memory_order_release);
+        }
+        if (slot.kind() == ObjectKind::Record) {
+            objectViewEpoch.fetch_add(1, std::memory_order_release);
         }
         slot.gcFlags &= static_cast<std::uint8_t>(~GcFlag::InDirtyQueue);
         if (hasDirtyTrackingTypes && !observerDirtyMasks.empty()) {
@@ -5050,6 +5350,7 @@ struct ManagedHeap::Impl {
         rememberedSet.clear();
         ++statistics.collectionsCompleted;
         gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
+        objectViewEpoch.fetch_add(1, std::memory_order_release);
         const auto doubled = statistics.liveBytes >
                 std::numeric_limits<std::size_t>::max() / 2
             ? config.maximumHeapBytes
@@ -5267,26 +5568,91 @@ struct ManagedHeap::Impl {
     HeapSnapshot snapshotUnlocked(const ShadowStack* shadowStack) const;
 };
 
+namespace {
+
+struct HeapSyncRegistryShard {
+    std::mutex mutex;
+    std::vector<std::pair<const ManagedHeap*, std::shared_ptr<HeapSyncState>>> entries;
+};
+
+HeapSyncRegistryShard& heapSyncRegistryShardFor(const ManagedHeap* heap) noexcept {
+    static auto* shards = new std::array<HeapSyncRegistryShard, 64>();
+    const auto idx = (reinterpret_cast<std::uintptr_t>(heap) >> 5u) & 63u;
+    return (*shards)[idx];
+}
+
+void registerHeapSyncLookup(const ManagedHeap* heap, const std::shared_ptr<HeapSyncState>& sync) {
+    if (!heap || !sync) return;
+    auto& shard = heapSyncRegistryShardFor(heap);
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    for (auto& kv : shard.entries) {
+        if (kv.first == heap) {
+            kv.second = sync;
+            return;
+        }
+    }
+    shard.entries.emplace_back(heap, sync);
+}
+
+void unregisterHeapSyncLookup(const ManagedHeap* heap) noexcept {
+    if (!heap) return;
+    auto& shard = heapSyncRegistryShardFor(heap);
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    for (std::size_t i = 0; i < shard.entries.size(); ++i) {
+        if (shard.entries[i].first == heap) {
+            shard.entries[i] = std::move(shard.entries.back());
+            shard.entries.pop_back();
+            return;
+        }
+    }
+}
+
+[[nodiscard]] std::shared_ptr<HeapSyncState> lookupHeapSyncState(const ManagedHeap* heap) noexcept {
+    if (!heap) return {};
+    auto& shard = heapSyncRegistryShardFor(heap);
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    for (const auto& kv : shard.entries) {
+        if (kv.first == heap) {
+            return kv.second;
+        }
+    }
+    return {};
+}
+
+} // namespace
+
 ManagedHeap::ManagedHeap(HeapConfig config)
     : impl_(std::make_unique<Impl>(std::move(config))) {
     impl_->ownerHeap = this;
+    registerHeapSyncLookup(this, impl_->syncState);
 }
 
-ManagedHeap::~ManagedHeap() = default;
+ManagedHeap::~ManagedHeap() {
+    unregisterHeapSyncLookup(this);
+}
 
 ManagedHeap::ManagedHeap(ManagedHeap&& other) noexcept
     : impl_(std::move(other.impl_)),
       hasDirtyTracking_(std::exchange(other.hasDirtyTracking_, false)),
       hasDirtyObjects_(std::exchange(other.hasDirtyObjects_, false)) {
-    if (impl_) impl_->ownerHeap = this;
+    unregisterHeapSyncLookup(&other);
+    if (impl_) {
+        impl_->ownerHeap = this;
+        registerHeapSyncLookup(this, impl_->syncState);
+    }
 }
 
 ManagedHeap& ManagedHeap::operator=(ManagedHeap&& other) noexcept {
     if (this != &other) {
+        unregisterHeapSyncLookup(this);
+        unregisterHeapSyncLookup(&other);
         impl_ = std::move(other.impl_);
         hasDirtyTracking_ = std::exchange(other.hasDirtyTracking_, false);
         hasDirtyObjects_ = std::exchange(other.hasDirtyObjects_, false);
-        if (impl_) impl_->ownerHeap = this;
+        if (impl_) {
+            impl_->ownerHeap = this;
+            registerHeapSyncLookup(this, impl_->syncState);
+        }
     }
     return *this;
 }
@@ -5385,6 +5751,7 @@ std::size_t ManagedHeap::trimExcessCapacity() noexcept {
             impl_->fieldMutationCallback != nullptr ||
             !impl_->observerDirtyMasks.empty();
         hasDirtyTracking_ = impl_->hasDirtyTrackingTypes;
+        impl_->objectViewEpoch.fetch_add(1, std::memory_order_release);
     }
     if (!impl_->dirtyObjectQueue.empty()) {
         const std::size_t beforeCap = impl_->dirtyObjectQueue.capacity();
@@ -5440,6 +5807,30 @@ std::optional<ObjectRef> ManagedHeap::internString(
     RuntimeError* error) {
     ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    if (value.empty()) {
+        if (impl_->emptyStringIntern.valid()) {
+            if (impl_->getSlot(impl_->emptyStringIntern) != nullptr) {
+                if (impl_->phase != GcPhase::Idle) {
+                    impl_->mark(impl_->emptyStringIntern);
+                    impl_->reopenMarkFromSweep();
+                }
+                return impl_->emptyStringIntern;
+            }
+            impl_->emptyStringIntern = ObjectRef{};
+        }
+    } else if (value.size() == 1u && static_cast<unsigned char>(value[0]) < 128u) {
+        ObjectRef& fastRef = impl_->asciiCharInterns[static_cast<unsigned char>(value[0])];
+        if (fastRef.valid()) {
+            if (impl_->getSlot(fastRef) != nullptr) {
+                if (impl_->phase != GcPhase::Idle) {
+                    impl_->mark(fastRef);
+                    impl_->reopenMarkFromSweep();
+                }
+                return fastRef;
+            }
+            fastRef = ObjectRef{};
+        }
+    }
     const std::string key(value);
     const auto found = impl_->internedStrings.find(key);
     if (found != impl_->internedStrings.end()) {
@@ -5447,6 +5838,11 @@ std::optional<ObjectRef> ManagedHeap::internString(
             if (impl_->phase != GcPhase::Idle) {
                 impl_->mark(found->second);
                 impl_->reopenMarkFromSweep();
+            }
+            if (key.empty()) {
+                impl_->emptyStringIntern = found->second;
+            } else if (key.size() == 1u && static_cast<unsigned char>(key[0]) < 128u) {
+                impl_->asciiCharInterns[static_cast<unsigned char>(key[0])] = found->second;
             }
             return found->second;
         }
@@ -5457,6 +5853,11 @@ std::optional<ObjectRef> ManagedHeap::internString(
     if (allocated) {
         impl_->slots[allocated->slot].gcFlags |= GcFlag::IsInterned;
         impl_->internedStrings[key] = *allocated;
+        if (key.empty()) {
+            impl_->emptyStringIntern = *allocated;
+        } else if (key.size() == 1u && static_cast<unsigned char>(key[0]) < 128u) {
+            impl_->asciiCharInterns[static_cast<unsigned char>(key[0])] = *allocated;
+        }
     }
     return allocated;
 }
@@ -7622,9 +8023,12 @@ bool ManagedHeap::fieldSet(
         impl_->pinHeapValueIfNeededUnlocked(value);
         slot->payload.s.data[index] = std::move(value);
         if (checkDirty && valueChanged) {
-            const auto tid = impl_->typeLayouts[slot->payload.s.layoutId].typeId;
-            dirtyBit = impl_->markDirtyForFieldUnlocked(
-                reference, tid, index, hasDirtyObjects_);
+            dirtyBit = impl_->markDirtyFromLayoutUnlocked(
+                reference,
+                impl_->typeLayouts[slot->payload.s.layoutId],
+                slot,
+                index,
+                hasDirtyObjects_);
             if (impl_->fieldMutationCallback != nullptr &&
                 (dirtyBit != 0xFFu || slot->hasFlag(GcFlag::HasObserver))) {
                 fieldCb = impl_->fieldMutationCallback;
@@ -7658,7 +8062,7 @@ bool ManagedHeap::fieldSetFast(
             valueType(value) != expectedFieldType) {
             return false;
         }
-        const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+        auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
         if (layout.typeId != expectedTypeId) return false;
         if (const auto* childRef = std::get_if<ObjectRef>(&value);
             childRef && !impl_->getSlot(*childRef)) {
@@ -7677,8 +8081,8 @@ bool ManagedHeap::fieldSetFast(
         impl_->pinHeapValueIfNeededUnlocked(stored);
         slot->payload.s.data[index] = stored;
         if (checkDirty && valueChanged) {
-            dirtyBit = impl_->markDirtyForFieldUnlocked(
-                reference, expectedTypeId, index, hasDirtyObjects_);
+            dirtyBit = impl_->markDirtyFromLayoutUnlocked(
+                reference, layout, slot, index, hasDirtyObjects_);
             if (impl_->fieldMutationCallback != nullptr &&
                 (dirtyBit != 0xFFu || slot->hasFlag(GcFlag::HasObserver))) {
                 fieldCb = impl_->fieldMutationCallback;
@@ -7727,6 +8131,8 @@ void ManagedHeap::setFieldMutationCallback(
         impl_->fieldMutationCallback != nullptr ||
         !impl_->observerDirtyMasks.empty();
     hasDirtyTracking_ = impl_->hasDirtyTrackingTypes;
+    impl_->refreshAllLayoutDirtyMetadataUnlocked();
+    impl_->objectViewEpoch.fetch_add(1, std::memory_order_release);
 }
 
 void ManagedHeap::setArrayMutationCallback(
@@ -7754,9 +8160,11 @@ bool ManagedHeap::setObjectObserved(ObjectRef reference, bool observed) noexcept
     if (observed) {
         slot->gcFlags |= GcFlag::HasObserver;
         impl_->gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
+        impl_->objectViewEpoch.fetch_add(1, std::memory_order_release);
     } else {
         slot->gcFlags &= static_cast<std::uint8_t>(~GcFlag::HasObserver);
         impl_->gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
+        impl_->objectViewEpoch.fetch_add(1, std::memory_order_release);
     }
     return true;
 }
@@ -7816,6 +8224,8 @@ void ManagedHeap::registerTypeParent(
     if (typeId == 0 || baseTypeId == 0 || typeId == baseTypeId) return;
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     impl_->typeBaseIds[typeId] = baseTypeId;
+    impl_->refreshAllLayoutDirtyMetadataUnlocked();
+    impl_->objectViewEpoch.fetch_add(1, std::memory_order_release);
 }
 
 void ManagedHeap::registerTypeHierarchy(const ProgramImage& program) {
@@ -7825,6 +8235,8 @@ void ManagedHeap::registerTypeHierarchy(const ProgramImage& program) {
             impl_->typeBaseIds[tid] = ts->baseTypeId;
         }
     }
+    impl_->refreshAllLayoutDirtyMetadataUnlocked();
+    impl_->objectViewEpoch.fetch_add(1, std::memory_order_release);
 }
 
 void ManagedHeap::notifyFieldMutated(
@@ -7843,9 +8255,9 @@ void ManagedHeap::notifyFieldMutated(
             fieldIndex >= slot->payload.s.length) {
             return;
         }
-        const auto tid = impl_->typeLayouts[slot->payload.s.layoutId].typeId;
-        dirtyBit = impl_->markDirtyForFieldUnlocked(
-            reference, tid, fieldIndex, hasDirtyObjects_);
+        auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+        dirtyBit = impl_->markDirtyFromLayoutUnlocked(
+            reference, layout, slot, fieldIndex, hasDirtyObjects_);
         if (impl_->fieldMutationCallback != nullptr &&
             (dirtyBit != 0xFFu || slot->hasFlag(GcFlag::HasObserver))) {
             fieldCb = impl_->fieldMutationCallback;
@@ -7869,6 +8281,8 @@ void ManagedHeap::enableTypeDirtyTracking(
         impl_->fieldMutationCallback != nullptr ||
         !impl_->observerDirtyMasks.empty();
     hasDirtyTracking_ = impl_->hasDirtyTrackingTypes;
+    impl_->refreshAllLayoutDirtyMetadataUnlocked();
+    impl_->objectViewEpoch.fetch_add(1, std::memory_order_release);
 }
 
 bool ManagedHeap::markDirtyBit(ObjectRef reference, std::uint8_t bitIndex) noexcept {
@@ -7884,6 +8298,7 @@ bool ManagedHeap::markDirtyBit(ObjectRef reference, std::uint8_t bitIndex) noexc
         impl_->dirtyObjectQueue.push_back(reference);
     }
     hasDirtyObjects_ = true;
+    impl_->objectViewEpoch.fetch_add(1, std::memory_order_release);
     return true;
 }
 
@@ -9108,6 +9523,7 @@ std::size_t ManagedHeap::collectYoung(
     impl_->rememberedSet.clear();
             ++impl_->statistics.youngCollections;
             impl_->gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
+            impl_->objectViewEpoch.fetch_add(1, std::memory_order_release);
             if (impl_->statistics.liveBytes < impl_->nextCollectionThreshold) {
                 impl_->requested = false;
             }
@@ -9774,6 +10190,8 @@ bool ManagedHeap::restore(
     hasDirtyTracking_ = impl_->hasDirtyTrackingTypes;
     hasDirtyObjects_ = false;
     impl_->gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
+    impl_->stringInternEpoch.fetch_add(1, std::memory_order_release);
+    impl_->objectViewEpoch.fetch_add(1, std::memory_order_release);
     impl_->typeLayouts.assign(1, TypeLayoutEntry{});
     impl_->sharedRecordLayoutByTypeId.clear();
     impl_->arrayLayoutByKey.clear();
@@ -9990,6 +10408,8 @@ bool ManagedHeap::restore(
     impl_->persistentRoots = std::move(roots);
     impl_->nextRootToken = nextRootToken;
     impl_->internedStrings.clear();
+    impl_->asciiCharInterns.fill(ObjectRef{});
+    impl_->emptyStringIntern = ObjectRef{};
     impl_->markStack.clear();
     impl_->nurserySlots.clear();
     impl_->rememberedSet.clear();
@@ -11339,6 +11759,7 @@ bool ManagedHeap::migrateTypeLayouts(
             entry.referenceFields = refs;
             canonicalId = static_cast<std::uint32_t>(impl_->typeLayouts.size());
             impl_->typeLayouts.push_back(std::move(entry));
+            impl_->ensureLayoutDirtyMetadataUnlocked(impl_->typeLayouts.back());
             impl_->sharedRecordLayoutByTypeId[tid] = canonicalId;
         }
 
@@ -11354,6 +11775,7 @@ bool ManagedHeap::migrateTypeLayouts(
                 }
             }
         }
+        impl_->objectViewEpoch.fetch_add(1, std::memory_order_release);
         return canonicalId;
     };
 
@@ -11940,6 +12362,163 @@ void* localHeapPoolMarkerShardsPtr() noexcept {
 
 void* localLiveStringHeapShardsPtr() noexcept {
     return &localLiveStringHeapShards();
+}
+
+std::optional<ObjectRef> internShortAsciiIfFast(
+    ManagedHeap* heap,
+    std::string_view text,
+    RuntimeError* error) {
+    if (!heap) {
+        return std::nullopt;
+    }
+    if (text.empty() ||
+        (text.size() == 1u && static_cast<unsigned char>(text[0]) < 128u)) {
+        return heap->internString(text, error);
+    }
+    return std::nullopt;
+}
+
+bool isHeapObjectAliveFast(
+    const ManagedHeap* heap,
+    ObjectRef ref) noexcept {
+    return heap != nullptr && heap->isAlive(ref);
+}
+
+bool isInternedStringAliveIdleFast(
+    const ManagedHeap* heap,
+    ObjectRef ref) noexcept {
+    const auto sync = lookupHeapSyncState(heap);
+    if (!sync || !sync->isStringAliveIdleFn) {
+        return false;
+    }
+    HeapReadOrDisjointGuard heapLock(*sync);
+    return sync->isStringAliveIdleFn(sync->ownerImpl, ref);
+}
+
+bool heapStringsEqualWithToken(
+    const void* heapImplToken,
+    ObjectRef left,
+    ObjectRef right,
+    bool& outEqual) noexcept {
+    const auto* sync = static_cast<const HeapSyncState*>(heapImplToken);
+    if (!sync || !sync->stringsEqualFn) {
+        return false;
+    }
+    HeapReadOrDisjointGuard heapLock(*const_cast<HeapSyncState*>(sync));
+    return sync->stringsEqualFn(sync->ownerImpl, left, right, outEqual);
+}
+
+bool heapStringCodePointLengthWithToken(
+    const void* heapImplToken,
+    ObjectRef ref,
+    std::int64_t& outLen) noexcept {
+    const auto* sync = static_cast<const HeapSyncState*>(heapImplToken);
+    if (!sync || !sync->stringLenFn) {
+        return false;
+    }
+    HeapReadOrDisjointGuard heapLock(*const_cast<HeapSyncState*>(sync));
+    return sync->stringLenFn(sync->ownerImpl, ref, outLen);
+}
+
+const void* lookupHeapImplFast(const ManagedHeap* heap) noexcept {
+    const auto sync = lookupHeapSyncState(heap);
+    return sync.get();
+}
+
+std::uint64_t heapStringInternEpochWithToken(
+    const void* heapImplToken) noexcept {
+    const auto* sync = static_cast<const HeapSyncState*>(heapImplToken);
+    if (!sync || !sync->stringInternEpochPtr) {
+        return 0u;
+    }
+    return sync->stringInternEpochPtr->load(std::memory_order_acquire);
+}
+
+std::uint64_t heapObjectViewEpochWithToken(
+    const void* heapImplToken) noexcept {
+    const auto* sync = static_cast<const HeapSyncState*>(heapImplToken);
+    if (!sync || !sync->objectViewEpochPtr) {
+        return 0u;
+    }
+    return sync->objectViewEpochPtr->load(std::memory_order_acquire);
+}
+
+std::uint64_t heapLayoutEpochWithToken(
+    const void* heapImplToken) noexcept {
+    const auto* sync = static_cast<const HeapSyncState*>(heapImplToken);
+    if (!sync || !sync->layoutEpochPtr) {
+        return 0u;
+    }
+    return sync->layoutEpochPtr->load(std::memory_order_acquire);
+}
+
+bool isHeapObjectAliveWithToken(
+    const void* heapImplToken,
+    const ManagedHeap* fallbackHeap,
+    ObjectRef ref) noexcept {
+    const auto* sync = static_cast<const HeapSyncState*>(heapImplToken);
+    if (sync && sync->isObjectAliveFn) {
+        HeapReadOrDisjointGuard heapLock(*const_cast<HeapSyncState*>(sync));
+        return sync->isObjectAliveFn(sync->ownerImpl, ref);
+    }
+    return fallbackHeap != nullptr && fallbackHeap->isAlive(ref);
+}
+
+bool bindObjectFastViewDirtyWithToken(
+    const void* heapImplToken,
+    ManagedHeap* fallbackHeap,
+    ObjectRef ref,
+    ObjectFastView& outView,
+    bool& outMayNotifyDirty) noexcept {
+    const auto* sync = static_cast<const HeapSyncState*>(heapImplToken);
+    if (sync && sync->bindObjectFastViewDirtyFn) {
+        HeapReadOrDisjointGuard heapLock(*const_cast<HeapSyncState*>(sync));
+        return sync->bindObjectFastViewDirtyFn(
+            sync->ownerImpl, ref, outView, outMayNotifyDirty);
+    }
+    if (fallbackHeap != nullptr && fallbackHeap->tryBindObjectFastView(ref, outView)) {
+        outMayNotifyDirty = fallbackHeap->hasDirtyTracking();
+        return true;
+    }
+    return false;
+}
+
+bool heapStringAsciiSlice1WithToken(
+    const void* heapImplToken,
+    ObjectRef strRef,
+    std::size_t index,
+    ObjectRef& outRef) noexcept {
+    const auto* sync = static_cast<const HeapSyncState*>(heapImplToken);
+    if (!sync || !sync->asciiSlice1Fn) {
+        return false;
+    }
+    HeapReadOrDisjointGuard heapLock(*const_cast<HeapSyncState*>(sync));
+    return sync->asciiSlice1Fn(sync->ownerImpl, strRef, index, outRef);
+}
+
+bool heapStringsEqualFast(
+    const ManagedHeap* heap,
+    ObjectRef left,
+    ObjectRef right,
+    bool& outEqual) noexcept {
+    const auto sync = lookupHeapSyncState(heap);
+    if (!sync || !sync->stringsEqualFn) {
+        return false;
+    }
+    HeapReadOrDisjointGuard heapLock(*sync);
+    return sync->stringsEqualFn(sync->ownerImpl, left, right, outEqual);
+}
+
+bool heapStringCodePointLengthFast(
+    const ManagedHeap* heap,
+    ObjectRef ref,
+    std::int64_t& outLen) noexcept {
+    const auto sync = lookupHeapSyncState(heap);
+    if (!sync || !sync->stringLenFn) {
+        return false;
+    }
+    HeapReadOrDisjointGuard heapLock(*sync);
+    return sync->stringLenFn(sync->ownerImpl, ref, outLen);
 }
 
 } // namespace detail

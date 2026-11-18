@@ -3829,7 +3829,10 @@ public:
 
     static std::optional<ProgramImage> link(
         std::vector<bytecode::Module> modules,
-        RuntimeError& error);
+        RuntimeError& error,
+        bool verifyModules = true);
+
+    void compactForRuntime();
 
     [[nodiscard]] const std::vector<bytecode::Module>& modules() const noexcept;
     [[nodiscard]] std::size_t functionCount() const noexcept;

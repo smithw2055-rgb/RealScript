@@ -293,8 +293,8 @@ private:
         }
         case BoundNodeKind::MemberAssignmentExpression: {
             const auto& value = static_cast<const BoundMemberAssignmentExpression&>(expression);
-            if (value.ownerType.synthetic &&
-                value.ownerType.fields.size() == 1 &&
+            if (value.ownerType->synthetic &&
+                value.ownerType->fields.size() == 1 &&
                 value.field.name == "Value" &&
                 value.receiver &&
                 value.receiver->kind() == BoundNodeKind::VariableExpression) {

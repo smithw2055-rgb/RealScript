@@ -1,4 +1,5 @@
 #include "RuntimeInternal.h"
+#include "ExecutionMirror.h"
 
 #include "realscript/runtime/AsyncRuntime.h"
 
@@ -2232,6 +2233,10 @@ bool makeIntrinsicStringResult(
     RuntimeError& error) {
     if (heap) {
         RuntimeError err;
+        if (const auto fastRef = detail::internShortAsciiIfFast(heap, text, &err)) {
+            result = *fastRef;
+            return true;
+        }
         const auto ref = heap->allocateString(std::move(text), &err);
         if (!ref) {
             error.code = err.code != ErrorCode::None ? err.code : ErrorCode::OutOfMemory;
@@ -2247,6 +2252,32 @@ bool makeIntrinsicStringResult(
     return true;
 }
 
+bool makeIntrinsicStringSliceResult(
+    const Value& sourceArg,
+    std::string_view fullView,
+    std::string_view slice,
+    ManagedHeap* heap,
+    Value& result,
+    RuntimeError& error) {
+    if (slice.size() == fullView.size() &&
+        slice.data() == fullView.data() &&
+        (std::holds_alternative<ObjectRef>(sourceArg) ||
+         std::holds_alternative<StringValue>(sourceArg))) {
+        result = sourceArg;
+        return true;
+    }
+    if (heap && slice.size() <= 1u) {
+        char buf[1] = {slice.empty() ? '\0' : slice[0]};
+        const std::string_view localSlice(buf, slice.size());
+        RuntimeError err;
+        if (const auto fastRef = detail::internShortAsciiIfFast(heap, localSlice, &err)) {
+            result = *fastRef;
+            return true;
+        }
+    }
+    return makeIntrinsicStringResult(std::string(slice), heap, result, error);
+}
+
 std::optional<std::string_view> extractIntrinsicStringView(
     const Value& val,
     const ManagedHeap* heap) noexcept {
@@ -2259,6 +2290,406 @@ std::optional<std::string_view> extractIntrinsicStringView(
         }
     }
     return std::nullopt;
+}
+
+bool transformAsciiCase(
+    const Value& sourceArg,
+    bool toUpper,
+    ManagedHeap* heap,
+    Value& result,
+    RuntimeError& error) {
+    const char lo = toUpper ? 'a' : 'A';
+    const char hi = toUpper ? 'z' : 'Z';
+    const int delta = toUpper ? ('A' - 'a') : ('a' - 'A');
+    if (const auto sView = extractIntrinsicStringView(sourceArg, heap)) {
+        bool dirty = false;
+        for (const char ch : *sView) {
+            if (ch >= lo && ch <= hi) {
+                dirty = true;
+                break;
+            }
+        }
+        if (!dirty &&
+            (std::holds_alternative<ObjectRef>(sourceArg) ||
+             std::holds_alternative<StringValue>(sourceArg))) {
+            result = sourceArg;
+            return true;
+        }
+    }
+    auto s = detail::extractIntrinsicString(sourceArg, heap);
+    for (auto& ch : s) {
+        if (ch >= lo && ch <= hi) {
+            ch = static_cast<char>(ch + delta);
+        }
+    }
+    return makeIntrinsicStringResult(std::move(s), heap, result, error);
+}
+
+bool executeArrayMutationByKind(
+    detail::FastIntrinsicKind kind,
+    const ObjectRef& arrRef,
+    std::size_t len,
+    ValueSpan arguments,
+    ManagedHeap* heap,
+    Value& result,
+    RuntimeError& error) {
+    const auto setErr = [&](ErrorCode code, std::string msg) -> bool {
+        error.code = code;
+        error.message = std::move(msg);
+        return false;
+    };
+    const auto propagateErr = [&](RuntimeError err, std::string fallback) -> bool {
+        error.code = err.code != ErrorCode::None ? err.code : ErrorCode::InvalidProgram;
+        error.message = err.message.empty() ? std::move(fallback) : std::move(err.message);
+        return false;
+    };
+    switch (kind) {
+    case detail::FastIntrinsicKind::ArrayPush: {
+        if (arguments.size() < 2) {
+            return setErr(ErrorCode::InvalidArguments, "array_push requires 2 arguments");
+        }
+        RuntimeError mutErr;
+        if (!heap->arrayPush(
+                arrRef,
+                arguments[1],
+                &mutErr,
+                ArrayStoreTypePolicy::PrevalidatedAssignableObject)) {
+            return propagateErr(std::move(mutErr), "array push failed");
+        }
+        result = std::monostate{};
+        return true;
+    }
+    case detail::FastIntrinsicKind::ArrayRemoveAt: {
+        if (arguments.size() < 2 || !std::holds_alternative<std::int64_t>(arguments[1])) {
+            return setErr(ErrorCode::InvalidArguments, "array_remove_at requires (array, int index)");
+        }
+        const auto rawIdx = std::get<std::int64_t>(arguments[1]);
+        if (rawIdx < 0 || static_cast<std::size_t>(rawIdx) >= len) {
+            return setErr(ErrorCode::IndexOutOfRange, "array removeAt index is out of range");
+        }
+        RuntimeError mutErr;
+        if (!heap->arrayRemoveAt(arrRef, static_cast<std::size_t>(rawIdx), nullptr, &mutErr)) {
+            return propagateErr(std::move(mutErr), "array removeAt failed");
+        }
+        result = std::monostate{};
+        return true;
+    }
+    case detail::FastIntrinsicKind::ArrayPop: {
+        if (len == 0) {
+            return setErr(ErrorCode::IndexOutOfRange, "cannot pop from an empty array");
+        }
+        Value popped{};
+        RuntimeError mutErr;
+        if (!heap->arrayRemoveAt(arrRef, len - 1u, &popped, &mutErr)) {
+            return propagateErr(std::move(mutErr), "array pop failed");
+        }
+        result = std::move(popped);
+        return true;
+    }
+    case detail::FastIntrinsicKind::ArrayClear: {
+        RuntimeError mutErr;
+        if (!heap->arrayClear(arrRef, &mutErr)) {
+            return propagateErr(std::move(mutErr), "array clear failed");
+        }
+        result = std::monostate{};
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+bool executeFastIntrinsicCore(
+    detail::FastIntrinsicKind kind,
+    ValueSpan arguments,
+    ManagedHeap* heap,
+    Value& result,
+    RuntimeError& error) {
+    const auto setErr = [&](ErrorCode code, std::string msg) -> bool {
+        error.code = code;
+        error.message = std::move(msg);
+        return false;
+    };
+
+    switch (kind) {
+    case detail::FastIntrinsicKind::StableHash: {
+        if (arguments.empty()) {
+            result = std::int64_t{0};
+            return true;
+        }
+        std::uint64_t h = 1469598103934665603ULL;
+        const auto mixU64 = [&](std::uint64_t v) {
+            for (unsigned shift = 0; shift < 64; shift += 8) {
+                h ^= static_cast<std::uint8_t>((v >> shift) & 0xffu);
+                h *= 1099511628211ULL;
+            }
+        };
+        const auto mixStr = [&](std::string_view s) {
+            mixU64(s.size());
+            for (unsigned char ch : s) {
+                h ^= ch;
+                h *= 1099511628211ULL;
+            }
+        };
+        const auto hashVal = [&](const auto& self, const Value& v) -> void {
+            mixU64(v.index());
+            if (const auto* b = std::get_if<bool>(&v)) mixU64(*b ? 1u : 0u);
+            else if (const auto* i = std::get_if<std::int64_t>(&v)) mixU64(static_cast<std::uint64_t>(*i));
+            else if (const auto* l = std::get_if<LongValue>(&v)) mixU64(static_cast<std::uint64_t>(l->value));
+            else if (const auto* ui = std::get_if<UIntValue>(&v)) mixU64(ui->value);
+            else if (const auto* ul = std::get_if<ULongValue>(&v)) mixU64(ul->value);
+            else if (const auto* by = std::get_if<ByteValue>(&v)) mixU64(by->value);
+            else if (const auto* sb = std::get_if<SByteValue>(&v)) mixU64(static_cast<std::uint8_t>(sb->value));
+            else if (const auto* sh = std::get_if<ShortValue>(&v)) mixU64(static_cast<std::uint16_t>(sh->value));
+            else if (const auto* us = std::get_if<UShortValue>(&v)) mixU64(us->value);
+            else if (const auto* ch = std::get_if<CharValue>(&v)) mixU64(ch->value);
+            else if (EnumValue en{}; v.tryGetEnum(en)) { mixU64(en.typeId); mixU64(static_cast<std::uint64_t>(en.value)); }
+            else if (const auto* fx = std::get_if<FixedValue>(&v)) mixU64(static_cast<std::uint32_t>(fx->raw));
+            else if (const auto* f16 = std::get_if<Fixed16Value>(&v)) mixU64(static_cast<std::uint64_t>(f16->raw));
+            else if (const auto* v2 = std::get_if<Vec2Value>(&v)) { mixU64(static_cast<std::uint32_t>(v2->x)); mixU64(static_cast<std::uint32_t>(v2->y)); }
+            else if (const auto* v3 = std::get_if<Vec3Value>(&v)) { mixU64(static_cast<std::uint32_t>(v3->x)); mixU64(static_cast<std::uint32_t>(v3->y)); mixU64(static_cast<std::uint32_t>(v3->z)); }
+            else if (QuatValue q{}; v.tryGetQuat(q)) { mixU64(static_cast<std::uint32_t>(q.x)); mixU64(static_cast<std::uint32_t>(q.y)); mixU64(static_cast<std::uint32_t>(q.z)); mixU64(static_cast<std::uint32_t>(q.w)); }
+            else if (const auto* f64 = std::get_if<Fixed64Value>(&v)) mixU64(static_cast<std::uint64_t>(f64->raw));
+            else if (const auto* v2f = std::get_if<Vec2fValue>(&v)) {
+                auto mixF = [&](float f) { std::uint32_t b = 0; const float n = (f == 0.0f) ? 0.0f : f; std::memcpy(&b, &n, 4); mixU64(b); };
+                mixF(v2f->x); mixF(v2f->y);
+            }
+            else if (const auto* v3f = std::get_if<Vec3fValue>(&v)) {
+                auto mixF = [&](float f) { std::uint32_t b = 0; const float n = (f == 0.0f) ? 0.0f : f; std::memcpy(&b, &n, 4); mixU64(b); };
+                mixF(v3f->x); mixF(v3f->y); mixF(v3f->z);
+            }
+            else if (QuatfValue qf{}; v.tryGetQuatf(qf)) {
+                auto mixF = [&](float f) { std::uint32_t b = 0; const float n = (f == 0.0f) ? 0.0f : f; std::memcpy(&b, &n, 4); mixU64(b); };
+                mixF(qf.x); mixF(qf.y); mixF(qf.z); mixF(qf.w);
+            }
+            else if (const auto* d = std::get_if<double>(&v)) {
+                std::uint64_t bits = 0;
+                const double norm = (*d == 0.0) ? 0.0 : *d;
+                std::memcpy(&bits, &norm, sizeof(bits));
+                mixU64(bits);
+            } else if (const auto* fl = std::get_if<FloatValue>(&v)) {
+                std::uint32_t bits = 0;
+                const float norm = (fl->value == 0.0f) ? 0.0f : fl->value;
+                std::memcpy(&bits, &norm, sizeof(bits));
+                mixU64(bits);
+            } else if (const auto* s = std::get_if<std::string>(&v)) {
+                mixStr(*s);
+            } else if (const auto* o = std::get_if<ObjectRef>(&v)) {
+                if (o->kind == ObjectKind::String && heap) {
+                    if (const auto sv = heap->stringView(*o)) {
+                        mixStr(*sv);
+                        return;
+                    }
+                }
+                mixU64((static_cast<std::uint64_t>(o->generation) << 32u) | o->slot);
+            } else if (const auto* st = std::get_if<StructValue>(&v)) {
+                mixU64(st->typeId);
+                for (std::size_t idx = 0; idx < st->fieldCount(); ++idx) {
+                    if (const auto fld = structValueFieldAt(*st, idx)) {
+                        self(self, *fld);
+                    }
+                }
+            }
+        };
+        hashVal(hashVal, arguments[0]);
+        result = static_cast<std::int64_t>(static_cast<std::int32_t>(h & 0x7fffffffULL));
+        return true;
+    }
+    case detail::FastIntrinsicKind::StringConcat: {
+        if (arguments.size() != 2) {
+            return setErr(ErrorCode::InvalidArguments, "string_concat requires 2 arguments");
+        }
+        if (const auto v0 = extractIntrinsicStringView(arguments[0], heap)) {
+            if (const auto v1 = extractIntrinsicStringView(arguments[1], heap)) {
+                std::string combined;
+                combined.reserve(v0->size() + v1->size());
+                combined.append(*v0);
+                combined.append(*v1);
+                return makeIntrinsicStringResult(std::move(combined), heap, result, error);
+            }
+        }
+        std::string combined = detail::extractIntrinsicString(arguments[0], heap);
+        combined.append(detail::extractIntrinsicString(arguments[1], heap));
+        return makeIntrinsicStringResult(std::move(combined), heap, result, error);
+    }
+    case detail::FastIntrinsicKind::ArrayPush:
+    case detail::FastIntrinsicKind::ArrayRemoveAt:
+    case detail::FastIntrinsicKind::ArrayPop:
+    case detail::FastIntrinsicKind::ArrayClear: {
+        if (arguments.empty() || std::holds_alternative<NullArray>(arguments[0])) {
+            return setErr(ErrorCode::NullReference, "cannot invoke array method on null array");
+        }
+        const auto* arrRef = std::get_if<ObjectRef>(&arguments[0]);
+        const auto lenOpt = (arrRef && heap) ? heap->arrayLength(*arrRef) : std::nullopt;
+        if (!lenOpt) {
+            return setErr(ErrorCode::InvalidObjectReference, "invalid array reference");
+        }
+        return executeArrayMutationByKind(kind, *arrRef, *lenOpt, arguments, heap, result, error);
+    }
+    case detail::FastIntrinsicKind::StringLength:
+    case detail::FastIntrinsicKind::StringIsEmpty:
+    case detail::FastIntrinsicKind::StringContains:
+    case detail::FastIntrinsicKind::StringStartsWith:
+    case detail::FastIntrinsicKind::StringEndsWith:
+    case detail::FastIntrinsicKind::StringSubstring1:
+    case detail::FastIntrinsicKind::StringSubstring2:
+    case detail::FastIntrinsicKind::StringTrim:
+    case detail::FastIntrinsicKind::StringToLower:
+    case detail::FastIntrinsicKind::StringToUpper: {
+        if (!arguments.empty() && std::holds_alternative<NullString>(arguments[0])) {
+            return setErr(ErrorCode::NullReference, "cannot invoke string method on null string");
+        }
+        if (arguments.empty()) {
+            return setErr(ErrorCode::InvalidArguments, "string intrinsic requires at least 1 argument");
+        }
+        switch (kind) {
+        case detail::FastIntrinsicKind::StringLength: {
+            if (const auto svOpt = extractIntrinsicStringView(arguments[0], heap)) {
+                result = static_cast<std::int64_t>(utf8CodePointLength(*svOpt));
+                return true;
+            }
+            const auto s = detail::extractIntrinsicString(arguments[0], heap);
+            result = static_cast<std::int64_t>(utf8CodePointLength(s));
+            return true;
+        }
+        case detail::FastIntrinsicKind::StringIsEmpty: {
+            if (const auto svOpt = extractIntrinsicStringView(arguments[0], heap)) {
+                result = svOpt->empty();
+                return true;
+            }
+            result = detail::extractIntrinsicString(arguments[0], heap).empty();
+            return true;
+        }
+        case detail::FastIntrinsicKind::StringContains: {
+            if (arguments.size() < 2) {
+                return setErr(ErrorCode::InvalidArguments, "string_contains requires 2 arguments");
+            }
+            if (const auto sView = extractIntrinsicStringView(arguments[0], heap)) {
+                if (const auto subView = extractIntrinsicStringView(arguments[1], heap)) {
+                    result = (sView->find(*subView) != std::string_view::npos);
+                    return true;
+                }
+            }
+            const auto s = detail::extractIntrinsicString(arguments[0], heap);
+            const auto sub = detail::extractIntrinsicString(arguments[1], heap);
+            result = (s.find(sub) != std::string::npos);
+            return true;
+        }
+        case detail::FastIntrinsicKind::StringStartsWith: {
+            if (arguments.size() < 2) {
+                return setErr(ErrorCode::InvalidArguments, "string_starts_with requires 2 arguments");
+            }
+            if (const auto sView = extractIntrinsicStringView(arguments[0], heap)) {
+                if (const auto pView = extractIntrinsicStringView(arguments[1], heap)) {
+                    result = (sView->size() >= pView->size() &&
+                              sView->compare(0, pView->size(), *pView) == 0);
+                    return true;
+                }
+            }
+            const auto s = detail::extractIntrinsicString(arguments[0], heap);
+            const auto p = detail::extractIntrinsicString(arguments[1], heap);
+            result = (s.size() >= p.size() && s.compare(0, p.size(), p) == 0);
+            return true;
+        }
+        case detail::FastIntrinsicKind::StringEndsWith: {
+            if (arguments.size() < 2) {
+                return setErr(ErrorCode::InvalidArguments, "string_ends_with requires 2 arguments");
+            }
+            if (const auto sView = extractIntrinsicStringView(arguments[0], heap)) {
+                if (const auto sfxView = extractIntrinsicStringView(arguments[1], heap)) {
+                    result = (sView->size() >= sfxView->size() &&
+                              sView->compare(sView->size() - sfxView->size(), sfxView->size(), *sfxView) == 0);
+                    return true;
+                }
+            }
+            const auto s = detail::extractIntrinsicString(arguments[0], heap);
+            const auto sfx = detail::extractIntrinsicString(arguments[1], heap);
+            result = (s.size() >= sfx.size() &&
+                      s.compare(s.size() - sfx.size(), sfx.size(), sfx) == 0);
+            return true;
+        }
+        case detail::FastIntrinsicKind::StringSubstring1: {
+            if (arguments.size() < 2) {
+                return setErr(ErrorCode::InvalidArguments, "string_substring_1 requires 2 arguments");
+            }
+            const auto rawStart = std::holds_alternative<std::int64_t>(arguments[1])
+                ? std::get<std::int64_t>(arguments[1])
+                : 0;
+            const auto safeStart = static_cast<std::size_t>(std::max<std::int64_t>(0, rawStart));
+            if (const auto sView = extractIntrinsicStringView(arguments[0], heap)) {
+                const auto slice = utf8CodePointSlice(*sView, safeStart);
+                return makeIntrinsicStringSliceResult(arguments[0], *sView, slice, heap, result, error);
+            }
+            const auto s = detail::extractIntrinsicString(arguments[0], heap);
+            return makeIntrinsicStringResult(
+                std::string(utf8CodePointSlice(s, safeStart)),
+                heap,
+                result,
+                error);
+        }
+        case detail::FastIntrinsicKind::StringSubstring2: {
+            if (arguments.size() < 3) {
+                return setErr(ErrorCode::InvalidArguments, "string_substring_2 requires 3 arguments");
+            }
+            const auto rawStart = std::holds_alternative<std::int64_t>(arguments[1])
+                ? std::get<std::int64_t>(arguments[1])
+                : 0;
+            const auto rawLen = std::holds_alternative<std::int64_t>(arguments[2])
+                ? std::get<std::int64_t>(arguments[2])
+                : 0;
+            const auto safeStart = static_cast<std::size_t>(std::max<std::int64_t>(0, rawStart));
+            const auto safeLen = static_cast<std::size_t>(std::max<std::int64_t>(0, rawLen));
+            if (const auto sView = extractIntrinsicStringView(arguments[0], heap)) {
+                const auto slice = utf8CodePointSlice(*sView, safeStart, safeLen);
+                return makeIntrinsicStringSliceResult(arguments[0], *sView, slice, heap, result, error);
+            }
+            const auto s = detail::extractIntrinsicString(arguments[0], heap);
+            return makeIntrinsicStringResult(
+                std::string(utf8CodePointSlice(s, safeStart, safeLen)),
+                heap,
+                result,
+                error);
+        }
+        case detail::FastIntrinsicKind::StringTrim: {
+            const auto isSpace = [](unsigned char c) noexcept {
+                return c == ' ' || c == '\t' || c == '\r' ||
+                       c == '\n' || c == '\v' || c == '\f';
+            };
+            if (const auto sView = extractIntrinsicStringView(arguments[0], heap)) {
+                std::size_t first = 0;
+                while (first < sView->size() && isSpace(static_cast<unsigned char>((*sView)[first]))) {
+                    ++first;
+                }
+                std::size_t last = sView->size();
+                while (last > first && isSpace(static_cast<unsigned char>((*sView)[last - 1]))) {
+                    --last;
+                }
+                return makeIntrinsicStringSliceResult(
+                    arguments[0], *sView, sView->substr(first, last - first), heap, result, error);
+            }
+            const auto s = detail::extractIntrinsicString(arguments[0], heap);
+            std::size_t first = 0;
+            while (first < s.size() && isSpace(static_cast<unsigned char>(s[first]))) {
+                ++first;
+            }
+            std::size_t last = s.size();
+            while (last > first && isSpace(static_cast<unsigned char>(s[last - 1]))) {
+                --last;
+            }
+            return makeIntrinsicStringResult(
+                s.substr(first, last - first), heap, result, error);
+        }
+        case detail::FastIntrinsicKind::StringToUpper:
+            return transformAsciiCase(arguments[0], true, heap, result, error);
+        case detail::FastIntrinsicKind::StringToLower:
+            return transformAsciiCase(arguments[0], false, heap, result, error);
+        default:
+            return false;
+        }
+    }
+    default:
+        return setErr(ErrorCode::InvalidProgram, "unsupported fast runtime intrinsic kind");
+    }
 }
 
 bool tryExecuteRuntimeIntrinsicImpl(
@@ -2684,99 +3115,13 @@ bool tryExecuteRuntimeIntrinsicImpl(
     }
 
     if (op == "stable_hash" || op.rfind("stable_hash::", 0) == 0) {
-        if (arguments.empty()) {
-            result = std::int64_t{0};
-            return true;
-        }
-        std::uint64_t h = 1469598103934665603ULL;
-        const auto mixU64 = [&](std::uint64_t v) {
-            for (unsigned shift = 0; shift < 64; shift += 8) {
-                h ^= static_cast<std::uint8_t>((v >> shift) & 0xffu);
-                h *= 1099511628211ULL;
-            }
-        };
-        const auto mixStr = [&](std::string_view s) {
-            mixU64(s.size());
-            for (unsigned char ch : s) {
-                h ^= ch;
-                h *= 1099511628211ULL;
-            }
-        };
-        const auto hashVal = [&](const auto& self, const Value& v) -> void {
-            mixU64(v.index());
-            if (const auto* b = std::get_if<bool>(&v)) mixU64(*b ? 1u : 0u);
-            else if (const auto* i = std::get_if<std::int64_t>(&v)) mixU64(static_cast<std::uint64_t>(*i));
-            else if (const auto* l = std::get_if<LongValue>(&v)) mixU64(static_cast<std::uint64_t>(l->value));
-            else if (const auto* ui = std::get_if<UIntValue>(&v)) mixU64(ui->value);
-            else if (const auto* ul = std::get_if<ULongValue>(&v)) mixU64(ul->value);
-            else if (const auto* by = std::get_if<ByteValue>(&v)) mixU64(by->value);
-            else if (const auto* sb = std::get_if<SByteValue>(&v)) mixU64(static_cast<std::uint8_t>(sb->value));
-            else if (const auto* sh = std::get_if<ShortValue>(&v)) mixU64(static_cast<std::uint16_t>(sh->value));
-            else if (const auto* us = std::get_if<UShortValue>(&v)) mixU64(us->value);
-            else if (const auto* ch = std::get_if<CharValue>(&v)) mixU64(ch->value);
-            else if (EnumValue en{}; v.tryGetEnum(en)) { mixU64(en.typeId); mixU64(static_cast<std::uint64_t>(en.value)); }
-            else if (const auto* fx = std::get_if<FixedValue>(&v)) mixU64(static_cast<std::uint32_t>(fx->raw));
-            else if (const auto* f16 = std::get_if<Fixed16Value>(&v)) mixU64(static_cast<std::uint64_t>(f16->raw));
-            else if (const auto* v2 = std::get_if<Vec2Value>(&v)) { mixU64(static_cast<std::uint32_t>(v2->x)); mixU64(static_cast<std::uint32_t>(v2->y)); }
-            else if (const auto* v3 = std::get_if<Vec3Value>(&v)) { mixU64(static_cast<std::uint32_t>(v3->x)); mixU64(static_cast<std::uint32_t>(v3->y)); mixU64(static_cast<std::uint32_t>(v3->z)); }
-            else if (QuatValue q{}; v.tryGetQuat(q)) { mixU64(static_cast<std::uint32_t>(q.x)); mixU64(static_cast<std::uint32_t>(q.y)); mixU64(static_cast<std::uint32_t>(q.z)); mixU64(static_cast<std::uint32_t>(q.w)); }
-            else if (const auto* f64 = std::get_if<Fixed64Value>(&v)) mixU64(static_cast<std::uint64_t>(f64->raw));
-            else if (const auto* v2f = std::get_if<Vec2fValue>(&v)) {
-                auto mixF = [&](float f) { std::uint32_t b = 0; const float n = (f == 0.0f) ? 0.0f : f; std::memcpy(&b, &n, 4); mixU64(b); };
-                mixF(v2f->x); mixF(v2f->y);
-            }
-            else if (const auto* v3f = std::get_if<Vec3fValue>(&v)) {
-                auto mixF = [&](float f) { std::uint32_t b = 0; const float n = (f == 0.0f) ? 0.0f : f; std::memcpy(&b, &n, 4); mixU64(b); };
-                mixF(v3f->x); mixF(v3f->y); mixF(v3f->z);
-            }
-            else if (QuatfValue qf{}; v.tryGetQuatf(qf)) {
-                auto mixF = [&](float f) { std::uint32_t b = 0; const float n = (f == 0.0f) ? 0.0f : f; std::memcpy(&b, &n, 4); mixU64(b); };
-                mixF(qf.x); mixF(qf.y); mixF(qf.z); mixF(qf.w);
-            }
-            else if (const auto* d = std::get_if<double>(&v)) {
-                std::uint64_t bits = 0;
-                const double norm = (*d == 0.0) ? 0.0 : *d;
-                std::memcpy(&bits, &norm, sizeof(bits));
-                mixU64(bits);
-            } else if (const auto* fl = std::get_if<FloatValue>(&v)) {
-                std::uint32_t bits = 0;
-                const float norm = (fl->value == 0.0f) ? 0.0f : fl->value;
-                std::memcpy(&bits, &norm, sizeof(bits));
-                mixU64(bits);
-            } else if (const auto* s = std::get_if<std::string>(&v)) {
-                mixStr(*s);
-            } else if (const auto* o = std::get_if<ObjectRef>(&v)) {
-                if (o->kind == ObjectKind::String && heap) {
-                    if (const auto sv = heap->stringView(*o)) {
-                        mixStr(*sv);
-                        return;
-                    }
-                }
-                mixU64((static_cast<std::uint64_t>(o->generation) << 32u) | o->slot);
-            } else if (const auto* st = std::get_if<StructValue>(&v)) {
-                mixU64(st->typeId);
-                for (std::size_t idx = 0; idx < st->fieldCount(); ++idx) {
-                    if (const auto fld = structValueFieldAt(*st, idx)) {
-                        self(self, *fld);
-                    }
-                }
-            }
-        };
-        hashVal(hashVal, arguments[0]);
-        result = static_cast<std::int64_t>(static_cast<std::int32_t>(h & 0x7fffffffULL));
-        return true;
+        return executeFastIntrinsicCore(
+            detail::FastIntrinsicKind::StableHash, arguments, heap, result, error);
     }
 
     if (op == "string_concat") {
-        if (arguments.size() != 2) {
-            return setErr(ErrorCode::InvalidArguments, "string_concat requires 2 arguments");
-        }
-        return makeIntrinsicStringResult(
-            detail::extractIntrinsicString(arguments[0], heap) +
-                detail::extractIntrinsicString(arguments[1], heap),
-            heap,
-            result,
-            error);
+        return executeFastIntrinsicCore(
+            detail::FastIntrinsicKind::StringConcat, arguments, heap, result, error);
     }
 
     constexpr std::string_view toStringPrefix = "to_string::";
@@ -2856,19 +3201,8 @@ bool tryExecuteRuntimeIntrinsicImpl(
             return true;
         }
         if (op.rfind("array_push::", 0) == 0) {
-            if (arguments.size() < 2) {
-                return setErr(ErrorCode::InvalidArguments, "array_push requires 2 arguments");
-            }
-            RuntimeError mutErr;
-            if (!heap->arrayPush(
-                    *arrRef,
-                    arguments[1],
-                    &mutErr,
-                    ArrayStoreTypePolicy::PrevalidatedAssignableObject)) {
-                return propagateErr(std::move(mutErr), "array push failed");
-            }
-            result = std::monostate{};
-            return true;
+            return executeArrayMutationByKind(
+                detail::FastIntrinsicKind::ArrayPush, *arrRef, len, arguments, heap, result, error);
         }
         if (op.rfind("array_insert::", 0) == 0) {
             if (arguments.size() < 3 || !std::holds_alternative<std::int64_t>(arguments[1])) {
@@ -2891,39 +3225,16 @@ bool tryExecuteRuntimeIntrinsicImpl(
             return true;
         }
         if (op.rfind("array_remove_at::", 0) == 0) {
-            if (arguments.size() < 2 || !std::holds_alternative<std::int64_t>(arguments[1])) {
-                return setErr(ErrorCode::InvalidArguments, "array_remove_at requires (array, int index)");
-            }
-            const auto rawIdx = std::get<std::int64_t>(arguments[1]);
-            if (rawIdx < 0 || static_cast<std::size_t>(rawIdx) >= len) {
-                return setErr(ErrorCode::IndexOutOfRange, "array removeAt index is out of range");
-            }
-            RuntimeError mutErr;
-            if (!heap->arrayRemoveAt(*arrRef, static_cast<std::size_t>(rawIdx), nullptr, &mutErr)) {
-                return propagateErr(std::move(mutErr), "array removeAt failed");
-            }
-            result = std::monostate{};
-            return true;
+            return executeArrayMutationByKind(
+                detail::FastIntrinsicKind::ArrayRemoveAt, *arrRef, len, arguments, heap, result, error);
         }
         if (op.rfind("array_pop::", 0) == 0) {
-            if (len == 0) {
-                return setErr(ErrorCode::IndexOutOfRange, "cannot pop from an empty array");
-            }
-            Value popped{};
-            RuntimeError mutErr;
-            if (!heap->arrayRemoveAt(*arrRef, len - 1u, &popped, &mutErr)) {
-                return propagateErr(std::move(mutErr), "array pop failed");
-            }
-            result = std::move(popped);
-            return true;
+            return executeArrayMutationByKind(
+                detail::FastIntrinsicKind::ArrayPop, *arrRef, len, arguments, heap, result, error);
         }
         if (op.rfind("array_clear::", 0) == 0) {
-            RuntimeError mutErr;
-            if (!heap->arrayClear(*arrRef, &mutErr)) {
-                return propagateErr(std::move(mutErr), "array clear failed");
-            }
-            result = std::monostate{};
-            return true;
+            return executeArrayMutationByKind(
+                detail::FastIntrinsicKind::ArrayClear, *arrRef, len, arguments, heap, result, error);
         }
         if (op.rfind("array_reserve::", 0) == 0) {
             if (arguments.size() < 2 || !std::holds_alternative<std::int64_t>(arguments[1])) {
@@ -2984,40 +3295,19 @@ bool tryExecuteRuntimeIntrinsicImpl(
     }
 
     if (op == "string_length") {
-        if (const auto svOpt = extractIntrinsicStringView(arguments[0], heap)) {
-            result = static_cast<std::int64_t>(utf8CodePointLength(*svOpt));
-            return true;
-        }
-        const auto s = detail::extractIntrinsicString(arguments[0], heap);
-        result = static_cast<std::int64_t>(utf8CodePointLength(s));
-        return true;
+        return executeFastIntrinsicCore(detail::FastIntrinsicKind::StringLength, arguments, heap, result, error);
     }
     if (op == "string_is_empty") {
-        if (const auto svOpt = extractIntrinsicStringView(arguments[0], heap)) {
-            result = svOpt->empty();
-            return true;
-        }
-        result = detail::extractIntrinsicString(arguments[0], heap).empty();
-        return true;
+        return executeFastIntrinsicCore(detail::FastIntrinsicKind::StringIsEmpty, arguments, heap, result, error);
     }
     if (op == "string_contains") {
-        const auto s = detail::extractIntrinsicString(arguments[0], heap);
-        const auto sub = detail::extractIntrinsicString(arguments[1], heap);
-        result = (s.find(sub) != std::string::npos);
-        return true;
+        return executeFastIntrinsicCore(detail::FastIntrinsicKind::StringContains, arguments, heap, result, error);
     }
     if (op == "string_starts_with") {
-        const auto s = detail::extractIntrinsicString(arguments[0], heap);
-        const auto p = detail::extractIntrinsicString(arguments[1], heap);
-        result = (s.size() >= p.size() && s.compare(0, p.size(), p) == 0);
-        return true;
+        return executeFastIntrinsicCore(detail::FastIntrinsicKind::StringStartsWith, arguments, heap, result, error);
     }
     if (op == "string_ends_with") {
-        const auto s = detail::extractIntrinsicString(arguments[0], heap);
-        const auto sfx = detail::extractIntrinsicString(arguments[1], heap);
-        result = (s.size() >= sfx.size() &&
-                  s.compare(s.size() - sfx.size(), sfx.size(), sfx) == 0);
-        return true;
+        return executeFastIntrinsicCore(detail::FastIntrinsicKind::StringEndsWith, arguments, heap, result, error);
     }
     if (op == "string_index_of") {
         if (const auto sView = extractIntrinsicStringView(arguments[0], heap)) {
@@ -3044,56 +3334,28 @@ bool tryExecuteRuntimeIntrinsicImpl(
         return true;
     }
     if (op == "string_substring_1") {
-        const auto s = detail::extractIntrinsicString(arguments[0], heap);
-        const auto rawStart = std::holds_alternative<std::int64_t>(arguments[1])
-            ? std::get<std::int64_t>(arguments[1])
-            : 0;
-        const auto safeStart = static_cast<std::size_t>(std::max<std::int64_t>(0, rawStart));
-        return makeIntrinsicStringResult(
-            std::string(utf8CodePointSlice(s, safeStart)),
-            heap,
-            result,
-            error);
+        return executeFastIntrinsicCore(detail::FastIntrinsicKind::StringSubstring1, arguments, heap, result, error);
     }
     if (op == "string_substring_2") {
-        const auto s = detail::extractIntrinsicString(arguments[0], heap);
-        const auto rawStart = std::holds_alternative<std::int64_t>(arguments[1])
-            ? std::get<std::int64_t>(arguments[1])
-            : 0;
-        const auto rawLen = std::holds_alternative<std::int64_t>(arguments[2])
-            ? std::get<std::int64_t>(arguments[2])
-            : 0;
-        const auto safeStart = static_cast<std::size_t>(std::max<std::int64_t>(0, rawStart));
-        const auto safeLen = static_cast<std::size_t>(std::max<std::int64_t>(0, rawLen));
-        return makeIntrinsicStringResult(
-            std::string(utf8CodePointSlice(s, safeStart, safeLen)),
-            heap,
-            result,
-            error);
+        return executeFastIntrinsicCore(detail::FastIntrinsicKind::StringSubstring2, arguments, heap, result, error);
     }
     if (op == "string_trim") {
-        const auto s = detail::extractIntrinsicString(arguments[0], heap);
-        const auto isSpace = [](unsigned char c) {
-            return c == ' ' || c == '\t' || c == '\r' ||
-                   c == '\n' || c == '\v' || c == '\f';
-        };
-        std::size_t first = 0;
-        while (first < s.size() && isSpace(static_cast<unsigned char>(s[first]))) {
-            ++first;
-        }
-        std::size_t last = s.size();
-        while (last > first && isSpace(static_cast<unsigned char>(s[last - 1]))) {
-            --last;
-        }
-        return makeIntrinsicStringResult(
-            s.substr(first, last - first), heap, result, error);
+        return executeFastIntrinsicCore(detail::FastIntrinsicKind::StringTrim, arguments, heap, result, error);
     }
     if (op == "string_trim_start") {
-        const auto s = detail::extractIntrinsicString(arguments[0], heap);
-        const auto isSpace = [](unsigned char c) {
+        const auto isSpace = [](unsigned char c) noexcept {
             return c == ' ' || c == '\t' || c == '\r' ||
                    c == '\n' || c == '\v' || c == '\f';
         };
+        if (const auto sView = extractIntrinsicStringView(arguments[0], heap)) {
+            std::size_t first = 0;
+            while (first < sView->size() && isSpace(static_cast<unsigned char>((*sView)[first]))) {
+                ++first;
+            }
+            return makeIntrinsicStringSliceResult(
+                arguments[0], *sView, sView->substr(first), heap, result, error);
+        }
+        const auto s = detail::extractIntrinsicString(arguments[0], heap);
         std::size_t first = 0;
         while (first < s.size() && isSpace(static_cast<unsigned char>(s[first]))) {
             ++first;
@@ -3102,11 +3364,19 @@ bool tryExecuteRuntimeIntrinsicImpl(
             s.substr(first), heap, result, error);
     }
     if (op == "string_trim_end") {
-        const auto s = detail::extractIntrinsicString(arguments[0], heap);
-        const auto isSpace = [](unsigned char c) {
+        const auto isSpace = [](unsigned char c) noexcept {
             return c == ' ' || c == '\t' || c == '\r' ||
                    c == '\n' || c == '\v' || c == '\f';
         };
+        if (const auto sView = extractIntrinsicStringView(arguments[0], heap)) {
+            std::size_t last = sView->size();
+            while (last > 0 && isSpace(static_cast<unsigned char>((*sView)[last - 1]))) {
+                --last;
+            }
+            return makeIntrinsicStringSliceResult(
+                arguments[0], *sView, sView->substr(0, last), heap, result, error);
+        }
+        const auto s = detail::extractIntrinsicString(arguments[0], heap);
         std::size_t last = s.size();
         while (last > 0 && isSpace(static_cast<unsigned char>(s[last - 1]))) {
             --last;
@@ -3175,28 +3445,35 @@ bool tryExecuteRuntimeIntrinsicImpl(
         return makeIntrinsicStringResult(std::move(s), heap, result, error);
     }
     if (op == "string_to_upper") {
-        auto s = detail::extractIntrinsicString(arguments[0], heap);
-        for (auto& ch : s) {
-            if (ch >= 'a' && ch <= 'z') {
-                ch = static_cast<char>(ch - 'a' + 'A');
-            }
-        }
-        return makeIntrinsicStringResult(std::move(s), heap, result, error);
+        return executeFastIntrinsicCore(detail::FastIntrinsicKind::StringToUpper, arguments, heap, result, error);
     }
     if (op == "string_to_lower") {
-        auto s = detail::extractIntrinsicString(arguments[0], heap);
-        for (auto& ch : s) {
-            if (ch >= 'A' && ch <= 'Z') {
-                ch = static_cast<char>(ch - 'A' + 'a');
-            }
-        }
-        return makeIntrinsicStringResult(std::move(s), heap, result, error);
+        return executeFastIntrinsicCore(detail::FastIntrinsicKind::StringToLower, arguments, heap, result, error);
     }
 
     return setErr(ErrorCode::InvalidProgram, "unknown runtime intrinsic '" + std::string(name) + "'");
 }
 
 } // namespace
+
+namespace detail {
+
+bool tryExecuteFastIntrinsic(
+    std::uint8_t intrinsicKind,
+    const Value* args,
+    std::size_t argCount,
+    ManagedHeap* heap,
+    Value& result,
+    RuntimeError& error) {
+    return executeFastIntrinsicCore(
+        static_cast<FastIntrinsicKind>(intrinsicKind),
+        ValueSpan(args, argCount),
+        heap,
+        result,
+        error);
+}
+
+} // namespace detail
 
 bool tryExecuteRuntimeIntrinsic(
     std::string_view name,

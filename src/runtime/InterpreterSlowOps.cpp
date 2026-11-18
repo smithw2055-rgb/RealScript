@@ -120,7 +120,10 @@ void emitTrace(
     }
     if (state.profile) {
         ++state.profileEvents;
-        auto& profile = state.profileFunctions[state.currentFunctionId];
+        if (!state.profileFunctions) {
+            state.profileFunctions = std::make_unique<std::unordered_map<semantic::SymbolId, FunctionProfile>>();
+        }
+        auto& profile = (*state.profileFunctions)[state.currentFunctionId];
         if (profile.function.empty() && !state.stack.empty()) {
             profile.function = *state.stack.back();
         }
@@ -152,10 +155,12 @@ void mergeProfile(State& state) {
     if (!state.profile) return;
     ExecutionProfile profile;
     profile.totalEvents = state.profileEvents;
-    profile.functions.reserve(state.profileFunctions.size());
-    for (auto& [symbolId, function] : state.profileFunctions) {
-        (void)symbolId;
-        profile.functions.push_back(std::move(function));
+    if (state.profileFunctions) {
+        profile.functions.reserve(state.profileFunctions->size());
+        for (auto& [symbolId, function] : *state.profileFunctions) {
+            (void)symbolId;
+            profile.functions.push_back(std::move(function));
+        }
     }
     state.profile->merge(profile);
 }
@@ -995,39 +1000,8 @@ bool executeCall(
     }
     std::array<Value, 8> stackArguments{};
     std::vector<Value> heapArguments;
-    ValueSpan argSpan;
-    if (arguments.empty()) {
-        argSpan = ValueSpan(nullptr, 0);
-    } else if (!arguments.indices) {
-        argSpan = ValueSpan(
-            arguments.values->data() + arguments.offset,
-            arguments.count);
-    } else {
-        bool contiguous = true;
-        const auto firstIndex = arguments.indices[0];
-        for (std::size_t index = 1; index < arguments.count; ++index) {
-            if (arguments.indices[index] != firstIndex + index) {
-                contiguous = false;
-                break;
-            }
-        }
-        if (contiguous) {
-            argSpan = ValueSpan(
-                arguments.values->data() + arguments.offset + firstIndex,
-                arguments.count);
-        } else if (arguments.count <= stackArguments.size()) {
-            for (std::size_t index = 0; index < arguments.count; ++index) {
-                stackArguments[index] = arguments[index];
-            }
-            argSpan = ValueSpan(stackArguments.data(), arguments.count);
-        } else {
-            heapArguments.reserve(arguments.count);
-            for (std::size_t index = 0; index < arguments.count; ++index) {
-                heapArguments.push_back(arguments[index]);
-            }
-            argSpan = ValueSpan(heapArguments);
-        }
-    }
+    ValueSpan argSpan =
+        materializeArgumentSpan(arguments, stackArguments, heapArguments);
     if (reference.name.rfind("$intrinsic::Async.__", 0) == 0) {
         std::string intrinsicError;
         if (!tryExecuteAsyncIntrinsic(
@@ -1114,11 +1088,11 @@ bool executeCall(
         }
         argSpan = ValueSpan(detachedExtArgs);
     }
-    const bool extOk = state.determinism.invokeExternal(
-        state.bindings,
-        fallback,
+    const bool extOk = invokeStateExternal(
+        state,
         reference,
         argSpan,
+        fallback,
         externalResult,
         externalError);
     if (extOk && !extRefBridges.empty() && state.heap) {

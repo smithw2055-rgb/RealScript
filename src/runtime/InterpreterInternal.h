@@ -57,7 +57,7 @@ struct ResolvedDelegateLeaf {
 };
 
 struct DelegateCallSiteCache {
-    std::array<ResolvedDelegateLeaf, 16> singleWays{};
+    std::array<ResolvedDelegateLeaf, 4> singleWays{};
 
     semantic::SymbolId lastSymId = 0;
     const ProgramImage::FunctionLocation* lastSymTarget = nullptr;
@@ -115,11 +115,12 @@ struct State {
     bool determinismOnly = false;
     bool diagnosticEventsEnabled = false;
     bool fastAccounting = false;
+    bool enforceCapabilities = false;
     std::uint64_t determinismEventDigest = DeterminismEventSeed;
     std::uint64_t determinismEventCount = 0;
-    std::unordered_map<semantic::SymbolId, FunctionProfile> profileFunctions;
+    std::unique_ptr<std::unordered_map<semantic::SymbolId, FunctionProfile>> profileFunctions;
     std::uint64_t profileEvents = 0;
-    DeterminismSession determinism;
+    std::optional<DeterminismSession> determinism;
     semantic::SymbolId currentFunctionId = 0;
     ManagedHeap* heap = nullptr;
     debug::RuntimeDebugHook* debugger = nullptr;
@@ -131,6 +132,10 @@ struct State {
     std::vector<PolymorphicPicSite>* polyCallCache = nullptr;
     std::vector<DelegateCallSiteCache>* delegateCallCache = nullptr;
     const detail::ExecutionMirror* mirror = nullptr;
+    const void* heapImplFast = nullptr;
+    std::array<struct FastNativeBindEntry, 64>* nativeBindCache = nullptr;
+    std::vector<ObjectRef>* stringLiteralCache = nullptr;
+    std::uint64_t stringLiteralCacheEpoch = 0;
     std::optional<Value> pendingException;
     bool exceptionNotifiedDebugger = false;
     AsyncRuntimeContext* asyncRuntime = nullptr;
@@ -180,10 +185,42 @@ struct State {
     return val;
 }
 
+[[nodiscard]] inline bool invokeStateExternal(
+    State& state,
+    const bytecode::FunctionReference& reference,
+    ValueSpan arguments,
+    const ExternalFunction* fallback,
+    std::optional<Value>& result,
+    RuntimeError& error) {
+    if (state.determinism.has_value()) {
+        return state.determinism->invokeExternal(
+            state.bindings, fallback, reference, arguments, result, error);
+    }
+    const ExternalFunction* function = fallback;
+    if (state.bindings != nullptr) {
+        if (const auto resolved = state.bindings->resolve(reference)) {
+            function = resolved->function;
+        }
+    }
+    if (!function || !*function) {
+        error.code = ErrorCode::ExternalFunctionUnresolved;
+        error.message = "external function '" + reference.name + "' is not registered";
+        return false;
+    }
+    RuntimeError invocationError;
+    auto invocationResult = (*function)(reference, arguments, invocationError);
+    if (!invocationResult.has_value()) {
+        error = std::move(invocationError);
+        return false;
+    }
+    result = std::move(invocationResult);
+    return true;
+}
+
 struct FlatStackBankScope {
     State& state;
     explicit FlatStackBankScope(State& st) noexcept : state(st) {
-        state.flatBankId = detail::acquireFlatStackBank(&state.values);
+        state.flatBankId = 0u;
     }
     ~FlatStackBankScope() noexcept {
         if (state.flatBankId != 0u) {
@@ -245,17 +282,29 @@ struct InterpreterResumeEnv {
     std::weak_ptr<AsyncRuntimeContext> asyncRuntimeWeak;
 };
 
+struct FastNativeBindEntry {
+    const BindingRegistry* registry = nullptr;
+    std::size_t registrySize = 0;
+    semantic::SymbolId symbolId = 0;
+    const ExternalFunction* function = nullptr;
+};
+
 struct ThreadInvokeScratch {
     struct Buffers {
         std::vector<Value> values;
         std::vector<const std::string*> stack;
         std::array<InlineCallCacheEntry, 64> inlineCallCache{};
-        std::vector<PolymorphicPicSite> polyCallCache;
-        std::vector<DelegateCallSiteCache> delegateCallCache;
-        std::uint64_t lastMirrorId = 0;
+        std::array<FastNativeBindEntry, 64> nativeBindCache{};
+        std::vector<ObjectRef> stringLiteralCache;
+        std::uint64_t stringLiteralHeapId = 0;
+        std::uint64_t stringLiteralGcEpoch = 0;
+        std::uint64_t stringMirrorId = 0;
     };
     enum : std::size_t { MaxDepth = 8 };
     std::array<Buffers, MaxDepth> pool{};
+    std::vector<PolymorphicPicSite> sharedPolyCallCache;
+    std::vector<DelegateCallSiteCache> sharedDelegateCallCache;
+    std::uint64_t sharedMirrorId = 0;
     std::size_t depth = 0;
 };
 
@@ -541,7 +590,7 @@ struct ArgumentSource {
           inlineRegs{reg0, reg1, reg2},
           indices(inlineRegs.data()),
           count(3) {}
-    ArgumentSource(
+    explicit ArgumentSource(
         const ValueWindow& registers) noexcept
         : values(registers.values),
           offset(registers.offset),
@@ -556,6 +605,50 @@ struct ArgumentSource {
     }
     [[nodiscard]] const Value& front() const noexcept { return (*this)[0]; }
 };
+
+[[nodiscard]] inline ValueSpan materializeArgumentSpan(
+    const ArgumentSource& arguments,
+    std::array<Value, 8>& stackScratch,
+    std::vector<Value>& heapScratch) {
+    if (arguments.empty()) {
+        return ValueSpan(nullptr, 0);
+    }
+    if (arguments.directValues != nullptr) {
+        return ValueSpan(arguments.directValues, arguments.count);
+    }
+    if (arguments.values == nullptr) {
+        return ValueSpan(nullptr, 0);
+    }
+    const Value* const base = arguments.values->data() + arguments.offset;
+    if (!arguments.indices) {
+        return ValueSpan(base, arguments.count);
+    }
+    if (arguments.count == 1) {
+        return ValueSpan(base + arguments.indices[0], 1);
+    }
+    bool contiguous = true;
+    const auto firstIndex = arguments.indices[0];
+    for (std::size_t index = 1; index < arguments.count; ++index) {
+        if (arguments.indices[index] != firstIndex + index) {
+            contiguous = false;
+            break;
+        }
+    }
+    if (contiguous) {
+        return ValueSpan(base + firstIndex, arguments.count);
+    }
+    if (arguments.count <= stackScratch.size()) {
+        for (std::size_t index = 0; index < arguments.count; ++index) {
+            stackScratch[index] = arguments[index];
+        }
+        return ValueSpan(stackScratch.data(), arguments.count);
+    }
+    heapScratch.reserve(arguments.count);
+    for (std::size_t index = 0; index < arguments.count; ++index) {
+        heapScratch.push_back(arguments[index]);
+    }
+    return ValueSpan(heapScratch);
+}
 
 class ArenaFrameScope {
 public:

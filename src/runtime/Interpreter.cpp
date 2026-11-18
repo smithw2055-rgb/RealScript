@@ -5,6 +5,111 @@ namespace interp_detail {
 
 namespace {
 thread_local ThreadInvokeScratch tlsInvokeScratch;
+
+struct FallbackInvokeBuffers {
+    std::array<InlineCallCacheEntry, 64> inlineCallCache{};
+    std::array<FastNativeBindEntry, 64> nativeBindCache{};
+    std::vector<PolymorphicPicSite> polyCallCache;
+    std::vector<DelegateCallSiteCache> delegateCallCache;
+    std::vector<ObjectRef> stringLiteralCache;
+};
+
+struct InvokeScratchGuard {
+    ThreadInvokeScratch& scratch;
+    State& state;
+    std::unique_ptr<FallbackInvokeBuffers> fallbackBufs;
+    bool active = false;
+
+    InvokeScratchGuard(
+        ThreadInvokeScratch& s,
+        State& st,
+        const detail::ExecutionMirror& mirror,
+        const ManagedHeap* heap,
+        const void*& outHeapImplToken)
+        : scratch(s), state(st) {
+        state.mirror = &mirror;
+        outHeapImplToken = detail::lookupHeapImplFast(heap);
+        const std::uint64_t heapId = heap ? heap->heapId() : 0u;
+        const std::uint64_t stringEpoch = outHeapImplToken
+            ? detail::heapStringInternEpochWithToken(outHeapImplToken)
+            : (heap ? heap->gcEpoch() : 0u);
+        const std::uint64_t mirrorId = mirror.instanceId;
+        const std::size_t polyCount = mirror.polyCallSites.size();
+        const std::size_t delCount = mirror.invokeDelegateSites.size();
+        if (scratch.depth < ThreadInvokeScratch::MaxDepth) {
+            const std::size_t depthBefore = scratch.depth;
+            auto& buf = scratch.pool[scratch.depth++];
+            if (buf.values.size() < 256) buf.values.resize(256);
+            if (buf.stack.capacity() < 32) buf.stack.reserve(32);
+            const bool bufMirrorChanged = (buf.stringMirrorId != mirrorId);
+            if (bufMirrorChanged) {
+                buf.inlineCallCache.fill(InlineCallCacheEntry{});
+            }
+            const bool sharedMismatch =
+                (scratch.sharedMirrorId != mirrorId ||
+                 scratch.sharedPolyCallCache.size() != polyCount ||
+                 scratch.sharedDelegateCallCache.size() != delCount);
+            if (depthBefore == 0) {
+                if (sharedMismatch) {
+                    scratch.sharedPolyCallCache.assign(polyCount, PolymorphicPicSite{});
+                    scratch.sharedDelegateCallCache.assign(delCount, DelegateCallSiteCache{});
+                    scratch.sharedMirrorId = mirrorId;
+                }
+                state.inlineCallCache = &buf.inlineCallCache;
+                state.polyCallCache = &scratch.sharedPolyCallCache;
+                state.delegateCallCache = &scratch.sharedDelegateCallCache;
+            } else if (!sharedMismatch) {
+                state.inlineCallCache = &buf.inlineCallCache;
+                state.polyCallCache = &scratch.sharedPolyCallCache;
+                state.delegateCallCache = &scratch.sharedDelegateCallCache;
+            } else {
+                fallbackBufs = std::make_unique<FallbackInvokeBuffers>();
+                fallbackBufs->polyCallCache.assign(polyCount, PolymorphicPicSite{});
+                fallbackBufs->delegateCallCache.assign(delCount, DelegateCallSiteCache{});
+                state.inlineCallCache = &fallbackBufs->inlineCallCache;
+                state.polyCallCache = &fallbackBufs->polyCallCache;
+                state.delegateCallCache = &fallbackBufs->delegateCallCache;
+            }
+            if (bufMirrorChanged ||
+                buf.stringLiteralHeapId != heapId ||
+                buf.stringLiteralGcEpoch != stringEpoch ||
+                buf.stringLiteralCache.size() != mirror.stringLiterals.size()) {
+                buf.stringLiteralCache.assign(mirror.stringLiterals.size(), ObjectRef{});
+                buf.stringLiteralHeapId = heapId;
+                buf.stringLiteralGcEpoch = stringEpoch;
+                buf.stringMirrorId = mirrorId;
+            }
+            state.values = std::move(buf.values);
+            state.stack = std::move(buf.stack);
+            state.nativeBindCache = &buf.nativeBindCache;
+            state.stringLiteralCache = &buf.stringLiteralCache;
+            state.stringLiteralCacheEpoch = stringEpoch;
+            active = true;
+        } else {
+            fallbackBufs = std::make_unique<FallbackInvokeBuffers>();
+            fallbackBufs->polyCallCache.assign(polyCount, PolymorphicPicSite{});
+            fallbackBufs->delegateCallCache.assign(delCount, DelegateCallSiteCache{});
+            fallbackBufs->stringLiteralCache.assign(mirror.stringLiterals.size(), ObjectRef{});
+            state.inlineCallCache = &fallbackBufs->inlineCallCache;
+            state.polyCallCache = &fallbackBufs->polyCallCache;
+            state.delegateCallCache = &fallbackBufs->delegateCallCache;
+            state.nativeBindCache = &fallbackBufs->nativeBindCache;
+            state.stringLiteralCache = &fallbackBufs->stringLiteralCache;
+            state.stringLiteralCacheEpoch = stringEpoch;
+        }
+    }
+
+    ~InvokeScratchGuard() noexcept {
+        if (active) {
+            if (state.values.size() > 4096) state.values.resize(256);
+            state.stack.clear();
+            auto& buf = scratch.pool[--scratch.depth];
+            buf.values = std::move(state.values);
+            buf.stack = std::move(state.stack);
+            buf.stringLiteralGcEpoch = state.stringLiteralCacheEpoch;
+        }
+    }
+};
 } // namespace
 
 void resumeInterpreterCoroutineCallback(
@@ -96,56 +201,12 @@ void resumeInterpreterCoroutineCallback(
     const auto* found = env->program->resolveFunction(frame.functionSymbolId);
     if (!found) return;
 
-    std::array<InlineCallCacheEntry, 64> fallbackInlineCache;
-    std::vector<PolymorphicPicSite> fallbackPolyCache;
-    std::vector<DelegateCallSiteCache> fallbackDelCache;
     const auto& activeMirror = detail::executionMirror(*env->program);
 
     State state;
-    state.mirror = &activeMirror;
-    const std::uint64_t mirrorId = activeMirror.instanceId;
-    const std::size_t polyCount = activeMirror.polyCallSites.size();
-    const std::size_t delCount = activeMirror.invokeDelegateSites.size();
-    const bool useTls = (tlsInvokeScratch.depth < ThreadInvokeScratch::MaxDepth);
-    if (useTls) {
-        auto& buf = tlsInvokeScratch.pool[tlsInvokeScratch.depth++];
-        if (buf.values.size() < 256) buf.values.resize(256);
-        if (buf.stack.capacity() < 32) buf.stack.reserve(32);
-        if (buf.lastMirrorId != mirrorId ||
-            buf.polyCallCache.size() != polyCount ||
-            buf.delegateCallCache.size() != delCount) {
-            buf.inlineCallCache.fill(InlineCallCacheEntry{});
-            buf.polyCallCache.assign(polyCount, PolymorphicPicSite{});
-            buf.delegateCallCache.assign(delCount, DelegateCallSiteCache{});
-            buf.lastMirrorId = mirrorId;
-        }
-        state.values = std::move(buf.values);
-        state.stack = std::move(buf.stack);
-        state.inlineCallCache = &buf.inlineCallCache;
-        state.polyCallCache = &buf.polyCallCache;
-        state.delegateCallCache = &buf.delegateCallCache;
-    } else {
-        fallbackInlineCache.fill(InlineCallCacheEntry{});
-        fallbackPolyCache.assign(polyCount, PolymorphicPicSite{});
-        fallbackDelCache.assign(delCount, DelegateCallSiteCache{});
-        state.inlineCallCache = &fallbackInlineCache;
-        state.polyCallCache = &fallbackPolyCache;
-        state.delegateCallCache = &fallbackDelCache;
-    }
-
-    struct TlsReleaseGuard {
-        State& st;
-        bool active;
-        ~TlsReleaseGuard() noexcept {
-            if (active) {
-                if (st.values.size() > 4096) st.values.resize(256);
-                st.stack.clear();
-                auto& b = tlsInvokeScratch.pool[--tlsInvokeScratch.depth];
-                b.values = std::move(st.values);
-                b.stack = std::move(st.stack);
-            }
-        }
-    } tlsGuard{state, useTls};
+    const void* heapImplToken = nullptr;
+    InvokeScratchGuard tlsGuard(
+        tlsInvokeScratch, state, activeMirror, env->heap.get(), heapImplToken);
 
     ExecutionOptions resumeOpts = env->options;
     state.limits = resumeOpts.limits;
@@ -165,8 +226,9 @@ void resumeInterpreterCoroutineCallback(
         state.diagnosticEventsEnabled;
     state.fastAccounting = !state.traceEventsEnabled &&
         resumeOpts.debugger == nullptr;
-    state.determinism = DeterminismSession(std::move(resumeOpts.determinism));
+    state.determinism.emplace(std::move(resumeOpts.determinism));
     state.heap = env->heap.get();
+    state.heapImplFast = heapImplToken;
     state.shadowStack.setDomainId(
         (state.heap && state.heap->valuePoolDomain())
             ? state.heap->valuePoolDomain()->domainId()
@@ -658,9 +720,95 @@ ExecutionResult Interpreter::invoke(
     semantic::SymbolId symbolId,
     const std::vector<Value>& arguments,
     Limits limits) const {
-    ExecutionOptions options;
-    options.limits = limits;
-    return invoke(symbolId, arguments, std::move(options));
+    if (!program_) {
+        ExecutionResult invalid;
+        invalid.error = programError_;
+        if (invalid.error.code == ErrorCode::None) {
+            invalid.error.code = ErrorCode::InvalidProgram;
+            invalid.error.message = "interpreter has no linked program image";
+        }
+        return invalid;
+    }
+    const auto& activeMirror = detail::executionMirror(*program_);
+    const ProgramImage::FunctionLocation* found = nullptr;
+    const detail::ExecutionFunction* foundExec = nullptr;
+    if (const auto* fastEntry = activeMirror.lookupFunctionFast(symbolId)) {
+        found = fastEntry->location;
+        foundExec = fastEntry->execution;
+    } else {
+        found = program_->resolveFunction(symbolId);
+    }
+    if (!found) {
+        ExecutionResult missing;
+        missing.error.code = ErrorCode::FunctionNotFound;
+        missing.error.message = "entry function was not found";
+        return missing;
+    }
+    if (asyncRuntime_ != nullptr) {
+        ExecutionOptions options;
+        options.limits = limits;
+        return invoke(symbolId, arguments, std::move(options));
+    }
+
+    ScopedValuePoolDomain domainScope(heap_ ? heap_->valuePoolDomain().get() : nullptr);
+    detail::ActiveMutatorScope activeMutatorScope;
+
+    State state;
+    const void* heapImplToken = nullptr;
+    InvokeScratchGuard scratchGuard(
+        tlsInvokeScratch, state, activeMirror, heap_.get(), heapImplToken);
+    state.limits = limits;
+    state.program = program_.get();
+    state.externalResolver = &externalResolver_;
+    state.bindings = bindings_.get();
+    state.fastAccounting = true;
+    state.heap = heap_.get();
+    state.heapImplFast = heapImplToken;
+    state.shadowStack.setDomainId(
+        (state.heap && state.heap->valuePoolDomain())
+            ? state.heap->valuePoolDomain()->domainId()
+            : 0u);
+    state.executionPolicy = executionPolicy_;
+
+    Value value;
+    ExecutionResult execution;
+    {
+        FlatStackBankScope flatBankScope(state);
+        ManagedHeap::ActiveShadowStackScope activeHeapRoots(state.heap, &state.shadowStack);
+        ShadowFrameScope roots(
+            state.shadowStack, nullptr, nullptr, &state.values, &state.valueTop);
+        execution.succeeded = executeFunction(
+            state, *found, arguments, value, foundExec);
+        value = detachFrameSliceValue(value);
+    }
+    state.statistics.instructionsExecuted = state.executed;
+    if (!execution.succeeded && state.pendingException &&
+        state.error.code == ErrorCode::None) {
+        state.error.code = ErrorCode::ScriptException;
+        state.error.message = "unhandled script exception";
+        state.error.stackTrace = materializeStack(state.stack);
+        populateInterpreterSourceLocations(state);
+    }
+    if (!execution.succeeded && state.heap && program_) {
+        for (const auto& mod : program_->modules()) {
+            for (const auto& ts : mod.types) {
+                if (!ts.staticConstructor.has_value()) continue;
+                const auto guardId = semantic::stableTypeId(
+                    semantic::canonicalTypeName(ts) + "::cctor_guard");
+                if (const auto guardVal = state.heap->getStaticField(guardId)) {
+                    bool initialized = false;
+                    if (guardVal->tryGetBool(initialized) && !initialized) {
+                        (void)state.heap->removeStaticField(guardId);
+                    }
+                }
+            }
+        }
+    }
+    execution.value = std::move(value);
+    execution.error = std::move(state.error);
+    execution.instructionsExecuted = state.executed;
+    execution.statistics = state.statistics;
+    return execution;
 }
 
 ExecutionResult Interpreter::invoke(
@@ -676,7 +824,15 @@ ExecutionResult Interpreter::invoke(
         }
         return invalid;
     }
-    const auto* found = program_->resolveFunction(symbolId);
+    const auto& activeMirror = detail::executionMirror(*program_);
+    const ProgramImage::FunctionLocation* found = nullptr;
+    const detail::ExecutionFunction* foundExec = nullptr;
+    if (const auto* fastEntry = activeMirror.lookupFunctionFast(symbolId)) {
+        found = fastEntry->location;
+        foundExec = fastEntry->execution;
+    } else {
+        found = program_->resolveFunction(symbolId);
+    }
     if (!found) {
         ExecutionResult missing;
         missing.error.code = ErrorCode::FunctionNotFound;
@@ -685,73 +841,11 @@ ExecutionResult Interpreter::invoke(
     }
     ScopedValuePoolDomain domainScope(heap_ ? heap_->valuePoolDomain().get() : nullptr);
     detail::ActiveMutatorScope activeMutatorScope;
-    auto& tlsScratch = tlsInvokeScratch;
-    std::array<InlineCallCacheEntry, 64> fallbackInlineCache;
-    std::vector<PolymorphicPicSite> fallbackPolyCache;
-    std::vector<DelegateCallSiteCache> fallbackDelCache;
-    const auto& activeMirror = detail::executionMirror(*program_);
-    struct ScratchGuard {
-        ThreadInvokeScratch& scratch;
-        State& state;
-        bool active = false;
-        ScratchGuard(
-            ThreadInvokeScratch& s,
-            State& st,
-            const detail::ExecutionMirror& mirror,
-            std::array<InlineCallCacheEntry, 64>& fallback,
-            std::vector<PolymorphicPicSite>& fallbackPoly,
-            std::vector<DelegateCallSiteCache>& fallbackDel)
-            : scratch(s), state(st) {
-            state.mirror = &mirror;
-            const std::uint64_t mirrorId = mirror.instanceId;
-            const std::size_t polyCount = mirror.polyCallSites.size();
-            const std::size_t delCount = mirror.invokeDelegateSites.size();
-            if (scratch.depth < ThreadInvokeScratch::MaxDepth) {
-                auto& buf = scratch.pool[scratch.depth++];
-                if (buf.values.size() < 256) buf.values.resize(256);
-                if (buf.stack.capacity() < 32) buf.stack.reserve(32);
-                if (buf.lastMirrorId != mirrorId ||
-                    buf.polyCallCache.size() != polyCount ||
-                    buf.delegateCallCache.size() != delCount) {
-                    buf.inlineCallCache.fill(InlineCallCacheEntry{});
-                    buf.polyCallCache.assign(polyCount, PolymorphicPicSite{});
-                    buf.delegateCallCache.assign(delCount, DelegateCallSiteCache{});
-                    buf.lastMirrorId = mirrorId;
-                }
-                state.values = std::move(buf.values);
-                state.stack = std::move(buf.stack);
-                state.inlineCallCache = &buf.inlineCallCache;
-                state.polyCallCache = &buf.polyCallCache;
-                state.delegateCallCache = &buf.delegateCallCache;
-                active = true;
-            } else {
-                fallback.fill(InlineCallCacheEntry{});
-                fallbackPoly.assign(polyCount, PolymorphicPicSite{});
-                fallbackDel.assign(delCount, DelegateCallSiteCache{});
-                state.inlineCallCache = &fallback;
-                state.polyCallCache = &fallbackPoly;
-                state.delegateCallCache = &fallbackDel;
-            }
-        }
-        ~ScratchGuard() noexcept {
-            if (active) {
-                if (state.values.size() > 4096) state.values.resize(256);
-                state.stack.clear();
-                auto& buf = scratch.pool[--scratch.depth];
-                buf.values = std::move(state.values);
-                buf.stack = std::move(state.stack);
-            }
-        }
-    };
 
     State state;
-    ScratchGuard scratchGuard(
-        tlsScratch,
-        state,
-        activeMirror,
-        fallbackInlineCache,
-        fallbackPolyCache,
-        fallbackDelCache);
+    const void* heapImplToken = nullptr;
+    InvokeScratchGuard scratchGuard(
+        tlsInvokeScratch, state, activeMirror, heap_.get(), heapImplToken);
     state.limits = options.limits;
     state.program = program_.get();
     state.externalResolver = &externalResolver_;
@@ -779,24 +873,32 @@ ExecutionResult Interpreter::invoke(
                 options.grantedCapabilities.end());
         }
     }
-    if (!resumeEnv_ ||
-        static_cast<const InterpreterResumeEnv*>(resumeEnv_.get())->options.awaitScheduler !=
-            options.awaitScheduler) {
-        auto env = std::make_shared<InterpreterResumeEnv>();
-        env->program = program_;
-        env->heap = heap_;
-        env->bindings = bindings_;
-        env->externalResolver = externalResolver_;
-        env->options = options;
-        env->asyncRuntimeWeak = asyncRuntime_;
-        resumeEnv_ = env;
-    } else {
-        auto* env = static_cast<InterpreterResumeEnv*>(resumeEnv_.get());
-        env->options = options;
-        env->asyncRuntimeWeak = asyncRuntime_;
+    state.enforceCapabilities = options.determinism.enforceCapabilities;
+    const bool needsResumeEnv =
+        (asyncRuntime_ != nullptr || options.awaitScheduler != nullptr);
+    std::shared_ptr<const void> resumeOwnerRef;
+    if (needsResumeEnv) {
+        if (!resumeEnv_ ||
+            static_cast<const InterpreterResumeEnv*>(resumeEnv_.get())->options.awaitScheduler !=
+                options.awaitScheduler) {
+            auto env = std::make_shared<InterpreterResumeEnv>();
+            env->program = program_;
+            env->heap = heap_;
+            env->bindings = bindings_;
+            env->externalResolver = externalResolver_;
+            env->options = options;
+            env->asyncRuntimeWeak = asyncRuntime_;
+            resumeEnv_ = env;
+        } else {
+            auto* env = static_cast<InterpreterResumeEnv*>(resumeEnv_.get());
+            env->options = options;
+            env->asyncRuntimeWeak = asyncRuntime_;
+        }
+        resumeOwnerRef = resumeEnv_;
     }
-    state.determinism = DeterminismSession(std::move(options.determinism));
+    state.determinism.emplace(std::move(options.determinism));
     state.heap = heap_.get();
+    state.heapImplFast = heapImplToken;
     state.shadowStack.setDomainId(
         (state.heap && state.heap->valuePoolDomain())
             ? state.heap->valuePoolDomain()->domainId()
@@ -808,16 +910,15 @@ ExecutionResult Interpreter::invoke(
     state.executionPolicy = options.executionPolicy
         ? options.executionPolicy
         : executionPolicy_;
-    if (resumeEnv_) {
+    if (needsResumeEnv && resumeEnv_) {
         static_cast<InterpreterResumeEnv*>(resumeEnv_.get())->options.executionPolicy =
             state.executionPolicy;
     }
     if (state.asyncRuntime && state.heap && state.asyncRuntime->awaitables().heap() == nullptr) {
         state.asyncRuntime->setHeap(state.heap);
     }
-    const std::shared_ptr<const void> resumeOwnerRef = resumeEnv_;
-    state.resumeEnvRaw = resumeEnv_.get();
-    state.resumeEnvOwner = &resumeOwnerRef;
+    state.resumeEnvRaw = needsResumeEnv ? resumeEnv_.get() : nullptr;
+    state.resumeEnvOwner = needsResumeEnv ? &resumeOwnerRef : nullptr;
     void* const prevAsyncBridge = state.asyncRuntime
         ? state.asyncRuntime->activeInterpreterState()
         : nullptr;
@@ -855,7 +956,8 @@ ExecutionResult Interpreter::invoke(
         if (state.traceEventsEnabled && state.heap && state.heap->isWallClockCycleActive()) {
             state.heap->finishWallClockCycleForDeterminism(state.shadowStack);
         }
-        execution.succeeded = executeFunction(state, *found, arguments, value);
+        execution.succeeded = executeFunction(
+            state, *found, arguments, value, foundExec);
         value = detachFrameSliceValue(value);
     }
     state.statistics.instructionsExecuted = state.executed;
@@ -867,11 +969,11 @@ ExecutionResult Interpreter::invoke(
         populateInterpreterSourceLocations(state);
     }
     if (state.determinismEventsEnabled) {
-        state.determinism.mergeEventDigest(
+        state.determinism->mergeEventDigest(
             state.determinismEventDigest,
             state.determinismEventCount);
     }
-    execution.succeeded = state.determinism.finish(
+    execution.succeeded = state.determinism->finish(
         execution.succeeded,
         value,
         state.error,
@@ -896,8 +998,8 @@ ExecutionResult Interpreter::invoke(
     execution.error = std::move(state.error);
     execution.instructionsExecuted = state.executed;
     execution.statistics = state.statistics;
-    execution.determinismDigest = state.determinism.digest();
-    execution.replayEntriesConsumed = state.determinism.replayEntriesConsumed();
+    execution.determinismDigest = state.determinism->digest();
+    execution.replayEntriesConsumed = state.determinism->replayEntriesConsumed();
     return execution;
 }
 
@@ -905,9 +1007,22 @@ ExecutionResult Interpreter::invoke(
     const std::string& qualifiedName,
     const std::vector<Value>& arguments,
     Limits limits) const {
-    ExecutionOptions options;
-    options.limits = limits;
-    return invoke(qualifiedName, arguments, std::move(options));
+    if (!program_) {
+        ExecutionResult invalid;
+        invalid.error = programError_;
+        if (invalid.error.code == ErrorCode::None) {
+            invalid.error.code = ErrorCode::InvalidProgram;
+            invalid.error.message = "interpreter has no linked program image";
+        }
+        return invalid;
+    }
+    if (const auto symbolId = program_->findFunction(qualifiedName)) {
+        return invoke(*symbolId, arguments, limits);
+    }
+    ExecutionResult missing;
+    missing.error.code = ErrorCode::FunctionNotFound;
+    missing.error.message = "entry function '" + qualifiedName + "' was not found";
+    return missing;
 }
 
 ExecutionResult Interpreter::invoke(

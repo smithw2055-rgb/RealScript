@@ -241,7 +241,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             const auto hasVal = emitValue(
                 Opcode::LoadStructField, semantic::PrimitiveType::Bool, {sVal}, pat.span);
             auto& loadInst = block(*currentBlockId_).instructions.back();
-            loadInst.typeId = pat.nullableStructType.id;
+            loadInst.typeId = pat.nullableStructType->id;
             loadInst.fieldIndex = pat.nullableHasValueField.index;
             loadInst.symbolName = semantic::canonicalTypeName(pat.nullableStructType);
             emitBranch(hasVal, falseTarget, trueTarget, {}, {}, pat.span);
@@ -254,7 +254,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             const auto hasVal = emitValue(
                 Opcode::LoadStructField, semantic::PrimitiveType::Bool, {sVal}, pat.span);
             auto& hasLoad = block(*currentBlockId_).instructions.back();
-            hasLoad.typeId = pat.nullableStructType.id;
+            hasLoad.typeId = pat.nullableStructType->id;
             hasLoad.fieldIndex = pat.nullableHasValueField.index;
             hasLoad.symbolName = semantic::canonicalTypeName(pat.nullableStructType);
             const auto unwrapBlock = createBlock();
@@ -264,7 +264,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             const auto innerVal = emitValue(
                 Opcode::LoadStructField, pat.nullableValueField.type, {sVal2}, pat.span);
             auto& valLoad = block(*currentBlockId_).instructions.back();
-            valLoad.typeId = pat.nullableStructType.id;
+            valLoad.typeId = pat.nullableStructType->id;
             valLoad.fieldIndex = pat.nullableValueField.index;
             valLoad.resultTypeId = semantic::isExactType(pat.nullableValueField.type)
                 ? semantic::stableTypeId(pat.nullableValueField.typeName)
@@ -525,9 +525,9 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         Instruction instruction;
         instruction.result = nextValueId_++;
         instruction.resultType = semantic::PrimitiveType::Object;
-        instruction.resultTypeId = creation.delegateType.id;
+        instruction.resultTypeId = creation.delegateType->id;
         instruction.opcode = Opcode::NewDelegate;
-        instruction.typeId = creation.delegateType.id;
+        instruction.typeId = creation.delegateType->id;
         if (creation.closureType) {
             const auto closure = emitValue(
                 Opcode::NewObject,
@@ -604,12 +604,12 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             ? semantic::stableTypeId(invocation.typeName)
             : 0;
         instruction.opcode = Opcode::InvokeDelegate;
-        instruction.typeId = invocation.delegateType.id;
+        instruction.typeId = invocation.delegateType->id;
         instruction.operands.push_back(
             lowerExpression(*invocation.delegate));
         struct Writeback {
             semantic::VariableSymbol variable;
-            semantic::TypeSymbol wrapperType;
+            semantic::SharedTypeRef wrapperType;
             semantic::FieldSymbol field;
             ValueId wrapper = -1;
             std::optional<semantic::FunctionSymbol> assignHandle;
@@ -631,8 +631,8 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 {}, expression.span);
             auto& allocation =
                 block(*currentBlockId_).instructions.back();
-            allocation.typeId = argument.wrapperType.id;
-            allocation.resultTypeId = argument.wrapperType.id;
+            allocation.typeId = argument.wrapperType->id;
+            allocation.resultTypeId = argument.wrapperType->id;
             allocation.symbolName = semantic::canonicalTypeName(
                 argument.wrapperType);
             if (argument.modifier ==
@@ -643,7 +643,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 store.resultType = semantic::PrimitiveType::Void;
                 store.opcode = Opcode::StoreField;
                 store.operands = {wrapper, initial};
-                store.typeId = argument.wrapperType.id;
+                store.typeId = argument.wrapperType->id;
                 store.fieldIndex = argument.valueField.index;
                 store.symbolName = semantic::canonicalTypeName(
                     argument.wrapperType);
@@ -669,7 +669,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 store.resultType = semantic::PrimitiveType::Void;
                 store.opcode = Opcode::StoreField;
                 store.operands = {wrapper, defaultStruct};
-                store.typeId = argument.wrapperType.id;
+                store.typeId = argument.wrapperType->id;
                 store.fieldIndex = argument.valueField.index;
                 store.symbolName = semantic::canonicalTypeName(
                     argument.wrapperType);
@@ -701,7 +701,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 writeback.field.type,
                 {writeback.wrapper}, expression.span);
             auto& load = block(*currentBlockId_).instructions.back();
-            load.typeId = writeback.wrapperType.id;
+            load.typeId = writeback.wrapperType->id;
             load.resultTypeId = semantic::isExactType(
                     writeback.field.type)
                 ? semantic::stableTypeId(writeback.field.typeName)
@@ -809,8 +809,8 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             expression.span);
         auto& instruction = block(
             *currentBlockId_).instructions.back();
-        instruction.typeId = combination.delegateType.id;
-        instruction.resultTypeId = combination.delegateType.id;
+        instruction.typeId = combination.delegateType->id;
+        instruction.resultTypeId = combination.delegateType->id;
         instruction.symbolName = semantic::canonicalTypeName(
             combination.delegateType);
         return result;
@@ -1006,10 +1006,10 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
     }
     case semantic::BoundNodeKind::NewObjectExpression: {
         const auto& allocation = static_cast<const semantic::BoundNewObjectExpression&>(expression);
-        if (allocation.objectType.staticConstructor &&
-            (!currentFunction_ || currentFunction_->symbolId != allocation.objectType.staticConstructor->id)) {
+        if (allocation.objectType->staticConstructor &&
+            (!currentFunction_ || currentFunction_->symbolId != allocation.objectType->staticConstructor->id)) {
             (void)emitCallInstruction(
-                *allocation.objectType.staticConstructor,
+                *allocation.objectType->staticConstructor,
                 semantic::PrimitiveType::Void,
                 {},
                 {},
@@ -1022,8 +1022,8 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         }
         const auto value = emitValue(Opcode::NewObject, semantic::PrimitiveType::Object, {}, expression.span);
         auto& instruction = block(*currentBlockId_).instructions.back();
-        instruction.typeId = allocation.objectType.id;
-        instruction.resultTypeId = allocation.objectType.id;
+        instruction.typeId = allocation.objectType->id;
+        instruction.resultTypeId = allocation.objectType->id;
         instruction.symbolName = semantic::canonicalTypeName(allocation.objectType);
         auto emitConstantFieldValue = [&](const semantic::FieldSymbol& field,
                                           text::TextSpan span) -> ValueId {
@@ -1134,7 +1134,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             }
             return emitTypedNull(field.type, field.typeName, span);
         };
-        for (const auto& field : allocation.objectType.fields) {
+        for (const auto& field : allocation.objectType->fields) {
             if (field.staticField || field.constField || !field.hasConstantValue) {
                 continue;
             }
@@ -1143,7 +1143,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             store.resultType = semantic::PrimitiveType::Void;
             store.opcode = Opcode::StoreField;
             store.operands = {value, defaultVal};
-            store.typeId = allocation.objectType.id;
+            store.typeId = allocation.objectType->id;
             store.fieldIndex = field.index;
             store.symbolName = semantic::canonicalTypeName(allocation.objectType);
             store.sourceSpan = expression.span;
@@ -1158,7 +1158,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             store.resultType = semantic::PrimitiveType::Void;
             store.opcode = Opcode::StoreField;
             store.operands = {value, assigned};
-            store.typeId = allocation.objectType.id;
+            store.typeId = allocation.objectType->id;
             store.fieldIndex = initializer.field.index;
             store.symbolName = semantic::canonicalTypeName(allocation.objectType);
             store.sourceSpan = expression.span;
@@ -1197,7 +1197,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 store.resultType = semantic::PrimitiveType::Void;
                 store.opcode = Opcode::StoreField;
                 store.operands = {value, assigned};
-                store.typeId = allocation.objectType.id;
+                store.typeId = allocation.objectType->id;
                 store.fieldIndex = initializer.field.index;
                 store.symbolName = semantic::canonicalTypeName(allocation.objectType);
                 store.sourceSpan = expression.span;
@@ -1220,10 +1220,10 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
     }
     case semantic::BoundNodeKind::NewStructExpression: {
         const auto& allocation = static_cast<const semantic::BoundNewStructExpression&>(expression);
-        if (allocation.structType.staticConstructor &&
-            (!currentFunction_ || currentFunction_->symbolId != allocation.structType.staticConstructor->id)) {
+        if (allocation.structType->staticConstructor &&
+            (!currentFunction_ || currentFunction_->symbolId != allocation.structType->staticConstructor->id)) {
             (void)emitCallInstruction(
-                *allocation.structType.staticConstructor,
+                *allocation.structType->staticConstructor,
                 semantic::PrimitiveType::Void,
                 {},
                 {},
@@ -1236,10 +1236,10 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         }
         auto value = emitValue(Opcode::NewStruct, semantic::PrimitiveType::Struct, {}, expression.span);
         auto& instruction = block(*currentBlockId_).instructions.back();
-        instruction.typeId = allocation.structType.id;
-        instruction.resultTypeId = allocation.structType.id;
+        instruction.typeId = allocation.structType->id;
+        instruction.resultTypeId = allocation.structType->id;
         instruction.symbolName = semantic::canonicalTypeName(allocation.structType);
-        for (const auto& field : allocation.structType.fields) {
+        for (const auto& field : allocation.structType->fields) {
             if (field.staticField || field.constField || !field.hasConstantValue) {
                 continue;
             }
@@ -1297,8 +1297,8 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                     Opcode::StoreStructField, semantic::PrimitiveType::Struct,
                     {value, defaultVal}, expression.span);
                 auto& store = block(*currentBlockId_).instructions.back();
-                store.typeId = allocation.structType.id;
-                store.resultTypeId = allocation.structType.id;
+                store.typeId = allocation.structType->id;
+                store.resultTypeId = allocation.structType->id;
                 store.fieldIndex = field.index;
                 store.symbolName = semantic::canonicalTypeName(allocation.structType);
             }
@@ -1312,8 +1312,8 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 Opcode::StoreStructField, semantic::PrimitiveType::Struct,
                 {value, assigned}, expression.span);
             auto& store = block(*currentBlockId_).instructions.back();
-            store.typeId = allocation.structType.id;
-            store.resultTypeId = allocation.structType.id;
+            store.typeId = allocation.structType->id;
+            store.resultTypeId = allocation.structType->id;
             store.fieldIndex = initializer.field.index;
             store.symbolName = semantic::canonicalTypeName(allocation.structType);
         }
@@ -1354,8 +1354,8 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 Opcode::StoreStructField, semantic::PrimitiveType::Struct,
                 {value, assigned}, expression.span);
             auto& store = block(*currentBlockId_).instructions.back();
-            store.typeId = allocation.structType.id;
-            store.resultTypeId = allocation.structType.id;
+            store.typeId = allocation.structType->id;
+            store.resultTypeId = allocation.structType->id;
             store.fieldIndex = initializer.field.index;
             store.symbolName = semantic::canonicalTypeName(allocation.structType);
         }
@@ -1364,10 +1364,10 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
     case semantic::BoundNodeKind::MemberAccessExpression: {
         const auto& member = static_cast<const semantic::BoundMemberAccessExpression&>(expression);
         if (member.field.staticField) {
-            if (member.ownerType.staticConstructor &&
-                (!currentFunction_ || currentFunction_->symbolId != member.ownerType.staticConstructor->id)) {
+            if (member.ownerType->staticConstructor &&
+                (!currentFunction_ || currentFunction_->symbolId != member.ownerType->staticConstructor->id)) {
                 (void)emitCallInstruction(
-                    *member.ownerType.staticConstructor,
+                    *member.ownerType->staticConstructor,
                     semantic::PrimitiveType::Void,
                     {},
                     {},
@@ -1540,13 +1540,13 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 Opcode::LoadField, member.field.type,
                 {receiver}, expression.span);
             auto& load = block(*currentBlockId_).instructions.back();
-            load.typeId = member.ownerType.id;
+            load.typeId = member.ownerType->id;
             load.resultTypeId = semantic::isExactType(member.field.type)
                 ? semantic::stableTypeId(member.field.typeName)
                 : 0;
             load.fieldIndex = member.field.index;
             load.symbolName = semantic::canonicalTypeName(member.ownerType);
-            if (member.nullConditionalNullableType.id != 0) {
+            if (member.nullConditionalNullableType->id != 0) {
                 present = emitNullableValue(
                     member.nullConditionalNullableType,
                     member.nullConditionalHasValueField,
@@ -1556,7 +1556,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             emitJump(mergeBlock, {present}, expression.span);
             setCurrentBlock(missingBlock);
             const auto missing =
-                member.nullConditionalNullableType.id != 0
+                member.nullConditionalNullableType->id != 0
                 ? emitDefaultStruct(
                     member.nullConditionalNullableType, expression.span)
                 : emitTypedNull(
@@ -1567,12 +1567,12 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         }
         const auto checked = emitValue(Opcode::CheckNotNull, semantic::PrimitiveType::Object, {receiver}, member.receiver->span);
         auto& check = block(*currentBlockId_).instructions.back();
-        check.typeId = member.ownerType.id;
-        check.resultTypeId = member.ownerType.id;
+        check.typeId = member.ownerType->id;
+        check.resultTypeId = member.ownerType->id;
         check.symbolName = semantic::canonicalTypeName(member.ownerType);
         const auto value = emitValue(Opcode::LoadField, member.field.type, {checked}, expression.span);
         auto& instruction = block(*currentBlockId_).instructions.back();
-        instruction.typeId = member.ownerType.id;
+        instruction.typeId = member.ownerType->id;
         instruction.resultTypeId = semantic::isExactType(member.field.type)
             ? semantic::stableTypeId(member.field.typeName)
             : 0;
@@ -1583,10 +1583,10 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
     case semantic::BoundNodeKind::MemberAssignmentExpression: {
         const auto& assignment = static_cast<const semantic::BoundMemberAssignmentExpression&>(expression);
         if (assignment.field.staticField) {
-            if (assignment.ownerType.staticConstructor &&
-                (!currentFunction_ || currentFunction_->symbolId != assignment.ownerType.staticConstructor->id)) {
+            if (assignment.ownerType->staticConstructor &&
+                (!currentFunction_ || currentFunction_->symbolId != assignment.ownerType->staticConstructor->id)) {
                 (void)emitCallInstruction(
-                    *assignment.ownerType.staticConstructor,
+                    *assignment.ownerType->staticConstructor,
                     semantic::PrimitiveType::Void,
                     {},
                     {},
@@ -1618,15 +1618,15 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         const auto receiver = lowerExpression(*assignment.receiver);
         const auto checked = emitValue(Opcode::CheckNotNull, semantic::PrimitiveType::Object, {receiver}, assignment.receiver->span);
         auto& check = block(*currentBlockId_).instructions.back();
-        check.typeId = assignment.ownerType.id;
-        check.resultTypeId = assignment.ownerType.id;
+        check.typeId = assignment.ownerType->id;
+        check.resultTypeId = assignment.ownerType->id;
         check.symbolName = semantic::canonicalTypeName(assignment.ownerType);
         const auto value = lowerExpression(*assignment.expression);
         Instruction store;
         store.resultType = semantic::PrimitiveType::Void;
         store.opcode = Opcode::StoreField;
         store.operands = {checked, value};
-        store.typeId = assignment.ownerType.id;
+        store.typeId = assignment.ownerType->id;
         store.fieldIndex = assignment.field.index;
         store.symbolName = semantic::canonicalTypeName(assignment.ownerType);
         store.sourceSpan = expression.span;
@@ -1638,7 +1638,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         const auto value = emitValue(Opcode::LoadStructField, member.field.type,
             {lowerExpression(*member.receiver)}, expression.span);
         auto& instruction = block(*currentBlockId_).instructions.back();
-        instruction.typeId = member.ownerType.id;
+        instruction.typeId = member.ownerType->id;
         instruction.fieldIndex = member.field.index;
         instruction.resultTypeId = semantic::isExactType(member.field.type)
             ? semantic::stableTypeId(member.field.typeName)
@@ -1654,7 +1654,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         const auto& rootStructType = assignment.intermediateHops.empty()
             ? assignment.ownerType
             : assignment.intermediateHops.front().ownerType;
-        const auto rootStructTypeId = rootStructType.id;
+        const auto rootStructTypeId = rootStructType->id;
 
         // Step 1: Pre-evaluate root lvalue receiver/index handles (preserving left-to-right single evaluation)
         ValueId wrapper = -1;
@@ -1663,10 +1663,10 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         ValueId arrIdx = -1;
 
         if (effectiveRootKind == semantic::StructAssignmentRootKind::StaticField) {
-            if (assignment.staticReceiverOwnerType.staticConstructor &&
-                (!currentFunction_ || currentFunction_->symbolId != assignment.staticReceiverOwnerType.staticConstructor->id)) {
+            if (assignment.staticReceiverOwnerType->staticConstructor &&
+                (!currentFunction_ || currentFunction_->symbolId != assignment.staticReceiverOwnerType->staticConstructor->id)) {
                 (void)emitCallInstruction(
-                    *assignment.staticReceiverOwnerType.staticConstructor,
+                    *assignment.staticReceiverOwnerType->staticConstructor,
                     semantic::PrimitiveType::Void,
                     {},
                     {},
@@ -1720,8 +1720,8 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 {rawObj},
                 assignment.objectReceiver->span);
             auto& check = block(*currentBlockId_).instructions.back();
-            check.typeId = assignment.objectOwnerType.id;
-            check.resultTypeId = assignment.objectOwnerType.id;
+            check.typeId = assignment.objectOwnerType->id;
+            check.resultTypeId = assignment.objectOwnerType->id;
             check.symbolName = semantic::canonicalTypeName(assignment.objectOwnerType);
         } else if (effectiveRootKind == semantic::StructAssignmentRootKind::ArrayElement) {
             arrRecv = lowerExpression(*assignment.elementReceiver);
@@ -1732,7 +1732,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 {}, expression.span);
             auto& loadWrapper = block(*currentBlockId_).instructions.back();
             loadWrapper.localIndex = assignment.variable.index;
-            loadWrapper.resultTypeId = assignment.wrapperType.id;
+            loadWrapper.resultTypeId = assignment.wrapperType->id;
         }
 
         // Step 2: Evaluate RHS (or compound read-modify-write expression)
@@ -1770,7 +1770,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 {checkedObjRecv},
                 expression.span);
             auto& loadField = block(*currentBlockId_).instructions.back();
-            loadField.typeId = assignment.objectOwnerType.id;
+            loadField.typeId = assignment.objectOwnerType->id;
             loadField.resultTypeId = rootStructTypeId;
             loadField.fieldIndex = assignment.objectField.index;
             loadField.symbolName = semantic::canonicalTypeName(assignment.objectOwnerType);
@@ -1789,7 +1789,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 Opcode::LoadField, semantic::PrimitiveType::Struct,
                 {wrapper}, expression.span);
             auto& loadValue = block(*currentBlockId_).instructions.back();
-            loadValue.typeId = assignment.wrapperType.id;
+            loadValue.typeId = assignment.wrapperType->id;
             loadValue.resultTypeId = rootStructTypeId;
             loadValue.fieldIndex = assignment.wrapperValueField.index;
             loadValue.symbolName = semantic::canonicalTypeName(
@@ -1809,15 +1809,15 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         for (std::size_t m = 0; m < assignment.intermediateHops.size(); ++m) {
             const auto& hop = assignment.intermediateHops[m];
             const auto nextTypeId = (m + 1 < assignment.intermediateHops.size())
-                ? assignment.intermediateHops[m + 1].ownerType.id
-                : assignment.ownerType.id;
+                ? assignment.intermediateHops[m + 1].ownerType->id
+                : assignment.ownerType->id;
             const auto subStruct = emitValue(
                 Opcode::LoadStructField,
                 semantic::PrimitiveType::Struct,
                 {chainStructs.back()},
                 expression.span);
             auto& subLoad = block(*currentBlockId_).instructions.back();
-            subLoad.typeId = hop.ownerType.id;
+            subLoad.typeId = hop.ownerType->id;
             subLoad.fieldIndex = hop.field.index;
             subLoad.resultTypeId = nextTypeId;
             subLoad.symbolName = semantic::canonicalTypeName(hop.ownerType);
@@ -1831,8 +1831,8 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             expression.span);
         {
             auto& leafStore = block(*currentBlockId_).instructions.back();
-            leafStore.typeId = assignment.ownerType.id;
-            leafStore.resultTypeId = assignment.ownerType.id;
+            leafStore.typeId = assignment.ownerType->id;
+            leafStore.resultTypeId = assignment.ownerType->id;
             leafStore.fieldIndex = assignment.field.index;
             leafStore.symbolName = semantic::canonicalTypeName(assignment.ownerType);
         }
@@ -1846,8 +1846,8 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 {chainStructs[m], updated},
                 expression.span);
             auto& hopStore = block(*currentBlockId_).instructions.back();
-            hopStore.typeId = hop.ownerType.id;
-            hopStore.resultTypeId = hop.ownerType.id;
+            hopStore.typeId = hop.ownerType->id;
+            hopStore.resultTypeId = hop.ownerType->id;
             hopStore.fieldIndex = hop.field.index;
             hopStore.symbolName = semantic::canonicalTypeName(hop.ownerType);
         }
@@ -1870,7 +1870,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             storeObj.resultType = semantic::PrimitiveType::Void;
             storeObj.opcode = Opcode::StoreField;
             storeObj.operands = {checkedObjRecv, updated};
-            storeObj.typeId = assignment.objectOwnerType.id;
+            storeObj.typeId = assignment.objectOwnerType->id;
             storeObj.fieldIndex = assignment.objectField.index;
             storeObj.symbolName = semantic::canonicalTypeName(assignment.objectOwnerType);
             storeObj.sourceSpan = expression.span;
@@ -1889,7 +1889,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             writeback.resultType = semantic::PrimitiveType::Void;
             writeback.opcode = Opcode::StoreField;
             writeback.operands = {wrapper, updated};
-            writeback.typeId = assignment.wrapperType.id;
+            writeback.typeId = assignment.wrapperType->id;
             writeback.fieldIndex = assignment.wrapperValueField.index;
             writeback.symbolName = semantic::canonicalTypeName(
                 assignment.wrapperType);
@@ -1962,8 +1962,8 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             invocation.receiver->span);
         auto& receiverCheck =
             block(*currentBlockId_).instructions.back();
-        receiverCheck.typeId = invocation.ownerType.id;
-        receiverCheck.resultTypeId = invocation.ownerType.id;
+        receiverCheck.typeId = invocation.ownerType->id;
+        receiverCheck.resultTypeId = invocation.ownerType->id;
         receiverCheck.symbolName = semantic::canonicalTypeName(
             invocation.ownerType);
         std::vector<ValueId> values;
@@ -1975,9 +1975,9 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             semantic::PrimitiveType::Object,
             {receiver}, expression.span);
         auto& load = block(*currentBlockId_).instructions.back();
-        load.typeId = invocation.ownerType.id;
+        load.typeId = invocation.ownerType->id;
         load.fieldIndex = invocation.event.storageField.index;
-        load.resultTypeId = invocation.delegateType.id;
+        load.resultTypeId = invocation.delegateType->id;
         load.symbolName = semantic::canonicalTypeName(
             invocation.ownerType);
         const auto rawNull = emitValue(
@@ -1989,7 +1989,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             semantic::PrimitiveType::Object,
             {rawNull}, expression.span);
         block(*currentBlockId_).instructions.back().resultTypeId =
-            invocation.delegateType.id;
+            invocation.delegateType->id;
         const auto empty = emitValue(
             Opcode::Equal,
             semantic::PrimitiveType::Bool,
@@ -2002,7 +2002,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
         Instruction call;
         call.resultType = semantic::PrimitiveType::Void;
         call.opcode = Opcode::InvokeDelegate;
-        call.typeId = invocation.delegateType.id;
+        call.typeId = invocation.delegateType->id;
         call.operands.push_back(stored);
         call.operands.insert(
             call.operands.end(), values.begin(), values.end());
@@ -2022,12 +2022,12 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             semantic::ReferenceTargetKind targetKind =
                 semantic::ReferenceTargetKind::None;
             semantic::VariableSymbol variable;
-            semantic::TypeSymbol wrapperType;
+            semantic::SharedTypeRef wrapperType;
             semantic::FieldSymbol field;
             ValueId wrapper = -1;
             ValueId targetReceiver = -1;
             ValueId targetIndex = -1;
-            semantic::TypeSymbol targetOwnerType;
+            semantic::SharedTypeRef targetOwnerType;
             semantic::FieldSymbol targetField;
             semantic::PrimitiveType targetElementType =
                 semantic::PrimitiveType::Error;
@@ -2063,10 +2063,10 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 break;
             case semantic::ReferenceTargetKind::ObjectField: {
                 if (argument.targetField.staticField) {
-                    if (argument.targetOwnerType.staticConstructor &&
-                        (!currentFunction_ || currentFunction_->symbolId != argument.targetOwnerType.staticConstructor->id)) {
+                    if (argument.targetOwnerType->staticConstructor &&
+                        (!currentFunction_ || currentFunction_->symbolId != argument.targetOwnerType->staticConstructor->id)) {
                         (void)emitCallInstruction(
-                            *argument.targetOwnerType.staticConstructor,
+                            *argument.targetOwnerType->staticConstructor,
                             semantic::PrimitiveType::Void,
                             {},
                             {},
@@ -2089,8 +2089,8 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                     semantic::PrimitiveType::Object,
                     {targetReceiver}, expression.span);
                 auto& check = block(*currentBlockId_).instructions.back();
-                check.typeId = argument.targetOwnerType.id;
-                check.resultTypeId = argument.targetOwnerType.id;
+                check.typeId = argument.targetOwnerType->id;
+                check.resultTypeId = argument.targetOwnerType->id;
                 check.symbolName = semantic::canonicalTypeName(
                     argument.targetOwnerType);
                 if (argument.modifier == semantic::ParameterModifier::Ref) {
@@ -2098,7 +2098,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                         Opcode::LoadField, argument.targetField.type,
                         {targetReceiver}, expression.span);
                     auto& load = block(*currentBlockId_).instructions.back();
-                    load.typeId = argument.targetOwnerType.id;
+                    load.typeId = argument.targetOwnerType->id;
                     load.resultTypeId = semantic::isExactType(
                             argument.targetField.type)
                         ? semantic::stableTypeId(
@@ -2131,13 +2131,13 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 const auto& rootStructType = argument.intermediateHops.empty()
                     ? argument.targetOwnerType
                     : argument.intermediateHops.front().ownerType;
-                const auto rootStructTypeId = rootStructType.id;
+                const auto rootStructTypeId = rootStructType->id;
 
                 if (argument.structRootKind == semantic::StructAssignmentRootKind::StaticField) {
-                    if (argument.structRootOwnerType.staticConstructor &&
-                        (!currentFunction_ || currentFunction_->symbolId != argument.structRootOwnerType.staticConstructor->id)) {
+                    if (argument.structRootOwnerType->staticConstructor &&
+                        (!currentFunction_ || currentFunction_->symbolId != argument.structRootOwnerType->staticConstructor->id)) {
                         (void)emitCallInstruction(
-                            *argument.structRootOwnerType.staticConstructor,
+                            *argument.structRootOwnerType->staticConstructor,
                             semantic::PrimitiveType::Void,
                             {},
                             {},
@@ -2191,8 +2191,8 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                         {rawObj},
                         argument.targetReceiver->span);
                     auto& check = block(*currentBlockId_).instructions.back();
-                    check.typeId = argument.structRootOwnerType.id;
-                    check.resultTypeId = argument.structRootOwnerType.id;
+                    check.typeId = argument.structRootOwnerType->id;
+                    check.resultTypeId = argument.structRootOwnerType->id;
                     check.symbolName = semantic::canonicalTypeName(argument.structRootOwnerType);
                 } else if (argument.structRootKind == semantic::StructAssignmentRootKind::ArrayElement) {
                     targetReceiver = lowerExpression(*argument.targetReceiver);
@@ -2205,7 +2205,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                         expression.span);
                     auto& lw = block(*currentBlockId_).instructions.back();
                     lw.localIndex = argument.variable.index;
-                    lw.resultTypeId = argument.structRootWrapperType.id;
+                    lw.resultTypeId = argument.structRootWrapperType->id;
                 }
 
                 if (argument.modifier == semantic::ParameterModifier::Ref) {
@@ -2237,7 +2237,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                             Opcode::LoadField, semantic::PrimitiveType::Struct,
                             {targetReceiver}, expression.span);
                         auto& lf = block(*currentBlockId_).instructions.back();
-                        lf.typeId = argument.structRootOwnerType.id;
+                        lf.typeId = argument.structRootOwnerType->id;
                         lf.resultTypeId = rootStructTypeId;
                         lf.fieldIndex = argument.structRootField.index;
                         lf.symbolName = semantic::canonicalTypeName(argument.structRootOwnerType);
@@ -2254,7 +2254,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                             Opcode::LoadField, semantic::PrimitiveType::Struct,
                             {structRootWrapper}, expression.span);
                         auto& lf = block(*currentBlockId_).instructions.back();
-                        lf.typeId = argument.structRootWrapperType.id;
+                        lf.typeId = argument.structRootWrapperType->id;
                         lf.resultTypeId = rootStructTypeId;
                         lf.fieldIndex = argument.structRootWrapperValueField.index;
                         lf.symbolName = semantic::canonicalTypeName(argument.structRootWrapperType);
@@ -2269,13 +2269,13 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                     for (std::size_t m = 0; m < argument.intermediateHops.size(); ++m) {
                         const auto& hop = argument.intermediateHops[m];
                         const auto nextTid = (m + 1 < argument.intermediateHops.size())
-                            ? argument.intermediateHops[m + 1].ownerType.id
-                            : argument.targetOwnerType.id;
+                            ? argument.intermediateHops[m + 1].ownerType->id
+                            : argument.targetOwnerType->id;
                         cur = emitValue(
                             Opcode::LoadStructField, semantic::PrimitiveType::Struct,
                             {cur}, expression.span);
                         auto& sl = block(*currentBlockId_).instructions.back();
-                        sl.typeId = hop.ownerType.id;
+                        sl.typeId = hop.ownerType->id;
                         sl.fieldIndex = hop.field.index;
                         sl.resultTypeId = nextTid;
                         sl.symbolName = semantic::canonicalTypeName(hop.ownerType);
@@ -2284,7 +2284,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                         Opcode::LoadStructField, argument.targetField.type,
                         {cur}, expression.span);
                     auto& load = block(*currentBlockId_).instructions.back();
-                    load.typeId = argument.targetOwnerType.id;
+                    load.typeId = argument.targetOwnerType->id;
                     load.fieldIndex = argument.targetField.index;
                     load.resultTypeId = semantic::isExactType(
                             argument.targetField.type)
@@ -2310,8 +2310,8 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 expression.span);
             auto& allocation =
                 block(*currentBlockId_).instructions.back();
-            allocation.typeId = argument.wrapperType.id;
-            allocation.resultTypeId = argument.wrapperType.id;
+            allocation.typeId = argument.wrapperType->id;
+            allocation.resultTypeId = argument.wrapperType->id;
             allocation.symbolName =
                 semantic::canonicalTypeName(argument.wrapperType);
             if (argument.modifier ==
@@ -2322,7 +2322,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                     semantic::PrimitiveType::Void;
                 store.opcode = Opcode::StoreField;
                 store.operands = {wrapper, initial};
-                store.typeId = argument.wrapperType.id;
+                store.typeId = argument.wrapperType->id;
                 store.fieldIndex = argument.valueField.index;
                 store.symbolName = semantic::canonicalTypeName(
                     argument.wrapperType);
@@ -2348,7 +2348,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 store.resultType = semantic::PrimitiveType::Void;
                 store.opcode = Opcode::StoreField;
                 store.operands = {wrapper, defaultStruct};
-                store.typeId = argument.wrapperType.id;
+                store.typeId = argument.wrapperType->id;
                 store.fieldIndex = argument.valueField.index;
                 store.symbolName = semantic::canonicalTypeName(
                     argument.wrapperType);
@@ -2410,7 +2410,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 expression.span);
             auto& load = block(
                 *currentBlockId_).instructions.back();
-            load.typeId = writeback.wrapperType.id;
+            load.typeId = writeback.wrapperType->id;
             load.resultTypeId = semantic::isExactType(
                     writeback.field.type)
                 ? semantic::stableTypeId(
@@ -2544,7 +2544,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                         writeback.targetField.type,
                         {writeback.targetReceiver}, expression.span);
                     auto& oldLoad = block(*currentBlockId_).instructions.back();
-                    oldLoad.typeId = writeback.targetOwnerType.id;
+                    oldLoad.typeId = writeback.targetOwnerType->id;
                     oldLoad.resultTypeId = semantic::isExactType(
                             writeback.targetField.type)
                         ? semantic::stableTypeId(writeback.targetField.typeName)
@@ -2558,7 +2558,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 store.resultType = semantic::PrimitiveType::Void;
                 store.opcode = Opcode::StoreField;
                 store.operands = {writeback.targetReceiver, value};
-                store.typeId = writeback.targetOwnerType.id;
+                store.typeId = writeback.targetOwnerType->id;
                 store.fieldIndex = writeback.targetField.index;
                 store.symbolName = semantic::canonicalTypeName(
                     writeback.targetOwnerType);
@@ -2606,7 +2606,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 const auto& rootStructType = refArg.intermediateHops.empty()
                     ? writeback.targetOwnerType
                     : refArg.intermediateHops.front().ownerType;
-                const auto rootStructTypeId = rootStructType.id;
+                const auto rootStructTypeId = rootStructType->id;
 
                 ValueId rootCur = -1;
                 if (refArg.structRootKind == semantic::StructAssignmentRootKind::StaticField) {
@@ -2636,7 +2636,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                         Opcode::LoadField, semantic::PrimitiveType::Struct,
                         {writeback.targetReceiver}, expression.span);
                     auto& lf = block(*currentBlockId_).instructions.back();
-                    lf.typeId = refArg.structRootOwnerType.id;
+                    lf.typeId = refArg.structRootOwnerType->id;
                     lf.resultTypeId = rootStructTypeId;
                     lf.fieldIndex = refArg.structRootField.index;
                     lf.symbolName = semantic::canonicalTypeName(refArg.structRootOwnerType);
@@ -2653,7 +2653,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                         Opcode::LoadField, semantic::PrimitiveType::Struct,
                         {writeback.structRootWrapper}, expression.span);
                     auto& lf = block(*currentBlockId_).instructions.back();
-                    lf.typeId = refArg.structRootWrapperType.id;
+                    lf.typeId = refArg.structRootWrapperType->id;
                     lf.resultTypeId = rootStructTypeId;
                     lf.fieldIndex = refArg.structRootWrapperValueField.index;
                     lf.symbolName = semantic::canonicalTypeName(refArg.structRootWrapperType);
@@ -2672,13 +2672,13 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 for (std::size_t m = 0; m < refArg.intermediateHops.size(); ++m) {
                     const auto& hop = refArg.intermediateHops[m];
                     const auto nextTid = (m + 1 < refArg.intermediateHops.size())
-                        ? refArg.intermediateHops[m + 1].ownerType.id
-                        : writeback.targetOwnerType.id;
+                        ? refArg.intermediateHops[m + 1].ownerType->id
+                        : writeback.targetOwnerType->id;
                     const auto sub = emitValue(
                         Opcode::LoadStructField, semantic::PrimitiveType::Struct,
                         {chainStructs.back()}, expression.span);
                     auto& sl = block(*currentBlockId_).instructions.back();
-                    sl.typeId = hop.ownerType.id;
+                    sl.typeId = hop.ownerType->id;
                     sl.fieldIndex = hop.field.index;
                     sl.resultTypeId = nextTid;
                     sl.symbolName = semantic::canonicalTypeName(hop.ownerType);
@@ -2691,7 +2691,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                         writeback.targetField.type,
                         {chainStructs.back()}, expression.span);
                     auto& oldLoad = block(*currentBlockId_).instructions.back();
-                    oldLoad.typeId = writeback.targetOwnerType.id;
+                    oldLoad.typeId = writeback.targetOwnerType->id;
                     oldLoad.fieldIndex = writeback.targetField.index;
                     oldLoad.resultTypeId = semantic::isExactType(
                             writeback.targetField.type)
@@ -2708,8 +2708,8 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                     {chainStructs.back(), value}, expression.span);
                 {
                     auto& store = block(*currentBlockId_).instructions.back();
-                    store.typeId = writeback.targetOwnerType.id;
-                    store.resultTypeId = writeback.targetOwnerType.id;
+                    store.typeId = writeback.targetOwnerType->id;
+                    store.resultTypeId = writeback.targetOwnerType->id;
                     store.fieldIndex = writeback.targetField.index;
                     store.symbolName = semantic::canonicalTypeName(
                         writeback.targetOwnerType);
@@ -2722,8 +2722,8 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                         semantic::PrimitiveType::Struct,
                         {chainStructs[m], updated}, expression.span);
                     auto& hs = block(*currentBlockId_).instructions.back();
-                    hs.typeId = hop.ownerType.id;
-                    hs.resultTypeId = hop.ownerType.id;
+                    hs.typeId = hop.ownerType->id;
+                    hs.resultTypeId = hop.ownerType->id;
                     hs.fieldIndex = hop.field.index;
                     hs.symbolName = semantic::canonicalTypeName(hop.ownerType);
                 }
@@ -2746,7 +2746,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                     storeObj.resultType = semantic::PrimitiveType::Void;
                     storeObj.opcode = Opcode::StoreField;
                     storeObj.operands = {writeback.targetReceiver, updated};
-                    storeObj.typeId = refArg.structRootOwnerType.id;
+                    storeObj.typeId = refArg.structRootOwnerType->id;
                     storeObj.fieldIndex = refArg.structRootField.index;
                     storeObj.symbolName = semantic::canonicalTypeName(refArg.structRootOwnerType);
                     storeObj.sourceSpan = expression.span;
@@ -2765,7 +2765,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                     wb.resultType = semantic::PrimitiveType::Void;
                     wb.opcode = Opcode::StoreField;
                     wb.operands = {writeback.structRootWrapper, updated};
-                    wb.typeId = refArg.structRootWrapperType.id;
+                    wb.typeId = refArg.structRootWrapperType->id;
                     wb.fieldIndex = refArg.structRootWrapperValueField.index;
                     wb.symbolName = semantic::canonicalTypeName(refArg.structRootWrapperType);
                     wb.sourceSpan = expression.span;
@@ -2825,7 +2825,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 call.virtualDispatch, call.virtualSlot,
                 call.interfaceDispatch, call.interfaceTypeId,
                 call.interfaceSlot);
-            if (call.nullConditionalNullableType.id != 0) {
+            if (call.nullConditionalNullableType->id != 0) {
                 present = emitNullableValue(
                     call.nullConditionalNullableType,
                     call.nullConditionalHasValueField,
@@ -2834,7 +2834,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             }
             emitJump(mergeBlock, {present}, expression.span);
             setCurrentBlock(missingBlock);
-            const auto missing = call.nullConditionalNullableType.id != 0
+            const auto missing = call.nullConditionalNullableType->id != 0
                 ? emitDefaultStruct(
                     call.nullConditionalNullableType, expression.span)
                 : emitTypedNull(
@@ -3245,7 +3245,7 @@ ValueId Lowerer::lowerNullCoalescing(
             Opcode::LoadStructField, semantic::PrimitiveType::Bool,
             {left}, expression.span);
         auto& hasValueLoad = block(*currentBlockId_).instructions.back();
-        hasValueLoad.typeId = expression.nullableType.id;
+        hasValueLoad.typeId = expression.nullableType->id;
         hasValueLoad.fieldIndex = expression.hasValueField.index;
         hasValueLoad.symbolName = semantic::canonicalTypeName(
             expression.nullableType);
@@ -3265,7 +3265,7 @@ ValueId Lowerer::lowerNullCoalescing(
             Opcode::LoadStructField, expression.valueField.type,
             {left}, expression.span);
         auto& valueLoad = block(*currentBlockId_).instructions.back();
-        valueLoad.typeId = expression.nullableType.id;
+        valueLoad.typeId = expression.nullableType->id;
         valueLoad.fieldIndex = expression.valueField.index;
         valueLoad.resultTypeId = typeId;
         valueLoad.symbolName = semantic::canonicalTypeName(

@@ -482,6 +482,18 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
         semantic::SymbolId, ProgramImage::FunctionLocation>& functions) {
     auto mirror = std::make_shared<ExecutionMirror>();
     mirror->instanceId = nextExecutionMirrorId();
+    std::unordered_map<std::string, std::uint32_t> stringLiteralMap;
+    stringLiteralMap.reserve(256u);
+    const auto internMirrorLiteral = [&](const std::string& text) -> std::uint32_t {
+        const auto found = stringLiteralMap.find(text);
+        if (found != stringLiteralMap.end()) {
+            return found->second;
+        }
+        const auto idx = static_cast<std::uint32_t>(mirror->stringLiterals.size());
+        mirror->stringLiterals.push_back(text);
+        stringLiteralMap.emplace(text, idx);
+        return idx;
+    };
     std::size_t functionCount = 0;
     for (const auto& module : modules) functionCount += module.functions.size();
     mirror->functions.reserve(functionCount);
@@ -932,7 +944,23 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
             decoded.bytecode = &function;
             decoded.hasDebugSequencePoints = !function.debugInfo.sequencePoints.empty();
             decoded.blocks.resize(function.blocks.size());
-            decoded.blockIndices.reserve(function.blocks.size());
+            bytecode::BlockId maxBlockId = 0;
+            for (const auto& bb : function.blocks) {
+                if (bb.id > maxBlockId) maxBlockId = bb.id;
+            }
+            const bool useDenseBlockIndices =
+                !function.blocks.empty() &&
+                static_cast<std::uint64_t>(maxBlockId) <=
+                    static_cast<std::uint64_t>(function.blocks.size()) * 4ull + 32ull;
+            if (useDenseBlockIndices) {
+                decoded.denseBlockIndices.assign(
+                    static_cast<std::size_t>(maxBlockId) + 1u,
+                    InvalidStreamOffset);
+            } else if (!function.blocks.empty()) {
+                decoded.sparseBlockIndices =
+                    std::make_unique<std::unordered_map<bytecode::BlockId, std::size_t>>();
+                decoded.sparseBlockIndices->reserve(function.blocks.size());
+            }
             for (std::size_t index = 0; index < function.blocks.size(); ++index) {
                 const auto& bb = function.blocks[index];
                 auto& blockMirror = decoded.blocks[index];
@@ -968,7 +996,11 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                            function.returnTypeId == quatTypeId() ||
                            function.returnTypeId == vec2fTypeId() ||
                            function.returnTypeId == vec3fTypeId() ||
-                           function.returnTypeId == quatfTypeId())))) {
+                           function.returnTypeId == quatfTypeId())) ||
+                         (function.returnType == semantic::PrimitiveType::Enum &&
+                          function.returnTypeId != 0 &&
+                          bb.terminator.value < function.registerTypeIds.size() &&
+                          function.registerTypeIds[bb.terminator.value] == function.returnTypeId))) {
                         blockMirror.returnPrevalidatedScalar = true;
                     }
                 }
@@ -1133,20 +1165,24 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     }
                     ++instructionIndex;
                 }
-                decoded.blockIndices.emplace(bb.id, index);
+                if (useDenseBlockIndices) {
+                    decoded.denseBlockIndices[bb.id] = static_cast<std::uint32_t>(index);
+                } else if (decoded.sparseBlockIndices) {
+                    decoded.sparseBlockIndices->emplace(bb.id, index);
+                }
             }
 
-            const auto entry = decoded.blockIndices.find(0);
-            if (entry != decoded.blockIndices.end()) decoded.entry = entry->second;
+            const std::size_t entryIdx = decoded.findBlockIndex(0);
+            if (entryIdx != InvalidBlockIndex) decoded.entry = entryIdx;
             const auto bindEdge = [&](ExecutionEdge& edge,
                                       bytecode::BlockId target,
                                       const bytecode::SmallRegisterVector& sources) {
-                const auto found = decoded.blockIndices.find(target);
-                if (found == decoded.blockIndices.end()) return;
-                edge.target = found->second;
+                const std::size_t foundIdx = decoded.findBlockIndex(target);
+                if (foundIdx == InvalidBlockIndex) return;
+                edge.target = foundIdx;
                 edge.targetBlockId = target;
                 edge.sources = &sources;
-                edge.destinations = &function.blocks[found->second].parameters;
+                edge.destinations = &function.blocks[foundIdx].parameters;
                 edge.hasArguments = !sources.empty();
                 decoded.edgeScratchCount =
                     std::max(decoded.edgeScratchCount, sources.size());
@@ -2863,12 +2899,12 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     // Exception handler edges: any protected block can transfer control to its handler block
                     std::vector<std::vector<std::size_t>> extraSuccs(nBlocks);
                     for (const auto& eh : function.exceptionHandlers) {
-                        const auto hIt = execFunc.blockIndices.find(eh.handlerBlock);
-                        if (hIt == execFunc.blockIndices.end()) continue;
+                        const std::size_t hIdx = execFunc.findBlockIndex(eh.handlerBlock);
+                        if (hIdx == InvalidBlockIndex) continue;
                         for (const auto pbId : eh.protectedBlocks) {
-                            const auto pIt = execFunc.blockIndices.find(pbId);
-                            if (pIt != execFunc.blockIndices.end()) {
-                                extraSuccs[pIt->second].push_back(hIt->second);
+                            const std::size_t pIdx = execFunc.findBlockIndex(pbId);
+                            if (pIdx != InvalidBlockIndex) {
+                                extraSuccs[pIdx].push_back(hIdx);
                             }
                         }
                     }
@@ -5211,6 +5247,211 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                     break;
                                 }
                             }
+                            if (bcInst.opcode == bytecode::Opcode::ConstantString &&
+                                bcInst.result < regCount) {
+                                flat.flatOpcode = FlatOpcode::ConstantStringFast;
+                                flat.dstSlot = regSlot(static_cast<std::uint16_t>(bcInst.result));
+                                flat.auxImm32 = internMirrorLiteral(bcInst.stringImmediate);
+                                break;
+                            }
+                            if (((bcInst.opcode == bytecode::Opcode::ConstantInt &&
+                                  bcInst.result < function.registerTypes.size() &&
+                                  function.registerTypes[bcInst.result] == semantic::PrimitiveType::Enum) ||
+                                 bcInst.opcode == bytecode::Opcode::ConstantTypeId) &&
+                                bcInst.result < regCount) {
+                                flat.flatOpcode = FlatOpcode::ConstantEnumFast;
+                                flat.dstSlot = regSlot(static_cast<std::uint16_t>(bcInst.result));
+                                flat.auxImm32 = static_cast<std::uint32_t>(mirror->constPoolValues.size());
+                                if (bcInst.opcode == bytecode::Opcode::ConstantTypeId) {
+                                    mirror->constPoolValues.emplace_back(ULongValue{
+                                        static_cast<std::uint64_t>(bcInst.integerImmediate)});
+                                } else {
+                                    mirror->constPoolValues.emplace_back(EnumValue{
+                                        bcInst.result < function.registerTypeIds.size()
+                                            ? function.registerTypeIds[bcInst.result]
+                                            : semantic::SymbolId{0},
+                                        bcInst.integerImmediate});
+                                }
+                                break;
+                            }
+                            if (bcInst.opcode == bytecode::Opcode::ConstantNull &&
+                                bcInst.operands.empty() &&
+                                bcInst.result < regCount) {
+                                flat.flatOpcode = FlatOpcode::ConstantNullTagFast;
+                                flat.dstSlot = regSlot(static_cast<std::uint16_t>(bcInst.result));
+                                flat.aux0Slot = 0u;
+                                break;
+                            }
+                            if ((bcInst.opcode == bytecode::Opcode::ConvertNullToObject ||
+                                 bcInst.opcode == bytecode::Opcode::ConvertNullToString ||
+                                 bcInst.opcode == bytecode::Opcode::ConvertNullToArray) &&
+                                bcInst.operands.size() == 1 &&
+                                bcInst.operands[0] < regCount &&
+                                bcInst.result < regCount) {
+                                flat.flatOpcode = FlatOpcode::ConstantNullTagFast;
+                                flat.dstSlot = regSlot(static_cast<std::uint16_t>(bcInst.result));
+                                flat.src0Slot = regSlot(static_cast<std::uint16_t>(bcInst.operands[0]));
+                                flat.aux0Slot = (bcInst.opcode == bytecode::Opcode::ConvertNullToObject)
+                                    ? 1u
+                                    : (bcInst.opcode == bytecode::Opcode::ConvertNullToString ? 2u : 3u);
+                                break;
+                            }
+                            if ((bcInst.opcode == bytecode::Opcode::Equal ||
+                                 bcInst.opcode == bytecode::Opcode::NotEqual) &&
+                                bcInst.operands.size() == 2 &&
+                                bcInst.operands[0] < regCount &&
+                                bcInst.operands[1] < regCount &&
+                                bcInst.result < regCount) {
+                                flat.flatOpcode = FlatOpcode::EqualValueFast;
+                                flat.dstSlot = regSlot(static_cast<std::uint16_t>(bcInst.result));
+                                flat.src0Slot = regSlot(static_cast<std::uint16_t>(bcInst.operands[0]));
+                                flat.src1Slot = regSlot(static_cast<std::uint16_t>(bcInst.operands[1]));
+                                flat.aux0Slot = (bcInst.opcode == bytecode::Opcode::NotEqual) ? 1u : 0u;
+                                break;
+                            }
+                            if (bcInst.opcode == bytecode::Opcode::ConvertNumeric &&
+                                bcInst.operands.size() == 1 &&
+                                bcInst.operands[0] < regCount &&
+                                bcInst.result < regCount &&
+                                bcInst.result < function.registerTypes.size()) {
+                                flat.flatOpcode = FlatOpcode::ConvertNumericFast;
+                                flat.dstSlot = regSlot(static_cast<std::uint16_t>(bcInst.result));
+                                flat.src0Slot = regSlot(static_cast<std::uint16_t>(bcInst.operands[0]));
+                                flat.binaryOpcode1 = static_cast<QuickOpcode>(
+                                    static_cast<std::uint8_t>(function.registerTypes[bcInst.result]));
+                                flat.setChecked1(bcInst.checkedArithmetic);
+                                break;
+                            }
+                            if (bcInst.opcode == bytecode::Opcode::NegateInt &&
+                                bcInst.operands.size() == 1 &&
+                                bcInst.operands[0] < regCount &&
+                                bcInst.result < regCount) {
+                                flat.flatOpcode = FlatOpcode::NegateIntChecked;
+                                flat.dstSlot = regSlot(static_cast<std::uint16_t>(bcInst.result));
+                                flat.src0Slot = regSlot(static_cast<std::uint16_t>(bcInst.operands[0]));
+                                flat.setChecked1(bcInst.checkedArithmetic);
+                                break;
+                            }
+                            if (((bcInst.opcode >= bytecode::Opcode::AddInt &&
+                                  bcInst.opcode <= bytecode::Opcode::RemainderInt) ||
+                                 (bcInst.opcode >= bytecode::Opcode::LessInt &&
+                                  bcInst.opcode <= bytecode::Opcode::GreaterOrEqualInt)) &&
+                                bcInst.operands.size() == 2 &&
+                                bcInst.operands[0] < regCount &&
+                                bcInst.operands[1] < regCount &&
+                                bcInst.result < regCount &&
+                                bcInst.operands[0] < function.registerTypes.size() &&
+                                bcInst.operands[1] < function.registerTypes.size() &&
+                                bcInst.result < function.registerTypes.size() &&
+                                function.registerTypes[bcInst.operands[0]] == semantic::PrimitiveType::UInt &&
+                                function.registerTypes[bcInst.operands[1]] == semantic::PrimitiveType::UInt &&
+                                function.registerTypes[bcInst.result] ==
+                                    (bcInst.opcode <= bytecode::Opcode::RemainderInt
+                                         ? semantic::PrimitiveType::UInt
+                                         : semantic::PrimitiveType::Bool)) {
+                                flat.flatOpcode = FlatOpcode::BinaryUIntFast;
+                                flat.dstSlot = regSlot(static_cast<std::uint16_t>(bcInst.result));
+                                flat.src0Slot = regSlot(static_cast<std::uint16_t>(bcInst.operands[0]));
+                                flat.src1Slot = regSlot(static_cast<std::uint16_t>(bcInst.operands[1]));
+                                flat.aux0Slot = static_cast<std::uint16_t>(bcInst.opcode);
+                                flat.setChecked1(bcInst.checkedArithmetic);
+                                break;
+                            }
+                            if (bcInst.opcode == bytecode::Opcode::Call &&
+                                bcInst.index < module.functionReferences.size() &&
+                                bcInst.operands.size() <= 3 &&
+                                (bcInst.result == bytecode::InvalidRegister || bcInst.result < regCount)) {
+                                bool allOpsOk = true;
+                                for (const auto opReg : bcInst.operands) {
+                                    if (opReg >= regCount) {
+                                        allOpsOk = false;
+                                        break;
+                                    }
+                                }
+                                const std::string& refName = module.functionReferences[bcInst.index].name;
+                                if (allOpsOk && refName.rfind("$intrinsic::", 0) == 0) {
+                                    const std::string_view op = std::string_view(refName).substr(12u);
+                                    FastIntrinsicKind ikind = FastIntrinsicKind::None;
+                                    std::int64_t staticSym = 0;
+                                    const bool hasRes = (bcInst.result != bytecode::InvalidRegister);
+                                    const std::size_t nArgs = bcInst.operands.size();
+                                    const auto parseU64 = [](std::string_view sv) noexcept -> std::int64_t {
+                                        std::uint64_t acc = 0;
+                                        for (const char ch : sv) {
+                                            if (ch < '0' || ch > '9') break;
+                                            acc = acc * 10u + static_cast<std::uint64_t>(ch - '0');
+                                        }
+                                        return static_cast<std::int64_t>(acc);
+                                    };
+                                    if (op.rfind("static_has::", 0) == 0 && nArgs == 0 && hasRes) {
+                                        ikind = FastIntrinsicKind::StaticHas;
+                                        staticSym = parseU64(op.substr(12u));
+                                    } else if (op.rfind("static_get::", 0) == 0) {
+                                        const std::string_view subOp = op.substr(12u);
+                                        if (subOp.rfind("ecs_col::", 0) != 0 &&
+                                            subOp.rfind("ecs_ent::", 0) != 0 &&
+                                            nArgs <= 1 && hasRes) {
+                                            ikind = FastIntrinsicKind::StaticGet;
+                                            staticSym = parseU64(subOp);
+                                        }
+                                    } else if (op.rfind("static_set::", 0) == 0 && nArgs >= 1) {
+                                        ikind = FastIntrinsicKind::StaticSet;
+                                        staticSym = parseU64(op.substr(12u));
+                                    } else if (op == "string_length" && nArgs == 1 && hasRes) {
+                                        ikind = FastIntrinsicKind::StringLength;
+                                    } else if (op == "string_is_empty" && nArgs == 1 && hasRes) {
+                                        ikind = FastIntrinsicKind::StringIsEmpty;
+                                    } else if (op == "string_contains" && nArgs == 2 && hasRes) {
+                                        ikind = FastIntrinsicKind::StringContains;
+                                    } else if (op == "string_starts_with" && nArgs == 2 && hasRes) {
+                                        ikind = FastIntrinsicKind::StringStartsWith;
+                                    } else if (op == "string_ends_with" && nArgs == 2 && hasRes) {
+                                        ikind = FastIntrinsicKind::StringEndsWith;
+                                    } else if (op == "string_substring_1" && nArgs == 2 && hasRes) {
+                                        ikind = FastIntrinsicKind::StringSubstring1;
+                                    } else if (op == "string_substring_2" && nArgs == 3 && hasRes) {
+                                        ikind = FastIntrinsicKind::StringSubstring2;
+                                    } else if (op == "string_trim" && nArgs == 1 && hasRes) {
+                                        ikind = FastIntrinsicKind::StringTrim;
+                                    } else if (op == "string_to_lower" && nArgs == 1 && hasRes) {
+                                        ikind = FastIntrinsicKind::StringToLower;
+                                    } else if (op == "string_to_upper" && nArgs == 1 && hasRes) {
+                                        ikind = FastIntrinsicKind::StringToUpper;
+                                    } else if (op == "string_concat" && nArgs == 2 && hasRes) {
+                                        ikind = FastIntrinsicKind::StringConcat;
+                                    } else if ((op == "stable_hash" || op.rfind("stable_hash::", 0) == 0) &&
+                                               nArgs >= 1 && hasRes) {
+                                        ikind = FastIntrinsicKind::StableHash;
+                                    } else if (op.rfind("array_push::", 0) == 0 && nArgs == 2) {
+                                        ikind = FastIntrinsicKind::ArrayPush;
+                                    } else if (op.rfind("array_remove_at::", 0) == 0 && nArgs == 2) {
+                                        ikind = FastIntrinsicKind::ArrayRemoveAt;
+                                    } else if (op.rfind("array_pop::", 0) == 0 && nArgs == 1) {
+                                        ikind = FastIntrinsicKind::ArrayPop;
+                                    } else if (op.rfind("array_clear::", 0) == 0 && nArgs == 1) {
+                                        ikind = FastIntrinsicKind::ArrayClear;
+                                    }
+                                    if (ikind != FastIntrinsicKind::None) {
+                                        flat.flatOpcode = FlatOpcode::CallIntrinsicFast;
+                                        flat.dstSlot = hasRes
+                                            ? regSlot(static_cast<std::uint16_t>(bcInst.result))
+                                            : InvalidCompactReg;
+                                        flat.src0Slot = nArgs >= 1
+                                            ? regSlot(static_cast<std::uint16_t>(bcInst.operands[0]))
+                                            : InvalidCompactReg;
+                                        flat.src1Slot = nArgs >= 2
+                                            ? regSlot(static_cast<std::uint16_t>(bcInst.operands[1]))
+                                            : InvalidCompactReg;
+                                        flat.src2Slot = nArgs >= 3
+                                            ? regSlot(static_cast<std::uint16_t>(bcInst.operands[2]))
+                                            : InvalidCompactReg;
+                                        flat.inlineArgCount = static_cast<std::uint8_t>(nArgs);
+                                        flat.binaryOpcode1 = static_cast<QuickOpcode>(static_cast<std::uint8_t>(ikind));
+                                        flat.integerImmediate = staticSym;
+                                        break;
+                                    }
+                                }
+                            }
                         }
                         flat.flatOpcode = FlatOpcode::GenericBytecode;
                         break;
@@ -5305,6 +5546,8 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         case FlatOpcode::GreaterOrEqualFloat:
                         case FlatOpcode::EqualFloat:
                         case FlatOpcode::NotEqualFloat:
+                        case FlatOpcode::EqualValueFast:
+                        case FlatOpcode::BinaryUIntFast:
                         case FlatOpcode::LoadElementIntFast:
                         case FlatOpcode::LoadElementTypedFast:
                         case FlatOpcode::StoreFieldFast:
@@ -5998,6 +6241,55 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     return false;
                 };
 
+                const std::size_t nLoopSlots = execFunc.totalFrameSlots;
+                std::uint32_t preEpoch = 0;
+                std::vector<std::uint32_t> slotConstGen(nLoopSlots, 0u);
+                std::vector<std::int64_t> slotConstVals(nLoopSlots, 0);
+                std::vector<std::uint32_t> arrayLenActive(nLoopSlots, 0u);
+                std::vector<std::uint32_t> arrayLenQueued(nLoopSlots, 0u);
+                std::vector<std::int64_t> arrayLenVals(nLoopSlots, 0);
+                std::vector<std::uint16_t> touchedArraySlots;
+                const auto setSlotConst = [&](std::uint16_t s, std::int64_t v) noexcept {
+                    if (s < nLoopSlots) {
+                        slotConstGen[s] = preEpoch;
+                        slotConstVals[s] = v;
+                    }
+                };
+                const auto eraseSlotConst = [&](std::uint16_t s) noexcept {
+                    if (s < nLoopSlots) {
+                        slotConstGen[s] = 0u;
+                    }
+                };
+                const auto tryGetSlotConst = [&](std::uint16_t s, std::int64_t& out) noexcept -> bool {
+                    if (s < nLoopSlots && slotConstGen[s] == preEpoch) {
+                        out = slotConstVals[s];
+                        return true;
+                    }
+                    return false;
+                };
+                const auto setArrayLen = [&](std::uint16_t s, std::int64_t v) {
+                    if (s < nLoopSlots) {
+                        arrayLenActive[s] = preEpoch;
+                        arrayLenVals[s] = v;
+                        if (arrayLenQueued[s] != preEpoch) {
+                            arrayLenQueued[s] = preEpoch;
+                            touchedArraySlots.push_back(s);
+                        }
+                    }
+                };
+                const auto eraseArrayLen = [&](std::uint16_t s) noexcept {
+                    if (s < nLoopSlots) {
+                        arrayLenActive[s] = 0u;
+                    }
+                };
+                const auto tryGetArrayLen = [&](std::uint16_t s, std::int64_t& out) noexcept -> bool {
+                    if (s < nLoopSlots && arrayLenActive[s] == preEpoch) {
+                        out = arrayLenVals[s];
+                        return true;
+                    }
+                    return false;
+                };
+
                 for (std::size_t latchBlk = 2; latchBlk < nBlocks; ++latchBlk) {
                     const auto& latchEb = execFunc.blocks[latchBlk];
                     if (latchEb.terminatorKind != bytecode::TerminatorKind::Jump ||
@@ -6047,46 +6339,50 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     if (!trueEntersLoop || !falseExitsLoop) continue;
 
                     // Track integer constants & fixed-size NewArray allocations at end of preBlk
-                    std::unordered_map<std::uint16_t, std::int64_t> preSlotConst;
-                    std::unordered_map<std::uint16_t, std::int64_t> preArrayLen;
+                    if (++preEpoch == 0u) {
+                        std::fill(slotConstGen.begin(), slotConstGen.end(), 0u);
+                        std::fill(arrayLenActive.begin(), arrayLenActive.end(), 0u);
+                        std::fill(arrayLenQueued.begin(), arrayLenQueued.end(), 0u);
+                        preEpoch = 1u;
+                    }
+                    touchedArraySlots.clear();
                     for (std::size_t k = execFunc.blockStreamOffsets[preBlk]; k < blkEnd[preBlk]; ++k) {
                         const auto& pfi = buildStream[k].hot;
                         if (pfi.flatOpcode == FlatOpcode::ConstantInt && pfi.dstSlot != InvalidCompactReg) {
-                            preSlotConst[pfi.dstSlot] = pfi.integerImmediate;
-                            preArrayLen.erase(pfi.dstSlot);
+                            setSlotConst(pfi.dstSlot, pfi.integerImmediate);
+                            eraseArrayLen(pfi.dstSlot);
                         } else if (pfi.flatOpcode == FlatOpcode::MoveSlot && pfi.dstSlot != InvalidCompactReg) {
-                            const auto itC = preSlotConst.find(pfi.src0Slot);
-                            if (itC != preSlotConst.end()) preSlotConst[pfi.dstSlot] = itC->second;
-                            else preSlotConst.erase(pfi.dstSlot);
-                            const auto itA = preArrayLen.find(pfi.src0Slot);
-                            if (itA != preArrayLen.end()) preArrayLen[pfi.dstSlot] = itA->second;
-                            else preArrayLen.erase(pfi.dstSlot);
+                            std::int64_t tmpVal = 0;
+                            if (tryGetSlotConst(pfi.src0Slot, tmpVal)) setSlotConst(pfi.dstSlot, tmpVal);
+                            else eraseSlotConst(pfi.dstSlot);
+                            if (tryGetArrayLen(pfi.src0Slot, tmpVal)) setArrayLen(pfi.dstSlot, tmpVal);
+                            else eraseArrayLen(pfi.dstSlot);
                         } else if (pfi.flatOpcode == FlatOpcode::NewArrayFast && pfi.dstSlot != InvalidCompactReg) {
-                            preSlotConst.erase(pfi.dstSlot);
-                            const auto itLen = preSlotConst.find(pfi.src0Slot);
-                            if (itLen != preSlotConst.end() && itLen->second > 0) {
-                                preArrayLen[pfi.dstSlot] = itLen->second;
+                            eraseSlotConst(pfi.dstSlot);
+                            std::int64_t arrLenVal = 0;
+                            if (tryGetSlotConst(pfi.src0Slot, arrLenVal) && arrLenVal > 0) {
+                                setArrayLen(pfi.dstSlot, arrLenVal);
                             } else {
-                                preArrayLen.erase(pfi.dstSlot);
+                                eraseArrayLen(pfi.dstSlot);
                             }
                         } else {
                             if (pfi.dstSlot != InvalidCompactReg) {
-                                preSlotConst.erase(pfi.dstSlot);
-                                preArrayLen.erase(pfi.dstSlot);
+                                eraseSlotConst(pfi.dstSlot);
+                                eraseArrayLen(pfi.dstSlot);
                             }
                             if (!isBranchOrJumpFlatOp(pfi.flatOpcode) && pfi.storeSlot != InvalidCompactReg) {
-                                preSlotConst.erase(pfi.storeSlot);
-                                preArrayLen.erase(pfi.storeSlot);
+                                eraseSlotConst(pfi.storeSlot);
+                                eraseArrayLen(pfi.storeSlot);
                             }
                             bool wAux0 = false, wAux1 = false;
                             instWritesAux(pfi.flatOpcode, wAux0, wAux1);
                             if (wAux0 && pfi.aux0Slot != InvalidCompactReg) {
-                                preSlotConst.erase(pfi.aux0Slot);
-                                preArrayLen.erase(pfi.aux0Slot);
+                                eraseSlotConst(pfi.aux0Slot);
+                                eraseArrayLen(pfi.aux0Slot);
                             }
                             if (wAux1 && pfi.aux1Slot != InvalidCompactReg) {
-                                preSlotConst.erase(pfi.aux1Slot);
-                                preArrayLen.erase(pfi.aux1Slot);
+                                eraseSlotConst(pfi.aux1Slot);
+                                eraseArrayLen(pfi.aux1Slot);
                             }
                         }
                     }
@@ -6104,8 +6400,8 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         if (headerInst.flatOpcode == FlatOpcode::SuperLessLocalConstBranch) {
                             boundN = headerInst.integerImmediate;
                         } else {
-                            const auto itB = preSlotConst.find(headerInst.src1Slot);
-                            if (itB != preSlotConst.end()) {
+                            std::int64_t regBound = 0;
+                            if (tryGetSlotConst(headerInst.src1Slot, regBound)) {
                                 bool rhsModified = false;
                                 for (std::size_t k = hStart; k < blkEnd[latchBlk]; ++k) {
                                     if (instWritesSlot(buildStream[k].hot, headerInst.src1Slot)) {
@@ -6113,20 +6409,22 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                         break;
                                     }
                                 }
-                                if (!rhsModified) boundN = itB->second;
+                                if (!rhsModified) boundN = regBound;
                             }
                         }
                         if (boundN > 0) {
                             iSlot = headerInst.src0Slot;
-                            for (const auto& [aSlot, aLen] : preArrayLen) {
-                                if (aLen >= boundN) provenArrSlots.push_back(aSlot);
+                            for (const std::uint16_t aSlot : touchedArraySlots) {
+                                if (arrayLenActive[aSlot] == preEpoch && arrayLenVals[aSlot] >= boundN) {
+                                    provenArrSlots.push_back(aSlot);
+                                }
                             }
                         }
                     }
 
                     if (iSlot == InvalidCompactReg || provenArrSlots.empty()) continue;
-                    const auto itInit = preSlotConst.find(iSlot);
-                    if (itInit == preSlotConst.end() || itInit->second < 0) continue;
+                    std::int64_t initVal = 0;
+                    if (!tryGetSlotConst(iSlot, initVal) || initVal < 0) continue;
 
                     // Verify latchBlk is a single checked positive increment `iSlot = iSlot + posStep; jump header`
                     const std::size_t lStart = execFunc.blockStreamOffsets[latchBlk];
@@ -6142,8 +6440,8 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                             latchInst.integerImmediate > 0) {
                             validPositiveCheckedStep = true;
                         } else if (latchInst.flatOpcode == FlatOpcode::SuperBinaryLocalIntRegStoreJump) {
-                            const auto itStep = preSlotConst.find(latchInst.src1Slot);
-                            if (itStep != preSlotConst.end() && itStep->second > 0) {
+                            std::int64_t stepVal = 0;
+                            if (tryGetSlotConst(latchInst.src1Slot, stepVal) && stepVal > 0) {
                                 bool stepModified = false;
                                 for (std::size_t k = hStart; k < lEnd; ++k) {
                                     if (instWritesSlot(buildStream[k].hot, latchInst.src1Slot)) {
@@ -6531,6 +6829,60 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     case FlatOpcode::StoreStackRefCell:
                     case FlatOpcode::StoreStackRefStructFieldInPlace:
                         break;
+                    case FlatOpcode::NegateIntChecked:
+                        setSlot(fi.dstSlot, ProvenTag::ExactInt32);
+                        break;
+                    case FlatOpcode::EqualValueFast:
+                        setSlot(fi.dstSlot, ProvenTag::ExactBool);
+                        break;
+                    case FlatOpcode::ConstantStringFast:
+                    case FlatOpcode::ConstantEnumFast:
+                    case FlatOpcode::ConstantNullTagFast:
+                        setSlot(fi.dstSlot, ProvenTag::Mixed);
+                        break;
+                    case FlatOpcode::ConvertNumericFast: {
+                        const auto targetPt = static_cast<semantic::PrimitiveType>(
+                            static_cast<std::uint8_t>(fi.binaryOpcode1));
+                        setSlot(
+                            fi.dstSlot,
+                            targetPt == semantic::PrimitiveType::Int
+                                ? ProvenTag::ExactInt32
+                                : (targetPt == semantic::PrimitiveType::Double
+                                    ? ProvenTag::ExactDouble
+                                    : (targetPt == semantic::PrimitiveType::Float
+                                        ? ProvenTag::ExactFloat
+                                        : ProvenTag::Mixed)));
+                        break;
+                    }
+                    case FlatOpcode::BinaryUIntFast: {
+                        const auto bcOp = static_cast<bytecode::Opcode>(fi.aux0Slot);
+                        setSlot(
+                            fi.dstSlot,
+                            (bcOp >= bytecode::Opcode::LessInt &&
+                             bcOp <= bytecode::Opcode::GreaterOrEqualInt)
+                                ? ProvenTag::ExactBool
+                                : ProvenTag::Mixed);
+                        break;
+                    }
+                    case FlatOpcode::CallIntrinsicFast: {
+                        if (fi.dstSlot != InvalidCompactReg) {
+                            const auto ik = static_cast<FastIntrinsicKind>(
+                                static_cast<std::uint8_t>(fi.binaryOpcode1));
+                            if (ik == FastIntrinsicKind::StringLength ||
+                                ik == FastIntrinsicKind::StableHash) {
+                                setSlot(fi.dstSlot, ProvenTag::ExactInt32);
+                            } else if (ik == FastIntrinsicKind::StaticHas ||
+                                       ik == FastIntrinsicKind::StringIsEmpty ||
+                                       ik == FastIntrinsicKind::StringContains ||
+                                       ik == FastIntrinsicKind::StringStartsWith ||
+                                       ik == FastIntrinsicKind::StringEndsWith) {
+                                setSlot(fi.dstSlot, ProvenTag::ExactBool);
+                            } else {
+                                setSlot(fi.dstSlot, ProvenTag::Mixed);
+                            }
+                        }
+                        break;
+                    }
                     case FlatOpcode::GenericBytecode:
                         std::fill(st.begin(), st.end(), ProvenTag::Mixed);
                         break;
@@ -7163,6 +7515,14 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     case FlatOpcode::AddFloatTrusted:
                     case FlatOpcode::SubFloatTrusted:
                     case FlatOpcode::MulFloatTrusted:
+                    case FlatOpcode::ConstantStringFast:
+                    case FlatOpcode::ConstantEnumFast:
+                    case FlatOpcode::ConstantNullTagFast:
+                    case FlatOpcode::EqualValueFast:
+                    case FlatOpcode::ConvertNumericFast:
+                    case FlatOpcode::NegateIntChecked:
+                    case FlatOpcode::BinaryUIntFast:
+                    case FlatOpcode::CallIntrinsicFast:
                     case FlatOpcode::TermJumpNoArgs:
                     case FlatOpcode::TermBranchBoolNoArgs:
                     case FlatOpcode::TermReturnVoid:
@@ -7278,7 +7638,10 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
 
     // Pass 3b: Pre-link per-type virtual & interface dispatch tables + flattened O(1) assignable IDs
     {
+        std::size_t totalTypeCount = 0;
+        for (const auto& module : modules) totalTypeCount += module.types.size();
         std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> allTypesById;
+        allTypesById.reserve(totalTypeCount);
         for (const auto& module : modules) {
             for (const auto& type : module.types) {
                 if (type.id != 0) allTypesById.emplace(type.id, &type);
@@ -7419,6 +7782,14 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     op == FlatOpcode::StoreQuatFieldFast ||
                     op == FlatOpcode::SuperLoadVec3RawFast ||
                     op == FlatOpcode::SuperLoadQuatRawFast ||
+                    op == FlatOpcode::ConstantStringFast ||
+                    op == FlatOpcode::ConstantEnumFast ||
+                    op == FlatOpcode::ConstantNullTagFast ||
+                    op == FlatOpcode::EqualValueFast ||
+                    op == FlatOpcode::ConvertNumericFast ||
+                    op == FlatOpcode::NegateIntChecked ||
+                    op == FlatOpcode::BinaryUIntFast ||
+                    op == FlatOpcode::CallIntrinsicFast ||
                     (op >= FlatOpcode::MathFixedConst && op <= FlatOpcode::SuperQuatMulRotateVec3);
             };
 
@@ -7426,6 +7797,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
             std::uint32_t maxCalleeSlots = 0;
             std::size_t extraInstCount = 0;
             bool anyInlinableCall = false;
+            std::vector<std::uint8_t> unfoldAt(caller.flatStream.size(), 0u);
             for (std::size_t i = 0; i < caller.flatStream.size(); ++i) {
                 const auto& fi = caller.flatStream[i];
                 const auto& fc = caller.flatCold[i];
@@ -7443,12 +7815,16 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     if (caller.totalFrameSlots + fc.directExecution->totalFrameSlots >= InvalidCompactReg) {
                         continue;
                     }
-                    if (caller.flatStream.size() + extraInstCount + fc.directExecution->flatStream.size() > 512) {
+                    const std::size_t calleeLen = fc.directExecution->flatStream.size();
+                    if (extraInstCount + calleeLen > 512 ||
+                        caller.flatStream.size() + extraInstCount + calleeLen > 8192 ||
+                        (caller.flatStream.size() > 512 && calleeLen > 48)) {
                         continue;
                     }
+                    unfoldAt[i] = 1u;
                     anyInlinableCall = true;
                     maxCalleeSlots = std::max(maxCalleeSlots, fc.directExecution->totalFrameSlots);
-                    extraInstCount += fc.directExecution->flatStream.size();
+                    extraInstCount += calleeLen;
                 }
             }
 
@@ -7474,17 +7850,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     const auto fi = caller.flatStream[i];
                     const auto fc = caller.flatCold[i];
 
-                    bool canUnfoldHere =
-                        (fi.flatOpcode == FlatOpcode::CallDirect0 ||
-                         fi.flatOpcode == FlatOpcode::CallDirect1 ||
-                         fi.flatOpcode == FlatOpcode::CallDirect2 ||
-                         (fi.flatOpcode == FlatOpcode::CallDirectN &&
-                          fc.bytecode && fc.bytecode->operands.size() <= 4)) &&
-                        fc.directExecution != nullptr &&
-                        fc.directTarget != nullptr &&
-                        fc.directExecution != &caller &&
-                        fc.directExecution->isSmallLeafInlineCandidate &&
-                        (newStream.size() + (oldLen - i) + fc.directExecution->flatStream.size() <= 576);
+                    const bool canUnfoldHere = (unfoldAt[i] != 0u);
 
                     if (!canUnfoldHere) {
                         newStream.push_back(fi);
@@ -7503,6 +7869,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     enterInst.dstSlot = inlineBias;
                     enterInst.inlineArgCount = static_cast<std::uint8_t>(calleeParamCount);
                     enterInst.aux0Slot = static_cast<std::uint16_t>(calleeLocalCount);
+                    enterInst.storeSlot = fi.dstSlot;
                     if (callee.hasFastParamToLocalPrologue) {
                         enterInst.arithFlags = static_cast<std::uint8_t>(
                             enterInst.arithFlags | FlatInstruction::FlagFastParamPrologue);
@@ -7532,8 +7899,11 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     }
                     FlatColdMeta enterCold;
                     enterCold.bytecode = fc.bytecode;
+                    enterCold.directTarget = fc.directTarget;
+                    enterCold.directExecution = fc.directExecution;
                     enterCold.blockIndex = fc.blockIndex;
                     enterCold.instructionIndexInBlock = fc.instructionIndexInBlock;
+                    const std::size_t enterIdx = newStream.size();
                     newStream.push_back(enterInst);
                     newCold.push_back(enterCold);
 
@@ -7570,6 +7940,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     const std::uint32_t bodyBase = static_cast<std::uint32_t>(newStream.size());
                     const std::size_t cLen = callee.flatStream.size();
                     const std::uint32_t afterInlineOffset = bodyBase + static_cast<std::uint32_t>(cLen);
+                    newStream[enterIdx].auxImm32 = afterInlineOffset;
 
                     for (std::size_t k = 0; k < cLen; ++k) {
                         FlatInstruction cInst = callee.flatStream[k];
@@ -7709,6 +8080,27 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
             }
         }
     }
+    if (!functions.empty()) {
+        std::size_t tableCap = 16u;
+        const std::size_t minCap = functions.size() * 2u;
+        while (tableCap < minCap) {
+            tableCap <<= 1u;
+        }
+        mirror->fastFunctionTable.resize(tableCap);
+        const std::size_t mask = tableCap - 1u;
+        for (const auto& [symId, loc] : functions) {
+            if (symId == 0u) continue;
+            std::size_t slot = static_cast<std::size_t>(
+                (symId ^ (symId >> 32u)) * 11400714819323198485ULL) & mask;
+            while (mirror->fastFunctionTable[slot].symbolId != 0u) {
+                slot = (slot + 1u) & mask;
+            }
+            mirror->fastFunctionTable[slot] = FastFunctionDispatchEntry{
+                symId,
+                &loc,
+                loc.function ? findExecutionFunction(*mirror, *loc.function) : nullptr};
+        }
+    }
     return mirror;
 }
 
@@ -7720,6 +8112,15 @@ const ExecutionMirror& executionMirror(const ProgramImage& program) noexcept {
 
 ProgramImage::ProgramImage(std::vector<bytecode::Module> modules)
     : modules_(std::move(modules)) {
+    std::size_t totalTypes = 0;
+    std::size_t totalFunctions = 0;
+    for (const auto& module : modules_) {
+        totalTypes += module.types.size();
+        totalFunctions += module.functions.size();
+    }
+    types_.reserve(totalTypes);
+    functions_.reserve(totalFunctions);
+    names_.reserve(totalFunctions);
     for (const auto& module : modules_) {
         for (const auto& type : module.types) {
             types_.emplace(type.id, &type);
@@ -7747,33 +8148,59 @@ ProgramImage& ProgramImage::operator=(const ProgramImage& other) {
 
 std::optional<ProgramImage> ProgramImage::link(
     std::vector<bytecode::Module> modules,
-    RuntimeError& error) {
-    std::unordered_map<semantic::SymbolId, std::string> symbols;
-    std::unordered_map<std::string, semantic::SymbolId> names;
+    RuntimeError& error,
+    bool verifyModules) {
+    std::size_t totalFunctions = 0;
     for (const auto& module : modules) {
-        diagnostics::DiagnosticBag diagnostics;
-        if (!bytecode::verifyModule(module, diagnostics)) {
-            error.code = ErrorCode::InvalidProgram;
-            error.message =
-                "bytecode verification failed while linking module '" +
-                module.name + "'";
-            for (const auto& diagnostic : diagnostics.items()) {
-                error.message += "; " + diagnostic.code + ": " +
-                    diagnostic.message;
+        totalFunctions += module.functions.size();
+    }
+    struct LinkSymbolEntry {
+        semantic::SymbolId symbolId = 0;
+        std::size_t ordinal = 0;
+        const std::string* moduleName = nullptr;
+        const std::string* functionName = nullptr;
+    };
+    std::vector<LinkSymbolEntry> linkSymbols;
+    linkSymbols.reserve(totalFunctions);
+    std::size_t ordinal = 0;
+    for (const auto& module : modules) {
+        if (verifyModules) {
+            diagnostics::DiagnosticBag diagnostics;
+            if (!bytecode::verifyModule(module, diagnostics)) {
+                error.code = ErrorCode::InvalidProgram;
+                error.message =
+                    "bytecode verification failed while linking module '" +
+                    module.name + "'";
+                for (const auto& diagnostic : diagnostics.items()) {
+                    error.message += "; " + diagnostic.code + ": " +
+                        diagnostic.message;
+                }
+                return std::nullopt;
             }
-            return std::nullopt;
         }
         for (const auto& function : module.functions) {
-            const auto qualified = module.name + "::" + function.name;
-            if (!symbols.emplace(function.symbolId, qualified).second) {
+            linkSymbols.push_back(LinkSymbolEntry{
+                function.symbolId, ordinal++, &module.name, &function.name});
+        }
+    }
+    if (linkSymbols.size() > 1u) {
+        std::sort(
+            linkSymbols.begin(),
+            linkSymbols.end(),
+            [](const LinkSymbolEntry& lhs, const LinkSymbolEntry& rhs) noexcept {
+                if (lhs.symbolId != rhs.symbolId) {
+                    return lhs.symbolId < rhs.symbolId;
+                }
+                return lhs.ordinal < rhs.ordinal;
+            });
+        for (std::size_t i = 1; i < linkSymbols.size(); ++i) {
+            if (linkSymbols[i].symbolId == linkSymbols[i - 1u].symbolId) {
+                const auto qualified =
+                    *linkSymbols[i].moduleName + "::" + *linkSymbols[i].functionName;
                 error.code = ErrorCode::DuplicateSymbol;
                 error.message = "duplicate function SymbolId while linking '" + qualified + "'";
                 return std::nullopt;
             }
-            // Source-level overloads intentionally share a qualified display
-            // name. Calls and constructor invocations carry the stable SymbolId;
-            // the name index retains the first declaration for legacy lookup.
-            names.emplace(qualified, function.symbolId);
         }
     }
     if (!validateObjectModel(modules, error)) {
@@ -7783,6 +8210,72 @@ std::optional<ProgramImage> ProgramImage::link(
 }
 
 const std::vector<bytecode::Module>& ProgramImage::modules() const noexcept { return modules_; }
+
+void ProgramImage::compactForRuntime() {
+    for (auto& module : modules_) {
+        module.functions.shrink_to_fit();
+        module.types.shrink_to_fit();
+        module.functionReferences.shrink_to_fit();
+        module.sourceFiles.shrink_to_fit();
+        for (auto& type : module.types) {
+            type.fields.shrink_to_fit();
+            type.virtualDispatchTable.shrink_to_fit();
+            type.interfaceDispatchMaps.shrink_to_fit();
+            const auto found = types_.find(type.id);
+            const bool isPrimary = (found != types_.end() && found->second == &type);
+            if (!isPrimary) {
+                std::vector<semantic::FunctionSymbol>().swap(type.methods);
+                std::vector<semantic::FunctionSymbol>().swap(type.constructors);
+                std::vector<semantic::PropertySymbol>().swap(type.properties);
+                std::vector<semantic::EventSymbol>().swap(type.events);
+                std::vector<std::string>().swap(type.baseInterfaceNames);
+                std::string().swap(type.sourceName);
+            } else {
+                type.methods.shrink_to_fit();
+                type.constructors.shrink_to_fit();
+                type.properties.shrink_to_fit();
+            }
+        }
+        for (auto& fn : module.functions) {
+            fn.parameterTypes.shrink_to_fit();
+            fn.parameterTypeIds.shrink_to_fit();
+            fn.localTypes.shrink_to_fit();
+            fn.localTypeIds.shrink_to_fit();
+            fn.registerTypes.shrink_to_fit();
+            fn.registerTypeIds.shrink_to_fit();
+            fn.blocks.shrink_to_fit();
+            for (auto& bb : fn.blocks) {
+                bb.parameters.shrink_to_fit();
+                bb.instructions.shrink_to_fit();
+            }
+        }
+    }
+    if (executionMirror_ && executionMirror_.use_count() == 1) {
+        auto* mirror = const_cast<detail::ExecutionMirror*>(executionMirror_.get());
+        mirror->fieldMetas.shrink_to_fit();
+        mirror->objectTemplates.shrink_to_fit();
+        mirror->stringLiterals.shrink_to_fit();
+        mirror->constPoolValues.shrink_to_fit();
+        mirror->stackRefTemplates.shrink_to_fit();
+        mirror->polyCallSites.shrink_to_fit();
+        mirror->newDelegateSites.shrink_to_fit();
+        mirror->invokeDelegateSites.shrink_to_fit();
+        for (auto& [fnPtr, execFn] : mirror->functions) {
+            (void)fnPtr;
+            execFn.slotPayloadOffsets.shrink_to_fit();
+            execFn.slotStructSchemaIds.shrink_to_fit();
+            execFn.flatStream.shrink_to_fit();
+            execFn.flatCold.shrink_to_fit();
+            execFn.blockStreamOffsets.shrink_to_fit();
+            execFn.denseBlockIndices.shrink_to_fit();
+            execFn.blocks.shrink_to_fit();
+            for (auto& blk : execFn.blocks) {
+                blk.instructions.shrink_to_fit();
+            }
+        }
+    }
+}
+
 std::size_t ProgramImage::functionCount() const noexcept { return functions_.size(); }
 std::size_t ProgramImage::moduleCount() const noexcept { return modules_.size(); }
 bool ProgramImage::contains(semantic::SymbolId symbolId) const noexcept {

@@ -1445,6 +1445,490 @@ public int OuterRoot(int n) {
         "ProfileCollector::reset() must clear both counters and traceEvents");
 }
 
+void testFlatLoopExecutionPolicyAndFastOpcodes() {
+    const std::string src = R"RS(
+module Kernel.FlatPolicyAndFastOps;
+
+public enum Kind { Zero = 0, Alpha = 5, Beta = 12 }
+public delegate int IntOp(int x);
+
+public class Box {
+    public int value = 1;
+    public string label = "init";
+    public int Add(int x) { return value + x; }
+    public virtual int Score() { return value + 10; }
+    public virtual void SetVal(int v) { value = v; }
+}
+
+public class SubBox : Box {
+    public override int Score() { return value + 100; }
+    public override void SetVal(int v) { value = v; }
+}
+
+public class PlainBox {
+    public int value = 0;
+}
+
+public Kind PickKind(int x) {
+    return x > 0 ? Kind.Beta : Kind.Alpha;
+}
+
+public int UsePickedKind(int x) {
+    Kind k = PickKind(x);
+    return k == Kind.Beta ? 12 : 5;
+}
+
+public string SliceCharAt(string s, int i) {
+    return s.Substring(i, 1);
+}
+
+public int RunPolySetVal(Box b, int v) {
+    b.SetVal(v);
+    return b.Score();
+}
+
+public int MutateBothBoxes(Box b, PlainBox p, int v) {
+    b.SetVal(v);
+    p.value = v + 1;
+    return b.Score() + p.value;
+}
+
+public int LeafMul(int x) {
+    return x * 3 + 1;
+}
+
+public int InvokeViaDelegates(IntOp a, IntOp b, int x) {
+    return a(x) + b(x);
+}
+
+public int RunDelegatesWithPolicy(int x) {
+    Box b = new Box();
+    b.value = 20;
+    return InvokeViaDelegates(LeafMul, b.Add, x);
+}
+
+public int RunInlinedAndPoly(int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i = i + 1) {
+        sum = sum + LeafMul(i);
+    }
+    Box b = new SubBox();
+    b.value = 7;
+    return sum + b.Score();
+}
+
+public int MutateField(Box b, int v, string lbl) {
+    b.value = v;
+    b.label = lbl;
+    return b.value;
+}
+
+public int MutateArray(int[] arr, int idx, int val) {
+    arr[idx] = val;
+    return arr[idx];
+}
+
+public int ExerciseFastOpcodes(string raw, int signedIn) {
+    string trimmed = raw.Trim();
+    string lower = trimmed.ToLower();
+    string upper = trimmed.ToUpper();
+    string rebuilt = "ab" + "cd";
+    string nullStr = null;
+    Box nullBox = null;
+    int[] nullArr = null;
+    int acc = 0;
+    if (trimmed == "AbCd") acc = acc + 10;
+    if (lower == "abcd") acc = acc + 20;
+    if (upper == "ABCD") acc = acc + 40;
+    if (rebuilt == trimmed.ToLower()) acc = acc + 80;
+    if (trimmed != "nope") acc = acc + 100;
+    if (nullStr == null && nullBox == null && nullArr == null) acc = acc + 200;
+    if (trimmed.Contains("bC") && trimmed.StartsWith("Ab") && trimmed.EndsWith("Cd")) {
+        acc = acc + 400;
+    }
+    int singleMatches = 0;
+    for (int i = 0; i < upper.Length; i = i + 1) {
+        string ch = upper.Substring(i, 1);
+        if (ch == "A" || ch == "B" || ch == "C" || ch == "D") {
+            singleMatches = singleMatches + 1;
+        }
+    }
+    Kind k = Kind.Beta;
+    int kInt = (k == Kind.Beta && k != Kind.Alpha) ? 12 : 0;
+    int neg = -signedIn;
+    uint u1 = 10u;
+    uint u2 = 25u;
+    uint uSum = u1 + u2;
+    uint uDiff = u2 - u1;
+    uint uProd = u1 * 3u;
+    int uConv = (int)u1;
+    if (u1 < u2 && uDiff == 15u && uSum == 35u && uProd == 30u) {
+        acc = acc + 800;
+    }
+    int[] list = new int[0];
+    list.Push(11);
+    list.Push(22);
+    list.RemoveAt(0);
+    return acc + singleMatches * 1000 + kInt + uConv + neg + list[0];
+}
+)RS";
+
+    auto prog = compileAndLink({{"flat_policy_fast_ops.rscript", src}}, optimization::Level::Basic);
+    auto heap = std::make_shared<runtime::ManagedHeap>();
+    runtime::Interpreter interp(prog, heap);
+
+    struct DetailedPolicy final : public runtime::IExecutionPolicy {
+        semantic::SymbolId blockedLeafFn = 0;
+        semantic::SymbolId interceptPolyFn = 0;
+        semantic::SymbolId interceptPolyVoidFn = 0;
+        bool rejectCall = false;
+        bool interceptCallActive = false;
+        bool rejectFieldWrite = false;
+        bool rejectArrayWrite = false;
+        std::size_t fieldWritesSeen = 0;
+        std::size_t arrayWritesSeen = 0;
+        std::size_t callsIntercepted = 0;
+        semantic::SymbolId lastDeclTypeId = 0;
+        std::string lastFieldName;
+
+        bool checkFieldWrite(
+            const runtime::ManagedHeap*,
+            const runtime::ManagedHeap*,
+            runtime::ObjectRef,
+            semantic::SymbolId declTypeId,
+            std::size_t,
+            std::string_view fieldName,
+            const runtime::Value&,
+            runtime::RuntimeError& outError) const override {
+            const_cast<DetailedPolicy*>(this)->fieldWritesSeen += 1u;
+            const_cast<DetailedPolicy*>(this)->lastDeclTypeId = declTypeId;
+            const_cast<DetailedPolicy*>(this)->lastFieldName = std::string(fieldName);
+            if (rejectFieldWrite) {
+                outError.code = runtime::ErrorCode::CapabilityDenied;
+                outError.message = "policy denied field write in FlatLoop";
+                return false;
+            }
+            return true;
+        }
+
+        bool checkArrayWrite(
+            const runtime::ManagedHeap*,
+            const runtime::ManagedHeap*,
+            runtime::ObjectRef,
+            const runtime::Value&,
+            runtime::RuntimeError& outError) const override {
+            const_cast<DetailedPolicy*>(this)->arrayWritesSeen += 1u;
+            if (rejectArrayWrite) {
+                outError.code = runtime::ErrorCode::CapabilityDenied;
+                outError.message = "policy denied array write in FlatLoop";
+                return false;
+            }
+            return true;
+        }
+
+        bool interceptCall(
+            semantic::SymbolId functionId,
+            runtime::ValueSpan arguments,
+            bool& outIntercepted,
+            runtime::Value& outResult,
+            runtime::RuntimeError& outError) override {
+            if (functionId == blockedLeafFn) {
+                if (rejectCall) {
+                    outError.code = runtime::ErrorCode::CapabilityDenied;
+                    outError.message = "policy denied inlined leaf call";
+                    return false;
+                }
+                if (interceptCallActive) {
+                    ++callsIntercepted;
+                    const std::int64_t x = (!arguments.empty() && std::holds_alternative<std::int64_t>(arguments[0]))
+                        ? std::get<std::int64_t>(arguments[0])
+                        : 0;
+                    outIntercepted = true;
+                    outResult = runtime::Value{x + 50};
+                    return true;
+                }
+            }
+            if (functionId == interceptPolyFn && interceptCallActive) {
+                ++callsIntercepted;
+                outIntercepted = true;
+                outResult = runtime::Value{std::int64_t{999}};
+                return true;
+            }
+            if (functionId == interceptPolyVoidFn && interceptCallActive) {
+                ++callsIntercepted;
+                outIntercepted = true;
+                outResult = std::monostate{};
+                return true;
+            }
+            outIntercepted = false;
+            return true;
+        }
+    };
+
+    const auto leafFn = prog->findFunction("Kernel.FlatPolicyAndFastOps::LeafMul");
+    const auto polyFn = prog->findFunction("Kernel.FlatPolicyAndFastOps::SubBox.Score");
+    const auto polySetFn = prog->findFunction("Kernel.FlatPolicyAndFastOps::SubBox.SetVal");
+    require(leafFn.has_value() && polyFn.has_value() && polySetFn.has_value(),
+        "Expected LeafMul, SubBox.Score and SubBox.SetVal functions");
+
+    DetailedPolicy policy;
+    policy.blockedLeafFn = *leafFn;
+    policy.interceptPolyFn = *polyFn;
+    policy.interceptPolyVoidFn = *polySetFn;
+    interp.setExecutionPolicy(&policy);
+
+    // 1. Passthrough matches baseline (LeafMul(0)+LeafMul(1)+LeafMul(2) = 1+4+7 = 12; SubBox.Score() = 107 -> 119)
+    const auto passRes = interp.invoke(
+        "Kernel.FlatPolicyAndFastOps::RunInlinedAndPoly", {runtime::Value{std::int64_t{3}}});
+    require(passRes.succeeded && std::get<std::int64_t>(passRes.value) == 119 &&
+            policy.fieldWritesSeen >= 1u,
+        "FlatLoop policy passthrough result or checkFieldWrite tracking mismatch");
+
+    // 2. Intercept both inlined leaf (InlineCallEnter) and polymorphic call (CallPolledFast)
+    policy.interceptCallActive = true;
+    const auto intRes = interp.invoke(
+        "Kernel.FlatPolicyAndFastOps::RunInlinedAndPoly", {runtime::Value{std::int64_t{3}}});
+    // Intercepted LeafMul(0..2) = 50+51+52 = 153; SubBox.Score() = 999 -> 1152
+    require(intRes.succeeded && std::get<std::int64_t>(intRes.value) == 1152 &&
+            policy.callsIntercepted == 4u,
+        "FlatLoop InlineCallEnter / CallPolledFast interceptCall mismatch");
+
+    // 3. Reject call in InlineCallEnter
+    policy.interceptCallActive = false;
+    policy.rejectCall = true;
+    const auto rejectCallRes = interp.invoke(
+        "Kernel.FlatPolicyAndFastOps::RunInlinedAndPoly", {runtime::Value{std::int64_t{3}}});
+    require(!rejectCallRes.succeeded &&
+            rejectCallRes.error.code == runtime::ErrorCode::CapabilityDenied,
+        "FlatLoop InlineCallEnter reject should return CapabilityDenied");
+    policy.rejectCall = false;
+
+    // 3b. Delegate invocation forwarding directValues ArgumentSource under active executionPolicy
+    policy.callsIntercepted = 0;
+    policy.interceptCallActive = false;
+    const auto delPassRes = interp.invoke(
+        "Kernel.FlatPolicyAndFastOps::RunDelegatesWithPolicy", {runtime::Value{std::int64_t{4}}});
+    require(delPassRes.succeeded && std::get<std::int64_t>(delPassRes.value) == 37,
+        "FlatLoop RunDelegatesWithPolicy passthrough mismatch");
+    policy.interceptCallActive = true;
+    const auto delIntRes = interp.invoke(
+        "Kernel.FlatPolicyAndFastOps::RunDelegatesWithPolicy", {runtime::Value{std::int64_t{4}}});
+    require(delIntRes.succeeded && std::get<std::int64_t>(delIntRes.value) == 78 &&
+            policy.callsIntercepted == 1u,
+        "FlatLoop RunDelegatesWithPolicy interceptCall mismatch");
+    policy.callsIntercepted = 0;
+    policy.interceptCallActive = false;
+
+    // 4. Field and array write enforcement under FlatLoop
+    const auto boxTypeId = semantic::stableTypeId("Kernel.FlatPolicyAndFastOps::Box");
+    const auto intArrTypeId = semantic::stableTypeId(
+        semantic::arrayTypeName(semantic::PrimitiveType::Int, ""));
+    auto boxOpt = heap->allocateObject(boxTypeId, {runtime::Value{std::int64_t{5}}, runtime::Value{runtime::NullString{}}}, {1u});
+    auto arrOpt = heap->allocateTypedArray(intArrTypeId, semantic::PrimitiveType::Int, 0, 2, runtime::Value{std::int64_t{0}});
+    require(boxOpt.has_value() && arrOpt.has_value(), "Allocation failed for policy test");
+    auto pinBox = heap->retain(runtime::Value{*boxOpt});
+    auto pinArr = heap->retain(runtime::Value{*arrOpt});
+
+    policy.fieldWritesSeen = 0;
+    policy.rejectFieldWrite = false;
+    const auto mutFieldOk = interp.invoke(
+        "Kernel.FlatPolicyAndFastOps::MutateField",
+        {runtime::Value{*boxOpt}, runtime::Value{std::int64_t{42}}, runtime::Value{runtime::StringValue(std::string("ok"))}});
+    require(mutFieldOk.succeeded && std::get<std::int64_t>(mutFieldOk.value) == 42 &&
+            policy.fieldWritesSeen == 2u,
+        "FlatLoop MutateField allow path mismatch");
+
+    policy.rejectFieldWrite = true;
+    const auto mutFieldDeny = interp.invoke(
+        "Kernel.FlatPolicyAndFastOps::MutateField",
+        {runtime::Value{*boxOpt}, runtime::Value{std::int64_t{99}}, runtime::Value{runtime::StringValue(std::string("no"))}});
+    require(!mutFieldDeny.succeeded &&
+            mutFieldDeny.error.code == runtime::ErrorCode::CapabilityDenied &&
+            heap->fieldGet(*boxOpt, 0u) == std::optional<runtime::Value>(runtime::Value{std::int64_t{42}}),
+        "FlatLoop checkFieldWrite rejection must block write");
+    policy.rejectFieldWrite = false;
+
+    policy.arrayWritesSeen = 0;
+    policy.rejectArrayWrite = false;
+    const auto mutArrOk = interp.invoke(
+        "Kernel.FlatPolicyAndFastOps::MutateArray",
+        {runtime::Value{*arrOpt}, runtime::Value{std::int64_t{1}}, runtime::Value{std::int64_t{77}}});
+    require(mutArrOk.succeeded && std::get<std::int64_t>(mutArrOk.value) == 77 &&
+            policy.arrayWritesSeen == 1u,
+        "FlatLoop MutateArray allow path mismatch");
+
+    policy.rejectArrayWrite = true;
+    const auto mutArrDeny = interp.invoke(
+        "Kernel.FlatPolicyAndFastOps::MutateArray",
+        {runtime::Value{*arrOpt}, runtime::Value{std::int64_t{1}}, runtime::Value{std::int64_t{88}}});
+    require(!mutArrDeny.succeeded &&
+            mutArrDeny.error.code == runtime::ErrorCode::CapabilityDenied &&
+            heap->arrayGet(*arrOpt, 1u) == std::optional<runtime::Value>(runtime::Value{std::int64_t{77}}),
+        "FlatLoop checkArrayWrite rejection must block array write");
+    policy.rejectArrayWrite = false;
+    interp.setExecutionPolicy(nullptr);
+
+    // 5. Parity of all new fast opcodes vs BlockVM (trace enabled forces BlockVM) + GC epoch invalidation
+    auto rawStr = heap->allocateString("  AbCd  ");
+    require(rawStr.has_value(), "allocateString failed");
+    const std::int64_t expectedFast = 10 + 20 + 40 + 80 + 100 + 200 + 400 + 800 + 4000 + 12 + 10 - (-7) + 22;
+    const auto flatRes = interp.invoke(
+        "Kernel.FlatPolicyAndFastOps::ExerciseFastOpcodes",
+        {runtime::Value{*rawStr}, runtime::Value{std::int64_t{-7}}});
+    require(flatRes.succeeded && std::get<std::int64_t>(flatRes.value) == expectedFast,
+        "FlatLoop fast opcodes result mismatch");
+
+    // Collect full heap so cached literal ObjectRefs in TLS stringLiteralCache are swept, then re-invoke!
+    heap->collect(runtime::RootSet{});
+    auto rawStr2 = heap->allocateString("  AbCd  ");
+    require(rawStr2.has_value(), "allocateString2 failed");
+    const auto afterGcRes = interp.invoke(
+        "Kernel.FlatPolicyAndFastOps::ExerciseFastOpcodes",
+        {runtime::Value{*rawStr2}, runtime::Value{std::int64_t{-7}}});
+    require(afterGcRes.succeeded && std::get<std::int64_t>(afterGcRes.value) == expectedFast,
+        "FlatLoop ConstantStringFast after GC epoch bump must re-intern cleanly");
+
+    runtime::ExecutionOptions blockOpts;
+    blockOpts.trace = [](const runtime::TraceEvent&) {};
+    const auto blockRes = interp.invoke(
+        "Kernel.FlatPolicyAndFastOps::ExerciseFastOpcodes",
+        {runtime::Value{*rawStr2}, runtime::Value{std::int64_t{-7}}},
+        blockOpts);
+    require(blockRes.succeeded && blockRes.value == flatRes.value,
+        "FlatLoop vs BlockVM parity mismatch on new fast opcodes");
+
+    // 6. CallPolledFast trivial virtual setter under active IExecutionPolicy
+    {
+        const auto subBoxTypeId = semantic::stableTypeId("Kernel.FlatPolicyAndFastOps::SubBox");
+        auto subOpt = heap->allocateObject(
+            subBoxTypeId, {runtime::Value{std::int64_t{5}}, runtime::Value{runtime::NullString{}}}, {1u});
+        require(subOpt.has_value(), "allocateObject SubBox failed");
+        auto pinSub = heap->retain(runtime::Value{*subOpt});
+
+        policy.fieldWritesSeen = 0;
+        policy.rejectFieldWrite = false;
+        policy.interceptCallActive = false;
+        policy.callsIntercepted = 0;
+        policy.lastDeclTypeId = 0;
+        policy.lastFieldName.clear();
+        interp.setExecutionPolicy(&policy);
+
+        const auto polySetAllow = interp.invoke(
+            "Kernel.FlatPolicyAndFastOps::RunPolySetVal",
+            {runtime::Value{*subOpt}, runtime::Value{std::int64_t{31}}});
+        require(polySetAllow.succeeded && std::get<std::int64_t>(polySetAllow.value) == 131 &&
+                policy.fieldWritesSeen == 1u &&
+                policy.lastDeclTypeId != 0 &&
+                policy.lastFieldName == "value",
+            "CallPolledFast StoreThisFieldExact under IExecutionPolicy allow mismatch");
+
+        policy.rejectFieldWrite = true;
+        const auto polySetDeny = interp.invoke(
+            "Kernel.FlatPolicyAndFastOps::RunPolySetVal",
+            {runtime::Value{*subOpt}, runtime::Value{std::int64_t{99}}});
+        require(!polySetDeny.succeeded &&
+                polySetDeny.error.code == runtime::ErrorCode::CapabilityDenied &&
+                heap->fieldGet(*subOpt, 0u) == std::optional<runtime::Value>(runtime::Value{std::int64_t{31}}),
+            "CallPolledFast StoreThisFieldExact checkFieldWrite rejection must block write");
+        policy.rejectFieldWrite = false;
+
+        policy.interceptCallActive = true;
+        const auto polySetIntercept = interp.invoke(
+            "Kernel.FlatPolicyAndFastOps::RunPolySetVal",
+            {runtime::Value{*subOpt}, runtime::Value{std::int64_t{55}}});
+        require(polySetIntercept.succeeded &&
+                policy.callsIntercepted == 2u &&
+                std::get<std::int64_t>(polySetIntercept.value) == 999 &&
+                heap->fieldGet(*subOpt, 0u) == std::optional<runtime::Value>(runtime::Value{std::int64_t{31}}),
+            "CallPolledFast StoreThisFieldExact interceptCall mismatch");
+        policy.interceptCallActive = false;
+        interp.setExecutionPolicy(nullptr);
+    }
+
+    // 7. Wave 2: Selective per-layout dirty tracking + setObjectObserved
+    {
+        const auto plainTypeId = semantic::stableTypeId("Kernel.FlatPolicyAndFastOps::PlainBox");
+        heap->enableTypeDirtyTracking(boxTypeId, {3u, 4u});
+        auto trackedBoxOpt = heap->allocateObject(
+            boxTypeId, {runtime::Value{std::int64_t{1}}, runtime::Value{runtime::NullString{}}}, {1u});
+        auto plainBoxOpt = heap->allocateObject(
+            plainTypeId, {runtime::Value{std::int64_t{1}}}, {});
+        require(trackedBoxOpt.has_value() && plainBoxOpt.has_value(),
+            "Allocation failed for selective dirty tracking test");
+        auto pinTracked = heap->retain(runtime::Value{*trackedBoxOpt});
+        auto pinPlain = heap->retain(runtime::Value{*plainBoxOpt});
+        (void)heap->consumeDirtyMask(*trackedBoxOpt);
+        (void)heap->consumeDirtyMask(*plainBoxOpt);
+
+        L0CallbackLog cbLog{};
+        heap->setFieldMutationCallback(&onL0FieldMutated, &cbLog);
+
+        const auto m1 = interp.invoke(
+            "Kernel.FlatPolicyAndFastOps::MutateBothBoxes",
+            {runtime::Value{*trackedBoxOpt}, runtime::Value{*plainBoxOpt}, runtime::Value{std::int64_t{10}}});
+        require(m1.succeeded && std::get<std::int64_t>(m1.value) == 31,
+            "MutateBothBoxes result mismatch");
+        require(heap->consumeDirtyMask(*trackedBoxOpt) == (1ULL << 3u) &&
+                heap->consumeDirtyMask(*plainBoxOpt) == 0ULL &&
+                cbLog.fieldCallbacks == 1u &&
+                cbLog.lastFieldObj == *trackedBoxOpt &&
+                cbLog.lastDirtyBit == 3u,
+            "Selective per-layout dirty tracking must only notify tracked or observed objects");
+
+        require(heap->setObjectObserved(*plainBoxOpt, true), "setObjectObserved(plain, true) failed");
+        const auto m2 = interp.invoke(
+            "Kernel.FlatPolicyAndFastOps::MutateBothBoxes",
+            {runtime::Value{*trackedBoxOpt}, runtime::Value{*plainBoxOpt}, runtime::Value{std::int64_t{20}}});
+        require(m2.succeeded && std::get<std::int64_t>(m2.value) == 51 &&
+                cbLog.fieldCallbacks == 3u &&
+                cbLog.lastFieldObj == *plainBoxOpt &&
+                cbLog.lastDirtyBit == 0xFFu,
+            "Observed plain object after setObjectObserved(true) must fire fieldMutationCallback");
+        heap->setFieldMutationCallback(nullptr, nullptr);
+    }
+
+    // 8. Wave 2: Enum leaf return unfolding & ASCII + multi-byte UTF-8 Substring(i, 1)
+    {
+        const auto enumFlat1 = interp.invoke(
+            "Kernel.FlatPolicyAndFastOps::UsePickedKind", {runtime::Value{std::int64_t{1}}});
+        const auto enumFlat0 = interp.invoke(
+            "Kernel.FlatPolicyAndFastOps::UsePickedKind", {runtime::Value{std::int64_t{0}}});
+        const auto enumBlk1 = interp.invoke(
+            "Kernel.FlatPolicyAndFastOps::UsePickedKind", {runtime::Value{std::int64_t{1}}}, blockOpts);
+        require(enumFlat1.succeeded && std::get<std::int64_t>(enumFlat1.value) == 12 &&
+                enumFlat0.succeeded && std::get<std::int64_t>(enumFlat0.value) == 5 &&
+                enumBlk1.succeeded && enumBlk1.value == enumFlat1.value,
+            "Enum leaf return unfolding mismatch");
+
+        auto asciiStr = heap->allocateString("Az");
+        auto utf8Str = heap->allocateString("A\xE4\xB8\xAD" "B");
+        require(asciiStr.has_value() && utf8Str.has_value(), "allocateString failed for SliceCharAt");
+        const auto a0 = interp.invoke(
+            "Kernel.FlatPolicyAndFastOps::SliceCharAt",
+            {runtime::Value{*asciiStr}, runtime::Value{std::int64_t{0}}});
+        const auto a1 = interp.invoke(
+            "Kernel.FlatPolicyAndFastOps::SliceCharAt",
+            {runtime::Value{*asciiStr}, runtime::Value{std::int64_t{1}}});
+        const auto u0 = interp.invoke(
+            "Kernel.FlatPolicyAndFastOps::SliceCharAt",
+            {runtime::Value{*utf8Str}, runtime::Value{std::int64_t{0}}});
+        const auto u1 = interp.invoke(
+            "Kernel.FlatPolicyAndFastOps::SliceCharAt",
+            {runtime::Value{*utf8Str}, runtime::Value{std::int64_t{1}}});
+        const auto u2 = interp.invoke(
+            "Kernel.FlatPolicyAndFastOps::SliceCharAt",
+            {runtime::Value{*utf8Str}, runtime::Value{std::int64_t{2}}});
+        const auto svOf = [&](const runtime::ExecutionResult& r) {
+            require(r.succeeded && std::holds_alternative<runtime::ObjectRef>(r.value),
+                "Expected managed string slice result");
+            return heap->stringView(std::get<runtime::ObjectRef>(r.value)).value_or(std::string_view{});
+        };
+        require(svOf(a0) == "A" && svOf(a1) == "z" &&
+                svOf(u0) == "A" && svOf(u1) == "\xE4\xB8\xAD" && svOf(u2) == "B",
+            "Substring(i, 1) ASCII or multi-byte UTF-8 slice mismatch");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1461,6 +1945,7 @@ int main() {
             {"Pillar 6: ManagedHeap::trimExcessCapacity & ABA safety", testManagedHeapTrimExcessCapacity},
             {"L0 dirty callbacks, dynamic array ops, UTF-8/borrowed, weak delegates & IExecutionPolicy", testL0DirtyCallbacksArraysUtf8WeakDelegatesAndPolicy},
             {"Zero-lock ProfileCollector RingBuffer & steady_clock ChromeTrace flamegraph", testZeroLockProfileRingBufferAndChromeTrace},
+            {"FlatLoop IExecutionPolicy enforcement & new fast opcodes", testFlatLoopExecutionPolicyAndFastOpcodes},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

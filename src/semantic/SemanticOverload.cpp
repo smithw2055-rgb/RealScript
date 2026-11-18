@@ -258,12 +258,32 @@ const TypeSymbol* unwrapEnclosingOwner(
     return cur;
 }
 
+namespace {
+
+[[nodiscard]] SharedTypeRef shareTypeHelper(
+    const TypeSymbol& type,
+    std::unordered_map<SymbolId, std::shared_ptr<const TypeSymbol>>* sharedTypesById) {
+    if (sharedTypesById && type.id != 0) {
+        const auto it = sharedTypesById->find(type.id);
+        if (it != sharedTypesById->end()) {
+            return SharedTypeRef(it->second);
+        }
+        auto sp = std::make_shared<TypeSymbol>(type);
+        sharedTypesById->emplace(type.id, sp);
+        return SharedTypeRef(std::move(sp));
+    }
+    return SharedTypeRef::makeCopy(type);
+}
+
+} // namespace
+
 std::pair<std::unique_ptr<BoundExpression>, const TypeSymbol*>
 buildUnwrappedCapturedThis(
     const VariableSymbol& thisVariable,
     const TypeSymbol& ownerType,
     const TypeSymbolMap& visibleTypes,
-    text::TextSpan span) {
+    text::TextSpan span,
+    std::unordered_map<SymbolId, std::shared_ptr<const TypeSymbol>>* sharedTypesById) {
     std::unique_ptr<BoundExpression> expr = variableExpression(thisVariable, span);
     const TypeSymbol* cur = &ownerType;
     for (int depth = 0; depth < 16 && cur && cur->synthetic; ++depth) {
@@ -280,7 +300,7 @@ buildUnwrappedCapturedThis(
         step->type = capturedThis->type;
         step->typeName = capturedThis->typeName;
         step->receiver = std::move(expr);
-        step->ownerType = *cur;
+        step->ownerType = shareTypeHelper(*cur, sharedTypesById);
         step->field = *capturedThis;
         expr = std::move(step);
         cur = &outerIt->second;
@@ -350,7 +370,8 @@ std::optional<UnwrappedCapturedField> findUnwrappedCapturedField(
     const TypeSymbol& ownerType,
     const std::string& name,
     const TypeSymbolMap& visibleTypes,
-    text::TextSpan span) {
+    text::TextSpan span,
+    std::unordered_map<SymbolId, std::shared_ptr<const TypeSymbol>>* sharedTypesById) {
     if (!ownerType.synthetic || name == "this") {
         return std::nullopt;
     }
@@ -370,14 +391,14 @@ std::optional<UnwrappedCapturedField> findUnwrappedCapturedField(
         step->type = capturedThis->type;
         step->typeName = capturedThis->typeName;
         step->receiver = std::move(expr);
-        step->ownerType = *cur;
+        step->ownerType = shareTypeHelper(*cur, sharedTypesById);
         step->field = *capturedThis;
         expr = std::move(step);
         cur = &outerIt->second;
         if (const FieldSymbol* found = findField(*cur, name)) {
             UnwrappedCapturedField out;
             out.receiver = std::move(expr);
-            out.ownerType = *cur;
+            out.ownerType = shareTypeHelper(*cur, sharedTypesById);
             out.field = *found;
             return out;
         }
@@ -1213,7 +1234,7 @@ bool isReadonlyFieldWritable(
     const FieldSymbol& field,
     bool currentConstructor,
     bool currentStaticMethod,
-    const std::optional<TypeSymbol>& currentOwnerType) noexcept {
+    const SharedTypeRef& currentOwnerType) noexcept {
     if (!field.readonlyField) return true;
     if (!currentConstructor || !currentOwnerType ||
         currentOwnerType->id != field.declaringTypeId) {
@@ -1405,7 +1426,7 @@ std::unique_ptr<BoundExpression> Binder::convertExpression(
         result->span = span;
         result->type = PrimitiveType::Struct;
         result->typeName = targetTypeName;
-        result->structType = nullable->second;
+        result->structType = shareType(nullable->second);
         if (expression->type == PrimitiveType::Null) {
             return result;
         }

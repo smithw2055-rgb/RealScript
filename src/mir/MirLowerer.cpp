@@ -639,8 +639,8 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
             {receiver},
             statement.span);
         auto& check = block(*currentBlockId_).instructions.back();
-        check.typeId = subscription.ownerType.id;
-        check.resultTypeId = subscription.ownerType.id;
+        check.typeId = subscription.ownerType->id;
+        check.resultTypeId = subscription.ownerType->id;
         check.symbolName = semantic::canonicalTypeName(
             subscription.ownerType);
         const auto current = emitValue(
@@ -648,9 +648,9 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
             semantic::PrimitiveType::Object,
             {receiver}, statement.span);
         auto& load = block(*currentBlockId_).instructions.back();
-        load.typeId = subscription.ownerType.id;
+        load.typeId = subscription.ownerType->id;
         load.fieldIndex = subscription.event.storageField.index;
-        load.resultTypeId = subscription.delegateType.id;
+        load.resultTypeId = subscription.delegateType->id;
         load.symbolName = semantic::canonicalTypeName(
             subscription.ownerType);
         const auto handler = lowerExpression(*subscription.handler);
@@ -661,15 +661,15 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
             semantic::PrimitiveType::Object,
             {current, handler}, statement.span);
         auto& combine = block(*currentBlockId_).instructions.back();
-        combine.typeId = subscription.delegateType.id;
-        combine.resultTypeId = subscription.delegateType.id;
+        combine.typeId = subscription.delegateType->id;
+        combine.resultTypeId = subscription.delegateType->id;
         combine.symbolName = semantic::canonicalTypeName(
             subscription.delegateType);
         Instruction store;
         store.resultType = semantic::PrimitiveType::Void;
         store.opcode = Opcode::StoreField;
         store.operands = {receiver, combined};
-        store.typeId = subscription.ownerType.id;
+        store.typeId = subscription.ownerType->id;
         store.fieldIndex = subscription.event.storageField.index;
         store.symbolName = semantic::canonicalTypeName(
             subscription.ownerType);

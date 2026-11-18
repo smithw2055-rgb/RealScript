@@ -329,6 +329,22 @@ void collectLambdaCaptureNames(
 Binder::Binder(diagnostics::DiagnosticBag& diagnostics)
     : rootDiagnostics_(diagnostics), diagnostics_{*this} {}
 
+SharedTypeRef Binder::shareType(const TypeSymbol& type) {
+    if (type.id != 0) {
+        const auto it = sharedTypesById_.find(type.id);
+        if (it != sharedTypesById_.end()) {
+            return SharedTypeRef(it->second);
+        }
+        auto sp = std::make_shared<TypeSymbol>(type);
+        sharedTypesById_.emplace(type.id, sp);
+        return SharedTypeRef(std::move(sp));
+    }
+    if (type.name.empty() && type.moduleName.empty() && type.fields.empty()) {
+        return SharedTypeRef{};
+    }
+    return SharedTypeRef::makeCopy(type);
+}
+
 SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
     ModuleBindingInput input;
     input.moduleName = syntaxTree.moduleDeclaration
@@ -665,22 +681,29 @@ SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
 }
 
 SemanticModel Binder::bindModule(const ModuleBindingInput& input) {
-    visibleFunctions_ = input.visibleFunctions;
+    ModuleBindingInput copy = input;
+    return bindModule(std::move(copy));
+}
+
+SemanticModel Binder::bindModule(ModuleBindingInput&& input) {
+    visibleFunctions_ = std::move(input.visibleFunctions);
     occurrences_.clear();
-    visibleTypes_ = input.visibleTypes;
-    hygienicAccessibleModules_ = input.hygienicAccessibleModules;
-    obsoleteSymbols_ = input.obsoleteSymbols;
+    sharedTypesById_.clear();
+    collectOccurrences_ = input.collectOccurrences;
+    visibleTypes_ = std::move(input.visibleTypes);
+    hygienicAccessibleModules_ = std::move(input.hygienicAccessibleModules);
+    obsoleteSymbols_ = std::move(input.obsoleteSymbols);
     pendingFunctionBindings_.clear();
     pendingTypes_.clear();
     ctorThisEdges_.clear();
     bindingConstructorInitializer_ = false;
 
     SemanticModel result;
-    result.moduleName = input.moduleName;
-    result.types = input.types;
+    result.moduleName = std::move(input.moduleName);
+    result.types = std::move(input.types);
 
     if (!input.functionBindings.empty()) {
-        currentModuleName_ = input.moduleName;
+        currentModuleName_ = result.moduleName;
         for (const auto& binding : input.functionBindings) {
             for (const auto& param : binding.symbol.parameters) {
                 if (param.modifier == ParameterModifier::Ref ||
@@ -694,7 +717,7 @@ SemanticModel Binder::bindModule(const ModuleBindingInput& input) {
         }
         for (std::size_t index = 0;
              index < pendingFunctionBindings_.size(); ++index) {
-            const auto binding = pendingFunctionBindings_[index];
+            auto binding = std::move(pendingFunctionBindings_[index]);
             result.functions.push_back(bindFunction(binding));
         }
         if (!ctorThisEdges_.empty()) {
@@ -730,8 +753,9 @@ SemanticModel Binder::bindModule(const ModuleBindingInput& input) {
         }
         result.types.insert(
             result.types.end(),
-            pendingTypes_.begin(), pendingTypes_.end());
-        result.occurrences = occurrences_;
+            std::make_move_iterator(pendingTypes_.begin()),
+            std::make_move_iterator(pendingTypes_.end()));
+        result.occurrences = std::move(occurrences_);
         return result;
     }
 
@@ -752,7 +776,7 @@ SemanticModel Binder::bindModule(const ModuleBindingInput& input) {
             result.functions.push_back(bindFunction(binding));
         }
     }
-    result.occurrences = occurrences_;
+    result.occurrences = std::move(occurrences_);
     return result;
 }
 
@@ -851,7 +875,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
     if (!input.symbol.ownerTypeName.empty()) {
         const auto found = visibleTypes_.find(input.symbol.ownerTypeName);
         if (found != visibleTypes_.end()) {
-            currentOwnerType_ = found->second;
+            currentOwnerType_ = shareType(found->second);
             hygienicAccessibleModules_.insert(
                 currentOwnerType_->hygienicAccessibleModules.begin(),
                 currentOwnerType_->hygienicAccessibleModules.end());
@@ -930,7 +954,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                 auto memberAccess = std::make_unique<BoundMemberAccessExpression>();
                 memberAccess->type = input.syntheticField.type;
                 memberAccess->typeName = input.syntheticField.typeName;
-                memberAccess->ownerType = *currentOwnerType_;
+                memberAccess->ownerType = currentOwnerType_;
                 memberAccess->field = input.syntheticField;
                 if (!currentOwnerType_->staticConstructor.has_value() &&
                     !input.syntheticField.hasConstantValue &&
@@ -947,7 +971,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                 auto assignment = std::make_unique<BoundMemberAssignmentExpression>();
                 assignment->type = input.syntheticField.type;
                 assignment->typeName = input.syntheticField.typeName;
-                assignment->ownerType = *currentOwnerType_;
+                assignment->ownerType = currentOwnerType_;
                 assignment->field = input.syntheticField;
                 auto value = std::make_unique<BoundVariableExpression>();
                 value->type = valueVariable->type;
@@ -956,7 +980,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                 auto oldAccess = std::make_unique<BoundMemberAccessExpression>();
                 oldAccess->type = input.syntheticField.type;
                 oldAccess->typeName = input.syntheticField.typeName;
-                oldAccess->ownerType = *currentOwnerType_;
+                oldAccess->ownerType = currentOwnerType_;
                 oldAccess->field = input.syntheticField;
                 assignment->expression = wrapResourceHandleOverwriteRelease(
                     std::move(oldAccess), std::move(value), input.symbol.declarationSpan);
@@ -974,7 +998,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                     structureAccess->type = input.syntheticField.type;
                     structureAccess->typeName = input.syntheticField.typeName;
                     structureAccess->receiver = std::move(receiver);
-                    structureAccess->ownerType = *currentOwnerType_;
+                    structureAccess->ownerType = currentOwnerType_;
                     structureAccess->field = input.syntheticField;
                     access = std::move(structureAccess);
                 } else {
@@ -982,7 +1006,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                     memberAccess->type = input.syntheticField.type;
                     memberAccess->typeName = input.syntheticField.typeName;
                     memberAccess->receiver = std::move(receiver);
-                    memberAccess->ownerType = *currentOwnerType_;
+                    memberAccess->ownerType = currentOwnerType_;
                     memberAccess->field = input.syntheticField;
                     access = std::move(memberAccess);
                 }
@@ -1003,7 +1027,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                     assignment->type = input.syntheticField.type;
                     assignment->typeName = input.syntheticField.typeName;
                     assignment->receiver = std::move(receiver);
-                    assignment->ownerType = *currentOwnerType_;
+                    assignment->ownerType = currentOwnerType_;
                     assignment->field = input.syntheticField;
                     auto value = std::make_unique<BoundVariableExpression>();
                     value->type = valueVariable->type;
@@ -1013,7 +1037,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                     oldAccess->type = input.syntheticField.type;
                     oldAccess->typeName = input.syntheticField.typeName;
                     oldAccess->receiver = makeVariableAccess(*thisVariable, input.symbol.declarationSpan);
-                    oldAccess->ownerType = *currentOwnerType_;
+                    oldAccess->ownerType = currentOwnerType_;
                     oldAccess->field = input.syntheticField;
                     assignment->expression = wrapResourceHandleOverwriteRelease(
                         std::move(oldAccess), std::move(value), input.symbol.declarationSpan);
@@ -1071,7 +1095,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                     assignment->span = field.declarationSpan;
                     assignment->type = field.type;
                     assignment->typeName = field.typeName;
-                    assignment->ownerType = *currentOwnerType_;
+                    assignment->ownerType = currentOwnerType_;
                     assignment->field = field;
                     assignment->expression = std::move(value);
                     auto stmt = std::make_unique<BoundExpressionStatement>();
@@ -1096,7 +1120,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                         assignment->type = field.type;
                         assignment->typeName = field.typeName;
                         assignment->variable = thisVar;
-                        assignment->ownerType = *currentOwnerType_;
+                        assignment->ownerType = currentOwnerType_;
                         assignment->field = field;
                         assignment->expression = std::move(value);
                         auto stmt = std::make_unique<BoundExpressionStatement>();
@@ -1109,7 +1133,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
                         assignment->type = field.type;
                         assignment->typeName = field.typeName;
                         assignment->receiver = makeVariableAccess(thisVar, field.declarationSpan);
-                        assignment->ownerType = *currentOwnerType_;
+                        assignment->ownerType = currentOwnerType_;
                         assignment->field = field;
                         assignment->expression = std::move(value);
                         auto stmt = std::make_unique<BoundExpressionStatement>();
@@ -1154,7 +1178,7 @@ BoundFunction Binder::bindFunction(const FunctionBindingInput& input) {
             assignment->span = field.declarationSpan;
             assignment->receiver = makeVariableAccess(
                 *receiver, field.declarationSpan);
-            assignment->ownerType = *currentOwnerType_;
+            assignment->ownerType = currentOwnerType_;
             assignment->field = field;
             assignment->expression = wrapResourceHandleOverwriteRelease(
                 makeSequenceFieldAccess(field, field.declarationSpan),
@@ -1352,7 +1376,7 @@ std::unique_ptr<BoundExpression> Binder::makeVariableAccess(
             result->type = variable.type;
             result->typeName = variable.typeName;
             result->receiver = std::move(storage);
-            result->ownerType = wrapper->second;
+            result->ownerType = shareType(wrapper->second);
             result->field = wrapper->second.fields.front();
             result->span = span;
             return result;
@@ -1378,7 +1402,7 @@ std::unique_ptr<BoundExpression> Binder::makeSequenceFieldAccess(
         result->typeName = field.typeName;
         result->span = span;
         result->receiver = makeVariableAccess(*receiver, span);
-        result->ownerType = *currentOwnerType_;
+        result->ownerType = currentOwnerType_;
         result->field = field;
         return result;
     }
@@ -1387,7 +1411,7 @@ std::unique_ptr<BoundExpression> Binder::makeSequenceFieldAccess(
     result->typeName = field.typeName;
     result->span = span;
     result->receiver = makeVariableAccess(*receiver, span);
-    result->ownerType = *currentOwnerType_;
+    result->ownerType = currentOwnerType_;
     result->field = field;
     return result;
 }
@@ -1518,7 +1542,7 @@ void Binder::appendSequenceParameterHandleReset(
         assignment->type = field.type;
         assignment->typeName = field.typeName;
         assignment->receiver = makeVariableAccess(receiver, span);
-        assignment->ownerType = *currentOwnerType_;
+        assignment->ownerType = currentOwnerType_;
         assignment->field = field;
         assignment->expression = wrapResourceHandleOverwriteRelease(
             makeSequenceFieldAccess(field, span), std::move(emptyCall), span);
@@ -1814,7 +1838,7 @@ void Binder::appendSequenceSuspendedCleanup(
         assignment->type = field.type;
         assignment->typeName = field.typeName;
         assignment->receiver = makeVariableAccess(receiver, span);
-        assignment->ownerType = *currentOwnerType_;
+        assignment->ownerType = currentOwnerType_;
         assignment->field = field;
         assignment->expression = wrapResourceHandleOverwriteRelease(
             makeSequenceFieldAccess(field, span), std::move(emptyCall), span);
@@ -1937,7 +1961,7 @@ std::unique_ptr<BoundBlockStatement> Binder::bindSequenceCancellation(
         assignment->receiver = receiver
             ? makeVariableAccess(*receiver, input.symbol.declarationSpan)
             : makeError(input.symbol.declarationSpan);
-        assignment->ownerType = *currentOwnerType_;
+        assignment->ownerType = currentOwnerType_;
         assignment->field = field;
         auto literal = std::make_unique<BoundLiteralExpression>();
         literal->type = field.type;
@@ -2022,7 +2046,7 @@ Binder::bindSingleYieldLoopSequence(const FunctionBindingInput& input) {
             assignment->span = input.sequence->identifierToken.span;
             assignment->receiver = makeVariableAccess(
                 *receiver, input.sequence->identifierToken.span);
-            assignment->ownerType = *currentOwnerType_;
+            assignment->ownerType = currentOwnerType_;
             assignment->field = input.sequenceTargetField;
             assignment->expression = makeVariableAccess(
                 *target,
@@ -2081,7 +2105,7 @@ Binder::bindSingleYieldLoopSequence(const FunctionBindingInput& input) {
             assignment->span = yieldSyntax.span();
             assignment->receiver = makeVariableAccess(
                 *receiver, yieldSyntax.span());
-            assignment->ownerType = *currentOwnerType_;
+            assignment->ownerType = currentOwnerType_;
             assignment->field = input.sequenceTimerField;
             assignment->expression = std::move(call);
             statement->expression = std::move(assignment);
@@ -2204,7 +2228,7 @@ Binder::bindSingleYieldBranchSequence(const FunctionBindingInput& input) {
         assignment->span = input.sequence->identifierToken.span;
         assignment->receiver = makeVariableAccess(
             *receiver, input.sequence->identifierToken.span);
-        assignment->ownerType = *currentOwnerType_;
+        assignment->ownerType = currentOwnerType_;
         assignment->field = input.sequenceTargetField;
         assignment->expression = makeVariableAccess(
             *target, input.sequence->parameters.front().identifierToken.span);
@@ -2249,7 +2273,7 @@ Binder::bindSingleYieldBranchSequence(const FunctionBindingInput& input) {
         timerAssignment->span = yieldSyntax.span();
         timerAssignment->receiver = makeVariableAccess(
             *receiver, yieldSyntax.span());
-        timerAssignment->ownerType = *currentOwnerType_;
+        timerAssignment->ownerType = currentOwnerType_;
         timerAssignment->field = input.sequenceTimerField;
         timerAssignment->expression = std::move(call);
         auto statement = std::make_unique<BoundExpressionStatement>();
@@ -2536,7 +2560,7 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
         assignment->receiver = receiver
             ? makeVariableAccess(*receiver, span)
             : makeError(span);
-        assignment->ownerType = *currentOwnerType_;
+        assignment->ownerType = currentOwnerType_;
         assignment->field = input.sequenceStateField;
         assignment->expression = makeIntLiteral(value, span);
         auto statement = std::make_unique<BoundExpressionStatement>();
@@ -2556,7 +2580,7 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
         assignment->receiver = receiver
             ? makeVariableAccess(*receiver, span)
             : makeError(span);
-        assignment->ownerType = *currentOwnerType_;
+        assignment->ownerType = currentOwnerType_;
         assignment->field = field;
         assignment->expression = std::move(value);
         return assignment;
@@ -2805,7 +2829,7 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
                     timer->receiver = receiver
                         ? makeVariableAccess(*receiver, yield.span())
                         : makeError(yield.span());
-                    timer->ownerType = *currentOwnerType_;
+                    timer->ownerType = currentOwnerType_;
                     timer->field = input.sequenceTimerField;
                     timer->expression = std::move(call);
                     auto subStatement =
@@ -2905,7 +2929,7 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
                     timer->receiver = receiver
                         ? makeVariableAccess(*receiver, yield.span())
                         : makeError(yield.span());
-                    timer->ownerType = *currentOwnerType_;
+                    timer->ownerType = currentOwnerType_;
                     timer->field = input.sequenceTimerField;
                     timer->expression = std::move(call);
                     auto subStatement =
@@ -2942,7 +2966,7 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
                     timer->receiver = receiver
                         ? makeVariableAccess(*receiver, yield.span())
                         : makeError(yield.span());
-                    timer->ownerType = *currentOwnerType_;
+                    timer->ownerType = currentOwnerType_;
                     timer->field = input.sequenceTimerField;
                     timer->expression = std::move(call);
                     auto scheduleStatement =
@@ -3679,7 +3703,7 @@ Binder::bindStateMachineSequence(const FunctionBindingInput& input) {
             targetAssignment->span = input.sequence->identifierToken.span;
             targetAssignment->receiver = makeVariableAccess(
                 *receiver, input.sequence->identifierToken.span);
-            targetAssignment->ownerType = *currentOwnerType_;
+            targetAssignment->ownerType = currentOwnerType_;
             targetAssignment->field = input.sequenceTargetField;
             targetAssignment->expression = makeVariableAccess(
                 *target, input.sequence->identifierToken.span);
@@ -3779,7 +3803,7 @@ std::unique_ptr<BoundBlockStatement> Binder::bindSequenceSegment(
             assignment->receiver = makeVariableAccess(
                 *receiver,
                 input.sequence->identifierToken.span);
-            assignment->ownerType = *currentOwnerType_;
+            assignment->ownerType = currentOwnerType_;
             assignment->field = input.sequenceTargetField;
             assignment->expression = makeVariableAccess(
                 *target,
@@ -3839,7 +3863,7 @@ std::unique_ptr<BoundBlockStatement> Binder::bindSequenceSegment(
                 assignment->span = yieldSyntax.span();
                 assignment->receiver = makeVariableAccess(
                     *receiver, yieldSyntax.span());
-                assignment->ownerType = *currentOwnerType_;
+                assignment->ownerType = currentOwnerType_;
                 assignment->field = input.sequenceTimerField;
                 assignment->expression = std::move(call);
                 statement->expression = std::move(assignment);
@@ -5009,7 +5033,7 @@ std::unique_ptr<BoundStatement> Binder::bindTryStatement(
                         clearAssign->type = usingSeqFieldSym->type;
                         clearAssign->typeName = usingSeqFieldSym->typeName;
                         clearAssign->receiver = makeVariableAccess(*receiver, usingVarSpan);
-                        clearAssign->ownerType = *currentOwnerType_;
+                        clearAssign->ownerType = currentOwnerType_;
                         clearAssign->field = *usingSeqFieldSym;
                         clearAssign->expression = convertExpression(
                             std::move(clearLit),
@@ -5057,7 +5081,7 @@ std::unique_ptr<BoundStatement> Binder::bindTryStatement(
                     clearAssign->type = usingSeqFieldSym->type;
                     clearAssign->typeName = usingSeqFieldSym->typeName;
                     clearAssign->receiver = makeVariableAccess(*receiver, usingVarSpan);
-                    clearAssign->ownerType = *currentOwnerType_;
+                    clearAssign->ownerType = currentOwnerType_;
                     clearAssign->field = *usingSeqFieldSym;
                     clearAssign->expression = std::move(emptyCall);
                     auto clearStmt = std::make_unique<BoundExpressionStatement>();
@@ -5223,7 +5247,7 @@ Binder::bindEventSubscriptionStatement(
 
     auto result = std::make_unique<BoundEventSubscriptionStatement>();
     result->span = syntaxTree.span();
-    TypeSymbol eventOwner;
+    SharedTypeRef eventOwnerRef;
     std::unique_ptr<BoundExpression> receiver;
     if (syntaxTree.receiver) {
         receiver = bindExpression(*syntaxTree.receiver);
@@ -5243,7 +5267,7 @@ Binder::bindEventSubscriptionStatement(
                 syntaxTree.receiver->span());
             return result;
         }
-        eventOwner = owner->second;
+        eventOwnerRef = shareType(owner->second);
     } else {
         if (!currentOwnerType_ || currentStaticMethod_) {
             diagnostics_.report(
@@ -5254,10 +5278,11 @@ Binder::bindEventSubscriptionStatement(
         }
         const auto* thisVariable = lookupVariable("this");
         if (!thisVariable) return result;
-        eventOwner = *currentOwnerType_;
+        eventOwnerRef = currentOwnerType_;
         receiver = makeVariableAccess(
             *thisVariable, syntaxTree.span());
     }
+    const TypeSymbol& eventOwner = *eventOwnerRef;
     for (const auto& event : eventOwner.events) {
         if (event.name != syntaxTree.eventNameToken.text) continue;
         if (!isMemberAccessible(
@@ -5279,10 +5304,10 @@ Binder::bindEventSubscriptionStatement(
                 syntaxTree.span());
             return result;
         }
-        result->ownerType = eventOwner;
+        result->ownerType = eventOwnerRef;
         result->receiver = std::move(receiver);
         result->event = event;
-        result->delegateType = delegate->second;
+        result->delegateType = shareType(delegate->second);
         result->handler = bindTargetExpression(
             *syntaxTree.handler,
             PrimitiveType::Object,
@@ -5365,7 +5390,7 @@ std::unique_ptr<BoundStatement> Binder::bindVariableDeclaration(
         assignment->typeName = sequenceField->second.typeName;
         assignment->span = syntaxTree.span();
         assignment->receiver = makeVariableAccess(*receiver, syntaxTree.span());
-        assignment->ownerType = *currentOwnerType_;
+        assignment->ownerType = currentOwnerType_;
         assignment->field = sequenceField->second;
         auto seqInitVal = bindTargetExpression(
             *syntaxTree.initializer,
@@ -5508,18 +5533,20 @@ std::unique_ptr<BoundStatement> Binder::bindVariableDeclaration(
             return result;
         }
         aliases.emplace(syntaxTree.identifierToken.text, target);
-        SymbolOccurrence occurrence;
-        occurrence.id = target.id;
-        occurrence.kind = SymbolKind::Local;
-        occurrence.name = syntaxTree.identifierToken.text;
-        occurrence.detail = "ref " + std::string(
-            isExactType(declaredType) && !declaredTypeName.empty()
-                ? declaredTypeName
-                : primitiveTypeName(declaredType));
-        occurrence.sourceName = currentSourceName_;
-        occurrence.span = syntaxTree.identifierToken.span;
-        occurrence.definition = true;
-        occurrences_.push_back(std::move(occurrence));
+        if (collectOccurrences_) {
+            SymbolOccurrence occurrence;
+            occurrence.id = target.id;
+            occurrence.kind = SymbolKind::Local;
+            occurrence.name = syntaxTree.identifierToken.text;
+            occurrence.detail = "ref " + std::string(
+                isExactType(declaredType) && !declaredTypeName.empty()
+                    ? declaredTypeName
+                    : primitiveTypeName(declaredType));
+            occurrence.sourceName = currentSourceName_;
+            occurrence.span = syntaxTree.identifierToken.span;
+            occurrence.definition = true;
+            occurrences_.push_back(std::move(occurrence));
+        }
         return result;
     }
 
@@ -5752,7 +5779,7 @@ PrimitiveType Binder::bindType(
                 "type",
                 canonicalTypeName(found->second),
                 syntaxTree.span());
-            if (found->second.id != 0 && !syntaxTree.name.span.empty()) {
+            if (collectOccurrences_ && found->second.id != 0 && !syntaxTree.name.span.empty()) {
                 SymbolOccurrence occ;
                 occ.id = found->second.id;
                 occ.kind = SymbolKind::Type;
@@ -5850,17 +5877,19 @@ bool Binder::declareVariable(VariableSymbol variable, text::TextSpan span) {
         return false;
     }
     allVariables_.push_back(variable);
-    SymbolOccurrence occurrence;
-    occurrence.id = variable.id;
-    occurrence.kind = variable.parameter ? SymbolKind::Parameter : SymbolKind::Local;
-    occurrence.name = variable.name;
-    occurrence.detail = isExactType(variable.type) && !variable.typeName.empty()
-        ? variable.typeName
-        : primitiveTypeName(variable.type);
-    occurrence.sourceName = currentSourceName_;
-    occurrence.span = span;
-    occurrence.definition = true;
-    occurrences_.push_back(std::move(occurrence));
+    if (collectOccurrences_) {
+        SymbolOccurrence occurrence;
+        occurrence.id = variable.id;
+        occurrence.kind = variable.parameter ? SymbolKind::Parameter : SymbolKind::Local;
+        occurrence.name = variable.name;
+        occurrence.detail = isExactType(variable.type) && !variable.typeName.empty()
+            ? variable.typeName
+            : primitiveTypeName(variable.type);
+        occurrence.sourceName = currentSourceName_;
+        occurrence.span = span;
+        occurrence.definition = true;
+        occurrences_.push_back(std::move(occurrence));
+    }
     scope.emplace(variable.name, std::move(variable));
     return true;
 }

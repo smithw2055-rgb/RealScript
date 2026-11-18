@@ -763,48 +763,73 @@ if(REALSCRIPT_BUILD_TESTS)
     endif()
 endif()
 
-if(REALSCRIPT_INSTALL_SDK)
-    set(realscript_install_export_targets
-        realscript_slice_foundation_core
-        realscript_slice_bytecode_core
-        realscript_slice_runtime_core
-        realscript_slice_aot_runtime
-        realscript_slice_bindgen_runtime
-        realscript_slice_stencil_jit
-        realscript_slice_hot_reload
-        realscript_aot_support
-        realscript_slim_runtime
+set(realscript_install_export_targets
+    realscript_slice_foundation_core
+    realscript_slice_bytecode_core
+    realscript_slice_runtime_core
+    realscript_slice_aot_runtime
+    realscript_slice_bindgen_runtime
+    realscript_slice_stencil_jit
+    realscript_slice_hot_reload
+    realscript_aot_support
+    realscript_slim_runtime
+)
+set(realscript_install_cli_targets)
+
+if(NOT REALSCRIPT_SLIM_RUNTIME)
+    list(APPEND realscript_install_export_targets
+        realscript_slice_compiler_core
+        realscript_slice_native_backends
+        realscript_kernel
+        realscript_frontend
+        realscript_full
+        rsaot
     )
-    set(realscript_install_cli_targets)
+    list(APPEND realscript_install_cli_targets rsc rsbench)
 
-    if(NOT REALSCRIPT_SLIM_RUNTIME)
-        list(APPEND realscript_install_export_targets
-            realscript_slice_compiler_core
-            realscript_slice_native_backends
-            realscript_kernel
-            realscript_frontend
-            realscript_full
-            rsaot
-        )
-        list(APPEND realscript_install_cli_targets rsc rsbench)
-
-        if(REALSCRIPT_ENABLE_DEBUG_SERVICES)
-            list(APPEND realscript_install_export_targets realscript_app_debug)
-            list(APPEND realscript_install_cli_targets rsdebug)
-        endif()
-        if(REALSCRIPT_ENABLE_TOOLING)
-            list(APPEND realscript_install_export_targets realscript_app_tooling)
-            list(APPEND realscript_install_cli_targets rslsp)
-        endif()
-        if(REALSCRIPT_ENABLE_EXTENSIBILITY)
-            list(APPEND realscript_install_export_targets realscript_app_extensibility)
-        endif()
-        if(REALSCRIPT_ENABLE_BINDGEN)
-            list(APPEND realscript_install_export_targets realscript_app_bindgen)
-            list(APPEND realscript_install_cli_targets rsbind)
-        endif()
+    if(REALSCRIPT_ENABLE_DEBUG_SERVICES)
+        list(APPEND realscript_install_export_targets realscript_app_debug)
+        list(APPEND realscript_install_cli_targets rsdebug)
     endif()
+    if(REALSCRIPT_ENABLE_TOOLING)
+        list(APPEND realscript_install_export_targets realscript_app_tooling)
+        list(APPEND realscript_install_cli_targets rslsp)
+    endif()
+    if(REALSCRIPT_ENABLE_EXTENSIBILITY)
+        list(APPEND realscript_install_export_targets realscript_app_extensibility)
+    endif()
+    if(REALSCRIPT_ENABLE_BINDGEN)
+        list(APPEND realscript_install_export_targets realscript_app_bindgen)
+        list(APPEND realscript_install_cli_targets rsbind)
+    endif()
+endif()
 
+# Always export build-tree package config/targets so downstream sibling projects
+# (RealScript-GamePack, AeroGUI2, Warcraft3) can consume build outputs directly.
+if(NOT REALSCRIPT_SLIM_RUNTIME)
+    configure_file(
+        cmake/RealScriptAot.cmake
+        "${CMAKE_CURRENT_BINARY_DIR}/RealScriptAot.cmake"
+        COPYONLY
+    )
+endif()
+export(
+    TARGETS ${realscript_install_export_targets}
+    NAMESPACE RealScript::
+    FILE "${CMAKE_CURRENT_BINARY_DIR}/RealScriptTargets.cmake"
+)
+configure_package_config_file(
+    cmake/RealScriptConfig.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/RealScriptConfig.cmake"
+    INSTALL_DESTINATION .
+)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/RealScriptConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMinorVersion
+)
+
+if(REALSCRIPT_INSTALL_SDK)
     install(
         TARGETS ${realscript_install_export_targets}
         EXPORT RealScriptTargets
@@ -830,13 +855,8 @@ if(REALSCRIPT_INSTALL_SDK)
 
     configure_package_config_file(
         cmake/RealScriptConfig.cmake.in
-        "${CMAKE_CURRENT_BINARY_DIR}/RealScriptConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/InstallConfig/RealScriptConfig.cmake"
         INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/RealScript
-    )
-    write_basic_package_version_file(
-        "${CMAKE_CURRENT_BINARY_DIR}/RealScriptConfigVersion.cmake"
-        VERSION ${PROJECT_VERSION}
-        COMPATIBILITY SameMinorVersion
     )
     install(
         EXPORT RealScriptTargets
@@ -846,7 +866,7 @@ if(REALSCRIPT_INSTALL_SDK)
     )
     install(
         FILES
-            "${CMAKE_CURRENT_BINARY_DIR}/RealScriptConfig.cmake"
+            "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/InstallConfig/RealScriptConfig.cmake"
             "${CMAKE_CURRENT_BINARY_DIR}/RealScriptConfigVersion.cmake"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/RealScript
     )

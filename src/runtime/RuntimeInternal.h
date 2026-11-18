@@ -43,6 +43,64 @@ namespace realscript::runtime::detail {
     bool pinEntry = false);
 [[nodiscard]] StringValue lookupRuntimeStringById(std::uint32_t id) noexcept;
 
+[[nodiscard]] std::optional<ObjectRef> internShortAsciiIfFast(
+    ManagedHeap* heap,
+    std::string_view text,
+    RuntimeError* error = nullptr);
+[[nodiscard]] bool isHeapObjectAliveFast(
+    const ManagedHeap* heap,
+    ObjectRef ref) noexcept;
+[[nodiscard]] bool isInternedStringAliveIdleFast(
+    const ManagedHeap* heap,
+    ObjectRef ref) noexcept;
+[[nodiscard]] bool heapStringsEqualFast(
+    const ManagedHeap* heap,
+    ObjectRef left,
+    ObjectRef right,
+    bool& outEqual) noexcept;
+[[nodiscard]] bool heapStringCodePointLengthFast(
+    const ManagedHeap* heap,
+    ObjectRef ref,
+    std::int64_t& outLen) noexcept;
+[[nodiscard]] const void* lookupHeapImplFast(const ManagedHeap* heap) noexcept;
+[[nodiscard]] bool heapStringsEqualWithToken(
+    const void* heapImplToken,
+    ObjectRef left,
+    ObjectRef right,
+    bool& outEqual) noexcept;
+[[nodiscard]] bool heapStringCodePointLengthWithToken(
+    const void* heapImplToken,
+    ObjectRef ref,
+    std::int64_t& outLen) noexcept;
+[[nodiscard]] std::uint64_t heapStringInternEpochWithToken(
+    const void* heapImplToken) noexcept;
+[[nodiscard]] std::uint64_t heapObjectViewEpochWithToken(
+    const void* heapImplToken) noexcept;
+[[nodiscard]] std::uint64_t heapLayoutEpochWithToken(
+    const void* heapImplToken) noexcept;
+[[nodiscard]] bool isHeapObjectAliveWithToken(
+    const void* heapImplToken,
+    const ManagedHeap* fallbackHeap,
+    ObjectRef ref) noexcept;
+[[nodiscard]] bool bindObjectFastViewDirtyWithToken(
+    const void* heapImplToken,
+    ManagedHeap* fallbackHeap,
+    ObjectRef ref,
+    ObjectFastView& outView,
+    bool& outMayNotifyDirty) noexcept;
+[[nodiscard]] bool heapStringAsciiSlice1WithToken(
+    const void* heapImplToken,
+    ObjectRef strRef,
+    std::size_t index,
+    ObjectRef& outRef) noexcept;
+[[nodiscard]] bool tryExecuteFastIntrinsic(
+    std::uint8_t intrinsicKind,
+    const Value* args,
+    std::size_t argCount,
+    ManagedHeap* heap,
+    Value& result,
+    RuntimeError& error);
+
 [[nodiscard]] std::uint32_t allocateInlineArenaEntry(
     const InlineStructArenaEntry& entry) noexcept;
 [[nodiscard]] const InlineStructArenaEntry& lookupInlineArenaEntry(

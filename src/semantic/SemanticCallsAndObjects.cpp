@@ -249,9 +249,9 @@ std::unique_ptr<BoundExpression> Binder::bindDelegateCreation(
         result->span = lambda.span();
         result->type = PrimitiveType::Object;
         result->typeName = canonicalTypeName(delegateType);
-        result->delegateType = delegateType;
+        result->delegateType = shareType(delegateType);
         result->function = lambdaFunction;
-        result->closureType = closure;
+        result->closureType = shareType(closure);
         result->captureFields = closure.fields;
         for (const auto& variable : captured) {
             result->captures.push_back(
@@ -266,7 +266,7 @@ std::unique_ptr<BoundExpression> Binder::bindDelegateCreation(
     std::vector<const FunctionSymbol*> candidates;
     std::unique_ptr<BoundExpression> receiver;
     bool staticMemberGroup = false;
-    TypeSymbol methodOwner;
+    const TypeSymbol* methodOwner = nullptr;
     if (syntaxTree.kind() == syntax::SyntaxKind::NameExpression) {
         const auto& name = static_cast<
             const syntax::NameExpressionSyntax&>(syntaxTree);
@@ -344,7 +344,7 @@ std::unique_ptr<BoundExpression> Binder::bindDelegateCreation(
                 name.identifierToken.text);
             if (!lookupVariable(name.identifierToken.text) &&
                 found != visibleTypes_.end()) {
-                methodOwner = found->second;
+                methodOwner = &found->second;
                 staticMemberGroup = true;
             }
         }
@@ -365,10 +365,10 @@ std::unique_ptr<BoundExpression> Binder::bindDelegateCreation(
                     member.receiver->span());
                 return makeError(syntaxTree.span());
             }
-            methodOwner = found->second;
+            methodOwner = &found->second;
         }
         for (const auto* method : collectInterfaceAndBaseMethods(
-                 methodOwner, methodName, staticMemberGroup, visibleTypes_)) {
+                 *methodOwner, methodName, staticMemberGroup, visibleTypes_)) {
             if (isMemberAccessible(
                     method->accessibility,
                     method->declaringTypeId,
@@ -434,7 +434,7 @@ std::unique_ptr<BoundExpression> Binder::bindDelegateCreation(
                 return makeError(syntaxTree.span());
             }
             receiver = buildUnwrappedCapturedThis(
-                *self, *currentOwnerType_, visibleTypes_, syntaxTree.span()).first;
+                *self, *currentOwnerType_, visibleTypes_, syntaxTree.span(), &sharedTypesById_).first;
         } else {
             if (isStackOnlyType(self->type, self->typeName, visibleTypes_)) {
                 diagnostics_.report(
@@ -450,7 +450,7 @@ std::unique_ptr<BoundExpression> Binder::bindDelegateCreation(
     result->span = syntaxTree.span();
     result->type = PrimitiveType::Object;
     result->typeName = canonicalTypeName(delegateType);
-    result->delegateType = delegateType;
+    result->delegateType = shareType(delegateType);
     result->function = *selected;
     result->receiver = std::move(receiver);
     result->interfaceDispatch = result->receiver &&
@@ -541,7 +541,7 @@ std::unique_ptr<BoundStatement> Binder::bindBaseConstructorInitializer(
             newStruct->span = callSpan;
             newStruct->type = PrimitiveType::Struct;
             newStruct->typeName = canonicalTypeName(*currentOwnerType_);
-            newStruct->structType = *currentOwnerType_;
+            newStruct->structType = currentOwnerType_;
             for (const auto& field : currentOwnerType_->fields) {
                 if (field.staticField || field.constField ||
                     field.hasConstantValue || !field.initializerSyntax) {
@@ -930,7 +930,7 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
                 argument.value = std::move(value);
                 return false;
             }
-            const TypeSymbol leafOwnerType = leafMember.ownerType;
+            const SharedTypeRef leafOwnerType = leafMember.ownerType;
             const FieldSymbol leafField = leafMember.field;
             std::vector<StructAssignmentHop> hopsRev;
             std::unique_ptr<BoundExpression> cursor = std::move(leafMember.receiver);
@@ -1003,7 +1003,7 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
                     const auto wrapper = visibleTypes_.find(storageTypeNameOf(*rootVar));
                     if (wrapper != visibleTypes_.end() && !wrapper->second.fields.empty()) {
                         argument.wrappedStructRootVariable = true;
-                        argument.structRootWrapperType = wrapper->second;
+                        argument.structRootWrapperType = shareType(wrapper->second);
                         argument.structRootWrapperValueField = wrapper->second.fields.front();
                     }
                 }
@@ -1034,7 +1034,7 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
                     argument.structRootStaticInitializer = std::move(mRecv.staticInitializer);
                     return true;
                 }
-                if (mRecv.receiver && mRecv.ownerType.kind == TypeKind::Class) {
+                if (mRecv.receiver && mRecv.ownerType->kind == TypeKind::Class) {
                     argument.structRootKind = StructAssignmentRootKind::ObjectField;
                     argument.structRootOwnerType = mRecv.ownerType;
                     argument.structRootField = mRecv.field;
@@ -1104,7 +1104,7 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
                             m.field, currentConstructor_, currentStaticMethod_, currentOwnerType_)) {
                         return false;
                     }
-                    return m.field.staticField || (m.receiver && m.ownerType.kind == TypeKind::Class);
+                    return m.field.staticField || (m.receiver && m.ownerType->kind == TypeKind::Class);
                 }
                 return false;
             };
@@ -1122,7 +1122,7 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
                         "mutable struct receiver storage descriptor is unavailable",
                         receiverSpan);
                 } else {
-                    receiverArgument.wrapperType = wrapper->second;
+                    receiverArgument.wrapperType = shareType(wrapper->second);
                     receiverArgument.valueField =
                         wrapper->second.fields.front();
                 }
@@ -1138,7 +1138,7 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
                         "mutable struct receiver storage descriptor is unavailable",
                         receiverSpan);
                 } else {
-                    receiverArgument.wrapperType = wrapper->second;
+                    receiverArgument.wrapperType = shareType(wrapper->second);
                     receiverArgument.valueField =
                         wrapper->second.fields.front();
                     if (receiverArgument.targetKind ==
@@ -1258,7 +1258,7 @@ std::unique_ptr<BoundExpression> Binder::bindSelectedCall(
             result->arguments.push_back(std::move(argument));
             continue;
         }
-        argument.wrapperType = wrapper->second;
+        argument.wrapperType = shareType(wrapper->second);
         argument.valueField = wrapper->second.fields.front();
         if (variable &&
             (variable->modifier == ParameterModifier::Ref ||
@@ -1394,7 +1394,7 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
         result->span = syntaxTree.span();
         result->type = invoke->returnType;
         result->typeName = invoke->returnTypeName;
-        result->delegateType = *calledDelegateType;
+        result->delegateType = shareType(*calledDelegateType);
         syntax::NameExpressionSyntax delegateName;
         delegateName.identifierToken = syntaxTree.identifierToken;
         result->delegate = bindNameExpression(delegateName);
@@ -1483,7 +1483,7 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
                 result->arguments.push_back(std::move(argument));
                 continue;
             }
-            argument.wrapperType = wrapper->second;
+            argument.wrapperType = shareType(wrapper->second);
             argument.valueField = wrapper->second.fields.front();
             if ((variable->modifier == ParameterModifier::Ref ||
                  variable->modifier == ParameterModifier::Out) &&
@@ -1526,7 +1526,7 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
     }
 
     std::vector<const FunctionSymbol*> targetCandidates;
-    TypeSymbol enclosingOwnerCopy;
+    SharedTypeRef enclosingOwnerCopy;
     bool hasEnclosingOwnerCopy = false;
     const auto targetGlobals = visibleFunctions_.find(
         syntaxTree.identifierToken.text);
@@ -1569,12 +1569,12 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
             if (const TypeSymbol* enclosingOwner =
                     unwrapEnclosingOwner(&*currentOwnerType_, visibleTypes_);
                 enclosingOwner && enclosingOwner != &*currentOwnerType_) {
-                enclosingOwnerCopy = *enclosingOwner;
+                enclosingOwnerCopy = shareType(*enclosingOwner);
                 hasEnclosingOwnerCopy = true;
                 if (findField(*currentOwnerType_, "this") != nullptr ||
                     bindingConstructorInitializer_) {
                     for (const auto* method : findMethods(
-                             enclosingOwnerCopy,
+                             *enclosingOwnerCopy,
                              syntaxTree.identifierToken.text,
                              false)) {
                         if (isMemberAccessible(
@@ -1586,7 +1586,7 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
                     }
                 }
                 for (const auto* method : findMethods(
-                         enclosingOwnerCopy,
+                         *enclosingOwnerCopy,
                          syntaxTree.identifierToken.text,
                          true)) {
                     if (isMemberAccessible(
@@ -1625,7 +1625,7 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
                 std::make_unique<BoundEventInvocationExpression>();
             result->span = syntaxTree.span();
             result->type = PrimitiveType::Void;
-            result->ownerType = *currentOwnerType_;
+            result->ownerType = currentOwnerType_;
             result->event = event;
             const auto delegate = visibleTypes_.find(event.delegateName);
             if (delegate == visibleTypes_.end() ||
@@ -1636,7 +1636,7 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
                     syntaxTree.span());
                 return makeError(syntaxTree.span());
             }
-            result->delegateType = delegate->second;
+            result->delegateType = shareType(delegate->second);
             const auto* thisVariable = lookupVariable("this");
             if (!thisVariable) return makeError(syntaxTree.span());
             result->receiver = variableExpression(
@@ -1764,13 +1764,15 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
         return makeError(syntaxTree.span());
     }
 
-    recordSymbolReference(
-        occurrences_,
-        currentSourceName_,
-        best->id,
-        SymbolKind::Function,
-        best->name,
-        syntaxTree.identifierToken.span);
+    if (collectOccurrences_) {
+        recordSymbolReference(
+            occurrences_,
+            currentSourceName_,
+            best->id,
+            SymbolKind::Function,
+            best->name,
+            syntaxTree.identifierToken.span);
+    }
 
     std::unique_ptr<BoundExpression> receiver;
     if (best->method && !best->staticMethod) {
@@ -1795,7 +1797,7 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
                 return makeError(syntaxTree.span());
             }
             auto [capturedReceiver, resolvedOwner] = buildUnwrappedCapturedThis(
-                *thisVariable, *currentOwnerType_, visibleTypes_, syntaxTree.span());
+                *thisVariable, *currentOwnerType_, visibleTypes_, syntaxTree.span(), &sharedTypesById_);
             (void)resolvedOwner;
             receiver = std::move(capturedReceiver);
         } else {
@@ -1880,13 +1882,15 @@ std::unique_ptr<BoundExpression> Binder::tryBindExtensionMethodCall(
         return nullptr;
     }
 
-    recordSymbolReference(
-        occurrences_,
-        currentSourceName_,
-        extPlan.function->id,
-        SymbolKind::Function,
-        extPlan.function->name,
-        syntaxTree.nameToken.span);
+    if (collectOccurrences_) {
+        recordSymbolReference(
+            occurrences_,
+            currentSourceName_,
+            extPlan.function->id,
+            SymbolKind::Function,
+            extPlan.function->name,
+            syntaxTree.nameToken.span);
+    }
     if (extMods.empty()) {
         extMods.resize(syntaxTree.arguments.size() + 1);
     }
@@ -1946,7 +1950,7 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
     }
 
     bool staticCall = false;
-    TypeSymbol owner;
+    SharedTypeRef ownerRef;
     std::unique_ptr<BoundExpression> receiver;
     if (syntaxTree.receiver->kind() ==
         syntax::SyntaxKind::NameExpression) {
@@ -1970,14 +1974,16 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
                 "type",
                 canonicalTypeName(type->second),
                 name.identifierToken.span);
-            recordSymbolReference(
-                occurrences_,
-                currentSourceName_,
-                type->second.id,
-                SymbolKind::Type,
-                type->second.name,
-                name.identifierToken.span);
-            owner = type->second;
+            if (collectOccurrences_) {
+                recordSymbolReference(
+                    occurrences_,
+                    currentSourceName_,
+                    type->second.id,
+                    SymbolKind::Type,
+                    type->second.name,
+                    name.identifierToken.span);
+            }
+            ownerRef = shareType(type->second);
             staticCall = true;
         }
     }
@@ -2210,9 +2216,10 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
                 syntaxTree.receiver->span());
             return makeError(syntaxTree.span());
         }
-        owner = type->second;
+        ownerRef = shareType(type->second);
     }
 
+    const TypeSymbol& owner = *ownerRef;
     if (!staticCall && owner.kind == TypeKind::Struct && owner.synthetic &&
         owner.name.rfind("Nullable__", 0) == 0 &&
         syntaxTree.arguments.empty() && owner.fields.size() >= 2) {
@@ -2229,7 +2236,7 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
             result->type = intrinsicField->type;
             result->typeName = intrinsicField->typeName;
             result->receiver = std::move(receiver);
-            result->ownerType = owner;
+            result->ownerType = ownerRef;
             result->field = *intrinsicField;
             return result;
         }
@@ -2336,13 +2343,15 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
         return makeError(syntaxTree.span());
     }
 
-    recordSymbolReference(
-        occurrences_,
-        currentSourceName_,
-        best->id,
-        SymbolKind::Function,
-        best->name,
-        syntaxTree.nameToken.span);
+    if (collectOccurrences_) {
+        recordSymbolReference(
+            occurrences_,
+            currentSourceName_,
+            best->id,
+            SymbolKind::Function,
+            best->name,
+            syntaxTree.nameToken.span);
+    }
 
     auto prepared = prepareCallArguments(
         *best, plan.sources, std::move(arguments),
@@ -2369,19 +2378,22 @@ std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
         diagnostics_.report("RS2403", "cannot allocate unknown or enum type '" + syntaxTree.type.name.text + "'", syntaxTree.type.span());
         return makeError(syntaxTree.span());
     }
-    const TypeSymbol allocatedType = found->second;
+    const SharedTypeRef allocatedTypeRef = shareType(found->second);
+    const TypeSymbol& allocatedType = *allocatedTypeRef;
     checkObsoleteReference(
         allocatedType.id,
         "type",
         canonicalTypeName(allocatedType),
         syntaxTree.type.span());
-    recordSymbolReference(
-        occurrences_,
-        currentSourceName_,
-        allocatedType.id,
-        SymbolKind::Type,
-        allocatedType.name,
-        syntaxTree.type.name.span);
+    if (collectOccurrences_) {
+        recordSymbolReference(
+            occurrences_,
+            currentSourceName_,
+            allocatedType.id,
+            SymbolKind::Type,
+            allocatedType.name,
+            syntaxTree.type.name.span);
+    }
     if (!isTypeAccessible(allocatedType)) {
         diagnostics_.report(
             "RS2534",
@@ -2509,13 +2521,15 @@ std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
                     }
                     checkObsoleteReference(
                         field->id, "field", field->name, syntaxInitializer.nameToken->span);
-                    recordSymbolReference(
-                        occurrences_,
-                        currentSourceName_,
-                        field->id,
-                        SymbolKind::Field,
-                        field->name,
-                        syntaxInitializer.nameToken->span);
+                    if (collectOccurrences_) {
+                        recordSymbolReference(
+                            occurrences_,
+                            currentSourceName_,
+                            field->id,
+                            SymbolKind::Field,
+                            field->name,
+                            syntaxInitializer.nameToken->span);
+                    }
                     initializer.kind = BoundNewObjectExpression::Initializer::Kind::Field;
                     initializer.field = *field;
                     initializer.arguments.push_back(bindTargetExpression(
@@ -2543,13 +2557,15 @@ std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
                             syntaxInitializer.span());
                         continue;
                     }
-                    recordSymbolReference(
-                        occurrences_,
-                        currentSourceName_,
-                        property->id,
-                        SymbolKind::Property,
-                        property->name,
-                        syntaxInitializer.nameToken->span);
+                    if (collectOccurrences_) {
+                        recordSymbolReference(
+                            occurrences_,
+                            currentSourceName_,
+                            property->id,
+                            SymbolKind::Property,
+                            property->name,
+                            syntaxInitializer.nameToken->span);
+                    }
                     initializer.kind = BoundNewObjectExpression::Initializer::Kind::Property;
                     initializer.function = *property->setter;
                     initializer.arguments.push_back(bindTargetExpression(
@@ -2605,7 +2621,7 @@ std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
         result->span = syntaxTree.span();
         result->type = PrimitiveType::Struct;
         result->typeName = canonicalTypeName(allocatedType);
-        result->structType = allocatedType;
+        result->structType = allocatedTypeRef;
         if (!best) {
             for (const auto& field : allocatedType.fields) {
                 if (field.staticField || field.constField ||
@@ -2642,7 +2658,7 @@ std::unique_ptr<BoundExpression> Binder::bindNewObjectExpression(
     result->span = syntaxTree.span();
     result->type = PrimitiveType::Object;
     result->typeName = canonicalTypeName(allocatedType);
-    result->objectType = allocatedType;
+    result->objectType = allocatedTypeRef;
     if (!best) {
         for (const auto& field : allocatedType.fields) {
             if (field.staticField || field.constField ||

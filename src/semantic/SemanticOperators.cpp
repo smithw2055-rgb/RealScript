@@ -32,7 +32,7 @@ std::unique_ptr<BoundExpression> Binder::bindStaticFieldInitializer(
     std::vector<std::unordered_map<std::string, VariableSymbol>> savedAliases;
     std::swap(scopes_, savedScopes);
     std::swap(referenceAliasScopes_, savedAliases);
-    currentOwnerType_ = *declType;
+    currentOwnerType_ = shareType(*declType);
     currentStaticMethod_ = true;
     currentConstructor_ = false;
     if (!declType->moduleName.empty()) {
@@ -137,7 +137,7 @@ std::unique_ptr<BoundExpression> Binder::bindThisExpression(
     if (currentOwnerType_ && currentOwnerType_->synthetic) {
         if (findField(*currentOwnerType_, "this")) {
             auto [capturedReceiver, outerType] = buildUnwrappedCapturedThis(
-                *variable, *currentOwnerType_, visibleTypes_, syntaxTree.span());
+                *variable, *currentOwnerType_, visibleTypes_, syntaxTree.span(), &sharedTypesById_);
             if (outerType && !outerType->synthetic) {
                 return std::move(capturedReceiver);
             }
@@ -471,7 +471,7 @@ std::unique_ptr<BoundExpression> Binder::bindBinaryOperation(
         result->span = span;
         result->nullableValue = nullableValue;
         if (nullableValue) {
-            result->nullableType = nullable->second;
+            result->nullableType = shareType(nullable->second);
             result->hasValueField = nullable->second.fields[0];
             result->valueField = nullable->second.fields[1];
             result->type = result->valueField.type;
@@ -505,7 +505,7 @@ std::unique_ptr<BoundExpression> Binder::bindBinaryOperation(
             result->span = span;
             result->type = PrimitiveType::Object;
             result->typeName = left->typeName;
-            result->delegateType = found->second;
+            result->delegateType = shareType(found->second);
             result->remove = tokenKind == syntax::SyntaxKind::MinusToken;
             result->left = std::move(left);
             result->right = std::move(right);

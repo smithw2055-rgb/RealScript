@@ -1,7 +1,10 @@
 #include "realscript/bytecode/Bytecode.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <deque>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -109,17 +112,67 @@ bool descriptorAssignable(
         semantic::SymbolId,
         const semantic::TypeSymbol*>& descriptors) noexcept {
     if (actual == expected) return true;
-    std::unordered_set<semantic::SymbolId> visited;
-    std::vector<semantic::SymbolId> ifaceStack;
-    std::unordered_set<semantic::SymbolId> visitedIfaces;
+
+    std::array<semantic::SymbolId, 32> visitedSmall{};
+    std::size_t visitedSmallCount = 0;
+    std::vector<semantic::SymbolId> visitedOverflow;
+    const auto markVisited = [&](semantic::SymbolId id, bool isIface) -> bool {
+        for (std::size_t i = 0; i < visitedSmallCount; ++i) {
+            if (visitedSmall[i] == id) return false;
+        }
+        if (!visitedOverflow.empty()) {
+            for (const auto existing : visitedOverflow) {
+                if (existing == id) return false;
+            }
+        }
+        (void)isIface;
+        if (visitedSmallCount < visitedSmall.size()) {
+            visitedSmall[visitedSmallCount++] = id;
+        } else {
+            visitedOverflow.push_back(id);
+        }
+        return true;
+    };
+
+    std::array<semantic::SymbolId, 32> ifaceStackSmall{};
+    std::size_t ifaceStackCount = 0;
+    std::vector<semantic::SymbolId> ifaceStackOverflow;
+    const auto pushIface = [&](semantic::SymbolId id) {
+        if (ifaceStackCount < ifaceStackSmall.size() && ifaceStackOverflow.empty()) {
+            ifaceStackSmall[ifaceStackCount++] = id;
+        } else {
+            ifaceStackOverflow.push_back(id);
+        }
+    };
+
+    std::array<semantic::SymbolId, 32> visitedIfaceSmall{};
+    std::size_t visitedIfaceSmallCount = 0;
+    std::vector<semantic::SymbolId> visitedIfaceOverflow;
+    const auto markVisitedIface = [&](semantic::SymbolId id) -> bool {
+        for (std::size_t i = 0; i < visitedIfaceSmallCount; ++i) {
+            if (visitedIfaceSmall[i] == id) return false;
+        }
+        if (!visitedIfaceOverflow.empty()) {
+            for (const auto existing : visitedIfaceOverflow) {
+                if (existing == id) return false;
+            }
+        }
+        if (visitedIfaceSmallCount < visitedIfaceSmall.size()) {
+            visitedIfaceSmall[visitedIfaceSmallCount++] = id;
+        } else {
+            visitedIfaceOverflow.push_back(id);
+        }
+        return true;
+    };
+
     auto current = actual;
-    while (current != 0 && visited.insert(current).second) {
+    while (current != 0 && markVisited(current, false)) {
         const auto found = descriptors.find(current);
         if (found == descriptors.end()) break;
         for (const auto& baseIfaceName : found->second->baseInterfaceNames) {
             const auto baseIfaceId = semantic::stableTypeId(baseIfaceName);
             if (baseIfaceId == expected) return true;
-            ifaceStack.push_back(baseIfaceId);
+            pushIface(baseIfaceId);
         }
         for (const auto& interfaceMap :
              found->second->interfaceDispatchMaps) {
@@ -128,17 +181,22 @@ bool descriptorAssignable(
         if (found->second->baseTypeId == expected) return true;
         current = found->second->baseTypeId;
     }
-    while (!ifaceStack.empty()) {
-        const auto curIface = ifaceStack.back();
-        ifaceStack.pop_back();
+    while (ifaceStackCount > 0 || !ifaceStackOverflow.empty()) {
+        semantic::SymbolId curIface = 0;
+        if (!ifaceStackOverflow.empty()) {
+            curIface = ifaceStackOverflow.back();
+            ifaceStackOverflow.pop_back();
+        } else {
+            curIface = ifaceStackSmall[--ifaceStackCount];
+        }
         if (curIface == expected) return true;
-        if (!visitedIfaces.insert(curIface).second) continue;
+        if (!markVisitedIface(curIface)) continue;
         const auto foundIface = descriptors.find(curIface);
         if (foundIface == descriptors.end()) continue;
         for (const auto& baseIfaceName : foundIface->second->baseInterfaceNames) {
             const auto baseIfaceId = semantic::stableTypeId(baseIfaceName);
             if (baseIfaceId == expected) return true;
-            ifaceStack.push_back(baseIfaceId);
+            pushIface(baseIfaceId);
         }
     }
     return false;
@@ -201,17 +259,30 @@ semantic::SymbolId arrayTypeId(
     const std::unordered_map<
         semantic::SymbolId,
         const semantic::TypeSymbol*>& descriptors) {
-    std::string exactElementName;
-    if (elementType == semantic::PrimitiveType::Object ||
-        elementType == semantic::PrimitiveType::Struct ||
-        elementType == semantic::PrimitiveType::Enum) {
-        const auto found = descriptors.find(elementTypeId);
-        if (found == descriptors.end() ||
-            found->second->kind != expectedTypeKind(elementType)) {
-            return 0;
+    if (elementType != semantic::PrimitiveType::Object &&
+        elementType != semantic::PrimitiveType::Struct &&
+        elementType != semantic::PrimitiveType::Enum) {
+        static const auto kPrimitiveArrayIds = []() {
+            std::array<semantic::SymbolId, 32> ids{};
+            for (std::size_t i = 0; i < ids.size(); ++i) {
+                const auto name = semantic::arrayTypeName(
+                    static_cast<semantic::PrimitiveType>(i), "");
+                ids[i] = semantic::stableTypeId(name);
+            }
+            return ids;
+        }();
+        const auto idx = static_cast<std::size_t>(elementType);
+        if (idx < kPrimitiveArrayIds.size()) {
+            return kPrimitiveArrayIds[idx];
         }
-        exactElementName = semantic::canonicalTypeName(*found->second);
+        return semantic::stableTypeId(semantic::arrayTypeName(elementType, ""));
     }
+    const auto found = descriptors.find(elementTypeId);
+    if (found == descriptors.end() ||
+        found->second->kind != expectedTypeKind(elementType)) {
+        return 0;
+    }
+    const std::string exactElementName = semantic::canonicalTypeName(*found->second);
     const auto name = semantic::arrayTypeName(elementType, exactElementName);
     return semantic::stableTypeId(name);
 }
@@ -624,12 +695,52 @@ bool verifyModule(
                 "function debug info references an invalid source range",
                 {});
         }
-        std::unordered_set<std::uint64_t> sequenceKeys;
+        const std::size_t kInvalidDense = std::numeric_limits<std::size_t>::max();
+        BlockId maxBlockId = 0;
+        for (const auto& block : function.blocks) {
+            if (block.id > maxBlockId) {
+                maxBlockId = block.id;
+            }
+        }
+        const bool useDenseBlockTable =
+            !function.blocks.empty() && maxBlockId < 65536u;
+        std::vector<std::size_t> denseBlockById;
+        std::unordered_map<BlockId, std::size_t> denseBlockByIdFallback;
+        std::vector<const BasicBlock*> uniqueBlocks;
+        uniqueBlocks.reserve(function.blocks.size());
+        if (useDenseBlockTable) {
+            denseBlockById.assign(static_cast<std::size_t>(maxBlockId) + 1u, kInvalidDense);
+            for (const auto& block : function.blocks) {
+                if (denseBlockById[block.id] == kInvalidDense) {
+                    denseBlockById[block.id] = uniqueBlocks.size();
+                    uniqueBlocks.push_back(&block);
+                }
+            }
+        } else {
+            denseBlockByIdFallback.reserve(function.blocks.size());
+            for (const auto& block : function.blocks) {
+                if (denseBlockByIdFallback.emplace(block.id, uniqueBlocks.size()).second) {
+                    uniqueBlocks.push_back(&block);
+                }
+            }
+        }
+        const auto findDenseBlock = [&](BlockId id) noexcept -> std::size_t {
+            if (useDenseBlockTable) {
+                return id <= maxBlockId ? denseBlockById[id] : kInvalidDense;
+            }
+            const auto it = denseBlockByIdFallback.find(id);
+            return it == denseBlockByIdFallback.end() ? kInvalidDense : it->second;
+        };
+        const auto findBlockById = [&](BlockId id) noexcept -> const BasicBlock* {
+            const auto dense = findDenseBlock(id);
+            return dense == kInvalidDense ? nullptr : uniqueBlocks[dense];
+        };
+
+        std::vector<std::uint64_t> validSequenceKeys;
+        validSequenceKeys.reserve(function.debugInfo.sequencePoints.size());
         for (const auto& point : function.debugInfo.sequencePoints) {
-            const auto foundBlock = std::find_if(
-                function.blocks.begin(), function.blocks.end(),
-                [&](const BasicBlock& block) { return block.id == point.blockId; });
-            const bool validPosition = foundBlock != function.blocks.end() &&
+            const auto* foundBlock = findBlockById(point.blockId);
+            const bool validPosition = foundBlock != nullptr &&
                 (point.terminator
                     ? point.instructionIndex == foundBlock->instructions.size()
                     : point.instructionIndex < foundBlock->instructions.size());
@@ -650,13 +761,24 @@ bool verifyModule(
                         phys.end.column == point.range.end.column;
                 }
             }
-            if (!validPosition ||
-                !rangeValid ||
-                !sequenceKeys.insert(key).second) {
+            if (!validPosition || !rangeValid) {
                 diagnostics.report(
                     "RS5162",
                     "invalid or duplicate bytecode sequence point",
                     {});
+            } else {
+                validSequenceKeys.push_back(key);
+            }
+        }
+        if (validSequenceKeys.size() > 1) {
+            std::sort(validSequenceKeys.begin(), validSequenceKeys.end());
+            for (std::size_t seqIdx = 1; seqIdx < validSequenceKeys.size(); ++seqIdx) {
+                if (validSequenceKeys[seqIdx] == validSequenceKeys[seqIdx - 1]) {
+                    diagnostics.report(
+                        "RS5162",
+                        "invalid or duplicate bytecode sequence point",
+                        {});
+                }
             }
         }
         std::unordered_set<std::uint32_t> localSlots;
@@ -765,12 +887,17 @@ bool verifyModule(
             continue;
         }
 
-        std::unordered_map<BlockId, const BasicBlock*> blocks;
-        std::unordered_map<Register, Definition> definitions;
-        for (const auto& block : function.blocks) {
-            if (!blocks.emplace(block.id, &block).second) {
+        const std::size_t numUniqueBlocks = uniqueBlocks.size();
+        for (std::size_t bIdx = 0; bIdx < function.blocks.size(); ++bIdx) {
+            const auto& block = function.blocks[bIdx];
+            const auto firstDense = findDenseBlock(block.id);
+            if (firstDense == kInvalidDense || uniqueBlocks[firstDense] != &block) {
                 diagnostics.report("RS5114", "duplicate bytecode block id", {});
             }
+        }
+        std::vector<Definition> definitions(
+            function.registerTypes.size(), Definition{0, -2});
+        for (const auto& block : function.blocks) {
             for (const auto& parameter : block.parameters) {
                 if (parameter.target >= function.registerTypes.size() ||
                     parameter.type != function.registerTypes[parameter.target] ||
@@ -782,30 +909,31 @@ bool verifyModule(
                         "bytecode block parameter type does not match register table",
                         {});
                 }
-                if (!definitions.emplace(
-                        parameter.target,
-                        Definition{block.id, -1}).second) {
+                if (parameter.target >= definitions.size() ||
+                    definitions[parameter.target].instructionIndex != -2) {
                     diagnostics.report(
                         "RS5116",
                         "bytecode register has multiple definitions",
                         {});
+                } else {
+                    definitions[parameter.target] = Definition{block.id, -1};
                 }
             }
             for (std::size_t index = 0; index < block.instructions.size(); ++index) {
                 const auto& instruction = block.instructions[index];
                 const bool defines = instructionDefinesValue(instruction, module);
                 if (defines) {
-                    if (instruction.result >= function.registerTypes.size() ||
-                        !definitions.emplace(
-                            instruction.result,
-                            Definition{
-                                block.id,
-                                static_cast<std::int64_t>(index),
-                            }).second) {
+                    if (instruction.result >= definitions.size() ||
+                        definitions[instruction.result].instructionIndex != -2) {
                         diagnostics.report(
                             "RS5116",
                             "bytecode register has multiple or invalid definitions",
                             {});
+                    } else {
+                        definitions[instruction.result] = Definition{
+                            block.id,
+                            static_cast<std::int64_t>(index),
+                        };
                     }
                 } else if (instruction.result != InvalidRegister) {
                     diagnostics.report(
@@ -816,7 +944,7 @@ bool verifyModule(
             }
         }
         for (Register value = 0; value < function.registerTypes.size(); ++value) {
-            if (definitions.find(value) == definitions.end()) {
+            if (definitions[value].instructionIndex == -2) {
                 diagnostics.report(
                     "RS5150",
                     "bytecode register r" + std::to_string(value) +
@@ -825,19 +953,24 @@ bool verifyModule(
             }
         }
 
-        if (blocks.find(0) == blocks.end()) {
+        const auto entryDense = findDenseBlock(0);
+        if (entryDense == kInvalidDense) {
             diagnostics.report(
                 "RS5118",
                 "bytecode function entry block must be bb0",
                 {});
         }
 
-        std::unordered_map<BlockId, std::vector<BlockId>> successors;
-        std::unordered_map<BlockId, std::vector<BlockId>> predecessors;
+        std::vector<std::vector<std::size_t>> successors(numUniqueBlocks);
+        std::vector<std::vector<std::size_t>> predecessors(numUniqueBlocks);
         const auto addEdge = [&](BlockId from, BlockId to) {
-            if (blocks.find(to) != blocks.end()) {
-                successors[from].push_back(to);
-                predecessors[to].push_back(from);
+            const auto toDense = findDenseBlock(to);
+            if (toDense != kInvalidDense) {
+                const auto fromDense = findDenseBlock(from);
+                if (fromDense != kInvalidDense) {
+                    successors[fromDense].push_back(toDense);
+                    predecessors[toDense].push_back(fromDense);
+                }
             }
         };
         for (const auto& block : function.blocks) {
@@ -849,7 +982,7 @@ bool verifyModule(
             }
         }
         for (const auto& handler : function.exceptionHandlers) {
-            if (blocks.find(handler.handlerBlock) == blocks.end() ||
+            if (findDenseBlock(handler.handlerBlock) == kInvalidDense ||
                 handler.exceptionLocal >= function.localTypes.size() ||
                 function.localTypes[handler.exceptionLocal] !=
                     semantic::PrimitiveType::Object ||
@@ -869,7 +1002,7 @@ bool verifyModule(
                 }
             }
             for (const auto protectedBlock : handler.protectedBlocks) {
-                if (blocks.find(protectedBlock) == blocks.end()) {
+                if (findDenseBlock(protectedBlock) == kInvalidDense) {
                     diagnostics.report(
                         "RS5175", "invalid bytecode protected block", {});
                 } else {
@@ -878,23 +1011,55 @@ bool verifyModule(
             }
         }
 
-        std::unordered_set<BlockId> reachable;
-        std::deque<BlockId> queue;
-        if (blocks.find(0) != blocks.end()) {
-            reachable.insert(0);
-            queue.push_back(0);
-        }
-        while (!queue.empty()) {
-            const auto current = queue.front();
-            queue.pop_front();
-            for (const auto next : successors[current]) {
-                if (reachable.insert(next).second) {
-                    queue.push_back(next);
+        std::vector<std::uint8_t> reachable(numUniqueBlocks, 0u);
+        std::vector<std::size_t> rpoOrder;
+        if (entryDense != kInvalidDense) {
+            std::deque<std::size_t> queue;
+            reachable[entryDense] = 1u;
+            queue.push_back(entryDense);
+            while (!queue.empty()) {
+                const auto current = queue.front();
+                queue.pop_front();
+                for (const auto next : successors[current]) {
+                    if (!reachable[next]) {
+                        reachable[next] = 1u;
+                        queue.push_back(next);
+                    }
                 }
             }
+            // Compute reverse post-order over reachable nodes (excluding entryDense)
+            // for rapid iterative bitset dominator convergence.
+            std::vector<std::uint8_t> dfsVisited(numUniqueBlocks, 0u);
+            struct DfsFrame {
+                std::size_t node;
+                std::size_t nextSucc;
+            };
+            std::vector<DfsFrame> dfsStack;
+            dfsStack.reserve(numUniqueBlocks);
+            dfsVisited[entryDense] = 1u;
+            dfsStack.push_back(DfsFrame{entryDense, 0u});
+            rpoOrder.reserve(numUniqueBlocks);
+            while (!dfsStack.empty()) {
+                auto& frame = dfsStack.back();
+                const auto& succs = successors[frame.node];
+                if (frame.nextSucc < succs.size()) {
+                    const auto next = succs[frame.nextSucc++];
+                    if (!dfsVisited[next]) {
+                        dfsVisited[next] = 1u;
+                        dfsStack.push_back(DfsFrame{next, 0u});
+                    }
+                } else {
+                    if (frame.node != entryDense) {
+                        rpoOrder.push_back(frame.node);
+                    }
+                    dfsStack.pop_back();
+                }
+            }
+            std::reverse(rpoOrder.begin(), rpoOrder.end());
         }
         for (const auto& block : function.blocks) {
-            if (reachable.find(block.id) == reachable.end()) {
+            const auto d = findDenseBlock(block.id);
+            if (d == kInvalidDense || !reachable[d]) {
                 diagnostics.report(
                     "RS5119",
                     "unreachable bytecode block bb" + std::to_string(block.id),
@@ -902,42 +1067,55 @@ bool verifyModule(
             }
         }
 
-        std::unordered_map<BlockId, std::unordered_set<BlockId>> dominators;
-        for (const auto& block : function.blocks) {
-            if (block.id == 0) {
-                dominators[block.id] = {0};
-            } else {
-                for (const auto& candidate : function.blocks) {
-                    dominators[block.id].insert(candidate.id);
-                }
+        const std::size_t wordsPerSet = (numUniqueBlocks + 63u) >> 6u;
+        const std::size_t tailBits = numUniqueBlocks & 63u;
+        const std::uint64_t tailMask =
+            tailBits == 0u ? ~std::uint64_t{0} : ((std::uint64_t{1} << tailBits) - 1u);
+        std::vector<std::uint64_t> domBits(
+            numUniqueBlocks * wordsPerSet, ~std::uint64_t{0});
+        if (wordsPerSet > 0u) {
+            for (std::size_t d = 0; d < numUniqueBlocks; ++d) {
+                domBits[d * wordsPerSet + (wordsPerSet - 1u)] &= tailMask;
             }
-        }
-        bool changed = true;
-        while (changed) {
-            changed = false;
-            for (const auto& block : function.blocks) {
-                if (block.id == 0 || reachable.find(block.id) == reachable.end()) {
-                    continue;
-                }
-                std::unordered_set<BlockId> next;
-                const auto& incoming = predecessors[block.id];
-                if (!incoming.empty()) {
-                    next = dominators[incoming.front()];
-                    for (std::size_t index = 1; index < incoming.size(); ++index) {
-                        std::unordered_set<BlockId> intersection;
-                        for (const auto candidate : next) {
-                            if (dominators[incoming[index]].find(candidate) !=
-                                dominators[incoming[index]].end()) {
-                                intersection.insert(candidate);
+            if (entryDense != kInvalidDense) {
+                std::uint64_t* entryRow = domBits.data() + entryDense * wordsPerSet;
+                std::fill(entryRow, entryRow + wordsPerSet, std::uint64_t{0});
+                entryRow[entryDense >> 6u] = std::uint64_t{1} << (entryDense & 63u);
+            }
+            std::vector<std::uint64_t> nextRow(wordsPerSet, 0u);
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                for (const std::size_t bDense : rpoOrder) {
+                    const auto& incoming = predecessors[bDense];
+                    if (incoming.empty()) {
+                        std::fill(nextRow.begin(), nextRow.end(), std::uint64_t{0});
+                    } else {
+                        const std::uint64_t* firstRow =
+                            domBits.data() + incoming.front() * wordsPerSet;
+                        for (std::size_t w = 0; w < wordsPerSet; ++w) {
+                            nextRow[w] = firstRow[w];
+                        }
+                        for (std::size_t index = 1; index < incoming.size(); ++index) {
+                            const std::uint64_t* predRow =
+                                domBits.data() + incoming[index] * wordsPerSet;
+                            for (std::size_t w = 0; w < wordsPerSet; ++w) {
+                                nextRow[w] &= predRow[w];
                             }
                         }
-                        next = std::move(intersection);
                     }
-                }
-                next.insert(block.id);
-                if (next != dominators[block.id]) {
-                    dominators[block.id] = std::move(next);
-                    changed = true;
+                    nextRow[bDense >> 6u] |= std::uint64_t{1} << (bDense & 63u);
+                    std::uint64_t* curRow = domBits.data() + bDense * wordsPerSet;
+                    bool diff = false;
+                    for (std::size_t w = 0; w < wordsPerSet; ++w) {
+                        if (curRow[w] != nextRow[w]) {
+                            curRow[w] = nextRow[w];
+                            diff = true;
+                        }
+                    }
+                    if (diff) {
+                        changed = true;
+                    }
                 }
             }
         }
@@ -963,38 +1141,43 @@ bool verifyModule(
                     {});
                 return;
             }
-            const auto definition = definitions.find(value);
-            if (definition == definitions.end()) {
+            const auto& definition = definitions[value];
+            if (definition.instructionIndex == -2) {
                 diagnostics.report(
                     "RS5121",
                     "bytecode uses undefined register r" + std::to_string(value),
                     {});
                 return;
             }
-            if (definition->second.block == useBlock) {
-                if (definition->second.instructionIndex >= useIndex &&
-                    definition->second.instructionIndex >= 0) {
+            if (definition.block == useBlock) {
+                if (definition.instructionIndex >= useIndex &&
+                    definition.instructionIndex >= 0) {
                     diagnostics.report(
                         "RS5122",
                         "bytecode register is used before its definition",
                         {});
                 }
-            } else if (dominators[useBlock].find(definition->second.block) ==
-                       dominators[useBlock].end()) {
-                diagnostics.report(
-                    "RS5123",
-                    "bytecode register definition does not dominate its use",
-                    {});
+            } else {
+                const auto useDense = findDenseBlock(useBlock);
+                const auto defDense = findDenseBlock(definition.block);
+                if (useDense == kInvalidDense || defDense == kInvalidDense ||
+                    (domBits[useDense * wordsPerSet + (defDense >> 6u)] &
+                        (std::uint64_t{1} << (defDense & 63u))) == 0u) {
+                    diagnostics.report(
+                        "RS5123",
+                        "bytecode register definition does not dominate its use",
+                        {});
+                }
             }
         };
 
         const auto verifyEdge = [&](
             BlockId from,
             BlockId target,
-            const std::vector<Register>& arguments,
+            const SmallRegisterVector& arguments,
             std::int64_t useIndex) {
-            const auto targetBlock = blocks.find(target);
-            if (targetBlock == blocks.end()) {
+            const auto* targetBlock = findBlockById(target);
+            if (!targetBlock) {
                 diagnostics.report(
                     "RS5124",
                     "bytecode branch targets missing block bb" +
@@ -1002,7 +1185,7 @@ bool verifyModule(
                     {});
                 return;
             }
-            if (arguments.size() != targetBlock->second->parameters.size()) {
+            if (arguments.size() != targetBlock->parameters.size()) {
                 diagnostics.report(
                     "RS5125",
                     "bytecode branch argument count does not match block parameters",
@@ -1014,8 +1197,8 @@ bool verifyModule(
                 if (!compatibleType(
                         registerType(arguments[index]),
                         registerTypeId(arguments[index]),
-                        targetBlock->second->parameters[index].type,
-                        targetBlock->second->parameters[index].typeId,
+                        targetBlock->parameters[index].type,
+                        targetBlock->parameters[index].typeId,
                         typeDescriptors)) {
                     diagnostics.report(
                         "RS5126",
@@ -1723,7 +1906,7 @@ bool verifyModule(
                         registerType(instruction.operands.front()) != function.localTypes[instruction.index] ||
                         instruction.typeIndex >= module.types.size() ||
                         instruction.integerImmediate < 0 ||
-                        blocks.find(static_cast<BlockId>(instruction.integerImmediate)) == blocks.end()) {
+                        findBlockById(static_cast<BlockId>(instruction.integerImmediate)) == nullptr) {
                         diagnostics.report("RS5191", "invalid bytecode await.suspend", {});
                     }
                     break;

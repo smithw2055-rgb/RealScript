@@ -1,12 +1,15 @@
 #include "CompilationInternal.h"
 
 #include <algorithm>
+#include <atomic>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <sstream>
+#include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -614,6 +617,336 @@ void mergePartialRecordDeclarations(
 
 namespace {
 
+std::shared_ptr<syntax::CompilationUnitSyntax> cloneCompilationUnitSyntax(
+    const syntax::CompilationUnitSyntax& src) {
+    auto cloned = std::make_shared<syntax::CompilationUnitSyntax>();
+    if (src.moduleDeclaration) {
+        cloned->moduleDeclaration = std::make_unique<syntax::ModuleDeclarationSyntax>(*src.moduleDeclaration);
+    }
+    cloned->imports = src.imports;
+    cloned->classes.reserve(src.classes.size());
+    for (const auto& c : src.classes) {
+        cloned->classes.push_back(syntax::cloneClassDeclarationSyntax(c));
+    }
+    cloned->structs.reserve(src.structs.size());
+    for (const auto& s : src.structs) {
+        cloned->structs.push_back(syntax::cloneStructDeclarationSyntax(s));
+    }
+    cloned->enums = src.enums;
+    cloned->interfaces.reserve(src.interfaces.size());
+    for (const auto& iface : src.interfaces) {
+        cloned->interfaces.push_back(syntax::cloneInterfaceDeclarationSyntax(iface));
+    }
+    cloned->delegates.reserve(src.delegates.size());
+    for (const auto& del : src.delegates) {
+        cloned->delegates.push_back(syntax::cloneDelegateDeclarationSyntax(del));
+    }
+    cloned->functions.reserve(src.functions.size());
+    for (const auto& fn : src.functions) {
+        cloned->functions.push_back(syntax::cloneFunctionDeclarationSyntax(fn));
+    }
+    cloned->endOfFileToken = src.endOfFileToken;
+    return cloned;
+}
+
+template <typename Fn>
+void scanIdentifiersInSource(std::string_view text, Fn&& onIdent) {
+    const std::size_t n = text.size();
+    std::size_t i = 0;
+    bool inString = false;
+    bool inChar = false;
+    while (i < n) {
+        const char c = text[i];
+        if (!inString && !inChar && c == '/' && i + 1 < n) {
+            if (text[i + 1] == '/') {
+                i += 2;
+                while (i < n && text[i] != '\n') ++i;
+                continue;
+            }
+            if (text[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < n && !(text[i] == '*' && text[i + 1] == '/')) ++i;
+                i = (i + 1 < n) ? i + 2 : n;
+                continue;
+            }
+        }
+        if (inString) {
+            if (c == '\\' && i + 1 < n) {
+                i += 2;
+                continue;
+            }
+            if (c == '"') {
+                inString = false;
+                ++i;
+                continue;
+            }
+            ++i;
+            continue;
+        } else if (inChar) {
+            if (c == '\\' && i + 1 < n) {
+                i += 2;
+                continue;
+            }
+            if (c == '\'') {
+                inChar = false;
+                ++i;
+                continue;
+            }
+            ++i;
+            continue;
+        } else {
+            if (c == '"') {
+                inString = true;
+                ++i;
+                continue;
+            }
+            if (c == '\'') {
+                inChar = true;
+                ++i;
+                continue;
+            }
+        }
+        const bool isStart =
+            (c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') ||
+            c == '_';
+        if (isStart) {
+            const std::size_t start = i++;
+            while (i < n) {
+                const char d = text[i];
+                const bool isCont =
+                    (d >= 'A' && d <= 'Z') ||
+                    (d >= 'a' && d <= 'z') ||
+                    (d >= '0' && d <= '9') ||
+                    d == '_';
+                if (!isCont) break;
+                ++i;
+            }
+            onIdent(text.substr(start, i - start));
+        } else {
+            ++i;
+        }
+    }
+}
+
+void pruneUnreachableAstDeclarations(
+    const std::unordered_set<std::string>& pruneModules,
+    const std::unordered_set<std::string>& rootSymbols,
+    std::vector<std::unique_ptr<ParsedUnit>>& units,
+    BuildResult& result) {
+    if (pruneModules.empty()) return;
+
+    struct DeclSlice {
+        const ParsedUnit* unit = nullptr;
+        text::TextSpan span{};
+    };
+    struct DeclGroup {
+        std::string moduleName;
+        std::string name;
+        bool isType = false;
+        std::vector<DeclSlice> slices;
+        bool reachable = false;
+    };
+
+    std::vector<DeclGroup> groups;
+    std::unordered_map<std::string, std::size_t> groupIndexByKey;
+    std::unordered_map<std::string, std::vector<std::size_t>> groupsBySimpleName;
+
+    auto registerDecl = [&](
+        const ParsedUnit* unit,
+        const std::string& name,
+        bool isType,
+        text::TextSpan span) {
+        if (name.empty()) return;
+        const std::string key = unit->moduleName + '\n' + name;
+        auto [it, inserted] = groupIndexByKey.emplace(key, groups.size());
+        if (inserted) {
+            DeclGroup g;
+            g.moduleName = unit->moduleName;
+            g.name = name;
+            g.isType = isType;
+            groups.push_back(std::move(g));
+            groupsBySimpleName[name].push_back(it->second);
+        } else if (isType) {
+            groups[it->second].isType = true;
+        }
+        groups[it->second].slices.push_back(DeclSlice{unit, span});
+    };
+
+    std::vector<const ParsedUnit*> rootUnits;
+    std::vector<ParsedUnit*> prunableUnits;
+    for (auto& uPtr : units) {
+        if (!uPtr || !uPtr->source || !uPtr->syntaxTree) continue;
+        if (uPtr->invalid || pruneModules.count(uPtr->moduleName) == 0) {
+            rootUnits.push_back(uPtr.get());
+            continue;
+        }
+        prunableUnits.push_back(uPtr.get());
+        const auto& st = *uPtr->syntaxTree;
+        for (const auto& c : st.classes) {
+            registerDecl(uPtr.get(), c.identifierToken.text, true, c.span());
+        }
+        for (const auto& s : st.structs) {
+            registerDecl(uPtr.get(), s.identifierToken.text, true, s.span());
+        }
+        for (const auto& e : st.enums) {
+            registerDecl(uPtr.get(), e.identifierToken.text, true, e.span());
+        }
+        for (const auto& iface : st.interfaces) {
+            registerDecl(uPtr.get(), iface.identifierToken.text, true, iface.span());
+        }
+        for (const auto& del : st.delegates) {
+            registerDecl(uPtr.get(), del.identifierToken.text, true, del.span());
+        }
+        for (const auto& fn : st.functions) {
+            registerDecl(uPtr.get(), fn.identifierToken.text, false, fn.span());
+        }
+    }
+
+    if (groups.empty() || prunableUnits.empty()) return;
+
+    std::vector<std::size_t> worklist;
+    auto markSymbolName = [&](std::string_view ident) {
+        if (ident.empty()) return;
+        const auto it = groupsBySimpleName.find(std::string(ident));
+        if (it == groupsBySimpleName.end()) return;
+        for (const std::size_t gIdx : it->second) {
+            if (!groups[gIdx].reachable) {
+                groups[gIdx].reachable = true;
+                worklist.push_back(gIdx);
+            }
+        }
+    };
+
+    for (const auto* rootUnit : rootUnits) {
+        scanIdentifiersInSource(rootUnit->source->content(), markSymbolName);
+    }
+    for (const auto* pu : prunableUnits) {
+        if (pu->syntaxTree->moduleDeclaration) {
+            for (const auto& attrList : pu->syntaxTree->moduleDeclaration->attributes) {
+                const auto span = attrList.span();
+                const auto& content = pu->source->content();
+                if (span.start < content.size()) {
+                    const std::size_t len = (std::min)(span.length, content.size() - span.start);
+                    scanIdentifiersInSource(
+                        std::string_view(content).substr(span.start, len),
+                        markSymbolName);
+                }
+            }
+        }
+    }
+    for (const auto& rootSym : rootSymbols) {
+        const auto it = groupsBySimpleName.find(rootSym);
+        if (it != groupsBySimpleName.end()) {
+            for (const std::size_t gIdx : it->second) {
+                if (!groups[gIdx].reachable) {
+                    groups[gIdx].reachable = true;
+                    worklist.push_back(gIdx);
+                }
+            }
+        }
+    }
+
+    while (!worklist.empty()) {
+        const std::size_t gIdx = worklist.back();
+        worklist.pop_back();
+        for (const auto& slice : groups[gIdx].slices) {
+            if (!slice.unit || !slice.unit->source) continue;
+            const auto& content = slice.unit->source->content();
+            if (slice.span.start >= content.size() || slice.span.length == 0) {
+                scanIdentifiersInSource(content, markSymbolName);
+            } else {
+                const std::size_t len = (std::min)(slice.span.length, content.size() - slice.span.start);
+                scanIdentifiersInSource(
+                    std::string_view(content).substr(slice.span.start, len),
+                    markSymbolName);
+            }
+        }
+    }
+
+    auto isReachableName = [&](const std::string& modName, const std::string& declName) -> bool {
+        const auto it = groupIndexByKey.find(modName + '\n' + declName);
+        return it == groupIndexByKey.end() || groups[it->second].reachable;
+    };
+
+    std::size_t prunedTypes = 0;
+    std::size_t prunedFunctions = 0;
+    for (const auto& g : groups) {
+        if (!g.reachable && g.isType) {
+            ++prunedTypes;
+        }
+    }
+
+    auto countPropertyAccessors = [](const syntax::PropertyDeclarationSyntax& p) -> std::size_t {
+        std::size_t n = 0;
+        if (p.getter) ++n;
+        if (p.setter) ++n;
+        return n;
+    };
+
+    for (auto* pu : prunableUnits) {
+        const auto& st = *pu->syntaxTree;
+        const std::string& modName = pu->moduleName;
+        bool unitHasPruned = false;
+        for (const auto& c : st.classes) {
+            if (!isReachableName(modName, c.identifierToken.text)) {
+                unitHasPruned = true;
+                prunedFunctions += c.constructors.size() + c.methods.size() + c.sequences.size();
+                for (const auto& prop : c.properties) prunedFunctions += countPropertyAccessors(prop);
+            }
+        }
+        for (const auto& s : st.structs) {
+            if (!isReachableName(modName, s.identifierToken.text)) {
+                unitHasPruned = true;
+                prunedFunctions += s.constructors.size() + s.methods.size() + s.sequences.size();
+                for (const auto& prop : s.properties) prunedFunctions += countPropertyAccessors(prop);
+            }
+        }
+        for (const auto& e : st.enums) {
+            if (!isReachableName(modName, e.identifierToken.text)) {
+                unitHasPruned = true;
+            }
+        }
+        for (const auto& iface : st.interfaces) {
+            if (!isReachableName(modName, iface.identifierToken.text)) {
+                unitHasPruned = true;
+            }
+        }
+        for (const auto& del : st.delegates) {
+            if (!isReachableName(modName, del.identifierToken.text)) {
+                unitHasPruned = true;
+            }
+        }
+        for (const auto& fn : st.functions) {
+            if (!isReachableName(modName, fn.identifierToken.text)) {
+                unitHasPruned = true;
+                ++prunedFunctions;
+            }
+        }
+        if (!unitHasPruned) continue;
+
+        if (pu->syntaxTree.use_count() > 1) {
+            pu->syntaxTree = cloneCompilationUnitSyntax(*pu->syntaxTree);
+        }
+        auto& mut = *pu->syntaxTree;
+        auto pruneVec = [&](auto& vec) {
+            vec.erase(
+                std::remove_if(vec.begin(), vec.end(),
+                    [&](const auto& d) { return !isReachableName(modName, d.identifierToken.text); }),
+                vec.end());
+        };
+        pruneVec(mut.classes);
+        pruneVec(mut.structs);
+        pruneVec(mut.enums);
+        pruneVec(mut.interfaces);
+        pruneVec(mut.delegates);
+        pruneVec(mut.functions);
+    }
+
+    result.prunedFrontendTypes += prunedTypes;
+    result.prunedFrontendFunctions += prunedFunctions;
+}
+
 void mergePartialTypesInModule(ModuleWork& module, BuildResult& result) {
     // Clone shared syntaxTree before mutating so parsedUnitCache stays immutable!
     bool needsTreeMutation = false;
@@ -644,29 +977,7 @@ void mergePartialTypesInModule(ModuleWork& module, BuildResult& result) {
     std::vector<detail::PartialUnitEntry> partialUnits;
     partialUnits.reserve(module.units.size());
     for (auto* u : module.units) {
-        auto cloned = std::make_shared<syntax::CompilationUnitSyntax>();
-        if (u->syntaxTree->moduleDeclaration) {
-            cloned->moduleDeclaration = std::make_unique<syntax::ModuleDeclarationSyntax>(*u->syntaxTree->moduleDeclaration);
-        }
-        cloned->imports = u->syntaxTree->imports;
-        for (const auto& c : u->syntaxTree->classes) {
-            cloned->classes.push_back(syntax::cloneClassDeclarationSyntax(c));
-        }
-        for (const auto& s : u->syntaxTree->structs) {
-            cloned->structs.push_back(syntax::cloneStructDeclarationSyntax(s));
-        }
-        cloned->enums = u->syntaxTree->enums;
-        for (const auto& iface : u->syntaxTree->interfaces) {
-            cloned->interfaces.push_back(syntax::cloneInterfaceDeclarationSyntax(iface));
-        }
-        for (const auto& del : u->syntaxTree->delegates) {
-            cloned->delegates.push_back(syntax::cloneDelegateDeclarationSyntax(del));
-        }
-        for (const auto& fn : u->syntaxTree->functions) {
-            cloned->functions.push_back(syntax::cloneFunctionDeclarationSyntax(fn));
-        }
-        cloned->endOfFileToken = u->syntaxTree->endOfFileToken;
-        u->syntaxTree = std::move(cloned);
+        u->syntaxTree = cloneCompilationUnitSyntax(*u->syntaxTree);
         partialUnits.push_back(detail::PartialUnitEntry{u->syntaxTree.get(), u->source->name()});
     }
 
@@ -694,9 +1005,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
     std::vector<std::unique_ptr<ParsedUnit>> units;
     std::map<std::string, ModuleWork> modules;
 
-    static auto sDefaultSession = std::make_shared<CompilerSession>();
-    CompilerSession& activeSession = options_.session ? *options_.session : *sDefaultSession;
-    auto& sessionImpl = activeSession.impl();
+    CompilerSession* activeSession = options_.session.get();
+    CompilerSession::Impl* sessionImpl = activeSession ? &activeSession->impl() : nullptr;
 
     // Compute active ModulePack + MacroPlugin configuration fingerprint for cache isolation
     std::vector<ModulePack> effectivePacks;
@@ -751,14 +1061,14 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         }
     }
 
-    const auto addSourceUnit = [&](const SourceFile& sourceFile) {
+    const auto parseOneSource = [&](const SourceFile& sourceFile) -> std::unique_ptr<ParsedUnit> {
         const auto fp = stableFingerprint(sourceFile.path + "\n" + sourceFile.content);
         auto unit = std::make_unique<ParsedUnit>();
         bool cacheHit = false;
-        {
-            std::lock_guard<std::mutex> lock(sessionImpl.parsedUnitCacheMutex);
-            const auto found = sessionImpl.parsedUnitCache.find(fp);
-            if (found != sessionImpl.parsedUnitCache.end() &&
+        if (sessionImpl != nullptr) {
+            std::lock_guard<std::mutex> lock(sessionImpl->parsedUnitCacheMutex);
+            const auto found = sessionImpl->parsedUnitCache.find(fp);
+            if (found != sessionImpl->parsedUnitCache.end() &&
                 found->second.source &&
                 found->second.source->name() == sourceFile.path) {
                 *unit = found->second;
@@ -790,16 +1100,21 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 }
             }
             unit->hasGenericSyntax = (sourceFile.content.find('<') != std::string::npos);
-            {
-                std::lock_guard<std::mutex> lock(sessionImpl.parsedUnitCacheMutex);
-                if (sessionImpl.parsedUnitCache.size() > 8192) sessionImpl.parsedUnitCache.clear();
-                sessionImpl.parsedUnitCache[fp] = *unit;
+            if (sessionImpl != nullptr) {
+                std::lock_guard<std::mutex> lock(sessionImpl->parsedUnitCacheMutex);
+                if (sessionImpl->parsedUnitCache.size() > 8192) sessionImpl->parsedUnitCache.clear();
+                sessionImpl->parsedUnitCache[fp] = *unit;
             }
         }
+        return unit;
+    };
+
+    const auto registerParsedUnit = [&](std::unique_ptr<ParsedUnit> unit, const std::string& pathFallback) {
+        const std::string& diagPath = unit->source ? unit->source->name() : pathFallback;
         for (const auto& diagnostic : unit->parseDiagnostics) {
             result.diagnostics.report(
                 diagnostic.code, diagnostic.message, diagnostic.span,
-                diagnostic.severity, sourceFile.path);
+                diagnostic.severity, diagPath);
         }
         auto& module = modules[unit->moduleName];
         module.name = unit->moduleName;
@@ -810,8 +1125,36 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         units.push_back(std::move(unit));
     };
 
-    for (const auto& sourceFile : sources_) {
-        addSourceUnit(sourceFile);
+    const auto addSourceUnit = [&](const SourceFile& sourceFile) {
+        registerParsedUnit(parseOneSource(sourceFile), sourceFile.path);
+    };
+
+    if (sources_.size() >= 4u) {
+        std::vector<std::unique_ptr<ParsedUnit>> parsedSlots(sources_.size());
+        std::atomic<std::size_t> nextIdx{0};
+        const unsigned hw = std::thread::hardware_concurrency();
+        const std::size_t workerCount = (std::min)(
+            sources_.size(),
+            static_cast<std::size_t>(hw > 0u ? (std::min)(hw, 8u) : 4u));
+        std::vector<std::thread> workers;
+        workers.reserve(workerCount);
+        for (std::size_t w = 0; w < workerCount; ++w) {
+            workers.emplace_back([&]() {
+                while (true) {
+                    const std::size_t idx = nextIdx.fetch_add(1u, std::memory_order_relaxed);
+                    if (idx >= sources_.size()) break;
+                    parsedSlots[idx] = parseOneSource(sources_[idx]);
+                }
+            });
+        }
+        for (auto& t : workers) t.join();
+        for (std::size_t idx = 0; idx < sources_.size(); ++idx) {
+            registerParsedUnit(std::move(parsedSlots[idx]), sources_[idx].path);
+        }
+    } else {
+        for (const auto& sourceFile : sources_) {
+            addSourceUnit(sourceFile);
+        }
     }
 
     // Execute registered ICompilerMacroPlugin source generators prior to pack mounting & semantic binding
@@ -873,6 +1216,14 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         for (const auto& consumer : implicitConsumers) {
             modules[consumer].imports.insert(pack.moduleName);
         }
+    }
+
+    if (!options_.pruneUnreachableModules.empty()) {
+        pruneUnreachableAstDeclarations(
+            options_.pruneUnreachableModules,
+            options_.reachabilityRootSymbols,
+            units,
+            result);
     }
 
     // Merge partial class / partial struct declarations & reconcile partial methods
@@ -962,8 +1313,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             (void)module;
             (void)computeTransitiveFp(moduleName);
         }
-        if (previous) {
-            std::lock_guard<std::mutex> lock(sessionImpl.moduleFrontendCacheMutex);
+        if (previous && sessionImpl != nullptr) {
+            std::lock_guard<std::mutex> lock(sessionImpl->moduleFrontendCacheMutex);
             for (auto& [moduleName, module] : modules) {
                 if (moduleName == "$global" || module.invalid || module.transitiveSourceFingerprint == 0) continue;
                 const auto prevIt = previous->modules.find(moduleName);
@@ -974,8 +1325,8 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 const std::string cacheKey =
                     moduleName + "#" + std::to_string(module.transitiveSourceFingerprint) +
                     "#" + std::to_string(configFp);
-                const auto fcIt = sessionImpl.moduleFrontendCache.find(cacheKey);
-                if (fcIt == sessionImpl.moduleFrontendCache.end() ||
+                const auto fcIt = sessionImpl->moduleFrontendCache.find(cacheKey);
+                if (fcIt == sessionImpl->moduleFrontendCache.end() ||
                     fcIt->second.transitiveSourceFingerprint != module.transitiveSourceFingerprint ||
                     fcIt->second.sourceFingerprint != module.sourceFingerprint ||
                     fcIt->second.publicFingerprint != prevIt->second.publicFingerprint ||
@@ -1018,7 +1369,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                     const std::string cacheKey =
                         moduleName + "#" + std::to_string(module.transitiveSourceFingerprint) +
                         "#" + std::to_string(configFp);
-                    const auto& fc = sessionImpl.moduleFrontendCache.at(cacheKey);
+                    const auto& fc = sessionImpl->moduleFrontendCache.at(cacheKey);
                     module.types = fc.types;
                     module.interfaces = fc.interfaces;
                     module.delegates = fc.delegates;
@@ -1035,9 +1386,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
     closeGlobalInterfacesValidateAttributesAndLayouts(
         modules, result, globalObsoleteSymbols);
 
-    if (result.nativeGenericInstantiations.empty()) {
-        std::lock_guard<std::mutex> lock(sessionImpl.moduleFrontendCacheMutex);
-        if (sessionImpl.moduleFrontendCache.size() > 4096) sessionImpl.moduleFrontendCache.clear();
+    if (sessionImpl != nullptr && result.nativeGenericInstantiations.empty()) {
+        std::lock_guard<std::mutex> lock(sessionImpl->moduleFrontendCacheMutex);
+        if (sessionImpl->moduleFrontendCache.size() > 4096) sessionImpl->moduleFrontendCache.clear();
         for (const auto& [moduleName, module] : modules) {
             if (moduleName == "$global" || module.frontendCached || module.invalid || module.transitiveSourceFingerprint == 0) {
                 continue;
@@ -1075,12 +1426,40 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             const std::string cacheKey =
                 moduleName + "#" + std::to_string(module.transitiveSourceFingerprint) +
                 "#" + std::to_string(configFp);
-            sessionImpl.moduleFrontendCache[cacheKey] = std::move(fc);
+            sessionImpl->moduleFrontendCache[cacheKey] = std::move(fc);
         }
     }
 
+    std::unordered_map<std::string, const semantic::TypeSymbol*> globalTypesByName;
+    for (const auto& [modName, mod] : modules) {
+        (void)modName;
+        for (const auto& t : mod.types) {
+            globalTypesByName.emplace(semantic::canonicalTypeName(t), &t);
+        }
+    }
+
+    struct ModuleCompileTaskResult {
+        ModuleWork* modulePtr = nullptr;
+        bool reused = false;
+        const CachedModule* reusedCached = nullptr;
+        ModuleBuildInfo buildInfo{};
+        diagnostics::DiagnosticBag diagnostics;
+        std::vector<semantic::SymbolOccurrence> symbols;
+        bool hasMirModule = false;
+        mir::Module mirModule;
+        bool hasSnapshot = false;
+        CachedModule snapshotModule;
+    };
+
+    std::vector<ModuleCompileTaskResult> moduleTasks;
+    moduleTasks.reserve(modules.size());
+    std::vector<std::size_t> uncachedIndices;
+    uncachedIndices.reserve(modules.size());
+
     for (auto& [moduleName, module] : modules) {
-        ModuleBuildInfo buildInfo{
+        ModuleCompileTaskResult task;
+        task.modulePtr = &module;
+        task.buildInfo = ModuleBuildInfo{
             moduleName,
             module.sourceFingerprint,
             module.publicFingerprint,
@@ -1107,31 +1486,35 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 cached->second.sourceFingerprint == module.sourceFingerprint &&
                 cached->second.publicFingerprint == module.publicFingerprint &&
                 cached->second.dependencyFingerprint == module.dependencyFingerprint) {
-                buildInfo.reused = true;
-                result.modules.push_back(cached->second.module);
-                result.symbols.insert(result.symbols.end(),
-                    cached->second.symbols.begin(), cached->second.symbols.end());
-                result.snapshot.modules[moduleName] = cached->second;
-                result.buildInfo.push_back(buildInfo);
+                task.reused = true;
+                task.reusedCached = &cached->second;
+                task.buildInfo.reused = true;
+                moduleTasks.push_back(std::move(task));
                 continue;
             }
         }
-        // Even if a syntax error occurred (such as an incomplete trailing '.' during editing),
-        // still run the semantic binder to collect symbol occurrences for IDE/LSP services,
-        // and only skip MIR lowering if errors remain.
+        uncachedIndices.push_back(moduleTasks.size());
+        moduleTasks.push_back(std::move(task));
+    }
+
+    const auto freeFunctionParamKey = [](const semantic::FunctionSymbol& fn) {
+        std::string key = fn.name + "(";
+        for (std::size_t i = 0; i < fn.parameters.size(); ++i) {
+            if (i != 0) key += ",";
+            key += std::to_string(static_cast<int>(fn.parameters[i].modifier)) + ":" +
+                std::to_string(static_cast<int>(fn.parameters[i].type)) + ":" +
+                fn.parameters[i].typeName;
+        }
+        key += ")";
+        return key;
+    };
+
+    const auto compileOneModule = [&](std::size_t taskIdx) {
+        auto& out = moduleTasks[taskIdx];
+        const auto& module = *out.modulePtr;
+        const std::string& moduleName = module.name;
         const bool hadSyntaxError = module.invalid;
 
-        auto freeFunctionParamKey = [](const semantic::FunctionSymbol& fn) {
-            std::string key = fn.name + "(";
-            for (std::size_t i = 0; i < fn.parameters.size(); ++i) {
-                if (i != 0) key += ",";
-                key += std::to_string(static_cast<int>(fn.parameters[i].modifier)) + ":" +
-                    std::to_string(static_cast<int>(fn.parameters[i].type)) + ":" +
-                    fn.parameters[i].typeName;
-            }
-            key += ")";
-            return key;
-        };
         std::unordered_set<std::string> ownFreeFnSignatures;
         semantic::FunctionOverloadMap visibleFunctions;
         for (const auto& function : module.declarations) {
@@ -1171,25 +1554,29 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         bindingInput.moduleName = moduleName;
         bindingInput.declarations = module.declarations;
         bindingInput.functionBindings = module.functionBindings;
+        bindingInput.collectOccurrences = options_.collectSymbolOccurrences;
         {
-            std::unordered_map<semantic::SymbolId, semantic::TypeSymbol> descriptorsById;
-            std::vector<semantic::TypeSymbol> descriptorQueue;
+            std::unordered_set<semantic::SymbolId> seenTypeIds;
+            std::vector<const semantic::TypeSymbol*> descriptorQueue;
+            seenTypeIds.reserve(module.visibleTypes.size());
+            descriptorQueue.reserve(module.visibleTypes.size());
             for (const auto& [visibleName, type] : module.visibleTypes) {
                 (void)visibleName;
-                if (descriptorsById.emplace(type.id, type).second) {
-                    descriptorQueue.push_back(type);
+                if (seenTypeIds.insert(type.id).second) {
+                    descriptorQueue.push_back(&type);
                 }
             }
             const auto enqueueGlobalTypeByName = [&](const std::string& canonical) {
                 if (canonical.empty()) return;
-                if (const auto* target = findGlobalType(modules, canonical)) {
-                    if (descriptorsById.emplace(target->id, *target).second) {
-                        descriptorQueue.push_back(*target);
+                if (const auto gtIt = globalTypesByName.find(canonical);
+                    gtIt != globalTypesByName.end()) {
+                    if (seenTypeIds.insert(gtIt->second->id).second) {
+                        descriptorQueue.push_back(gtIt->second);
                     }
                 }
             };
             for (std::size_t qIdx = 0; qIdx < descriptorQueue.size(); ++qIdx) {
-                const auto curType = descriptorQueue[qIdx];
+                const semantic::TypeSymbol& curType = *descriptorQueue[qIdx];
                 if (!curType.baseTypeName.empty()) {
                     enqueueGlobalTypeByName(curType.baseTypeName);
                 }
@@ -1208,64 +1595,66 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                     }
                 }
             }
-            bindingInput.types.reserve(descriptorsById.size());
-            for (auto& [typeId, type] : descriptorsById) {
-                (void)typeId;
-                bindingInput.types.push_back(std::move(type));
-            }
-            std::sort(bindingInput.types.begin(), bindingInput.types.end(),
-                [](const semantic::TypeSymbol& left, const semantic::TypeSymbol& right) {
-                    return semantic::canonicalTypeName(left) < semantic::canonicalTypeName(right);
+            std::sort(descriptorQueue.begin(), descriptorQueue.end(),
+                [](const semantic::TypeSymbol* left, const semantic::TypeSymbol* right) {
+                    return semantic::canonicalTypeName(*left) < semantic::canonicalTypeName(*right);
                 });
+            bindingInput.types.reserve(descriptorQueue.size());
+            for (const semantic::TypeSymbol* typePtr : descriptorQueue) {
+                bindingInput.types.push_back(*typePtr);
+            }
         }
         bindingInput.visibleFunctions = std::move(visibleFunctions);
         bindingInput.visibleTypes = module.visibleTypes;
         bindingInput.obsoleteSymbols = globalObsoleteSymbols;
         for (const auto* unit : module.units) bindingInput.units.push_back(unit->syntaxTree.get());
 
-        diagnostics::DiagnosticBag moduleDiagnostics;
-        semantic::Binder binder(moduleDiagnostics);
-        auto semanticModel = binder.bindModule(bindingInput);
-        result.symbols.insert(result.symbols.end(),
-            semanticModel.occurrences.begin(), semanticModel.occurrences.end());
-        if (hadSyntaxError || moduleDiagnostics.hasErrors()) {
-            result.diagnostics.append(moduleDiagnostics);
-            for (const auto& t : bindingInput.types) {
-                if (t.moduleName == moduleName) {
-                    mir::Module partialMod;
-                    partialMod.name = moduleName;
-                    for (const auto& [visName, visType] : module.visibleTypes) {
-                        (void)visName;
-                        if (visType.moduleName == moduleName) {
-                            const bool dup = std::any_of(
-                                partialMod.types.begin(),
-                                partialMod.types.end(),
-                                [&](const semantic::TypeSymbol& ex) { return ex.id == visType.id; });
-                            if (!dup) partialMod.types.push_back(visType);
-                        }
-                    }
-                    {
-                        std::unordered_set<std::string> seenPaths;
-                        for (const auto* u : module.units) {
-                            if (u && u->source && seenPaths.insert(u->source->name()).second) {
-                                partialMod.sourceFiles.push_back(makeSourceFileInfo(
-                                    *u->source,
-                                    static_cast<debug::SourceFileId>(partialMod.sourceFiles.size())));
+        mir::Module mirModule;
+        {
+            semantic::Binder binder(out.diagnostics);
+            auto semanticModel = binder.bindModule(std::move(bindingInput));
+            if (options_.collectSymbolOccurrences) {
+                out.symbols = std::move(semanticModel.occurrences);
+            }
+            if (hadSyntaxError || out.diagnostics.hasErrors()) {
+                for (const auto& [visName, visType] : module.visibleTypes) {
+                    (void)visName;
+                    if (visType.moduleName == moduleName) {
+                        mir::Module partialMod;
+                        partialMod.name = moduleName;
+                        for (const auto& [visNameInner, visTypeInner] : module.visibleTypes) {
+                            (void)visNameInner;
+                            if (visTypeInner.moduleName == moduleName) {
+                                const bool dup = std::any_of(
+                                    partialMod.types.begin(),
+                                    partialMod.types.end(),
+                                    [&](const semantic::TypeSymbol& ex) { return ex.id == visTypeInner.id; });
+                                if (!dup) partialMod.types.push_back(visTypeInner);
                             }
                         }
+                        if (options_.emitDebugInfo) {
+                            std::unordered_set<std::string> seenPaths;
+                            for (const auto* u : module.units) {
+                                if (u && u->source && seenPaths.insert(u->source->name()).second) {
+                                    partialMod.sourceFiles.push_back(makeSourceFileInfo(
+                                        *u->source,
+                                        static_cast<debug::SourceFileId>(partialMod.sourceFiles.size())));
+                                }
+                            }
+                        }
+                        out.hasMirModule = true;
+                        out.mirModule = std::move(partialMod);
+                        break;
                     }
-                    result.modules.push_back(std::move(partialMod));
-                    break;
                 }
+                return;
             }
-            result.buildInfo.push_back(buildInfo);
-            continue;
+            mir::Lowerer lowerer;
+            mirModule = lowerer.lower(semanticModel);
         }
 
-        mir::Lowerer lowerer;
-        auto mirModule = lowerer.lower(semanticModel);
-        mirModule.sourceFiles.reserve(module.units.size());
-        {
+        if (options_.emitDebugInfo) {
+            mirModule.sourceFiles.reserve(module.units.size());
             std::unordered_set<std::string> seenPaths;
             for (const auto* u : module.units) {
                 if (u && u->source && seenPaths.insert(u->source->name()).second) {
@@ -1274,26 +1663,86 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                         static_cast<debug::SourceFileId>(mirModule.sourceFiles.size())));
                 }
             }
-        }
-        for (auto& function : mirModule.functions) {
-            debug::finalizeFunctionDebugInfo(
-                function.debugInfo, mirModule.sourceFiles);
+            for (auto& function : mirModule.functions) {
+                debug::finalizeFunctionDebugInfo(
+                    function.debugInfo, mirModule.sourceFiles);
+            }
+        } else {
+            for (auto& function : mirModule.functions) {
+                function.debugInfo.sourceName.clear();
+                function.debugInfo.locals.clear();
+            }
         }
         mirModule.languageMetadata = languageMetadataForModule(
             moduleName, mirModule, result);
-        (void)mir::verifyModule(mirModule, moduleDiagnostics);
-        result.diagnostics.append(moduleDiagnostics);
-        if (!moduleDiagnostics.hasErrors()) {
-            result.modules.push_back(mirModule);
-            result.snapshot.modules[moduleName] = {
-                module.sourceFingerprint,
-                module.publicFingerprint,
-                module.dependencyFingerprint,
-                mirModule,
-                semanticModel.occurrences,
-            };
+        (void)mir::verifyModule(mirModule, out.diagnostics);
+        if (!out.diagnostics.hasErrors()) {
+            if (options_.populateSnapshot) {
+                out.hasSnapshot = true;
+                out.snapshotModule = CachedModule{
+                    module.sourceFingerprint,
+                    module.publicFingerprint,
+                    module.dependencyFingerprint,
+                    mirModule,
+                    out.symbols,
+                };
+            }
+            out.hasMirModule = true;
+            out.mirModule = std::move(mirModule);
         }
-        result.buildInfo.push_back(buildInfo);
+    };
+
+    if (uncachedIndices.size() >= 2u) {
+        std::atomic<std::size_t> nextWork{0};
+        const unsigned hw = std::thread::hardware_concurrency();
+        const std::size_t workerCount = (std::min)(
+            uncachedIndices.size(),
+            static_cast<std::size_t>(hw > 0u ? (std::min)(hw, 8u) : 4u));
+        std::vector<std::thread> workers;
+        workers.reserve(workerCount);
+        for (std::size_t w = 0; w < workerCount; ++w) {
+            workers.emplace_back([&]() {
+                while (true) {
+                    const std::size_t k = nextWork.fetch_add(1u, std::memory_order_relaxed);
+                    if (k >= uncachedIndices.size()) break;
+                    compileOneModule(uncachedIndices[k]);
+                }
+            });
+        }
+        for (auto& t : workers) t.join();
+    } else if (uncachedIndices.size() == 1u) {
+        compileOneModule(uncachedIndices.front());
+    }
+
+    for (auto& task : moduleTasks) {
+        if (task.reused && task.reusedCached != nullptr) {
+            result.modules.push_back(task.reusedCached->module);
+            if (options_.collectSymbolOccurrences) {
+                result.symbols.insert(
+                    result.symbols.end(),
+                    task.reusedCached->symbols.begin(),
+                    task.reusedCached->symbols.end());
+            }
+            if (options_.populateSnapshot) {
+                result.snapshot.modules[task.buildInfo.name] = *task.reusedCached;
+            }
+            result.buildInfo.push_back(std::move(task.buildInfo));
+            continue;
+        }
+        result.diagnostics.append(task.diagnostics);
+        if (!task.symbols.empty()) {
+            result.symbols.insert(
+                result.symbols.end(),
+                std::make_move_iterator(task.symbols.begin()),
+                std::make_move_iterator(task.symbols.end()));
+        }
+        if (task.hasMirModule) {
+            result.modules.push_back(std::move(task.mirModule));
+        }
+        if (task.hasSnapshot) {
+            result.snapshot.modules[task.buildInfo.name] = std::move(task.snapshotModule);
+        }
+        result.buildInfo.push_back(std::move(task.buildInfo));
     }
 
     std::stable_sort(

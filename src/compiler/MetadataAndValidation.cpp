@@ -23,6 +23,22 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
     // declaration order. Close inherited maps globally so a derived module does
     // not depend on whether its imported base module sorts before it.
     {
+        std::unordered_map<std::string, const semantic::TypeSymbol*> globalTypesByName;
+        std::unordered_map<semantic::SymbolId, std::string> interfaceNamesById;
+        for (const auto& [modName, mod] : modules) {
+            (void)modName;
+            for (const auto& t : mod.types) {
+                globalTypesByName.emplace(semantic::canonicalTypeName(t), &t);
+                if (t.interfaceType) {
+                    interfaceNamesById.emplace(t.id, semantic::canonicalTypeName(t));
+                }
+            }
+        }
+        const auto findGlobalCached = [&](const std::string& canonicalName) -> const semantic::TypeSymbol* {
+            const auto it = globalTypesByName.find(canonicalName);
+            return it == globalTypesByName.end() ? nullptr : it->second;
+        };
+
         struct InterfaceOwnerWork {
             ModuleWork* module = nullptr;
             semantic::TypeSymbol* type = nullptr;
@@ -41,7 +57,7 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
                 std::unordered_set<semantic::SymbolId> visited;
                 auto current = type.baseTypeName;
                 while (!current.empty()) {
-                    const auto* base = findGlobalType(modules, current);
+                    const auto* base = findGlobalCached(current);
                     if (!base || !visited.insert(base->id).second) break;
                     ++depth;
                     current = base->baseTypeName;
@@ -62,23 +78,14 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
 
         const auto interfaceNameById =
             [&](semantic::SymbolId interfaceTypeId) {
-                for (const auto& [moduleName, module] : modules) {
-                    (void)moduleName;
-                    for (const auto& type : module.types) {
-                        if (type.id == interfaceTypeId &&
-                            type.interfaceType) {
-                            return semantic::canonicalTypeName(type);
-                        }
-                    }
-                }
-                return std::string{};
+                const auto it = interfaceNamesById.find(interfaceTypeId);
+                return it == interfaceNamesById.end() ? std::string{} : it->second;
             };
 
         for (auto& work : owners) {
             auto& owner = *work.type;
             if (!owner.baseTypeName.empty()) {
-                const auto* base = findGlobalType(
-                    modules, owner.baseTypeName);
+                const auto* base = findGlobalCached(owner.baseTypeName);
                 if (base) {
                     for (const auto& inherited :
                          base->interfaceDispatchMaps) {
@@ -948,6 +955,17 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
 
         // Propagate [FieldTag] / [FormerlySerializedAs] from base classes to derived field copies
         // and enforce [FieldTag(N)] uniqueness across each type and its base hierarchy.
+        std::unordered_map<std::string, const semantic::TypeSymbol*> fieldTagTypesByName;
+        for (const auto& [modName, mod] : modules) {
+            (void)modName;
+            for (const auto& t : mod.types) {
+                fieldTagTypesByName.emplace(semantic::canonicalTypeName(t), &t);
+            }
+        }
+        const auto findFieldTagGlobal = [&](const std::string& canonicalName) -> const semantic::TypeSymbol* {
+            const auto it = fieldTagTypesByName.find(canonicalName);
+            return it == fieldTagTypesByName.end() ? nullptr : it->second;
+        };
         for (auto& [modName, mod] : modules) {
             (void)modName;
             if (mod.frontendCached) continue;
@@ -966,7 +984,7 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
                     std::unordered_set<semantic::SymbolId> visitedBases{type.id};
                     auto curBase = type.baseTypeName;
                     while (!curBase.empty()) {
-                        const auto* base = findGlobalType(modules, curBase);
+                        const auto* base = findFieldTagGlobal(curBase);
                         if (!base || !visitedBases.insert(base->id).second) break;
                         auto& perBase = ancestorMeta[base->id];
                         for (const auto& bf : base->fields) {
@@ -1012,7 +1030,7 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
                     std::unordered_set<semantic::SymbolId> visitedBases{type.id};
                     auto curBase = type.baseTypeName;
                     while (!curBase.empty()) {
-                        const auto* base = findGlobalType(modules, curBase);
+                        const auto* base = findFieldTagGlobal(curBase);
                         if (!base || !visitedBases.insert(base->id).second) break;
                         for (const auto& bf : base->fields) {
                             if (bf.declaringTypeId == base->id && !bf.staticField && !bf.constField) {

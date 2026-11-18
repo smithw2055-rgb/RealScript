@@ -85,7 +85,8 @@ buildUnwrappedCapturedThis(
     const VariableSymbol& thisVariable,
     const TypeSymbol& ownerType,
     const TypeSymbolMap& visibleTypes,
-    text::TextSpan span);
+    text::TextSpan span,
+    std::unordered_map<SymbolId, std::shared_ptr<const TypeSymbol>>* sharedTypesById = nullptr);
 
 [[nodiscard]] bool hasAncestorMemberOrCapture(
     const TypeSymbol& startOwner,
@@ -99,7 +100,7 @@ buildUnwrappedCapturedThis(
 
 struct UnwrappedCapturedField {
     std::unique_ptr<BoundExpression> receiver;
-    TypeSymbol ownerType;
+    SharedTypeRef ownerType;
     FieldSymbol field;
 };
 
@@ -108,7 +109,8 @@ struct UnwrappedCapturedField {
     const TypeSymbol& ownerType,
     const std::string& name,
     const TypeSymbolMap& visibleTypes,
-    text::TextSpan span);
+    text::TextSpan span,
+    std::unordered_map<SymbolId, std::shared_ptr<const TypeSymbol>>* sharedTypesById = nullptr);
 
 void collectLambdaNamesFromStatement(
     const syntax::StatementSyntax& statement,
@@ -187,7 +189,7 @@ void collectLambdaNames(
     const FieldSymbol& field,
     bool currentConstructor,
     bool currentStaticMethod,
-    const std::optional<TypeSymbol>& currentOwnerType) noexcept;
+    const SharedTypeRef& currentOwnerType) noexcept;
 
 [[nodiscard]] std::optional<FunctionSymbol> findStaticConstructorForFunction(
     const TypeSymbolMap& visibleTypes,

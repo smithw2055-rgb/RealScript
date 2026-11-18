@@ -322,6 +322,15 @@ enum class FlatOpcode : std::uint8_t {
     LoadStackRefCell,
     StoreStackRefCell,
     StoreStackRefStructFieldInPlace,
+    // 7h. High-Frequency Literal / Conversion / Value Equality / Intrinsic Fast Opcodes
+    ConstantStringFast,
+    ConstantEnumFast,
+    ConstantNullTagFast,
+    EqualValueFast,
+    ConvertNumericFast,
+    NegateIntChecked,
+    BinaryUIntFast,
+    CallIntrinsicFast,
     GenericBytecode,
     // 8. Flattened block terminators
     TermJumpNoArgs,
@@ -461,6 +470,29 @@ struct alignas(32) FlatInstruction {
 static_assert(sizeof(FlatInstruction) == 32, "FlatInstruction must be 32 bytes (2 per 64B cache line)");
 static_assert(alignof(FlatInstruction) == 32, "FlatInstruction must be 32-byte aligned");
 
+enum class FastIntrinsicKind : std::uint8_t {
+    None = 0,
+    StaticHas = 1,
+    StaticGet = 2,
+    StaticSet = 3,
+    StringLength = 4,
+    StringIsEmpty = 5,
+    StringContains = 6,
+    StringStartsWith = 7,
+    StringEndsWith = 8,
+    StringSubstring1 = 9,
+    StringSubstring2 = 10,
+    StringTrim = 11,
+    StringToLower = 12,
+    StringToUpper = 13,
+    StringConcat = 14,
+    StableHash = 15,
+    ArrayPush = 16,
+    ArrayRemoveAt = 17,
+    ArrayPop = 18,
+    ArrayClear = 19,
+};
+
 enum class FastFieldKind : std::uint8_t {
     None = 0,
     ExactValueTag = 1,
@@ -593,7 +625,24 @@ struct ExecutionFunction {
     std::vector<FlatInstruction> flatStream;
     std::vector<FlatColdMeta> flatCold;
     std::vector<std::uint32_t> blockStreamOffsets;
-    std::unordered_map<bytecode::BlockId, std::size_t> blockIndices;
+    std::vector<std::uint32_t> denseBlockIndices;
+    std::unique_ptr<std::unordered_map<bytecode::BlockId, std::size_t>> sparseBlockIndices;
+
+    [[nodiscard]] std::size_t findBlockIndex(bytecode::BlockId id) const noexcept {
+        if (id < denseBlockIndices.size()) {
+            const std::uint32_t idx = denseBlockIndices[id];
+            return idx == InvalidStreamOffset
+                ? InvalidBlockIndex
+                : static_cast<std::size_t>(idx);
+        }
+        if (sparseBlockIndices) {
+            const auto found = sparseBlockIndices->find(id);
+            return found == sparseBlockIndices->end()
+                ? InvalidBlockIndex
+                : found->second;
+        }
+        return InvalidBlockIndex;
+    }
 };
 
 struct StackRefTemplate {
@@ -605,11 +654,20 @@ struct StackRefTemplate {
     Value scalarDefaultValue{};
 };
 
+struct FastFunctionDispatchEntry {
+    semantic::SymbolId symbolId = 0;
+    const ProgramImage::FunctionLocation* location = nullptr;
+    const ExecutionFunction* execution = nullptr;
+};
+
 struct ExecutionMirror {
     std::uint64_t instanceId = 0;
     std::unordered_map<const bytecode::Function*, ExecutionFunction> functions;
+    std::vector<FastFunctionDispatchEntry> fastFunctionTable;
     std::vector<FieldAccessMeta> fieldMetas;
     std::vector<ObjectAllocationTemplate> objectTemplates;
+    std::vector<std::string> stringLiterals;
+    std::vector<Value> constPoolValues;
     std::vector<StackRefTemplate> stackRefTemplates;
     std::unordered_map<semantic::SymbolId, std::uint16_t> stackRefTemplateByTypeId;
     std::unordered_map<semantic::SymbolId, TypeDispatchMetadata> typeDispatch;
@@ -622,6 +680,26 @@ struct ExecutionMirror {
     };
     mutable std::shared_ptr<ParallelBatchFactorySlot> parallelBatchFactorySlot =
         std::make_shared<ParallelBatchFactorySlot>();
+
+    [[nodiscard]] const FastFunctionDispatchEntry* lookupFunctionFast(
+        semantic::SymbolId symId) const noexcept {
+        if (symId == 0 || fastFunctionTable.empty()) {
+            return nullptr;
+        }
+        const std::size_t mask = fastFunctionTable.size() - 1u;
+        std::size_t slot = static_cast<std::size_t>(
+            (symId ^ (symId >> 32u)) * 11400714819323198485ULL) & mask;
+        while (true) {
+            const auto& entry = fastFunctionTable[slot];
+            if (entry.symbolId == symId) {
+                return &entry;
+            }
+            if (entry.symbolId == 0u) {
+                return nullptr;
+            }
+            slot = (slot + 1u) & mask;
+        }
+    }
 };
 
 [[nodiscard]] std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
@@ -639,10 +717,8 @@ struct ExecutionMirror {
 [[nodiscard]] inline const ExecutionBlock* findExecutionBlock(
     const ExecutionFunction& function,
     bytecode::BlockId id) noexcept {
-    const auto found = function.blockIndices.find(id);
-    return found == function.blockIndices.end()
-        ? nullptr
-        : &function.blocks[found->second];
+    const std::size_t idx = function.findBlockIndex(id);
+    return idx == InvalidBlockIndex ? nullptr : &function.blocks[idx];
 }
 
 } // namespace realscript::runtime::detail

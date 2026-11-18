@@ -29,7 +29,7 @@ std::unique_ptr<BoundPattern> Binder::bindPattern(
 
     // Check if inputType is a Nullable<T> struct wrapper
     bool inputIsNullableStruct = false;
-    TypeSymbol nullableDesc;
+    SharedTypeRef nullableDesc;
     FieldSymbol nullableHasVal;
     FieldSymbol nullableVal;
     if (inputType == PrimitiveType::Struct && !inputTypeName.empty()) {
@@ -38,7 +38,7 @@ std::unique_ptr<BoundPattern> Binder::bindPattern(
             found->second.name.rfind("Nullable__", 0) == 0 &&
             found->second.fields.size() >= 2) {
             inputIsNullableStruct = true;
-            nullableDesc = found->second;
+            nullableDesc = shareType(found->second);
             nullableHasVal = found->second.fields[0];
             nullableVal = found->second.fields[1];
         }
@@ -717,20 +717,22 @@ std::unique_ptr<BoundPattern> Binder::bindPattern(
                         }
                         checkObsoleteReference(
                             field->id, "field", field->name, subSyn.memberToken.span);
-                        recordSymbolReference(
-                            occurrences_,
-                            currentSourceName_,
-                            field->id,
-                            SymbolKind::Field,
-                            field->name,
-                            subSyn.memberToken.span);
+                        if (collectOccurrences_) {
+                            recordSymbolReference(
+                                occurrences_,
+                                currentSourceName_,
+                                field->id,
+                                SymbolKind::Field,
+                                field->name,
+                                subSyn.memberToken.span);
+                        }
                         if (ownerDesc.kind == TypeKind::Struct) {
                             auto sfa = std::make_unique<BoundStructFieldAccessExpression>();
                             sfa->span = subSyn.memberToken.span;
                             sfa->type = field->type;
                             sfa->typeName = field->typeName;
                             sfa->receiver = makeRecvExpr();
-                            sfa->ownerType = ownerDesc;
+                            sfa->ownerType = shareType(ownerDesc);
                             sfa->field = *field;
                             accessExpr = std::move(sfa);
                         } else {
@@ -739,7 +741,7 @@ std::unique_ptr<BoundPattern> Binder::bindPattern(
                             mfa->type = field->type;
                             mfa->typeName = field->typeName;
                             mfa->receiver = makeRecvExpr();
-                            mfa->ownerType = ownerDesc;
+                            mfa->ownerType = shareType(ownerDesc);
                             mfa->field = *field;
                             accessExpr = std::move(mfa);
                         }
@@ -764,13 +766,15 @@ std::unique_ptr<BoundPattern> Binder::bindPattern(
                         } else {
                             checkObsoleteReference(
                                 prop->id, "property", prop->name, subSyn.memberToken.span);
-                            recordSymbolReference(
-                                occurrences_,
-                                currentSourceName_,
-                                prop->id,
-                                SymbolKind::Property,
-                                prop->name,
-                                subSyn.memberToken.span);
+                            if (collectOccurrences_) {
+                                recordSymbolReference(
+                                    occurrences_,
+                                    currentSourceName_,
+                                    prop->id,
+                                    SymbolKind::Property,
+                                    prop->name,
+                                    subSyn.memberToken.span);
+                            }
                             std::vector<const syntax::ExpressionSyntax*> emptySyntaxArgs;
                             std::vector<std::optional<syntax::SyntaxToken>> emptyMods;
                             accessExpr = bindSelectedCall(

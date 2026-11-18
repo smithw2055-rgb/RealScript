@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <type_traits>
 #include <unordered_map>
 
 namespace realscript::bytecode {
@@ -109,83 +110,140 @@ private:
 
 class Reader {
 public:
-    Reader(const std::vector<std::uint8_t>& data, std::size_t begin, std::size_t size)
-        : data_(data), position_(begin), end_(begin) {
+    Reader(const std::vector<std::uint8_t>& data, std::size_t begin, std::size_t size) noexcept {
         if (begin > data.size() || size > data.size() - begin) {
             valid_ = false;
-            position_ = data.size();
-            end_ = data.size();
+            ptr_ = nullptr;
+            end_ = nullptr;
         } else {
-            end_ = begin + size;
+            const std::uint8_t* base = data.data();
+            ptr_ = base ? (base + begin) : nullptr;
+            end_ = base ? (base + begin + size) : nullptr;
         }
     }
     [[nodiscard]] bool valid() const noexcept { return valid_; }
-    [[nodiscard]] bool empty() const noexcept { return position_ == end_; }
+    [[nodiscard]] bool empty() const noexcept { return ptr_ == end_; }
     [[nodiscard]] std::size_t remaining() const noexcept {
-        return valid_ && position_ <= end_ ? end_ - position_ : 0;
+        return valid_ && ptr_ <= end_ ? static_cast<std::size_t>(end_ - ptr_) : 0u;
     }
     [[nodiscard]] std::uint32_t peekU32() const noexcept {
-        if (!valid_ || position_ + 4 > end_) {
-            return 0;
+        if (!valid_ || static_cast<std::size_t>(end_ - ptr_) < 4u) {
+            return 0u;
         }
-        std::uint32_t result = 0;
-        for (int shift = 0; shift < 32; shift += 8) {
-            result |= static_cast<std::uint32_t>(
-                          data_[position_ + static_cast<std::size_t>(shift / 8)]) <<
-                      shift;
-        }
+        return readLeU32(ptr_);
+    }
+    std::uint8_t u8() noexcept {
+        if (!require(1u)) return 0u;
+        return *ptr_++;
+    }
+    std::uint16_t u16() noexcept {
+        if (!require(2u)) return 0u;
+        const std::uint16_t result = readLeU16(ptr_);
+        ptr_ += 2u;
         return result;
     }
-    std::uint8_t u8() {
-        if (!require(1)) return 0;
-        return data_[position_++];
-    }
-    std::uint16_t u16() {
-        std::uint16_t result = 0;
-        for (int shift = 0; shift < 16; shift += 8) {
-            result |= static_cast<std::uint16_t>(u8()) << shift;
-        }
+    std::uint32_t u32() noexcept {
+        if (!require(4u)) return 0u;
+        const std::uint32_t result = readLeU32(ptr_);
+        ptr_ += 4u;
         return result;
     }
-    std::uint32_t u32() {
-        std::uint32_t result = 0;
-        for (int shift = 0; shift < 32; shift += 8) {
-            result |= static_cast<std::uint32_t>(u8()) << shift;
-        }
+    std::uint64_t u64() noexcept {
+        if (!require(8u)) return 0u;
+        const std::uint64_t result = readLeU64(ptr_);
+        ptr_ += 8u;
         return result;
     }
-    std::uint64_t u64() {
-        std::uint64_t result = 0;
-        for (int shift = 0; shift < 64; shift += 8) {
-            result |= static_cast<std::uint64_t>(u8()) << shift;
-        }
-        return result;
-    }
-    std::int64_t i64() { return static_cast<std::int64_t>(u64()); }
-    double f64() {
+    std::int64_t i64() noexcept { return static_cast<std::int64_t>(u64()); }
+    double f64() noexcept {
         const auto bits = u64();
         double value = 0.0;
         static_assert(sizeof(bits) == sizeof(value), "unexpected double size");
         std::memcpy(&value, &bits, sizeof(value));
         return value;
     }
+    bool readBulkU32(std::uint32_t* dst, std::size_t count) noexcept {
+        if (count == 0u) return valid_;
+        if (!valid_ || count > remaining() / 4u) {
+            valid_ = false;
+            return false;
+        }
+#if defined(_WIN32) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+        std::memcpy(dst, ptr_, count * sizeof(std::uint32_t));
+        ptr_ += count * sizeof(std::uint32_t);
+#else
+        for (std::size_t i = 0; i < count; ++i) {
+            dst[i] = readLeU32(ptr_);
+            ptr_ += 4u;
+        }
+#endif
+        return true;
+    }
+    bool readBulkU64(std::uint64_t* dst, std::size_t count) noexcept {
+        if (count == 0u) return valid_;
+        if (!valid_ || count > remaining() / 8u) {
+            valid_ = false;
+            return false;
+        }
+#if defined(_WIN32) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+        std::memcpy(dst, ptr_, count * sizeof(std::uint64_t));
+        ptr_ += count * sizeof(std::uint64_t);
+#else
+        for (std::size_t i = 0; i < count; ++i) {
+            dst[i] = readLeU64(ptr_);
+            ptr_ += 8u;
+        }
+#endif
+        return true;
+    }
     std::string string(std::size_t count) {
         if (!require(count)) return {};
-        const auto* begin = reinterpret_cast<const char*>(data_.data() + position_);
-        position_ += count;
+        if (count == 0u) return {};
+        const auto* begin = reinterpret_cast<const char*>(ptr_);
+        ptr_ += count;
         return std::string(begin, count);
     }
 private:
-    bool require(std::size_t count) {
-        if (!valid_ || count > end_ - position_) {
+    static std::uint16_t readLeU16(const std::uint8_t* p) noexcept {
+#if defined(_WIN32) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+        std::uint16_t v = 0;
+        std::memcpy(&v, p, sizeof(v));
+        return v;
+#else
+        return static_cast<std::uint16_t>(p[0]) | (static_cast<std::uint16_t>(p[1]) << 8);
+#endif
+    }
+    static std::uint32_t readLeU32(const std::uint8_t* p) noexcept {
+#if defined(_WIN32) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+        std::uint32_t v = 0;
+        std::memcpy(&v, p, sizeof(v));
+        return v;
+#else
+        return static_cast<std::uint32_t>(p[0]) |
+               (static_cast<std::uint32_t>(p[1]) << 8) |
+               (static_cast<std::uint32_t>(p[2]) << 16) |
+               (static_cast<std::uint32_t>(p[3]) << 24);
+#endif
+    }
+    static std::uint64_t readLeU64(const std::uint8_t* p) noexcept {
+#if defined(_WIN32) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+        std::uint64_t v = 0;
+        std::memcpy(&v, p, sizeof(v));
+        return v;
+#else
+        return static_cast<std::uint64_t>(readLeU32(p)) |
+               (static_cast<std::uint64_t>(readLeU32(p + 4)) << 32);
+#endif
+    }
+    bool require(std::size_t count) noexcept {
+        if (!valid_ || count > static_cast<std::size_t>(end_ - ptr_)) {
             valid_ = false;
             return false;
         }
         return true;
     }
-    const std::vector<std::uint8_t>& data_;
-    std::size_t position_ = 0;
-    std::size_t end_ = 0;
+    const std::uint8_t* ptr_ = nullptr;
+    const std::uint8_t* end_ = nullptr;
     bool valid_ = true;
 };
 
@@ -324,16 +382,21 @@ bool readTypeIds(
     Reader& reader,
     std::vector<semantic::SymbolId>& typeIds,
     diagnostics::DiagnosticBag& diagnostics) {
+    static_assert(
+        sizeof(semantic::SymbolId) == sizeof(std::uint64_t) &&
+        std::is_trivially_copyable_v<semantic::SymbolId>,
+        "SymbolId must be 64-bit trivially copyable");
     const auto count = reader.u32();
     if (!reader.valid() || count > reader.remaining() / 8) {
         diagnostics.report("RS5003", "truncated bytecode type ID list", {});
         return false;
     }
-    typeIds.reserve(count);
-    for (std::uint32_t index = 0; index < count; ++index) {
-        typeIds.push_back(reader.u64());
-    }
-    return reader.valid();
+    if (count == 0u) return reader.valid();
+    const std::size_t oldSize = typeIds.size();
+    typeIds.resize(oldSize + count);
+    return reader.readBulkU64(
+        reinterpret_cast<std::uint64_t*>(typeIds.data() + oldSize),
+        count);
 }
 
 template <typename RegContainer>
@@ -344,36 +407,43 @@ void writeRegisters(Writer& writer, const RegContainer& values) {
 
 template <typename RegContainer>
 bool readRegisters(Reader& reader, RegContainer& values) {
+    static_assert(
+        sizeof(Register) == sizeof(std::uint32_t) &&
+        std::is_trivially_copyable_v<Register>,
+        "Register must be 32-bit trivially copyable");
     const auto count = reader.u32();
     if (!reader.valid() || count > reader.remaining() / 4) return false;
-    values.reserve(count);
-    for (std::uint32_t index = 0; index < count; ++index) {
-        values.push_back(reader.u32());
-    }
-    return reader.valid();
+    if (count == 0u) return reader.valid();
+    const std::size_t oldSize = values.size();
+    values.resize(oldSize + count);
+    return reader.readBulkU32(
+        reinterpret_cast<std::uint32_t*>(values.data() + oldSize),
+        count);
 }
 
 bool readRegisters(Reader& reader, SmallRegisterVector& values) {
+    static_assert(
+        sizeof(Register) == sizeof(std::uint32_t) &&
+        std::is_trivially_copyable_v<Register>,
+        "Register must be 32-bit trivially copyable");
     const auto count = reader.u32();
     if (!reader.valid() || count > reader.remaining() / 4 || count > 0xFFFu) return false;
     if (count == 0u) {
         values.clear();
         return reader.valid();
     }
-    if (count <= 16u) {
-        Register stackRegs[16];
-        for (std::uint32_t index = 0; index < count; ++index) {
-            stackRegs[index] = reader.u32();
+    if (count <= 64u) {
+        Register stackRegs[64];
+        if (!reader.readBulkU32(reinterpret_cast<std::uint32_t*>(stackRegs), count)) {
+            return false;
         }
-        if (!reader.valid()) return false;
         values.assign(stackRegs, count);
         return true;
     }
     std::vector<Register> heapRegs(count);
-    for (std::uint32_t index = 0; index < count; ++index) {
-        heapRegs[index] = reader.u32();
+    if (!reader.readBulkU32(reinterpret_cast<std::uint32_t*>(heapRegs.data()), count)) {
+        return false;
     }
-    if (!reader.valid()) return false;
     values.assign(heapRegs.data(), heapRegs.size());
     return true;
 }
@@ -2119,6 +2189,7 @@ bool decodeModule(
         }
     }
 
+    module.functions.reserve(records.size());
     for (auto& record : records) {
         Reader reader(bytes, codeSection.offset + record.codeOffset, record.codeSize);
         const auto blockCount = reader.u32();
@@ -2126,6 +2197,7 @@ bool decodeModule(
             diagnostics.report("RS5003", "invalid bytecode block count", {});
             return false;
         }
+        record.function.blocks.reserve(blockCount);
         for (std::uint32_t blockIndex = 0; blockIndex < blockCount; ++blockIndex) {
             BasicBlock block;
             block.id = reader.u32();
@@ -2134,6 +2206,7 @@ bool decodeModule(
                 diagnostics.report("RS5003", "invalid block parameter count", {});
                 return false;
             }
+            block.parameters.reserve(parameterCount);
             for (std::uint32_t parameter = 0; parameter < parameterCount; ++parameter) {
                 BlockParameter value;
                 value.target = reader.u32();
@@ -2150,6 +2223,7 @@ bool decodeModule(
                 diagnostics.report("RS5003", "invalid bytecode instruction count", {});
                 return false;
             }
+            block.instructions.reserve(instructionCount);
             for (std::uint32_t instructionIndex = 0;
                  instructionIndex < instructionCount;
                  ++instructionIndex) {
@@ -2238,6 +2312,7 @@ bool decodeModule(
                 diagnostics.report("RS5003", "invalid exception handler count", {});
                 return false;
             }
+            record.function.exceptionHandlers.reserve(handlerCount);
             for (std::uint32_t index = 0; index < handlerCount; ++index) {
                 ExceptionHandler handler;
                 const auto protectedCount = reader.u32();
@@ -2245,8 +2320,10 @@ bool decodeModule(
                     diagnostics.report("RS5003", "invalid protected block count", {});
                     return false;
                 }
-                for (std::uint32_t block = 0; block < protectedCount; ++block) {
-                    handler.protectedBlocks.push_back(reader.u32());
+                handler.protectedBlocks.resize(protectedCount);
+                if (!reader.readBulkU32(handler.protectedBlocks.data(), protectedCount)) {
+                    diagnostics.report("RS5003", "truncated protected block list", {});
+                    return false;
                 }
                 handler.handlerBlock = reader.u32();
                 handler.catchTypeId = reader.u64();
@@ -2297,15 +2374,24 @@ bool decodeModule(
                 diagnostics.report("RS5003", "invalid debug line-start count", {});
                 return false;
             }
-            source.lineStarts.reserve(lineCount);
-            for (std::uint32_t line = 0; line < lineCount; ++line) {
-                source.lineStarts.push_back(reader.u32());
+            source.lineStarts.resize(lineCount);
+            if (!reader.readBulkU32(source.lineStarts.data(), lineCount)) {
+                diagnostics.report("RS5003", "truncated debug line-start table", {});
+                return false;
             }
             module.sourceFiles.push_back(std::move(source));
         }
         std::unordered_map<semantic::SymbolId, Function*> functionsById;
+        functionsById.reserve(module.functions.size());
         for (auto& function : module.functions) {
             functionsById.emplace(function.symbolId, &function);
+        }
+        std::unordered_map<std::uint32_t, std::size_t> sourceIdxById;
+        if (module.sourceFiles.size() > 4u) {
+            sourceIdxById.reserve(module.sourceFiles.size());
+            for (std::size_t sIdx = 0; sIdx < module.sourceFiles.size(); ++sIdx) {
+                sourceIdxById.emplace(module.sourceFiles[sIdx].id, sIdx);
+            }
         }
         const auto functionCount = reader.u32();
         if (!reader.valid() || functionCount != module.functions.size()) {
@@ -2371,10 +2457,17 @@ bool decodeModule(
                 }
                 info.locals.push_back(std::move(local));
             }
-            for (const auto& source : module.sourceFiles) {
-                if (source.id == info.sourceFileId) {
-                    info.sourceName = source.path;
-                    break;
+            if (module.sourceFiles.size() > 4u) {
+                const auto srcIt = sourceIdxById.find(info.sourceFileId);
+                if (srcIt != sourceIdxById.end()) {
+                    info.sourceName = module.sourceFiles[srcIt->second].path;
+                }
+            } else {
+                for (const auto& source : module.sourceFiles) {
+                    if (source.id == info.sourceFileId) {
+                        info.sourceName = source.path;
+                        break;
+                    }
                 }
             }
         }

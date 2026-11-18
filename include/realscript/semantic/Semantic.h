@@ -323,6 +323,31 @@ struct TypeSymbol {
     std::unordered_set<std::string> hygienicAccessibleModules;
 };
 
+struct SharedTypeRef {
+    std::shared_ptr<const TypeSymbol> ptr;
+
+    SharedTypeRef() = default;
+    explicit SharedTypeRef(std::shared_ptr<const TypeSymbol> p) noexcept
+        : ptr(std::move(p)) {}
+
+    [[nodiscard]] static SharedTypeRef makeCopy(const TypeSymbol& type) {
+        return SharedTypeRef(std::make_shared<TypeSymbol>(type));
+    }
+
+    [[nodiscard]] bool hasValue() const noexcept { return ptr != nullptr; }
+    [[nodiscard]] bool has_value() const noexcept { return ptr != nullptr; }
+    explicit operator bool() const noexcept { return ptr != nullptr; }
+    void reset() noexcept { ptr.reset(); }
+
+    [[nodiscard]] const TypeSymbol& get() const noexcept {
+        static const TypeSymbol kEmpty{};
+        return ptr ? *ptr : kEmpty;
+    }
+    [[nodiscard]] const TypeSymbol* operator->() const noexcept { return &get(); }
+    [[nodiscard]] const TypeSymbol& operator*() const noexcept { return get(); }
+    operator const TypeSymbol&() const noexcept { return get(); }
+};
+
 enum class SymbolKind {
     Module,
     Type,
@@ -534,6 +559,7 @@ struct ModuleBindingInput {
     TypeSymbolMap visibleTypes;
     std::unordered_set<std::string> hygienicAccessibleModules;
     std::unordered_map<SymbolId, ObsoleteInfo> obsoleteSymbols;
+    bool collectOccurrences = true;
 };
 
 enum class BoundNodeKind {
@@ -698,7 +724,7 @@ struct BoundPattern {
     std::string inputTypeName;
 
     bool unwrapsNullableStruct = false;
-    TypeSymbol nullableStructType;
+    SharedTypeRef nullableStructType;
     FieldSymbol nullableHasValueField;
     FieldSymbol nullableValueField;
     std::optional<VariableSymbol> unwrappedTempVariable;
@@ -776,7 +802,7 @@ struct BoundNullCoalescingExpression final : BoundExpression {
     std::unique_ptr<BoundExpression> left;
     std::unique_ptr<BoundExpression> right;
     bool nullableValue = false;
-    TypeSymbol nullableType;
+    SharedTypeRef nullableType;
     FieldSymbol hasValueField;
     FieldSymbol valueField;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
@@ -811,10 +837,10 @@ struct BoundConversionExpression final : BoundExpression {
 };
 
 struct BoundDelegateCreationExpression final : BoundExpression {
-    TypeSymbol delegateType;
+    SharedTypeRef delegateType;
     FunctionSymbol function;
     std::unique_ptr<BoundExpression> receiver;
-    std::optional<TypeSymbol> closureType;
+    SharedTypeRef closureType;
     std::vector<FieldSymbol> captureFields;
     std::vector<std::unique_ptr<BoundExpression>> captures;
     bool virtualDispatch = false;
@@ -832,12 +858,12 @@ struct BoundDelegateInvocationExpression final : BoundExpression {
         ParameterModifier modifier = ParameterModifier::None;
         std::unique_ptr<BoundExpression> value;
         VariableSymbol variable;
-        TypeSymbol wrapperType;
+        SharedTypeRef wrapperType;
         FieldSymbol valueField;
         bool forwarded = false;
         std::optional<FunctionSymbol> writebackAssignHandle;
     };
-    TypeSymbol delegateType;
+    SharedTypeRef delegateType;
     std::unique_ptr<BoundExpression> delegate;
     std::vector<Argument> arguments;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
@@ -846,7 +872,7 @@ struct BoundDelegateInvocationExpression final : BoundExpression {
 };
 
 struct BoundDelegateCombinationExpression final : BoundExpression {
-    TypeSymbol delegateType;
+    SharedTypeRef delegateType;
     bool remove = false;
     std::unique_ptr<BoundExpression> left;
     std::unique_ptr<BoundExpression> right;
@@ -868,7 +894,7 @@ struct BoundCallExpression final : BoundExpression {
     bool nullConditional = false;
     PrimitiveType nullConditionalValueType = PrimitiveType::Error;
     std::string nullConditionalValueTypeName;
-    TypeSymbol nullConditionalNullableType;
+    SharedTypeRef nullConditionalNullableType;
     FieldSymbol nullConditionalHasValueField;
     FieldSymbol nullConditionalValueField;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
@@ -900,7 +926,7 @@ enum class StructAssignmentRootKind {
 };
 
 struct StructAssignmentHop {
-    TypeSymbol ownerType;
+    SharedTypeRef ownerType;
     FieldSymbol field;
 };
 
@@ -908,7 +934,7 @@ struct BoundReferenceCallArgument {
     ParameterModifier modifier = ParameterModifier::None;
     std::unique_ptr<BoundExpression> value;
     VariableSymbol variable;
-    TypeSymbol wrapperType;
+    SharedTypeRef wrapperType;
     FieldSymbol valueField;
     bool forwarded = false;
     bool defensiveCopy = false;
@@ -916,15 +942,15 @@ struct BoundReferenceCallArgument {
     ReferenceTargetKind targetKind = ReferenceTargetKind::None;
     std::unique_ptr<BoundExpression> targetReceiver;
     std::unique_ptr<BoundExpression> targetIndex;
-    TypeSymbol targetOwnerType;
+    SharedTypeRef targetOwnerType;
     FieldSymbol targetField;
     PrimitiveType targetElementType = PrimitiveType::Error;
     std::string targetElementTypeName;
     StructAssignmentRootKind structRootKind = StructAssignmentRootKind::Variable;
     bool wrappedStructRootVariable = false;
-    TypeSymbol structRootWrapperType;
+    SharedTypeRef structRootWrapperType;
     FieldSymbol structRootWrapperValueField;
-    TypeSymbol structRootOwnerType;
+    SharedTypeRef structRootOwnerType;
     FieldSymbol structRootField;
     std::unique_ptr<BoundExpression> structRootStaticInitializer;
     std::vector<StructAssignmentHop> intermediateHops;
@@ -945,9 +971,9 @@ struct BoundReferenceCallExpression final : BoundExpression {
 };
 
 struct BoundEventInvocationExpression final : BoundExpression {
-    TypeSymbol ownerType;
+    SharedTypeRef ownerType;
     EventSymbol event;
-    TypeSymbol delegateType;
+    SharedTypeRef delegateType;
     std::unique_ptr<BoundExpression> receiver;
     std::vector<std::unique_ptr<BoundExpression>> arguments;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
@@ -962,7 +988,7 @@ struct BoundNewObjectExpression final : BoundExpression {
         FunctionSymbol function;
         std::vector<std::unique_ptr<BoundExpression>> arguments;
     };
-    TypeSymbol objectType;
+    SharedTypeRef objectType;
     std::optional<FunctionSymbol> constructor;
     std::vector<std::unique_ptr<BoundExpression>> arguments;
     std::vector<std::size_t> argumentEvaluationOrder;
@@ -975,7 +1001,7 @@ struct BoundNewObjectExpression final : BoundExpression {
 
 struct BoundNewStructExpression final : BoundExpression {
     using Initializer = BoundNewObjectExpression::Initializer;
-    TypeSymbol structType;
+    SharedTypeRef structType;
     std::optional<FunctionSymbol> constructor;
     std::vector<std::unique_ptr<BoundExpression>> arguments;
     std::vector<std::size_t> argumentEvaluationOrder;
@@ -988,7 +1014,7 @@ struct BoundNewStructExpression final : BoundExpression {
 
 struct BoundStructFieldAccessExpression final : BoundExpression {
     std::unique_ptr<BoundExpression> receiver;
-    TypeSymbol ownerType;
+    SharedTypeRef ownerType;
     FieldSymbol field;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
         return BoundNodeKind::StructFieldAccessExpression;
@@ -998,18 +1024,18 @@ struct BoundStructFieldAccessExpression final : BoundExpression {
 struct BoundStructFieldAssignmentExpression final : BoundExpression {
     StructAssignmentRootKind rootKind = StructAssignmentRootKind::Variable;
     VariableSymbol variable;
-    TypeSymbol ownerType;
+    SharedTypeRef ownerType;
     FieldSymbol field;
     std::unique_ptr<BoundExpression> expression;
     bool wrappedVariable = false;
-    TypeSymbol wrapperType;
+    SharedTypeRef wrapperType;
     FieldSymbol wrapperValueField;
     bool staticFieldReceiver = false;
-    TypeSymbol staticReceiverOwnerType;
+    SharedTypeRef staticReceiverOwnerType;
     FieldSymbol staticReceiverField;
     std::unique_ptr<BoundExpression> staticReceiverInitializer;
     std::unique_ptr<BoundExpression> objectReceiver;
-    TypeSymbol objectOwnerType;
+    SharedTypeRef objectOwnerType;
     FieldSymbol objectField;
     std::unique_ptr<BoundExpression> elementReceiver;
     std::unique_ptr<BoundExpression> elementIndex;
@@ -1052,12 +1078,12 @@ struct BoundElementAccessExpression final : BoundExpression {
 struct BoundMemberAccessExpression final : BoundExpression {
     std::unique_ptr<BoundExpression> receiver;
     std::unique_ptr<BoundExpression> staticInitializer;
-    TypeSymbol ownerType;
+    SharedTypeRef ownerType;
     FieldSymbol field;
     bool nullConditional = false;
     PrimitiveType nullConditionalValueType = PrimitiveType::Error;
     std::string nullConditionalValueTypeName;
-    TypeSymbol nullConditionalNullableType;
+    SharedTypeRef nullConditionalNullableType;
     FieldSymbol nullConditionalHasValueField;
     FieldSymbol nullConditionalValueField;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
@@ -1067,7 +1093,7 @@ struct BoundMemberAccessExpression final : BoundExpression {
 
 struct BoundMemberAssignmentExpression final : BoundExpression {
     std::unique_ptr<BoundExpression> receiver;
-    TypeSymbol ownerType;
+    SharedTypeRef ownerType;
     FieldSymbol field;
     std::unique_ptr<BoundExpression> expression;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
@@ -1237,10 +1263,10 @@ struct BoundTryStatement final : BoundStatement {
 };
 
 struct BoundEventSubscriptionStatement final : BoundStatement {
-    TypeSymbol ownerType;
+    SharedTypeRef ownerType;
     std::unique_ptr<BoundExpression> receiver;
     EventSymbol event;
-    TypeSymbol delegateType;
+    SharedTypeRef delegateType;
     std::unique_ptr<BoundExpression> handler;
     bool adding = true;
     [[nodiscard]] BoundNodeKind kind() const noexcept override {
@@ -1283,8 +1309,10 @@ public:
 
     [[nodiscard]] SemanticModel bind(const syntax::CompilationUnitSyntax& syntax);
     [[nodiscard]] SemanticModel bindModule(const ModuleBindingInput& input);
+    [[nodiscard]] SemanticModel bindModule(ModuleBindingInput&& input);
 
 private:
+    [[nodiscard]] SharedTypeRef shareType(const TypeSymbol& type);
     [[nodiscard]] BoundFunction bindFunction(
         const FunctionBindingInput& input);
     [[nodiscard]] std::unique_ptr<BoundBlockStatement> bindSequenceSegment(
@@ -1577,7 +1605,9 @@ private:
     std::size_t finallyLoopDepth_ = 0;
     FunctionOverloadMap visibleFunctions_;
     TypeSymbolMap visibleTypes_;
-    std::optional<TypeSymbol> currentOwnerType_;
+    std::unordered_map<SymbolId, std::shared_ptr<const TypeSymbol>> sharedTypesById_;
+    SharedTypeRef currentOwnerType_;
+    bool collectOccurrences_ = true;
     bool currentStaticMethod_ = false;
     bool currentConstructor_ = false;
     std::string currentModuleName_;
