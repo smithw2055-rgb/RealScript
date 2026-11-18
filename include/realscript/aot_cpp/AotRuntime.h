@@ -893,7 +893,10 @@ public:
         runtime::DeterminismOperationId operationId,
         std::string_view operation);
     [[nodiscard]] bool fastAccountingEnabled() const noexcept {
-        return fastAccounting_;
+        if (!fastAccounting_) return false;
+        if (options_.trustedRelease || options_.limits.gcWorkBudget == 0) return true;
+        return !heap_ ||
+            (heap_->phase() == runtime::GcPhase::Idle && !heap_->collectionRequested());
     }
     [[nodiscard]] bool trustedReleaseEnabled() const noexcept {
         return options_.trustedRelease && fastAccounting_;
@@ -1095,6 +1098,10 @@ public:
         std::size_t depth = 0) const;
 
     [[nodiscard]] bool constantString(
+        std::string_view value,
+        runtime::Value& result);
+    [[nodiscard]] bool constantStringIndexed(
+        std::uint32_t literalSlot,
         std::string_view value,
         runtime::Value& result);
     [[nodiscard]] bool newObject(
@@ -2313,6 +2320,7 @@ private:
         runtime::TraceEventKind kind,
         runtime::DeterminismOperationId operationId = 0,
         std::string_view operation = {});
+    void maybeStepGcBeforeAllocation();
     void ensureResumeEnv();
     [[nodiscard]] bool prepareCoroutineFrame(
         semantic::SymbolId functionSymbolId,
@@ -2450,6 +2458,9 @@ private:
     runtime::FrameTelemetryCollector* telemetry_ = nullptr;
     std::uint64_t telemetryChildExecuted_ = 0;
     std::vector<TelemetryCallFrame> telemetryFrames_;
+    std::vector<runtime::ObjectRef> stringLiteralCache_;
+    std::uint64_t stringLiteralCacheEpoch_ = 0;
+    std::uint64_t stringLiteralCacheHeapId_ = 0;
 };
 
 class Program {

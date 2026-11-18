@@ -1896,7 +1896,113 @@ bool devirtualizeCalls(
                 it->second->sealedType;
         };
 
-        // Pass 1: seed SSA values from NewObject & sealed class types in entry & all blocks
+        const auto propagateInstructionExact = [&](const mir::Instruction& inst,
+                                                 mir::BlockId blkId,
+                                                 bool inEntry) {
+            if (inst.result < 0) return;
+            const auto stIt = staticTypes.find(inst.result);
+            const auto stTid = stIt != staticTypes.end() ? stIt->second.typeId : 0;
+            if (inst.opcode == mir::Opcode::NewObject && stTid != 0) {
+                const auto tIt = allTypes.find(stTid);
+                if (tIt != allTypes.end() &&
+                    tIt->second->kind == semantic::TypeKind::Class &&
+                    !tIt->second->abstractType &&
+                    !tIt->second->interfaceType) {
+                    exactMap[inst.result] = {stTid, inst.result, blkId, inEntry, true};
+                }
+            } else if (inst.opcode == mir::Opcode::AsType && !inst.operands.empty()) {
+                const auto opIt = exactMap.find(inst.operands[0]);
+                if (opIt != exactMap.end() &&
+                    opIt->second.exactTypeId != 0 &&
+                    (stTid == 0 || devirtualizeTypeAssignable(opIt->second.exactTypeId, stTid, allTypes))) {
+                    exactMap[inst.result] = opIt->second;
+                } else if (inst.resultType == semantic::PrimitiveType::Object &&
+                           isSealedConcreteClass(stTid)) {
+                    exactMap[inst.result] = {stTid, inst.result, blkId, inEntry, false};
+                }
+            } else if (inst.opcode == mir::Opcode::CheckNotNull && !inst.operands.empty()) {
+                const auto opIt = exactMap.find(inst.operands[0]);
+                if (opIt != exactMap.end() && opIt->second.exactTypeId != 0) {
+                    ExactInfo info = opIt->second;
+                    info.knownNonNull = true;
+                    exactMap[inst.result] = info;
+                } else if (isSealedConcreteClass(stTid)) {
+                    exactMap[inst.result] = {stTid, inst.result, blkId, inEntry, true};
+                } else {
+                    exactMap[inst.result] = {0, -1, blkId, inEntry, true};
+                }
+            } else if (inst.resultType == semantic::PrimitiveType::Object &&
+                       isSealedConcreteClass(stTid)) {
+                exactMap[inst.result] = {stTid, inst.result, blkId, inEntry, false};
+            }
+        };
+
+        std::unordered_map<mir::BlockId, std::vector<const std::vector<mir::ValueId>*>> blockIncomingArgs;
+        for (const auto& blk : caller.blocks) {
+            if (blk.terminator.kind == mir::TerminatorKind::Jump) {
+                blockIncomingArgs[blk.terminator.target].push_back(&blk.terminator.arguments);
+            } else if (blk.terminator.kind == mir::TerminatorKind::Branch) {
+                blockIncomingArgs[blk.terminator.target].push_back(&blk.terminator.arguments);
+                blockIncomingArgs[blk.terminator.falseTarget].push_back(&blk.terminator.falseArguments);
+            }
+        }
+
+        const auto propagateUniformBlockParams = [&]() {
+            for (std::size_t bIdx = 0; bIdx < caller.blocks.size(); ++bIdx) {
+                const auto& blk = caller.blocks[bIdx];
+                const bool inEntry = (bIdx == 0 && entryCanDominateAllBlocks);
+                const auto incIt = blockIncomingArgs.find(blk.id);
+                if (incIt == blockIncomingArgs.end() || incIt->second.empty()) continue;
+                for (std::size_t pIdx = 0; pIdx < blk.parameters.size(); ++pIdx) {
+                    const auto& p = blk.parameters[pIdx];
+                    if (p.value < 0 || p.type != semantic::PrimitiveType::Object) continue;
+                    const auto curExIt = exactMap.find(p.value);
+                    if (curExIt != exactMap.end() && curExIt->second.exactTypeId != 0) continue;
+                    semantic::SymbolId commonTid = 0;
+                    mir::ValueId commonDom = -1;
+                    bool domValid = true;
+                    bool allNonNull = true;
+                    bool anyIncoming = false;
+                    bool conflict = false;
+                    for (const auto* argsPtr : incIt->second) {
+                        if (!argsPtr || pIdx >= argsPtr->size()) {
+                            conflict = true;
+                            break;
+                        }
+                        const mir::ValueId argVal = (*argsPtr)[pIdx];
+                        if (argVal == p.value) continue;
+                        anyIncoming = true;
+                        const auto aIt = exactMap.find(argVal);
+                        if (aIt == exactMap.end() || aIt->second.exactTypeId == 0) {
+                            conflict = true;
+                            break;
+                        }
+                        if (commonTid == 0) {
+                            commonTid = aIt->second.exactTypeId;
+                            commonDom = aIt->second.definedInEntry ? aIt->second.domExactValue : -1;
+                            if (commonDom < 0) domValid = false;
+                        } else if (commonTid != aIt->second.exactTypeId) {
+                            conflict = true;
+                            break;
+                        } else if (domValid && (!aIt->second.definedInEntry || aIt->second.domExactValue != commonDom)) {
+                            domValid = false;
+                            commonDom = -1;
+                        }
+                        allNonNull = allNonNull && aIt->second.knownNonNull;
+                    }
+                    if (!conflict && anyIncoming && commonTid != 0) {
+                        exactMap[p.value] = {
+                            commonTid,
+                            domValid ? commonDom : -1,
+                            blk.id,
+                            inEntry,
+                            allNonNull};
+                    }
+                }
+            }
+        };
+
+        // Pass 1: seed SSA values from NewObject, Copy/AsType, CheckNotNull & sealed class types
         for (std::size_t bIdx = 0; bIdx < caller.blocks.size(); ++bIdx) {
             const auto& blk = caller.blocks[bIdx];
             const bool inEntry = (bIdx == 0 && entryCanDominateAllBlocks);
@@ -1907,34 +2013,10 @@ bool devirtualizeCalls(
                 }
             }
             for (const auto& inst : blk.instructions) {
-                if (inst.result < 0) continue;
-                const auto stIt = staticTypes.find(inst.result);
-                const auto stTid = stIt != staticTypes.end() ? stIt->second.typeId : 0;
-                if (inst.opcode == mir::Opcode::NewObject && stTid != 0) {
-                    const auto tIt = allTypes.find(stTid);
-                    if (tIt != allTypes.end() &&
-                        tIt->second->kind == semantic::TypeKind::Class &&
-                        !tIt->second->abstractType &&
-                        !tIt->second->interfaceType) {
-                        exactMap[inst.result] = {stTid, inst.result, blk.id, inEntry, true};
-                    }
-                } else if (inst.opcode == mir::Opcode::CheckNotNull && !inst.operands.empty()) {
-                    const auto opIt = exactMap.find(inst.operands[0]);
-                    if (opIt != exactMap.end()) {
-                        ExactInfo info = opIt->second;
-                        info.knownNonNull = true;
-                        exactMap[inst.result] = info;
-                    } else if (isSealedConcreteClass(stTid)) {
-                        exactMap[inst.result] = {stTid, inst.result, blk.id, inEntry, true};
-                    } else {
-                        exactMap[inst.result] = {0, -1, blk.id, inEntry, true};
-                    }
-                } else if (inst.resultType == semantic::PrimitiveType::Object &&
-                           isSealedConcreteClass(stTid)) {
-                    exactMap[inst.result] = {stTid, inst.result, blk.id, inEntry, false};
-                }
+                propagateInstructionExact(inst, blk.id, inEntry);
             }
         }
+        propagateUniformBlockParams();
 
         // Analyze StoreLocal across function for single-assignment entry locals & uniform exact-type locals
         const std::size_t localCount = caller.localTypes.size();
@@ -2035,18 +2117,13 @@ bool devirtualizeCalls(
                             exactMap[inst.result] = {
                                 localUniformExact[slot], -1, blk.id, inEntry, false};
                         }
-                    } else if (inst.opcode == mir::Opcode::CheckNotNull &&
-                               inst.result >= 0 &&
-                               !inst.operands.empty()) {
-                        const auto opIt = exactMap.find(inst.operands[0]);
-                        if (opIt != exactMap.end()) {
-                            ExactInfo info = opIt->second;
-                            info.knownNonNull = true;
-                            exactMap[inst.result] = info;
-                        }
+                    } else if (inst.opcode == mir::Opcode::AsType ||
+                               inst.opcode == mir::Opcode::CheckNotNull) {
+                        propagateInstructionExact(inst, blk.id, inEntry);
                     }
                 }
             }
+            propagateUniformBlockParams();
         }
 
         bool callerChanged = false;

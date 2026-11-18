@@ -312,6 +312,7 @@ void emitTypedPrimitiveFunction(
     const std::map<semantic::SymbolId, TypeView>& allTypes,
     const std::unordered_map<const mir::Instruction*, std::size_t>& callIds,
     const std::unordered_map<semantic::SymbolId, std::size_t>& hotPatchSlots,
-    std::vector<OptimizationRemark>* remarks = nullptr);
+    std::vector<OptimizationRemark>* remarks = nullptr,
+    std::unordered_map<std::string, std::uint32_t>* stringLiteralIndices = nullptr);
 
 } // namespace realscript::aot::detail

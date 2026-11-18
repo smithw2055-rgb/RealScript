@@ -2681,17 +2681,21 @@ bool executeFunction(
                             : function.symbolId,
                         runtime::packAllocationSiteOffset(allocCold.blockIndex, allocCold.instructionIndexInBlock));
                     bool slotsMoved = false;
+                    bool ranGc = false;
                     RuntimeError allocErr;
-                    const auto ref = state.heap->allocateTypedArray(
-                        arrayTid,
-                        elemType,
-                        elemTid,
-                        static_cast<std::size_t>(lenVal),
-                        std::move(initVal),
-                        &allocErr,
-                        &slotsMoved);
+                    const auto ref = allocateWithOomGcRetry(
+                        state, allocErr, ranGc, [&]() {
+                            return state.heap->allocateTypedArray(
+                                arrayTid,
+                                elemType,
+                                elemTid,
+                                static_cast<std::size_t>(lenVal),
+                                initVal,
+                                &allocErr,
+                                &slotsMoved);
+                        });
                     if (RS_FLAT_LIKELY(ref.has_value())) {
-                        if (RS_FLAT_UNLIKELY(slotsMoved)) {
+                        if (RS_FLAT_UNLIKELY(slotsMoved || ranGc)) {
                             invalidateAllFlatCaches();
                         }
                         if (gcBudgetEnabled) {
@@ -5359,16 +5363,20 @@ bool executeFunction(
                         : function.symbolId,
                     runtime::packAllocationSiteOffset(allocCold.blockIndex, allocCold.instructionIndexInBlock));
                 bool slotsMoved = false;
+                bool ranGc = false;
                 RuntimeError allocErr;
-                const auto ref = state.heap->allocateObjectFromTemplate(
-                    tmpl.typeId,
-                    tmpl.defaultFields.data(),
-                    tmpl.defaultFields.size(),
-                    tmpl.referenceFields,
-                    &allocErr,
-                    &slotsMoved);
+                const auto ref = allocateWithOomGcRetry(
+                    state, allocErr, ranGc, [&]() {
+                        return state.heap->allocateObjectFromTemplate(
+                            tmpl.typeId,
+                            tmpl.defaultFields.data(),
+                            tmpl.defaultFields.size(),
+                            tmpl.referenceFields,
+                            &allocErr,
+                            &slotsMoved);
+                    });
                 if (RS_FLAT_LIKELY(ref.has_value())) {
-                    if (RS_FLAT_UNLIKELY(slotsMoved)) {
+                    if (RS_FLAT_UNLIKELY(slotsMoved || ranGc)) {
                         invalidateAllFlatCaches();
                     }
                     if (gcBudgetEnabled) {
@@ -5609,16 +5617,20 @@ bool executeFunction(
                         : function.symbolId,
                     runtime::packAllocationSiteOffset(allocCold.blockIndex, allocCold.instructionIndexInBlock));
                 bool slotsMoved = false;
+                bool ranGc = false;
                 RuntimeError allocErr;
-                const auto ref = state.heap->allocateObjectFromTemplate(
-                    site.delegateTypeId,
-                    fields.data(),
-                    fields.size(),
-                    delegateReferenceFields(),
-                    &allocErr,
-                    &slotsMoved);
+                const auto ref = allocateWithOomGcRetry(
+                    state, allocErr, ranGc, [&]() {
+                        return state.heap->allocateObjectFromTemplate(
+                            site.delegateTypeId,
+                            fields.data(),
+                            fields.size(),
+                            delegateReferenceFields(),
+                            &allocErr,
+                            &slotsMoved);
+                    });
                 if (RS_FLAT_LIKELY(ref.has_value())) {
-                    if (RS_FLAT_UNLIKELY(slotsMoved)) {
+                    if (RS_FLAT_UNLIKELY(slotsMoved || ranGc)) {
                         invalidateAllFlatCaches();
                     }
                     if (gcBudgetEnabled) {

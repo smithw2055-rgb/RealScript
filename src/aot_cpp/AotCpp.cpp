@@ -1366,6 +1366,12 @@ GeneratedProgram CppGenerator::generate(
     source.line();
 
     std::vector<SourceMapRecord> sourceMap;
+    std::unordered_map<std::string, std::uint32_t> stringLiteralIndices;
+    const auto internLiteralIndex = [&](const std::string& literal) -> std::uint32_t {
+        const auto [it, inserted] = stringLiteralIndices.emplace(
+            literal, static_cast<std::uint32_t>(stringLiteralIndices.size()));
+        return it->second;
+    };
 
     if (!sharedGenericGroups.empty()) {
         source.line("// Reference-Type Shared Generic Implementation Table & Bodies");
@@ -1620,7 +1626,9 @@ GeneratedProgram CppGenerator::generate(
                             (instruction.boolImmediate ? "true" : "false") + ";");
                         break;
                     case mir::Opcode::ConstantString:
-                        source.line("            if (!context.constantString(\"" +
+                        source.line("            if (!context.constantStringIndexed(" +
+                            std::to_string(internLiteralIndex(instruction.stringImmediate)) +
+                            "u, \"" +
                             escapeCppString(instruction.stringImmediate) + "\", " +
                             resExpr + ")) return false;");
                         break;
@@ -2092,7 +2100,8 @@ GeneratedProgram CppGenerator::generate(
             emitTypedPrimitiveFunction(
                 source, view, options, sourceMap, typedFunctions, types, callIds,
                 hotPatchSlotsBySymbol,
-                options.collectOptimizationRemarks ? &generated.optimizationRemarks : nullptr);
+                options.collectOptimizationRemarks ? &generated.optimizationRemarks : nullptr,
+                &stringLiteralIndices);
             if (options.collectOptimizationRemarks) {
                 generated.optimizationRemarks.push_back(makeFunctionRemark(
                     OptimizationRemarkKind::Passed,
@@ -2320,7 +2329,9 @@ GeneratedProgram CppGenerator::generate(
                         (instruction.boolImmediate ? "true" : "false") + ";");
                     break;
                 case mir::Opcode::ConstantString:
-                    source.line("            if (!context.constantString(\"" +
+                    source.line("            if (!context.constantStringIndexed(" +
+                        std::to_string(internLiteralIndex(instruction.stringImmediate)) +
+                        "u, \"" +
                         escapeCppString(instruction.stringImmediate) + "\", " +
                         result + ")) return false;");
                     break;

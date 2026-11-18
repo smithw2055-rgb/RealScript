@@ -15,6 +15,10 @@ option(REALSCRIPT_ENABLE_TOOLING "Build L1 Formatter, Linter, Fuzzer & LSP appli
 option(REALSCRIPT_ENABLE_EXTENSIBILITY "Build L1 Reflection & Sandboxed ModHost application layer" ON)
 option(REALSCRIPT_ENABLE_BINDGEN "Build L1 C++ Host Binding Generator (BindGen & rsbind) application layer" ON)
 option(REALSCRIPT_SLIM_RUNTIME "Build only slim L0 runtime and AOT runtime targets (zero Compiler/L1)" OFF)
+option(
+    REALSCRIPT_STENCIL_CROSS_ARCH_SIM
+    "Enable cross-arch ARM64 StencilJit simulator on non-ARM64 hosts"
+    ${REALSCRIPT_BUILD_TESTS})
 
 if(REALSCRIPT_SLIM_RUNTIME)
     set(REALSCRIPT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -224,6 +228,9 @@ realscript_add_layer_library(realscript_layer_stencil_jit
     src/jit/StencilJitArm64.cpp
     src/jit/StencilJit.cpp
 )
+if(REALSCRIPT_STENCIL_CROSS_ARCH_SIM OR CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)")
+    target_compile_definitions(realscript_layer_stencil_jit PRIVATE REALSCRIPT_STENCIL_ENABLE_ARM64=1)
+endif()
 realscript_add_slice_library(realscript_slice_stencil_jit StencilJit
     $<TARGET_OBJECTS:realscript_layer_stencil_jit>
 )

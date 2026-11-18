@@ -824,6 +824,16 @@ void buildThreadedStream(CompiledFunctionRecord& rec) {
         case FO::LoadFieldFast:
         case FO::StoreFieldExactFast:
         case FO::StoreFieldFast:
+        case FO::ConstantNullTagFast:
+        case FO::ConstantEnumFast:
+        case FO::ConstantStringFast:
+        case FO::EqualValueFast:
+        case FO::CallIntrinsicFast:
+        case FO::CallDirect0:
+        case FO::CallDirect1:
+        case FO::CallDirect2:
+        case FO::CallDirectN:
+        case FO::CallPolledFast:
         case FO::GenericBytecode:
             op.handler = &th_FlatStructOrStackRef;
             break;
@@ -990,7 +1000,9 @@ void buildThreadedStream(CompiledFunctionRecord& rec) {
 
 [[nodiscard]] bool validateJitEntryArguments(
     const bytecode::Function& function,
+    const runtime::ProgramImage* program,
     runtime::ManagedHeap* heap,
+    runtime::IExecutionPolicy* executionPolicy,
     const std::vector<runtime::Value>& arguments,
     bool& outAllIntArgsFit32,
     runtime::ErrorCode& outCode,
@@ -1008,7 +1020,10 @@ void buildThreadedStream(CompiledFunctionRecord& rec) {
             ? function.parameterTypeIds[i]
             : semantic::SymbolId{0};
         if (const auto* ref = std::get_if<runtime::ObjectRef>(&arg)) {
-            if (!heap || !heap->isAlive(*ref)) {
+            runtime::ManagedHeap* targetHeap = executionPolicy
+                ? executionPolicy->resolveHeap(*ref, heap)
+                : heap;
+            if (!targetHeap || !targetHeap->isAlive(*ref)) {
                 outCode = runtime::ErrorCode::InvalidObjectReference;
                 outMsg = "argument contains an invalid managed object reference";
                 return false;
@@ -1026,8 +1041,11 @@ void buildThreadedStream(CompiledFunctionRecord& rec) {
         } else if (expectedType == semantic::PrimitiveType::Array) {
             if (!std::holds_alternative<runtime::NullArray>(arg) && expectedTid != 0) {
                 const auto* ref = std::get_if<runtime::ObjectRef>(&arg);
-                const auto actualTid = (ref && heap)
-                    ? heap->arrayTypeId(*ref)
+                runtime::ManagedHeap* targetHeap = (ref && executionPolicy)
+                    ? executionPolicy->resolveHeap(*ref, heap)
+                    : heap;
+                const auto actualTid = (ref && targetHeap)
+                    ? targetHeap->arrayTypeId(*ref)
                     : std::optional<semantic::SymbolId>{};
                 if (!actualTid || *actualTid != expectedTid) {
                     outCode = runtime::ErrorCode::TypeMismatch;
@@ -1041,12 +1059,64 @@ void buildThreadedStream(CompiledFunctionRecord& rec) {
                 outMsg = "argument has the wrong runtime struct type";
                 return false;
             }
-        } else if (expectedType == semantic::PrimitiveType::Object ||
-                   expectedType == semantic::PrimitiveType::Enum ||
-                   expectedType == semantic::PrimitiveType::Handle) {
-            // Let full signature checker in Interpreter handle complex exact object/handle hierarchy if non-null
+        } else if (expectedType == semantic::PrimitiveType::Object) {
+            if (!std::holds_alternative<runtime::NullObject>(arg) && expectedTid != 0) {
+                const auto* ref = std::get_if<runtime::ObjectRef>(&arg);
+                runtime::ManagedHeap* targetHeap = (ref && executionPolicy)
+                    ? executionPolicy->resolveHeap(*ref, heap)
+                    : heap;
+                const auto actualTid = (ref && targetHeap)
+                    ? targetHeap->objectTypeId(*ref)
+                    : std::optional<semantic::SymbolId>{};
+                if (!actualTid) {
+                    outCode = runtime::ErrorCode::InvalidObjectReference;
+                    outMsg = "argument contains an invalid managed object reference";
+                    return false;
+                }
+                if (*actualTid != expectedTid) {
+                    bool assignable = false;
+                    if (program != nullptr) {
+                        auto curTid = *actualTid;
+                        for (std::size_t depth = 0; curTid != 0 && depth < 256; ++depth) {
+                            const auto* t = program->resolveType(curTid);
+                            if (!t) break;
+                            for (const auto& iface : t->interfaceDispatchMaps) {
+                                if (iface.interfaceTypeId == expectedTid) {
+                                    assignable = true;
+                                    break;
+                                }
+                            }
+                            if (assignable || t->baseTypeId == expectedTid) {
+                                assignable = true;
+                                break;
+                            }
+                            curTid = t->baseTypeId;
+                        }
+                    }
+                    if (!assignable) {
+                        outCode = runtime::ErrorCode::TypeMismatch;
+                        outMsg = "argument has the wrong runtime object type";
+                        return false;
+                    }
+                }
+            }
+        } else if (expectedType == semantic::PrimitiveType::Enum) {
             if (expectedTid != 0) {
-                outAllIntArgsFit32 = false;
+                runtime::EnumValue ev{};
+                if (!arg.tryGetEnum(ev) || (ev.typeId != 0 && ev.typeId != expectedTid)) {
+                    outCode = runtime::ErrorCode::TypeMismatch;
+                    outMsg = "argument has the wrong runtime enum type";
+                    return false;
+                }
+            }
+        } else if (expectedType == semantic::PrimitiveType::Handle) {
+            if (expectedTid != 0) {
+                runtime::NativeHandle h{};
+                if (!arg.tryGetNativeHandle(h) || (h.typeId != 0 && h.typeId != expectedTid)) {
+                    outCode = runtime::ErrorCode::TypeMismatch;
+                    outMsg = "argument has the wrong runtime handle type";
+                    return false;
+                }
             }
         }
     }
@@ -1205,6 +1275,17 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
     };
 
     std::shared_ptr<LifecycleTarget> lifecycleTarget;
+    mutable std::unique_ptr<runtime::Interpreter> cachedFallbackInterp;
+    mutable std::atomic<bool> fallbackInterpInUse{false};
+    mutable std::atomic<bool> fallbackInterpDirty{false};
+
+    void resetFallbackInterpreter() const noexcept {
+        fallbackInterpDirty.store(true, std::memory_order_release);
+        if (!fallbackInterpInUse.load(std::memory_order_acquire)) {
+            cachedFallbackInterp.reset();
+            fallbackInterpDirty.store(false, std::memory_order_release);
+        }
+    }
 
     explicit Impl(
         std::shared_ptr<const runtime::ProgramImage> prog,
@@ -1477,11 +1558,291 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
         const std::vector<runtime::Value>& arguments,
         runtime::ExecutionOptions execOptions) const {
         interpreterFallbackInvocations.fetch_add(1, std::memory_order_relaxed);
+        auto* const policy = execOptions.executionPolicy;
+        bool expected = false;
+        if (fallbackInterpInUse.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+            struct FallbackCacheGuard {
+                const Impl* self = nullptr;
+                runtime::Interpreter* interp = nullptr;
+                ~FallbackCacheGuard() noexcept {
+                    if (interp != nullptr) {
+                        interp->setExecutionPolicy(nullptr);
+                    }
+                    if (self != nullptr) {
+                        self->fallbackInterpInUse.store(false, std::memory_order_release);
+                    }
+                }
+            };
+            if (fallbackInterpDirty.exchange(false, std::memory_order_acq_rel)) {
+                cachedFallbackInterp.reset();
+            }
+            if (!cachedFallbackInterp) {
+                cachedFallbackInterp = std::make_unique<runtime::Interpreter>(program, heap);
+                if (bindings) cachedFallbackInterp->setBindingRegistry(bindings);
+                if (externalResolver) cachedFallbackInterp->setExternalResolver(externalResolver);
+                if (asyncRuntime) cachedFallbackInterp->setAsyncRuntime(asyncRuntime);
+            }
+            cachedFallbackInterp->setExecutionPolicy(policy);
+            FallbackCacheGuard guard{this, cachedFallbackInterp.get()};
+            return cachedFallbackInterp->invoke(symbolId, arguments, std::move(execOptions));
+        }
         runtime::Interpreter interp(program, heap);
         if (bindings) interp.setBindingRegistry(bindings);
         if (externalResolver) interp.setExternalResolver(externalResolver);
         if (asyncRuntime) interp.setAsyncRuntime(asyncRuntime);
+        interp.setExecutionPolicy(policy);
         return interp.invoke(symbolId, arguments, std::move(execOptions));
+    }
+
+    static std::uint32_t jitDirectInvokeTarget(
+        const void* moduleImplPtr,
+        JitAbiContext* callerCtx,
+        semantic::SymbolId targetSymbolId,
+        const runtime::Value* args,
+        std::uint32_t argCount,
+        runtime::Value* outResult,
+        bool forceSimulateArm64) noexcept {
+        if (!moduleImplPtr || !callerCtx || !callerCtx->session) {
+            return static_cast<std::uint32_t>(runtime::ErrorCode::InvalidProgram);
+        }
+        const auto* impl = static_cast<const Impl*>(moduleImplPtr);
+        auto& session = *callerCtx->session;
+
+        if (session.executionPolicy != nullptr) {
+            bool intercepted = false;
+            runtime::Value interceptedResult{};
+            runtime::RuntimeError policyError{};
+            if (!session.executionPolicy->interceptCall(
+                    targetSymbolId,
+                    runtime::ValueSpan(args, argCount),
+                    intercepted,
+                    interceptedResult,
+                    policyError)) {
+                session.error = std::move(policyError);
+                if (session.error.code == runtime::ErrorCode::None) {
+                    session.error.code = runtime::ErrorCode::CapabilityDenied;
+                }
+                if (session.error.message.empty()) {
+                    session.error.message = "call intercepted and rejected by execution policy";
+                }
+                return static_cast<std::uint32_t>(session.error.code);
+            }
+            if (intercepted) {
+                ++session.stats.functionCalls;
+                if (session.callDepth + 1u > session.stats.maximumCallDepth) {
+                    session.stats.maximumCallDepth = session.callDepth + 1u;
+                }
+                if (outResult != nullptr) {
+                    *outResult = runtime::detachFrameSliceValue(interceptedResult);
+                }
+                return 0u;
+            }
+        }
+
+        if (session.callDepth >= session.limits.recursionLimit) {
+            session.error.code = runtime::ErrorCode::RecursionLimitExceeded;
+            session.error.message = "recursion limit exceeded";
+            return static_cast<std::uint32_t>(runtime::ErrorCode::RecursionLimitExceeded);
+        }
+
+        const auto recIt = impl->records.find(targetSymbolId);
+        if (recIt != impl->records.end() &&
+            recIt->second &&
+            recIt->second->location &&
+            recIt->second->location->function &&
+            recIt->second->execFunc &&
+            session.values != nullptr) {
+            CompiledFunctionRecord& rec = *recIt->second;
+            const auto& fnLoc = *rec.location;
+            const auto& bcFunc = *fnLoc.function;
+            const auto& execFunc = *rec.execFunc;
+            StencilTier currentTier = rec.tier.load(std::memory_order_acquire);
+            if (impl->options.hotnessThreshold > 0 &&
+                currentTier != StencilTier::NativeMachineCode &&
+                rec.eligibleForNative &&
+                impl->nativeBackendAvailable) {
+                const std::uint32_t calls = rec.callCount.fetch_add(1, std::memory_order_relaxed) + 1u;
+                if (calls >= impl->options.hotnessThreshold) {
+                    std::lock_guard<std::mutex> lock(impl->tierPromotionMutex);
+                    (void)impl->promoteFunctionToNativeLocked(rec, nullptr);
+                    currentTier = rec.tier.load(std::memory_order_acquire);
+                }
+            }
+
+            const bool canRunJit =
+                (currentTier == StencilTier::NativeMachineCode ||
+                 currentTier == StencilTier::ThreadedStencils ||
+                 (forceSimulateArm64 && rec.eligibleForThreaded));
+            if (canRunJit && argCount == bcFunc.parameterTypes.size()) {
+                bool allIntArgsFit32 = true;
+                for (std::uint32_t i = 0; i < argCount; ++i) {
+                    if (bcFunc.parameterTypes[i] == semantic::PrimitiveType::Int &&
+                        args[i].rawTag() == runtime::ValueTag::Int64 &&
+                        !fitsInt32(args[i].asInt64Unchecked())) {
+                        allIntArgsFit32 = false;
+                        break;
+                    }
+                }
+                if (allIntArgsFit32) {
+                    const std::size_t savedValueTop = session.valueTop;
+                    const std::size_t savedFrameOffset = session.frameOffset;
+                    const std::uint32_t savedFrameOffset32 = session.frameOffset32;
+                    const std::size_t savedCallDepth = session.callDepth;
+                    const std::size_t calleeFrameOff = savedValueTop;
+                    const std::size_t calleeSlots = execFunc.totalFrameSlots;
+                    if (calleeFrameOff > runtime::StructStorageHandle::FrameOffsetMask ||
+                        calleeSlots > runtime::StructStorageHandle::FrameOffsetMask - calleeFrameOff) {
+                        session.error.code = runtime::ErrorCode::InvalidProgram;
+                        session.error.message = "callee frameOffset exceeds 24-bit FlatStruct slice address space";
+                        return static_cast<std::uint32_t>(runtime::ErrorCode::InvalidProgram);
+                    }
+                    const std::size_t newValueTop = calleeFrameOff + calleeSlots;
+                    if (session.values->size() < newValueTop) {
+                        session.values->resize(newValueTop);
+                    }
+                    session.valuesBase = session.values->data();
+                    session.frameOffset = calleeFrameOff;
+                    session.frameOffset32 = static_cast<std::uint32_t>(calleeFrameOff);
+                    session.valueTop = newValueTop;
+                    session.callDepth = savedCallDepth + 1u;
+                    ++session.stats.functionCalls;
+                    if (session.callDepth > session.stats.maximumCallDepth) {
+                        session.stats.maximumCallDepth = session.callDepth;
+                    }
+
+                    runtime::Value* const calleeBase = session.values->data() + calleeFrameOff;
+                    for (std::uint32_t i = 0; i < argCount; ++i) {
+                        calleeBase[i] = args[i];
+                    }
+                    if (calleeSlots > argCount) {
+                        std::memset(
+                            static_cast<void*>(calleeBase + argCount),
+                            0,
+                            (calleeSlots - argCount) * sizeof(runtime::Value));
+                    }
+                    populateJitFrameStructPayloads(
+                        bcFunc,
+                        execFunc,
+                        calleeBase,
+                        session.flatBankId,
+                        calleeFrameOff,
+                        argCount);
+
+                    runtime::Value subRet{};
+                    JitAbiContext subAbi{};
+                    subAbi.frameBase = calleeBase;
+                    subAbi.remainingBudget = callerCtx->remainingBudget;
+                    subAbi.branchesTaken = callerCtx->branchesTaken;
+                    subAbi.returnSlot = &subRet;
+                    subAbi.errorFlatIndex = 0;
+                    subAbi.errorCodeRaw = 0;
+                    subAbi.session = &session;
+                    subAbi.compiledFn = &rec;
+                    invalidateJitArrayCaches(subAbi);
+                    stepJitGcSafepoint(&subAbi);
+
+                    std::uint32_t subStatus = 0u;
+                    std::string simDiag;
+                    if (forceSimulateArm64) {
+#if !defined(__EMSCRIPTEN__) && UINTPTR_MAX == 0xffffffffffffffffULL
+                        const auto arm64Code = compileFunctionA64(rec);
+                        if (arm64Code.empty()) {
+                            simDiag = "compileFunctionA64 returned empty machine code";
+                            subStatus = static_cast<std::uint32_t>(runtime::ErrorCode::InvalidProgram);
+                        } else {
+                            subStatus = executeSimulatedArm64Code(arm64Code, &subAbi, simDiag);
+                        }
+#else
+                        simDiag = "ARM64 StencilJit requires 64-bit host pointers";
+                        subStatus = static_cast<std::uint32_t>(runtime::ErrorCode::InvalidProgram);
+#endif
+                    } else if (currentTier == StencilTier::NativeMachineCode) {
+                        const NativeJitEntryFn fn = rec.nativeEntry.load(std::memory_order_acquire);
+                        subStatus = fn(&subAbi);
+                    } else {
+                        const ThreadedStencilOp* pc = rec.threadedStream.data() + execFunc.entryStreamOffset;
+                        StencilStepStatus st = StencilStepStatus::Continue;
+                        while ((st = pc->handler(&subAbi, pc)) == StencilStepStatus::Continue) {}
+                        subStatus = (st == StencilStepStatus::ReturnOk) ? 0u : subAbi.errorCodeRaw;
+                    }
+
+                    callerCtx->remainingBudget = subAbi.remainingBudget;
+                    callerCtx->branchesTaken = subAbi.branchesTaken;
+                    subRet = runtime::detachFrameSliceValue(subRet);
+                    if (newValueTop > savedValueTop) {
+                        std::memset(
+                            static_cast<void*>(session.values->data() + savedValueTop),
+                            0,
+                            (newValueTop - savedValueTop) * sizeof(runtime::Value));
+                    }
+                    session.valueTop = savedValueTop;
+                    session.frameOffset = savedFrameOffset;
+                    session.frameOffset32 = savedFrameOffset32;
+                    session.callDepth = savedCallDepth;
+                    session.valuesBase = session.values->data();
+                    callerCtx->frameBase = session.valuesBase + savedFrameOffset;
+
+                    if (subStatus != 0u) {
+                        if (session.error.code == runtime::ErrorCode::None) {
+                            populateJitStatusError(
+                                session,
+                                fnLoc,
+                                execFunc,
+                                subStatus,
+                                subAbi.errorFlatIndex,
+                                simDiag);
+                        }
+                        return subStatus;
+                    }
+                    if (outResult != nullptr) {
+                        *outResult = std::move(subRet);
+                    }
+                    return 0u;
+                }
+            }
+        }
+
+        std::vector<runtime::Value> argVec;
+        if (args != nullptr && argCount > 0u) {
+            argVec.assign(args, args + argCount);
+        }
+        runtime::ExecutionOptions subOpts{};
+        subOpts.limits = session.limits;
+        subOpts.limits.instructionBudget = callerCtx->remainingBudget;
+        subOpts.limits.recursionLimit = session.limits.recursionLimit > session.callDepth
+            ? (session.limits.recursionLimit - session.callDepth)
+            : 0u;
+        subOpts.executionPolicy = session.executionPolicy;
+
+        const auto res = impl->invokeFallbackInterpreter(targetSymbolId, argVec, std::move(subOpts));
+        if (res.statistics.instructionsExecuted >= callerCtx->remainingBudget) {
+            callerCtx->remainingBudget = 0;
+        } else {
+            callerCtx->remainingBudget -= res.statistics.instructionsExecuted;
+        }
+        callerCtx->branchesTaken += res.statistics.branchesTaken;
+        session.stats.functionCalls += res.statistics.functionCalls;
+        session.stats.gcWorkPerformed += res.statistics.gcWorkPerformed;
+        const std::size_t totalDepth = session.callDepth + res.statistics.maximumCallDepth;
+        if (totalDepth > session.stats.maximumCallDepth) {
+            session.stats.maximumCallDepth = totalDepth;
+        }
+        if (session.values != nullptr) {
+            session.valuesBase = session.values->data();
+            callerCtx->frameBase = session.valuesBase + session.frameOffset;
+        }
+        if (!res.succeeded) {
+            session.error = res.error;
+            if (session.error.code == runtime::ErrorCode::None) {
+                session.error.code = runtime::ErrorCode::InvalidProgram;
+            }
+            return static_cast<std::uint32_t>(session.error.code);
+        }
+        if (outResult != nullptr) {
+            *outResult = runtime::detachFrameSliceValue(res.value);
+        }
+        return 0u;
     }
 
     runtime::ExecutionResult invokeBySymbol(
@@ -1544,7 +1905,15 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
         bool allIntArgsFit32 = true;
         runtime::ErrorCode argErrCode = runtime::ErrorCode::None;
         std::string argErrMsg;
-        if (!validateJitEntryArguments(bcFunc, heap.get(), arguments, allIntArgsFit32, argErrCode, argErrMsg)) {
+        if (!validateJitEntryArguments(
+                bcFunc,
+                program.get(),
+                heap.get(),
+                execOptions.executionPolicy,
+                arguments,
+                allIntArgsFit32,
+                argErrCode,
+                argErrMsg)) {
             runtime::ExecutionResult argFail;
             argFail.error.code = argErrCode;
             argFail.error.message = std::move(argErrMsg);
@@ -1610,9 +1979,14 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
                 (frameSlots - argCount) * sizeof(runtime::Value));
         }
 
+        std::vector<runtime::ObjectRef> localStringCache;
+        std::uint64_t localStrEpoch = 0;
+        std::uint64_t localStrHeapId = 0;
+
         JitRuntimeSession session{};
         session.program = program.get();
         session.heap = heap.get();
+        session.executionPolicy = execOptions.executionPolicy;
         session.limits = execOptions.limits;
         session.stats.functionCalls = 1;
         session.stats.maximumCallDepth = 1;
@@ -1623,6 +1997,18 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
         session.valuesBase = arenaPtr->data();
         session.frameOffset32 = static_cast<std::uint32_t>(baseFrameOffset);
         session.flatBankId = runtime::detail::acquireFlatStackBank(arenaPtr);
+        session.moduleImpl = this;
+        session.directInvokeFn = &Impl::jitDirectInvokeTarget;
+        session.forceSimulateArm64 = forceSimulateArm64;
+        if (usingTls) {
+            session.stringLiteralCache = &g_stencilTlsScratch.stringLiterals;
+            session.stringLiteralCacheEpoch = &g_stencilTlsScratch.strCacheEpoch;
+            session.stringLiteralCacheHeapId = &g_stencilTlsScratch.strCacheHeapId;
+        } else {
+            session.stringLiteralCache = &localStringCache;
+            session.stringLiteralCacheEpoch = &localStrEpoch;
+            session.stringLiteralCacheHeapId = &localStrHeapId;
+        }
         struct JitFlatBankGuard {
             std::uint8_t& bankId;
             ~JitFlatBankGuard() noexcept {
@@ -1641,6 +2027,11 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
             baseFrameOffset,
             argCount);
         session.shadowStack.pushFrame(nullptr, nullptr, arenaPtr, &session.valueTop);
+        struct ShadowFrameGuard {
+            runtime::ShadowStack& stack;
+            ~ShadowFrameGuard() noexcept { stack.popFrame(); }
+        } shadowGuard{session.shadowStack};
+        runtime::ManagedHeap::ActiveShadowStackScope activeHeapRoots(heap.get(), &session.shadowStack);
 
         runtime::Value retValue{};
         JitAbiContext abi{};
@@ -1685,7 +2076,6 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
         }
 
         retValue = runtime::detachFrameSliceValue(retValue);
-        session.shadowStack.popFrame();
 
         const std::uint64_t executed =
             execOptions.limits.instructionBudget >= abi.remainingBudget
@@ -2033,9 +2423,16 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
                 arenaPtr->resize(std::max<std::size_t>(frameSlots, 256));
             }
 
+            std::vector<runtime::ObjectRef> localStringCache;
+            std::uint64_t localStrEpoch = 0;
+            std::uint64_t localStrHeapId = 0;
+
             JitRuntimeSession session{};
             session.program = self->program.get();
             session.heap = activeHeap;
+            session.executionPolicy = batchCfg
+                ? batchCfg->executionOptions.executionPolicy
+                : nullptr;
             session.limits = batchLimits;
             session.values = arenaPtr;
             session.frameOffset = 0;
@@ -2045,6 +2442,18 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
             session.frameOffset32 = 0;
             session.telemetry = nullptr;
             session.flatBankId = runtime::detail::acquireFlatStackBank(arenaPtr);
+            session.moduleImpl = self.get();
+            session.directInvokeFn = &Impl::jitDirectInvokeTarget;
+            session.forceSimulateArm64 = false;
+            if (usingTls) {
+                session.stringLiteralCache = &g_stencilTlsScratch.stringLiterals;
+                session.stringLiteralCacheEpoch = &g_stencilTlsScratch.strCacheEpoch;
+                session.stringLiteralCacheHeapId = &g_stencilTlsScratch.strCacheHeapId;
+            } else {
+                session.stringLiteralCache = &localStringCache;
+                session.stringLiteralCacheEpoch = &localStrEpoch;
+                session.stringLiteralCacheHeapId = &localStrHeapId;
+            }
             struct JitFlatBankGuard {
                 std::uint8_t& bankId;
                 ~JitFlatBankGuard() noexcept {
@@ -2060,6 +2469,7 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
                 runtime::ShadowStack& stack;
                 ~ShadowFrameGuard() noexcept { stack.popFrame(); }
             } shadowGuard{session.shadowStack};
+            runtime::ManagedHeap::ActiveShadowStackScope activeHeapRoots(activeHeap, &session.shadowStack);
 
             const NativeJitEntryFn nativeFn = (runTier == StencilTier::NativeMachineCode)
                 ? recPtr->nativeEntry.load(std::memory_order_acquire)
@@ -2199,7 +2609,10 @@ std::shared_ptr<const runtime::ProgramImage> StencilModule::programSnapshot() co
 }
 
 void StencilModule::setBindings(std::shared_ptr<const runtime::BindingRegistry> bindings) {
-    if (impl_) impl_->bindings = std::move(bindings);
+    if (impl_) {
+        impl_->bindings = std::move(bindings);
+        impl_->resetFallbackInterpreter();
+    }
 }
 
 void StencilModule::setBindingRegistry(std::shared_ptr<const runtime::BindingRegistry> bindings) {
@@ -2207,7 +2620,10 @@ void StencilModule::setBindingRegistry(std::shared_ptr<const runtime::BindingReg
 }
 
 void StencilModule::setExternalResolver(runtime::ExternalFunction resolver) {
-    if (impl_) impl_->externalResolver = std::move(resolver);
+    if (impl_) {
+        impl_->externalResolver = std::move(resolver);
+        impl_->resetFallbackInterpreter();
+    }
 }
 
 void StencilModule::setHeap(std::shared_ptr<runtime::ManagedHeap> heap) {
@@ -2219,6 +2635,7 @@ void StencilModule::setHeap(std::shared_ptr<runtime::ManagedHeap> heap) {
     if (impl_->asyncRuntime) {
         impl_->asyncRuntime->setHeap(impl_->heap.get());
     }
+    impl_->resetFallbackInterpreter();
     impl_->registerValueLifecycleHooks();
 }
 
@@ -2234,6 +2651,7 @@ void StencilModule::setAsyncRuntime(std::shared_ptr<runtime::AsyncRuntimeContext
     if (impl_->heap && impl_->asyncRuntime->awaitables().heap() == nullptr) {
         impl_->asyncRuntime->setHeap(impl_->heap.get());
     }
+    impl_->resetFallbackInterpreter();
 }
 
 std::shared_ptr<runtime::AsyncRuntimeContext> StencilModule::asyncRuntime() const noexcept {
@@ -2587,12 +3005,7 @@ StencilCompileResult StencilJit::compile(
     if (!eagerNativeQueue.empty()) {
         for (auto* rec : eagerNativeQueue) {
             if (!impl->promoteFunctionToNativeLocked(*rec, &impl->primaryArena)) {
-                if (options.enableThreadedFallback) {
-                    buildThreadedStream(*rec);
-                    rec->tier.store(StencilTier::ThreadedStencils, std::memory_order_relaxed);
-                } else {
-                    rec->tier.store(StencilTier::InterpreterFallback, std::memory_order_relaxed);
-                }
+                rec->tier.store(StencilTier::InterpreterFallback, std::memory_order_relaxed);
             }
         }
         if (impl->primaryArena.allocatedBytes() > 0 && !impl->primaryArena.seal()) {

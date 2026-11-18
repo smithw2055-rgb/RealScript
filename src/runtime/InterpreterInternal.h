@@ -786,6 +786,32 @@ inline void stepGcIfNeeded(State& state, std::uint64_t steps = 1) {
     }
 }
 
+template <typename AllocFn>
+inline auto allocateWithOomGcRetry(
+    State& state,
+    RuntimeError& allocationError,
+    bool& outRanGc,
+    AllocFn&& allocFn) -> decltype(allocFn()) {
+    outRanGc = false;
+    auto ref = allocFn();
+    if (!ref && state.heap != nullptr &&
+        (allocationError.code == ErrorCode::None ||
+         allocationError.code == ErrorCode::OutOfMemory)) {
+        outRanGc = true;
+        (void)state.heap->collectYoung(state.shadowStack);
+        allocationError = {};
+        ref = allocFn();
+        if (!ref &&
+            (allocationError.code == ErrorCode::None ||
+             allocationError.code == ErrorCode::OutOfMemory)) {
+            state.heap->collectFull(state.shadowStack);
+            allocationError = {};
+            ref = allocFn();
+        }
+    }
+    return ref;
+}
+
 bool consume(
     State& state,
     DeterminismOperationId operationId,

@@ -255,8 +255,7 @@ ExecutionContext::ExecutionContext(
         options_.profile == nullptr && !diagnosticEventsEnabled_;
     fastAccounting_ = !determinismEventsEnabled_ &&
         options_.profile == nullptr && telemetry_ == nullptr &&
-        !diagnosticEventsEnabled_ &&
-        (options_.limits.gcWorkBudget == 0 || options_.trustedRelease);
+        !diagnosticEventsEnabled_;
     if (prebuiltTypes) {
         typesPtr_ = prebuiltTypes;
     } else {
@@ -1671,13 +1670,38 @@ bool ExecutionContext::newDelegate(
         word(signature.interfaceTypeId, true),
         runtime::NullObject{},
     }};
+    maybeStepGcBeforeAllocation();
     runtime::RuntimeError allocationError;
-    const auto reference = heap_->allocateObjectFromTemplate(
+    auto reference = heap_->allocateObjectFromTemplate(
         delegateTypeId,
         fields.data(),
         fields.size(),
         aotDelegateReferenceFields(),
         &allocationError);
+    if (RS_AOT_UNLIKELY(!reference.has_value()) &&
+        (allocationError.code == runtime::ErrorCode::None ||
+         allocationError.code == runtime::ErrorCode::OutOfMemory)) {
+        (void)heap_->collectYoung(shadowStack_);
+        allocationError = {};
+        reference = heap_->allocateObjectFromTemplate(
+            delegateTypeId,
+            fields.data(),
+            fields.size(),
+            aotDelegateReferenceFields(),
+            &allocationError);
+        if (!reference.has_value() &&
+            (allocationError.code == runtime::ErrorCode::None ||
+             allocationError.code == runtime::ErrorCode::OutOfMemory)) {
+            heap_->collectFull(shadowStack_);
+            allocationError = {};
+            reference = heap_->allocateObjectFromTemplate(
+                delegateTypeId,
+                fields.data(),
+                fields.size(),
+                aotDelegateReferenceFields(),
+                &allocationError);
+        }
+    }
     if (RS_AOT_UNLIKELY(!reference.has_value())) {
         return fail(
             allocationError.code == runtime::ErrorCode::None
@@ -2635,11 +2659,57 @@ bool ExecutionContext::invokeDelegate(
         result);
 }
 
+void ExecutionContext::maybeStepGcBeforeAllocation() {
+    if (!heap_ || options_.limits.gcWorkBudget == 0 || options_.trustedRelease) {
+        return;
+    }
+    if (heap_->phase() == runtime::GcPhase::Idle && !heap_->collectionRequested()) {
+        return;
+    }
+    const auto gcSliceStart = telemetry_
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+    const auto work = heap_->step(shadowStack_, options_.limits.gcWorkBudget);
+    statistics_.gcWorkPerformed += work;
+    if (work != 0 && traceEventsEnabled_) {
+        if (diagnosticEventsEnabled_) {
+            const auto workText = std::to_string(work);
+            emitTrace(runtime::TraceEventKind::GcStep, work, workText);
+        } else {
+            emitTrace(runtime::TraceEventKind::GcStep, work);
+        }
+    }
+    if (telemetry_ != nullptr) {
+        const auto elapsedNs = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - gcSliceStart).count());
+        telemetry_->recordGcSliceNanoseconds(elapsedNs);
+    }
+}
+
 bool ExecutionContext::constantString(
     std::string_view value,
     runtime::Value& result) {
+    if (RS_AOT_UNLIKELY(!heap_)) {
+        return fail(runtime::ErrorCode::InvalidProgram, "managed string allocation has no heap");
+    }
+    maybeStepGcBeforeAllocation();
     runtime::RuntimeError allocationError;
-    const auto reference = heap_->internString(value, &allocationError);
+    auto reference = heap_->internString(value, &allocationError);
+    if (RS_AOT_UNLIKELY(!reference) &&
+        (allocationError.code == runtime::ErrorCode::None ||
+         allocationError.code == runtime::ErrorCode::OutOfMemory)) {
+        (void)heap_->collectYoung(shadowStack_);
+        allocationError = {};
+        reference = heap_->internString(value, &allocationError);
+        if (!reference &&
+            (allocationError.code == runtime::ErrorCode::None ||
+             allocationError.code == runtime::ErrorCode::OutOfMemory)) {
+            heap_->collectFull(shadowStack_);
+            allocationError = {};
+            reference = heap_->internString(value, &allocationError);
+        }
+    }
     if (!reference) {
         return fail(
             allocationError.code == runtime::ErrorCode::None
@@ -2650,6 +2720,45 @@ bool ExecutionContext::constantString(
                 : allocationError.message);
     }
     result = *reference;
+    return true;
+}
+
+bool ExecutionContext::constantStringIndexed(
+    std::uint32_t literalSlot,
+    std::string_view value,
+    runtime::Value& result) {
+    if (RS_AOT_LIKELY(heap_ != nullptr)) {
+        const std::uint64_t heapId = static_cast<std::uint64_t>(heap_->heapId());
+        const std::uint64_t epoch = heap_->stringInternEpoch();
+        if (RS_AOT_UNLIKELY(heapId != stringLiteralCacheHeapId_ ||
+                            epoch != stringLiteralCacheEpoch_)) {
+            stringLiteralCache_.clear();
+            stringLiteralCacheHeapId_ = heapId;
+            stringLiteralCacheEpoch_ = epoch;
+        }
+        if (RS_AOT_LIKELY(heap_->phase() == runtime::GcPhase::Idle &&
+                          literalSlot < stringLiteralCache_.size() &&
+                          stringLiteralCache_[literalSlot].valid())) {
+            result = stringLiteralCache_[literalSlot];
+            return true;
+        }
+    }
+    if (!constantString(value, result)) {
+        return false;
+    }
+    if (heap_ != nullptr && result.rawTag() == runtime::ValueTag::ObjectRef) {
+        const std::uint64_t heapId = static_cast<std::uint64_t>(heap_->heapId());
+        const std::uint64_t epoch = heap_->stringInternEpoch();
+        if (heapId != stringLiteralCacheHeapId_ || epoch != stringLiteralCacheEpoch_) {
+            stringLiteralCache_.clear();
+            stringLiteralCacheHeapId_ = heapId;
+            stringLiteralCacheEpoch_ = epoch;
+        }
+        if (literalSlot >= stringLiteralCache_.size()) {
+            stringLiteralCache_.resize(static_cast<std::size_t>(literalSlot) + 1u);
+        }
+        stringLiteralCache_[literalSlot] = result.u_.objectRef;
+    }
     return true;
 }
 
@@ -2725,24 +2834,55 @@ bool ExecutionContext::newObject(
             runtime::ErrorCode::InvalidProgram,
             "AOT object allocation references an invalid class descriptor");
     }
+    const auto buildObjectFields = [&](std::vector<runtime::Value>& outFields,
+                                       std::vector<std::size_t>& outRefs) {
+        outFields.clear();
+        outRefs.clear();
+        outFields.reserve(type->fieldCount);
+        for (std::uint32_t index = 0; index < type->fieldCount; ++index) {
+            const auto& field = type->fields[index];
+            outFields.push_back(defaultValue(field.type, field.typeId));
+            if (semantic::isReferenceType(field.type) ||
+                (field.type == semantic::PrimitiveType::Struct &&
+                 !runtime::makeDefaultInlineStructValue(field.typeId).has_value())) {
+                outRefs.push_back(index);
+            }
+        }
+    };
+    maybeStepGcBeforeAllocation();
     std::vector<runtime::Value> fields;
     std::vector<std::size_t> references;
-    fields.reserve(type->fieldCount);
-    for (std::uint32_t index = 0; index < type->fieldCount; ++index) {
-        const auto& field = type->fields[index];
-        fields.push_back(defaultValue(field.type, field.typeId));
-        if (semantic::isReferenceType(field.type) ||
-            (field.type == semantic::PrimitiveType::Struct &&
-             !runtime::makeDefaultInlineStructValue(field.typeId).has_value())) {
-            references.push_back(index);
-        }
-    }
+    buildObjectFields(fields, references);
     runtime::RuntimeError allocationError;
-    const auto reference = heap_->allocateObject(
+    auto reference = heap_->allocateObject(
         typeId,
         std::move(fields),
         std::move(references),
         &allocationError);
+    if (RS_AOT_UNLIKELY(!reference) &&
+        (allocationError.code == runtime::ErrorCode::None ||
+         allocationError.code == runtime::ErrorCode::OutOfMemory)) {
+        (void)heap_->collectYoung(shadowStack_);
+        buildObjectFields(fields, references);
+        allocationError = {};
+        reference = heap_->allocateObject(
+            typeId,
+            std::move(fields),
+            std::move(references),
+            &allocationError);
+        if (!reference &&
+            (allocationError.code == runtime::ErrorCode::None ||
+             allocationError.code == runtime::ErrorCode::OutOfMemory)) {
+            heap_->collectFull(shadowStack_);
+            buildObjectFields(fields, references);
+            allocationError = {};
+            reference = heap_->allocateObject(
+                typeId,
+                std::move(fields),
+                std::move(references),
+                &allocationError);
+        }
+    }
     if (!reference) {
         return fail(
             allocationError.code == runtime::ErrorCode::None
@@ -2819,14 +2959,41 @@ bool ExecutionContext::newArray(
           runtime::findFlatStructSchemaByTypeId(elementTypeId) != nullptr))
         ? runtime::Value{}
         : defaultValue(elementType, elementTypeId);
+    maybeStepGcBeforeAllocation();
     runtime::RuntimeError allocationError;
-    const auto reference = heap_->allocateTypedArray(
+    auto reference = heap_->allocateTypedArray(
         arrayTypeId,
         elementType,
         elementTypeId,
         static_cast<std::size_t>(size),
         initElemVal,
         &allocationError);
+    if (RS_AOT_UNLIKELY(!reference) &&
+        (allocationError.code == runtime::ErrorCode::None ||
+         allocationError.code == runtime::ErrorCode::OutOfMemory)) {
+        (void)heap_->collectYoung(shadowStack_);
+        allocationError = {};
+        reference = heap_->allocateTypedArray(
+            arrayTypeId,
+            elementType,
+            elementTypeId,
+            static_cast<std::size_t>(size),
+            initElemVal,
+            &allocationError);
+        if (!reference &&
+            (allocationError.code == runtime::ErrorCode::None ||
+             allocationError.code == runtime::ErrorCode::OutOfMemory)) {
+            heap_->collectFull(shadowStack_);
+            allocationError = {};
+            reference = heap_->allocateTypedArray(
+                arrayTypeId,
+                elementType,
+                elementTypeId,
+                static_cast<std::size_t>(size),
+                initElemVal,
+                &allocationError);
+        }
+    }
     if (!reference) {
         return fail(
             allocationError.code == runtime::ErrorCode::None

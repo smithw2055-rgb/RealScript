@@ -3,7 +3,8 @@
 #include <iomanip>
 #include <sstream>
 
-#if !defined(__EMSCRIPTEN__) && UINTPTR_MAX == 0xffffffffffffffffULL
+#if !defined(__EMSCRIPTEN__) && UINTPTR_MAX == 0xffffffffffffffffULL && \
+    (defined(REALSCRIPT_STENCIL_ENABLE_ARM64) || defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64))
 
 namespace realscript::jit::jit_detail {
 namespace {
@@ -1050,6 +1051,16 @@ private:
         case FO::LoadFieldFast:
         case FO::StoreFieldExactFast:
         case FO::StoreFieldFast:
+        case FO::ConstantNullTagFast:
+        case FO::ConstantEnumFast:
+        case FO::ConstantStringFast:
+        case FO::EqualValueFast:
+        case FO::CallIntrinsicFast:
+        case FO::CallDirect0:
+        case FO::CallDirect1:
+        case FO::CallDirect2:
+        case FO::CallDirectN:
+        case FO::CallPolledFast:
         case FO::GenericBytecode:
             emitHelperCallInline(&jitFlatStructAndStackRefHelper, i32Idx);
             break;
@@ -2874,6 +2885,24 @@ private:
     }
 
     outSimDiagnostic = "ARM64 simulator ran off end of code buffer";
+    return static_cast<std::uint32_t>(runtime::ErrorCode::InvalidProgram);
+}
+
+} // namespace realscript::jit::jit_detail
+
+#elif !defined(__EMSCRIPTEN__) && UINTPTR_MAX == 0xffffffffffffffffULL
+
+namespace realscript::jit::jit_detail {
+
+std::vector<std::uint8_t> compileFunctionA64(const CompiledFunctionRecord&) {
+    return {};
+}
+
+std::uint32_t executeSimulatedArm64Code(
+    const std::vector<std::uint8_t>&,
+    JitAbiContext*,
+    std::string& outSimDiagnostic) noexcept {
+    outSimDiagnostic = "ARM64 cross-arch simulator disabled in this build";
     return static_cast<std::uint32_t>(runtime::ErrorCode::InvalidProgram);
 }
 

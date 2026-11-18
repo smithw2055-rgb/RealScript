@@ -3090,25 +3090,7 @@ bool writeNativeFieldToBytes(
 } // namespace
 
 struct ManagedHeap::Impl {
-    struct LegacyHeader {
-        ObjectKind kind = ObjectKind::Record;
-        semantic::SymbolId typeId = 0;
-        semantic::PrimitiveType elementType = semantic::PrimitiveType::Error;
-        semantic::SymbolId elementTypeId = 0;
-        bool marked = false;
-        bool inNursery = true;
-        bool inRememberedSet = false;
-        std::size_t sizeBytes = 0;
-    };
-
-    struct LegacyHeapObjectLayout {
-        LegacyHeader header;
-        std::vector<Value> values;
-        std::string stringPayload;
-        std::shared_ptr<const std::vector<std::size_t>> referenceFields;
-        std::optional<NativeRawColumnView> rawColumnView;
-    };
-    static constexpr std::size_t BaseObjectSizeBytes = sizeof(LegacyHeapObjectLayout);
+    static constexpr std::size_t BaseObjectSizeBytes = sizeof(CompactSlot); // 32 bytes
 
     struct NativeEcsColumnTable {
         std::vector<std::int64_t> entityIds;
@@ -6953,6 +6935,10 @@ void ManagedHeap::recordFlatStructArrayWriteBarrier(
 
 std::uint64_t ManagedHeap::gcEpoch() const noexcept {
     return impl_->gcAndLayoutEpoch.load(std::memory_order_acquire);
+}
+
+std::uint64_t ManagedHeap::stringInternEpoch() const noexcept {
+    return impl_->stringInternEpoch.load(std::memory_order_acquire);
 }
 
 void ManagedHeap::pinFlatStructArrayElement(

@@ -2558,10 +2558,14 @@ bool executeInstruction(
             return fail(state, ErrorCode::InvalidProgram,
                 "string allocation requires a managed heap");
         }
+        bool ranGc = false;
         RuntimeError allocationError;
-        const auto reference = state.heap->internString(
-            instruction.stringImmediate,
-            &allocationError);
+        const auto reference = allocateWithOomGcRetry(
+            state, allocationError, ranGc, [&]() {
+                return state.heap->internString(
+                    instruction.stringImmediate,
+                    &allocationError);
+            });
         if (!reference) {
             return fail(state,
                 allocationError.code == ErrorCode::None
@@ -2714,18 +2718,23 @@ bool executeInstruction(
             return fail(state, ErrorCode::InvalidProgram,
                 "array allocation result type metadata is missing");
         }
+        const Value initArrVal = (instruction.elementType == semantic::PrimitiveType::Struct &&
+                                  instruction.elementTypeId != 0 &&
+                                  findFlatStructSchemaByTypeId(instruction.elementTypeId) != nullptr)
+            ? Value{}
+            : defaultValue(module, instruction.elementType, instruction.elementTypeId);
+        bool ranGc = false;
         RuntimeError allocationError;
-        const auto reference = state.heap->allocateTypedArray(
-            function.registerTypeIds[instruction.result],
-            instruction.elementType,
-            instruction.elementTypeId,
-            static_cast<std::size_t>(length),
-            (instruction.elementType == semantic::PrimitiveType::Struct &&
-             instruction.elementTypeId != 0 &&
-             findFlatStructSchemaByTypeId(instruction.elementTypeId) != nullptr)
-                ? Value{}
-                : defaultValue(module, instruction.elementType, instruction.elementTypeId),
-            &allocationError);
+        const auto reference = allocateWithOomGcRetry(
+            state, allocationError, ranGc, [&]() {
+                return state.heap->allocateTypedArray(
+                    function.registerTypeIds[instruction.result],
+                    instruction.elementType,
+                    instruction.elementTypeId,
+                    static_cast<std::size_t>(length),
+                    initArrVal,
+                    &allocationError);
+            });
         if (!reference) {
             return fail(state,
                 allocationError.code == ErrorCode::None
@@ -2747,29 +2756,39 @@ bool executeInstruction(
             return fail(state, ErrorCode::InvalidProgram,
                 "object allocation references an invalid class or heap");
         }
-        std::vector<Value> fields;
-        std::vector<std::size_t> referenceFields;
-        fields.reserve(type->fields.size());
-        for (std::size_t index = 0; index < type->fields.size(); ++index) {
-            const auto fieldType = type->fields[index].type;
-            const auto fieldTypeId =
-                exactTypeId(fieldType, type->fields[index].typeName);
-            fields.push_back(defaultValue(
-                module, fieldType, fieldTypeId));
-            if (fieldType == semantic::PrimitiveType::String ||
-                fieldType == semantic::PrimitiveType::Object ||
-                fieldType == semantic::PrimitiveType::Array ||
-                (fieldType == semantic::PrimitiveType::Struct &&
-                 !makeDefaultInlineStructValue(fieldTypeId).has_value())) {
-                referenceFields.push_back(index);
+        const auto buildFields = [&](std::vector<Value>& outFields,
+                                     std::vector<std::size_t>& outRefs) {
+            outFields.clear();
+            outRefs.clear();
+            outFields.reserve(type->fields.size());
+            for (std::size_t index = 0; index < type->fields.size(); ++index) {
+                const auto fieldType = type->fields[index].type;
+                const auto fieldTypeId =
+                    exactTypeId(fieldType, type->fields[index].typeName);
+                outFields.push_back(defaultValue(
+                    module, fieldType, fieldTypeId));
+                if (fieldType == semantic::PrimitiveType::String ||
+                    fieldType == semantic::PrimitiveType::Object ||
+                    fieldType == semantic::PrimitiveType::Array ||
+                    (fieldType == semantic::PrimitiveType::Struct &&
+                     !makeDefaultInlineStructValue(fieldTypeId).has_value())) {
+                    outRefs.push_back(index);
+                }
             }
-        }
+        };
+        bool ranGc = false;
         RuntimeError allocationError;
-        const auto reference = state.heap->allocateObject(
-            type->id,
-            std::move(fields),
-            std::move(referenceFields),
-            &allocationError);
+        const auto reference = allocateWithOomGcRetry(
+            state, allocationError, ranGc, [&]() {
+                std::vector<Value> fields;
+                std::vector<std::size_t> referenceFields;
+                buildFields(fields, referenceFields);
+                return state.heap->allocateObject(
+                    type->id,
+                    std::move(fields),
+                    std::move(referenceFields),
+                    &allocationError);
+            });
         if (!reference) {
             return fail(state,
                 allocationError.code == ErrorCode::None
@@ -3216,9 +3235,13 @@ bool executeInstruction(
             delegateWord(reference.interfaceTypeId, true),
             NullObject{},
         }};
+        bool ranGc = false;
         RuntimeError error;
-        const auto allocated = state.heap->allocateObjectFromTemplate(
-            type->id, fields.data(), fields.size(), delegateReferenceFields(), &error);
+        const auto allocated = allocateWithOomGcRetry(
+            state, error, ranGc, [&]() {
+                return state.heap->allocateObjectFromTemplate(
+                    type->id, fields.data(), fields.size(), delegateReferenceFields(), &error);
+            });
         if (!allocated) {
             return fail(state,
                 error.code == ErrorCode::None

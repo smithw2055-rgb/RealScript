@@ -41,7 +41,8 @@ void emitTypedPrimitiveFunction(
     const std::map<semantic::SymbolId, TypeView>& allTypes,
     const std::unordered_map<const mir::Instruction*, std::size_t>& callIds,
     const std::unordered_map<semantic::SymbolId, std::size_t>& hotPatchSlots,
-    std::vector<OptimizationRemark>* remarks) {
+    std::vector<OptimizationRemark>* remarks,
+    std::unordered_map<std::string, std::uint32_t>* stringLiteralIndices) {
     const auto& module = *view.module;
     const auto& function = *view.function;
     const auto types = valueSlotTypes(function);
@@ -793,9 +794,20 @@ void emitTypedPrimitiveFunction(
                 }
                 break;
             case mir::Opcode::ConstantString:
-                source.line("            if (!context.constantString(\"" +
-                    escapeCppString(instruction.stringImmediate) + "\", " +
-                    result + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                if (stringLiteralIndices != nullptr) {
+                    const auto [litIt, inserted] = stringLiteralIndices->emplace(
+                        instruction.stringImmediate,
+                        static_cast<std::uint32_t>(stringLiteralIndices->size()));
+                    (void)inserted;
+                    source.line("            if (!context.constantStringIndexed(" +
+                        std::to_string(litIt->second) + "u, \"" +
+                        escapeCppString(instruction.stringImmediate) + "\", " +
+                        result + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                } else {
+                    source.line("            if (!context.constantString(\"" +
+                        escapeCppString(instruction.stringImmediate) + "\", " +
+                        result + ")) { if constexpr (DeterminismAccounting && !TrustedRelease) determinismAccounting.flush(); return false; }");
+                }
                 if (remarks != nullptr) {
                     appendAllocationRemark(
                         *remarks, module, function, view.qualifiedName,

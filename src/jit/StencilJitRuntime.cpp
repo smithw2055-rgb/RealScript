@@ -1,5 +1,7 @@
 #include "JitInternal.h"
+#include "../runtime/RuntimeInternal.h"
 
+#include <array>
 #include <chrono>
 
 #if defined(_WIN32)
@@ -665,17 +667,42 @@ std::uint32_t jitNewArrayHelper(JitAbiContext* ctx, std::uint32_t flatIdx) noexc
 
     const runtime::ScopedAllocationSite allocSite(makeJitAllocSite(*ctx, flatIdx));
     bool slotsMoved = false;
+    bool ranGc = false;
     runtime::RuntimeError allocErr;
-    const auto ref = session.heap->allocateTypedArray(
-        arrayTid,
-        elemType,
-        elemTid,
-        static_cast<std::size_t>(lenVal),
-        initVal,
-        &allocErr,
-        &slotsMoved);
+    const auto allocArray = [&]() {
+        bool attemptMoved = false;
+        auto res = session.heap->allocateTypedArray(
+            arrayTid,
+            elemType,
+            elemTid,
+            static_cast<std::size_t>(lenVal),
+            initVal,
+            &allocErr,
+            &attemptMoved);
+        slotsMoved = slotsMoved || attemptMoved;
+        return res;
+    };
+    auto ref = allocArray();
+    if (!ref.has_value() &&
+        (allocErr.code == runtime::ErrorCode::None ||
+         allocErr.code == runtime::ErrorCode::OutOfMemory)) {
+        ranGc = true;
+        allocErr = {};
+        (void)session.heap->collectYoung(session.shadowStack);
+        ref = allocArray();
+        if (!ref.has_value() &&
+            (allocErr.code == runtime::ErrorCode::None ||
+             allocErr.code == runtime::ErrorCode::OutOfMemory)) {
+            allocErr = {};
+            session.heap->collectFull(session.shadowStack);
+            ref = allocArray();
+        }
+    }
     if (!ref.has_value()) {
         ctx->remainingBudget -= opDoneCost;
+        if (ranGc) {
+            invalidateJitArrayCaches(*ctx);
+        }
         const auto errCode = allocErr.code == runtime::ErrorCode::None
             ? runtime::ErrorCode::OutOfMemory
             : allocErr.code;
@@ -687,7 +714,7 @@ std::uint32_t jitNewArrayHelper(JitAbiContext* ctx, std::uint32_t flatIdx) noexc
     }
 
     ctx->remainingBudget -= fi.span;
-    if (slotsMoved) {
+    if (slotsMoved || ranGc) {
         invalidateJitArrayCaches(*ctx);
     }
     ctx->frameBase[fi.dstSlot] = *ref;
@@ -1445,6 +1472,78 @@ bool jitValuesEqual(
     return true;
 }
 
+namespace {
+
+[[nodiscard]] const runtime::detail::PrelinkedDispatchTarget* resolveJitPolymorphicTarget(
+    const runtime::detail::ExecutionMirror& mirror,
+    semantic::SymbolId actualTypeId,
+    const runtime::detail::PolymorphicCallSiteDesc& site) noexcept {
+    if (!site.valid || actualTypeId == 0) return nullptr;
+    const auto tIt = mirror.typeDispatch.find(actualTypeId);
+    if (tIt == mirror.typeDispatch.end()) return nullptr;
+    const auto& meta = tIt->second;
+    if (!site.isInterface) {
+        if (site.slot >= meta.virtualTargets.size()) return nullptr;
+        const auto& target = meta.virtualTargets[site.slot];
+        return (target.target && target.execution) ? &target : nullptr;
+    }
+    const auto& imaps = meta.interfaceMaps;
+    if (imaps.size() <= 4) {
+        for (const auto& m : imaps) {
+            if (m.interfaceTypeId == site.interfaceTypeId) {
+                if (site.slot >= m.slots.size()) return nullptr;
+                const auto& target = m.slots[site.slot];
+                return (target.target && target.execution) ? &target : nullptr;
+            }
+        }
+        return nullptr;
+    }
+    std::size_t lo = 0;
+    std::size_t hi = imaps.size();
+    while (lo < hi) {
+        const std::size_t mid = lo + ((hi - lo) >> 1u);
+        if (imaps[mid].interfaceTypeId < site.interfaceTypeId) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo < imaps.size() && imaps[lo].interfaceTypeId == site.interfaceTypeId) {
+        if (site.slot >= imaps[lo].slots.size()) return nullptr;
+        const auto& target = imaps[lo].slots[site.slot];
+        return (target.target && target.execution) ? &target : nullptr;
+    }
+    return nullptr;
+}
+
+[[nodiscard]] std::optional<runtime::ObjectRef> jitInternStringWithOomRetry(
+    JitRuntimeSession& session,
+    std::string_view text,
+    runtime::RuntimeError& err,
+    bool& outRanGc) {
+    outRanGc = false;
+    err = {};
+    auto interned = session.heap->internString(text, &err);
+    if (!interned.has_value() &&
+        (err.code == runtime::ErrorCode::None ||
+         err.code == runtime::ErrorCode::OutOfMemory)) {
+        outRanGc = true;
+        err = {};
+        (void)session.heap->collectYoung(session.shadowStack);
+        interned = session.heap->internString(text, &err);
+        if (!interned.has_value() &&
+            (err.code == runtime::ErrorCode::None ||
+             err.code == runtime::ErrorCode::OutOfMemory)) {
+            err = {};
+            session.heap->collectFull(session.shadowStack);
+            interned = session.heap->internString(text, &err);
+        }
+    }
+    return interned;
+}
+
+} // namespace
+
 // Fast C++ runtime helper for FlatStruct slice & StackSlotRef opcodes in StencilJit
 std::uint32_t jitFlatStructAndStackRefHelper(JitAbiContext* ctx, std::uint32_t flatIdx) noexcept {
     const auto& execFunc = *ctx->compiledFn->execFunc;
@@ -1480,13 +1579,40 @@ std::uint32_t jitFlatStructAndStackRefHelper(JitAbiContext* ctx, std::uint32_t f
         const auto& tmpl = mirror.objectTemplates[fi.aux0Slot];
         const runtime::ScopedAllocationSite allocSite(makeJitAllocSite(*ctx, flatIdx));
         runtime::RuntimeError allocErr;
-        const auto allocated = session.heap->allocateObjectFromTemplate(
-            tmpl.typeId,
-            tmpl.defaultFields.data(),
-            tmpl.defaultFields.size(),
-            tmpl.referenceFields,
-            &allocErr);
+        bool slotsMoved = false;
+        bool ranGc = false;
+        const auto allocObj = [&]() {
+            bool attemptMoved = false;
+            auto res = session.heap->allocateObjectFromTemplate(
+                tmpl.typeId,
+                tmpl.defaultFields.data(),
+                tmpl.defaultFields.size(),
+                tmpl.referenceFields,
+                &allocErr,
+                &attemptMoved);
+            slotsMoved = slotsMoved || attemptMoved;
+            return res;
+        };
+        auto allocated = allocObj();
+        if (!allocated &&
+            (allocErr.code == runtime::ErrorCode::None ||
+             allocErr.code == runtime::ErrorCode::OutOfMemory)) {
+            ranGc = true;
+            allocErr = {};
+            (void)session.heap->collectYoung(session.shadowStack);
+            allocated = allocObj();
+            if (!allocated &&
+                (allocErr.code == runtime::ErrorCode::None ||
+                 allocErr.code == runtime::ErrorCode::OutOfMemory)) {
+                allocErr = {};
+                session.heap->collectFull(session.shadowStack);
+                allocated = allocObj();
+            }
+        }
         if (!allocated) {
+            if (ranGc || slotsMoved) {
+                invalidateJitArrayCaches(*ctx);
+            }
             return setHelperError(
                 ctx,
                 flatIdx,
@@ -1518,11 +1644,22 @@ std::uint32_t jitFlatStructAndStackRefHelper(JitAbiContext* ctx, std::uint32_t f
                 return 0u;
             }
         }
-        if (!session.heap) {
+        runtime::ManagedHeap* targetHeap = session.executionPolicy
+            ? session.executionPolicy->resolveHeap(ref, session.heap)
+            : session.heap;
+        if (!session.heap || !targetHeap) {
             return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "field load missing heap");
         }
+        const bool crossHeap = (targetHeap != session.heap && targetHeap->heapId() != session.heap->heapId());
+        runtime::CrossHeapAccessPolicy crossPolicy = runtime::CrossHeapAccessPolicy::AllowReadWrite;
+        if (crossHeap && session.executionPolicy != nullptr) {
+            crossPolicy = session.executionPolicy->crossHeapAccessPolicy(session.heap, targetHeap);
+            if (crossPolicy == runtime::CrossHeapAccessPolicy::Deny) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::CapabilityDenied, "cross-heap field read denied");
+            }
+        }
         runtime::ObjectFastView view{};
-        if (!session.heap->tryBindObjectFastView(ref, view)) {
+        if (!targetHeap->tryBindObjectFastView(ref, view)) {
             return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "dangling object reference");
         }
         const auto expectedOwnerTid = static_cast<semantic::SymbolId>(fi.integerImmediate);
@@ -1539,6 +1676,20 @@ std::uint32_t jitFlatStructAndStackRefHelper(JitAbiContext* ctx, std::uint32_t f
         }
         if (!ownerOk || fi.aux0Slot >= view.fieldCount) {
             return setHelperError(ctx, flatIdx, runtime::ErrorCode::TypeMismatch, "field load receiver type mismatch");
+        }
+        if (crossHeap) {
+            runtime::Value readVal;
+            runtime::RuntimeError readErr;
+            if (!session.heap->readFieldWithPolicy(*targetHeap, ref, fi.aux0Slot, crossPolicy, readVal, &readErr)) {
+                return setHelperError(
+                    ctx,
+                    flatIdx,
+                    readErr.code == runtime::ErrorCode::None ? runtime::ErrorCode::CrossHeapAccessViolation : readErr.code,
+                    readErr.message.empty() ? "cross-heap field read failed" : readErr.message);
+            }
+            ctx->remainingBudget -= fi.span;
+            ctx->frameBase[fi.dstSlot] = std::move(readVal);
+            return 0u;
         }
         ctx->remainingBudget -= fi.span;
         ctx->frameBase[fi.dstSlot] = view.fields[fi.aux0Slot];
@@ -1564,10 +1715,13 @@ std::uint32_t jitFlatStructAndStackRefHelper(JitAbiContext* ctx, std::uint32_t f
                 return 0u;
             }
         }
-        if (!session.heap) {
+        runtime::ManagedHeap* targetHeap = session.executionPolicy
+            ? session.executionPolicy->resolveHeap(ref, session.heap)
+            : session.heap;
+        if (!targetHeap) {
             return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "field store missing heap");
         }
-        const auto actualTid = session.heap->objectTypeId(ref);
+        const auto actualTid = targetHeap->objectTypeId(ref);
         if (!actualTid) {
             return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "dangling object reference");
         }
@@ -1586,8 +1740,18 @@ std::uint32_t jitFlatStructAndStackRefHelper(JitAbiContext* ctx, std::uint32_t f
         if (!ownerOk) {
             return setHelperError(ctx, flatIdx, runtime::ErrorCode::TypeMismatch, "field store receiver type mismatch");
         }
+        const runtime::Value cleanVal = runtime::detachFrameSliceValue(storeVal);
         runtime::RuntimeError setErr;
-        if (!session.heap->fieldSet(ref, fi.aux0Slot, runtime::detachFrameSliceValue(storeVal), &setErr)) {
+        if (session.executionPolicy != nullptr &&
+            !session.executionPolicy->checkFieldWrite(
+                session.heap, targetHeap, ref, *actualTid, fi.aux0Slot, {}, cleanVal, setErr)) {
+            return setHelperError(
+                ctx,
+                flatIdx,
+                setErr.code == runtime::ErrorCode::None ? runtime::ErrorCode::CapabilityDenied : setErr.code,
+                setErr.message.empty() ? "field store denied by execution policy" : setErr.message);
+        }
+        if (!targetHeap->fieldSet(ref, fi.aux0Slot, cleanVal, &setErr)) {
             return setHelperError(
                 ctx,
                 flatIdx,
@@ -1661,9 +1825,17 @@ std::uint32_t jitFlatStructAndStackRefHelper(JitAbiContext* ctx, std::uint32_t f
             }
             const runtime::ScopedAllocationSite allocSite(makeJitAllocSite(*ctx, flatIdx));
             runtime::RuntimeError strErr;
-            const auto interned = session.heap->internString(bc.stringImmediate, &strErr);
+            bool ranGc = false;
+            const auto interned = jitInternStringWithOomRetry(session, bc.stringImmediate, strErr, ranGc);
             if (!interned) {
-                return setHelperError(ctx, flatIdx, runtime::ErrorCode::OutOfMemory, strErr.message);
+                if (ranGc) {
+                    invalidateJitArrayCaches(*ctx);
+                }
+                return setHelperError(
+                    ctx,
+                    flatIdx,
+                    strErr.code == runtime::ErrorCode::None ? runtime::ErrorCode::OutOfMemory : strErr.code,
+                    strErr.message);
             }
             ctx->frameBase[regOff + bc.result] = *interned;
             ctx->remainingBudget -= fi.span;
@@ -1688,6 +1860,553 @@ std::uint32_t jitFlatStructAndStackRefHelper(JitAbiContext* ctx, std::uint32_t f
         default:
             return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "unsupported GenericBytecode in StencilJit");
         }
+    }
+    if (fi.flatOpcode == FO::ConstantNullTagFast) {
+        if (fi.aux0Slot == 0u) {
+            ctx->frameBase[fi.dstSlot] = std::monostate{};
+            ctx->remainingBudget -= fi.span;
+            return 0u;
+        }
+        const auto tag = ctx->frameBase[fi.src0Slot].rawTag();
+        if (tag != runtime::ValueTag::Monostate &&
+            tag != runtime::ValueTag::NullString &&
+            tag != runtime::ValueTag::NullObject &&
+            tag != runtime::ValueTag::NullArray) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::TypeMismatch, "expected null for conversion");
+        }
+        if (fi.aux0Slot == 1u) {
+            ctx->frameBase[fi.dstSlot] = runtime::NullObject{};
+        } else if (fi.aux0Slot == 2u) {
+            ctx->frameBase[fi.dstSlot] = runtime::NullString{};
+        } else {
+            ctx->frameBase[fi.dstSlot] = runtime::NullArray{};
+        }
+        ctx->remainingBudget -= fi.span;
+        return 0u;
+    }
+    if (fi.flatOpcode == FO::ConstantEnumFast) {
+        if (!session.program) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "ConstantEnumFast missing program");
+        }
+        const auto& mirror = runtime::detail::executionMirror(*session.program);
+        if (fi.auxImm32 >= mirror.constPoolValues.size()) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "ConstantEnumFast pool index out of bounds");
+        }
+        ctx->frameBase[fi.dstSlot] = mirror.constPoolValues[fi.auxImm32];
+        ctx->remainingBudget -= fi.span;
+        return 0u;
+    }
+    if (fi.flatOpcode == FO::ConstantStringFast) {
+        if (!session.heap || !session.program) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "ConstantStringFast requires heap and program");
+        }
+        const auto& mirror = runtime::detail::executionMirror(*session.program);
+        if (fi.auxImm32 >= mirror.stringLiterals.size()) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "ConstantStringFast literal index out of bounds");
+        }
+        const std::uint64_t curHeapId = session.heap->heapId();
+        const std::uint64_t curEpoch = session.heap->stringInternEpoch();
+        const bool gcIdle =
+            session.heap->phase() == runtime::GcPhase::Idle &&
+            !session.heap->collectionRequested();
+        if (gcIdle &&
+            session.stringLiteralCache != nullptr &&
+            session.stringLiteralCacheEpoch != nullptr &&
+            session.stringLiteralCacheHeapId != nullptr &&
+            *session.stringLiteralCacheHeapId == curHeapId &&
+            *session.stringLiteralCacheEpoch == curEpoch &&
+            fi.auxImm32 < session.stringLiteralCache->size()) {
+            const runtime::ObjectRef cached = (*session.stringLiteralCache)[fi.auxImm32];
+            if (cached.valid()) {
+                ctx->remainingBudget -= fi.span;
+                ctx->frameBase[fi.dstSlot] = cached;
+                return 0u;
+            }
+        }
+        const runtime::ScopedAllocationSite allocSite(makeJitAllocSite(*ctx, flatIdx));
+        runtime::RuntimeError strErr;
+        bool ranGc = false;
+        const auto interned = jitInternStringWithOomRetry(
+            session, mirror.stringLiterals[fi.auxImm32], strErr, ranGc);
+        if (!interned) {
+            if (ranGc) {
+                invalidateJitArrayCaches(*ctx);
+            }
+            return setHelperError(
+                ctx,
+                flatIdx,
+                strErr.code == runtime::ErrorCode::None ? runtime::ErrorCode::OutOfMemory : strErr.code,
+                strErr.message.empty() ? "string literal interning failed" : strErr.message);
+        }
+        if (session.stringLiteralCache != nullptr &&
+            session.stringLiteralCacheEpoch != nullptr &&
+            session.stringLiteralCacheHeapId != nullptr) {
+            if (session.stringLiteralCache->size() < mirror.stringLiterals.size()) {
+                session.stringLiteralCache->resize(mirror.stringLiterals.size());
+            }
+            const std::uint64_t afterEpoch = session.heap->stringInternEpoch();
+            if (*session.stringLiteralCacheHeapId != curHeapId ||
+                *session.stringLiteralCacheEpoch != afterEpoch) {
+                std::fill(
+                    session.stringLiteralCache->begin(),
+                    session.stringLiteralCache->end(),
+                    runtime::ObjectRef{});
+                *session.stringLiteralCacheHeapId = curHeapId;
+                *session.stringLiteralCacheEpoch = afterEpoch;
+            }
+            if (fi.auxImm32 < session.stringLiteralCache->size()) {
+                (*session.stringLiteralCache)[fi.auxImm32] = *interned;
+            }
+        }
+        ctx->remainingBudget -= fi.span;
+        ctx->frameBase[fi.dstSlot] = *interned;
+        invalidateJitArrayCaches(*ctx);
+        stepJitGcSafepoint(ctx);
+        return 0u;
+    }
+    if (fi.flatOpcode == FO::EqualValueFast) {
+        const runtime::Value& lhs = ctx->frameBase[fi.src0Slot];
+        const runtime::Value& rhs = ctx->frameBase[fi.src1Slot];
+        runtime::ManagedHeap* lHeap = session.heap;
+        runtime::ManagedHeap* rHeap = session.heap;
+        if (session.executionPolicy != nullptr) {
+            if (lhs.rawTag() == runtime::ValueTag::ObjectRef && !lhs.asObjectRefUnchecked().isStackSlotRef()) {
+                lHeap = session.executionPolicy->resolveHeap(lhs.asObjectRefUnchecked(), session.heap);
+            }
+            if (rhs.rawTag() == runtime::ValueTag::ObjectRef && !rhs.asObjectRefUnchecked().isStackSlotRef()) {
+                rHeap = session.executionPolicy->resolveHeap(rhs.asObjectRefUnchecked(), session.heap);
+            }
+        }
+        bool eq = false;
+        runtime::ErrorCode eqErrCode = runtime::ErrorCode::InvalidObjectReference;
+        const char* eqErrMsg = "equality comparison failed";
+        if (lhs.rawTag() == runtime::ValueTag::ObjectRef &&
+            rhs.rawTag() == runtime::ValueTag::ObjectRef &&
+            lHeap != rHeap) {
+            const auto lr = lhs.asObjectRefUnchecked();
+            const auto rr = rhs.asObjectRefUnchecked();
+            if (lr.kind == runtime::ObjectKind::String && rr.kind == runtime::ObjectKind::String) {
+                const auto ls = lHeap ? lHeap->stringView(lr) : std::nullopt;
+                const auto rs = rHeap ? rHeap->stringView(rr) : std::nullopt;
+                if (!ls || !rs) {
+                    return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "string equality encountered an invalid managed reference");
+                }
+                eq = (*ls == *rs);
+            } else {
+                const bool lAlive = lr.isStackSlotRef() || (lHeap != nullptr && lHeap->isAlive(lr));
+                const bool rAlive = rr.isStackSlotRef() || (rHeap != nullptr && rHeap->isAlive(rr));
+                if (!lAlive || !rAlive) {
+                    return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "reference equality encountered an invalid managed reference");
+                }
+                eq = (lr == rr);
+            }
+        } else {
+            runtime::ManagedHeap* eqHeap = session.heap;
+            if (lhs.rawTag() == runtime::ValueTag::ObjectRef && !lhs.asObjectRefUnchecked().isStackSlotRef()) {
+                eqHeap = lHeap;
+            } else if (rhs.rawTag() == runtime::ValueTag::ObjectRef && !rhs.asObjectRefUnchecked().isStackSlotRef()) {
+                eqHeap = rHeap;
+            }
+            if (!jitValuesEqual(eqHeap, lhs, rhs, eq, eqErrCode, eqErrMsg)) {
+                return setHelperError(ctx, flatIdx, eqErrCode, eqErrMsg);
+            }
+        }
+        ctx->remainingBudget -= fi.span;
+        ctx->frameBase[fi.dstSlot].storeBool(fi.aux0Slot != 0u ? !eq : eq);
+        return 0u;
+    }
+    if (fi.flatOpcode == FO::CallIntrinsicFast) {
+        const auto ikind = static_cast<runtime::detail::FastIntrinsicKind>(
+            static_cast<std::uint8_t>(fi.binaryOpcode1));
+        switch (ikind) {
+        case runtime::detail::FastIntrinsicKind::StaticHas: {
+            const auto sid = static_cast<semantic::SymbolId>(fi.integerImmediate);
+            ctx->remainingBudget -= fi.span;
+            ctx->frameBase[fi.dstSlot].storeBool(session.heap != nullptr && session.heap->hasStaticField(sid));
+            return 0u;
+        }
+        case runtime::detail::FastIntrinsicKind::StaticGet: {
+            const auto sid = static_cast<semantic::SymbolId>(fi.integerImmediate);
+            runtime::Value resVal{};
+            if (session.heap != nullptr) {
+                if (auto existing = session.heap->getStaticField(sid)) {
+                    resVal = std::move(*existing);
+                } else {
+                    if (fi.inlineArgCount >= 1u) {
+                        resVal = runtime::detachFrameSliceValue(ctx->frameBase[fi.src0Slot]);
+                    }
+                    session.heap->setStaticField(sid, resVal);
+                }
+            } else if (fi.inlineArgCount >= 1u) {
+                resVal = runtime::detachFrameSliceValue(ctx->frameBase[fi.src0Slot]);
+            }
+            ctx->remainingBudget -= fi.span;
+            ctx->frameBase[fi.dstSlot] = std::move(resVal);
+            return 0u;
+        }
+        case runtime::detail::FastIntrinsicKind::StaticSet: {
+            if (session.heap != nullptr) {
+                session.heap->setStaticField(
+                    static_cast<semantic::SymbolId>(fi.integerImmediate),
+                    runtime::detachFrameSliceValue(ctx->frameBase[fi.src0Slot]));
+            }
+            ctx->remainingBudget -= fi.span;
+            return 0u;
+        }
+        case runtime::detail::FastIntrinsicKind::ArrayPush: {
+            const runtime::Value& arrVal = ctx->frameBase[fi.src0Slot];
+            if (arrVal.rawTag() == runtime::ValueTag::NullArray) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::NullReference, "cannot invoke array method on null array");
+            }
+            if (arrVal.rawTag() != runtime::ValueTag::ObjectRef) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "invalid array reference");
+            }
+            const runtime::ObjectRef arrRef = arrVal.u_.objectRef;
+            runtime::ManagedHeap* arrHeap = session.executionPolicy
+                ? session.executionPolicy->resolveHeap(arrRef, session.heap)
+                : session.heap;
+            if (!arrHeap) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "array push missing heap");
+            }
+            const runtime::Value cleanElem = runtime::detachFrameSliceValue(ctx->frameBase[fi.src1Slot]);
+            if (session.executionPolicy != nullptr) {
+                runtime::RuntimeError policyErr;
+                if (!session.executionPolicy->checkArrayWrite(session.heap, arrHeap, arrRef, cleanElem, policyErr)) {
+                    return setHelperError(
+                        ctx,
+                        flatIdx,
+                        policyErr.code == runtime::ErrorCode::None ? runtime::ErrorCode::CapabilityDenied : policyErr.code,
+                        policyErr.message.empty() ? "array push denied by execution policy" : policyErr.message);
+                }
+            }
+            const runtime::ScopedAllocationSite allocSite(makeJitAllocSite(*ctx, flatIdx));
+            runtime::RuntimeError mutErr;
+            bool pushed = arrHeap->arrayPush(
+                arrRef,
+                cleanElem,
+                &mutErr,
+                runtime::ArrayStoreTypePolicy::PrevalidatedAssignableObject);
+            if (!pushed && mutErr.code == runtime::ErrorCode::OutOfMemory && arrHeap == session.heap) {
+                mutErr = {};
+                (void)session.heap->collectYoung(session.shadowStack);
+                pushed = arrHeap->arrayPush(
+                    arrRef,
+                    cleanElem,
+                    &mutErr,
+                    runtime::ArrayStoreTypePolicy::PrevalidatedAssignableObject);
+                if (!pushed && mutErr.code == runtime::ErrorCode::OutOfMemory) {
+                    mutErr = {};
+                    session.heap->collectFull(session.shadowStack);
+                    pushed = arrHeap->arrayPush(
+                        arrRef,
+                        cleanElem,
+                        &mutErr,
+                        runtime::ArrayStoreTypePolicy::PrevalidatedAssignableObject);
+                }
+            }
+            invalidateJitArrayCaches(*ctx);
+            if (!pushed) {
+                return setHelperError(
+                    ctx,
+                    flatIdx,
+                    mutErr.code == runtime::ErrorCode::None ? runtime::ErrorCode::InvalidObjectReference : mutErr.code,
+                    mutErr.message.empty() ? "array push failed" : mutErr.message);
+            }
+            ctx->remainingBudget -= fi.span;
+            stepJitGcSafepoint(ctx);
+            return 0u;
+        }
+        case runtime::detail::FastIntrinsicKind::ArrayRemoveAt: {
+            const runtime::Value& arrVal = ctx->frameBase[fi.src0Slot];
+            if (arrVal.rawTag() == runtime::ValueTag::NullArray) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::NullReference, "cannot invoke array method on null array");
+            }
+            if (arrVal.rawTag() != runtime::ValueTag::ObjectRef) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "invalid array reference");
+            }
+            const runtime::ObjectRef arrRef = arrVal.u_.objectRef;
+            runtime::ManagedHeap* arrHeap = session.executionPolicy
+                ? session.executionPolicy->resolveHeap(arrRef, session.heap)
+                : session.heap;
+            if (!arrHeap) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "array remove_at missing heap");
+            }
+            std::int64_t idx = 0;
+            if (!ctx->frameBase[fi.src1Slot].tryGetInt64(idx)) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::TypeMismatch, "array index must be integer");
+            }
+            if (idx < 0) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::IndexOutOfRange, "array index out of range");
+            }
+            if (session.executionPolicy != nullptr) {
+                runtime::RuntimeError policyErr;
+                if (!session.executionPolicy->checkArrayWrite(session.heap, arrHeap, arrRef, runtime::Value{std::monostate{}}, policyErr)) {
+                    return setHelperError(
+                        ctx,
+                        flatIdx,
+                        policyErr.code == runtime::ErrorCode::None ? runtime::ErrorCode::CapabilityDenied : policyErr.code,
+                        policyErr.message.empty() ? "array remove_at denied by execution policy" : policyErr.message);
+                }
+            }
+            runtime::RuntimeError mutErr;
+            if (!arrHeap->arrayRemoveAt(arrRef, static_cast<std::size_t>(idx), nullptr, &mutErr)) {
+                return setHelperError(
+                    ctx,
+                    flatIdx,
+                    mutErr.code == runtime::ErrorCode::None ? runtime::ErrorCode::InvalidObjectReference : mutErr.code,
+                    mutErr.message.empty() ? "array remove_at failed" : mutErr.message);
+            }
+            invalidateJitArrayCaches(*ctx);
+            if (fi.dstSlot != runtime::detail::InvalidCompactReg) {
+                ctx->frameBase[fi.dstSlot] = std::monostate{};
+            }
+            ctx->remainingBudget -= fi.span;
+            return 0u;
+        }
+        default: {
+            if (!session.heap) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "CallIntrinsicFast requires heap");
+            }
+            std::array<runtime::Value, 3> intrArgs{};
+            const std::size_t nArgs = fi.inlineArgCount;
+            if (nArgs > 3u) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "CallIntrinsicFast argument count out of range");
+            }
+            if (nArgs >= 1u) intrArgs[0] = runtime::detachFrameSliceValue(ctx->frameBase[fi.src0Slot]);
+            if (nArgs >= 2u) intrArgs[1] = runtime::detachFrameSliceValue(ctx->frameBase[fi.src1Slot]);
+            if (nArgs >= 3u) intrArgs[2] = runtime::detachFrameSliceValue(ctx->frameBase[fi.src2Slot]);
+
+            runtime::ManagedHeap* targetHeap = session.heap;
+            if ((ikind == runtime::detail::FastIntrinsicKind::ArrayPop ||
+                 ikind == runtime::detail::FastIntrinsicKind::ArrayClear) &&
+                nArgs >= 1u &&
+                intrArgs[0].rawTag() == runtime::ValueTag::ObjectRef) {
+                const auto arrRef = intrArgs[0].u_.objectRef;
+                if (session.executionPolicy != nullptr) {
+                    targetHeap = session.executionPolicy->resolveHeap(arrRef, session.heap);
+                    runtime::RuntimeError policyErr;
+                    if (!session.executionPolicy->checkArrayWrite(session.heap, targetHeap, arrRef, runtime::Value{std::monostate{}}, policyErr)) {
+                        return setHelperError(
+                            ctx,
+                            flatIdx,
+                            policyErr.code == runtime::ErrorCode::None ? runtime::ErrorCode::CapabilityDenied : policyErr.code,
+                            policyErr.message.empty() ? "array mutation denied by execution policy" : policyErr.message);
+                    }
+                }
+            } else if (session.executionPolicy != nullptr) {
+                for (std::size_t ai = 0; ai < nArgs; ++ai) {
+                    if (intrArgs[ai].rawTag() == runtime::ValueTag::ObjectRef &&
+                        intrArgs[ai].u_.objectRef.kind == runtime::ObjectKind::String) {
+                        const auto strRef = intrArgs[ai].u_.objectRef;
+                        if (auto* strHeap = session.executionPolicy->resolveHeap(strRef, session.heap);
+                            strHeap != nullptr && strHeap != session.heap) {
+                            if (const auto sv = strHeap->stringView(strRef)) {
+                                intrArgs[ai] = runtime::StringValue{std::string(*sv)};
+                            }
+                        }
+                    }
+                }
+            }
+
+            const runtime::ScopedAllocationSite allocSite(makeJitAllocSite(*ctx, flatIdx));
+            runtime::Value intrOut;
+            runtime::RuntimeError intrErr;
+            bool ranGc = false;
+            bool ok = runtime::detail::tryExecuteFastIntrinsic(
+                static_cast<std::uint8_t>(ikind),
+                intrArgs.data(),
+                nArgs,
+                targetHeap,
+                intrOut,
+                intrErr);
+            if (!ok && intrErr.code == runtime::ErrorCode::OutOfMemory && targetHeap == session.heap) {
+                ranGc = true;
+                intrErr = {};
+                (void)session.heap->collectYoung(session.shadowStack);
+                ok = runtime::detail::tryExecuteFastIntrinsic(
+                    static_cast<std::uint8_t>(ikind),
+                    intrArgs.data(),
+                    nArgs,
+                    targetHeap,
+                    intrOut,
+                    intrErr);
+                if (!ok && intrErr.code == runtime::ErrorCode::OutOfMemory) {
+                    intrErr = {};
+                    session.heap->collectFull(session.shadowStack);
+                    ok = runtime::detail::tryExecuteFastIntrinsic(
+                        static_cast<std::uint8_t>(ikind),
+                        intrArgs.data(),
+                        nArgs,
+                        targetHeap,
+                        intrOut,
+                        intrErr);
+                }
+            }
+            if (!ok) {
+                if (ranGc) {
+                    invalidateJitArrayCaches(*ctx);
+                }
+                return setHelperError(
+                    ctx,
+                    flatIdx,
+                    intrErr.code == runtime::ErrorCode::None ? runtime::ErrorCode::InvalidProgram : intrErr.code,
+                    intrErr.message.empty() ? "fast intrinsic execution failed" : intrErr.message);
+            }
+            if (ranGc ||
+                ikind == runtime::detail::FastIntrinsicKind::ArrayRemoveAt ||
+                ikind == runtime::detail::FastIntrinsicKind::ArrayPop ||
+                ikind == runtime::detail::FastIntrinsicKind::ArrayClear) {
+                invalidateJitArrayCaches(*ctx);
+            }
+            if (fi.dstSlot != runtime::detail::InvalidCompactReg) {
+                ctx->frameBase[fi.dstSlot] = std::move(intrOut);
+            }
+            ctx->remainingBudget -= fi.span;
+            stepJitGcSafepoint(ctx);
+            return 0u;
+        }
+        }
+    }
+    if (fi.flatOpcode == FO::CallDirect0 ||
+        fi.flatOpcode == FO::CallDirect1 ||
+        fi.flatOpcode == FO::CallDirect2 ||
+        fi.flatOpcode == FO::CallDirectN ||
+        fi.flatOpcode == FO::CallPolledFast) {
+        if (!session.directInvokeFn || !session.moduleImpl || !session.program ||
+            flatIdx >= execFunc.flatCold.size()) {
+            return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "direct/polymorphic call metadata missing in StencilJit");
+        }
+        const auto& cold = execFunc.flatCold[flatIdx];
+        semantic::SymbolId targetSymId = 0;
+        std::array<runtime::Value, 8> stackArgs{};
+        std::vector<runtime::Value> heapArgs;
+        const runtime::Value* argsPtr = nullptr;
+        std::uint32_t argCount = 0;
+
+        if (fi.flatOpcode == FO::CallDirect0 ||
+            fi.flatOpcode == FO::CallDirect1 ||
+            fi.flatOpcode == FO::CallDirect2 ||
+            fi.flatOpcode == FO::CallDirectN) {
+            if (!cold.directTarget || !cold.directTarget->function) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "missing direct call target in StencilJit");
+            }
+            targetSymId = cold.directTarget->function->symbolId;
+            if (fi.flatOpcode == FO::CallDirect1) {
+                argCount = 1u;
+                stackArgs[0] = runtime::detachFrameSliceValue(ctx->frameBase[fi.src0Slot]);
+                argsPtr = stackArgs.data();
+            } else if (fi.flatOpcode == FO::CallDirect2) {
+                argCount = 2u;
+                stackArgs[0] = runtime::detachFrameSliceValue(ctx->frameBase[fi.src0Slot]);
+                stackArgs[1] = runtime::detachFrameSliceValue(ctx->frameBase[fi.src1Slot]);
+                argsPtr = stackArgs.data();
+            } else if (fi.flatOpcode == FO::CallDirectN) {
+                if (!cold.bytecode) {
+                    return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "missing CallDirectN bytecode metadata");
+                }
+                const auto& ops = cold.bytecode->operands;
+                argCount = static_cast<std::uint32_t>(ops.size());
+                if (argCount <= stackArgs.size()) {
+                    for (std::uint32_t i = 0; i < argCount; ++i) {
+                        stackArgs[i] = runtime::detachFrameSliceValue(
+                            ctx->frameBase[execFunc.registerOffset + ops[i]]);
+                    }
+                    argsPtr = stackArgs.data();
+                } else {
+                    heapArgs.resize(argCount);
+                    for (std::uint32_t i = 0; i < argCount; ++i) {
+                        heapArgs[i] = runtime::detachFrameSliceValue(
+                            ctx->frameBase[execFunc.registerOffset + ops[i]]);
+                    }
+                    argsPtr = heapArgs.data();
+                }
+            }
+        } else {
+            const runtime::Value& recvVal = ctx->frameBase[fi.src0Slot];
+            if (recvVal.rawTag() == runtime::ValueTag::NullObject) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::NullReference, "polymorphic call on null object reference");
+            }
+            if (recvVal.rawTag() != runtime::ValueTag::ObjectRef) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "polymorphic call on invalid object reference");
+            }
+            const runtime::ObjectRef recvRef = recvVal.u_.objectRef;
+            runtime::ManagedHeap* recvHeap = session.executionPolicy
+                ? session.executionPolicy->resolveHeap(recvRef, session.heap)
+                : session.heap;
+            if (!recvHeap) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "polymorphic call missing heap");
+            }
+            if (recvHeap != session.heap && session.executionPolicy != nullptr &&
+                session.executionPolicy->crossHeapAccessPolicy(session.heap, recvHeap) == runtime::CrossHeapAccessPolicy::Deny) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::CapabilityDenied, "cross-heap polymorphic call denied");
+            }
+            const auto actualTid = recvHeap->objectTypeId(recvRef);
+            if (!actualTid) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidObjectReference, "polymorphic call on dangling object reference");
+            }
+            const auto& mirror = runtime::detail::executionMirror(*session.program);
+            if (fi.auxImm32 >= mirror.polyCallSites.size()) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "polymorphic call site index out of range");
+            }
+            const auto* pre = resolveJitPolymorphicTarget(
+                mirror, *actualTid, mirror.polyCallSites[fi.auxImm32]);
+            if (!pre || !pre->target || !pre->target->function) {
+                return setHelperError(ctx, flatIdx, runtime::ErrorCode::FunctionNotFound, "polymorphic method target not found");
+            }
+            targetSymId = pre->target->function->symbolId;
+            if (fi.inlineArgCount >= 1u && fi.inlineArgCount <= 3u) {
+                argCount = fi.inlineArgCount;
+                stackArgs[0] = runtime::detachFrameSliceValue(ctx->frameBase[fi.src0Slot]);
+                if (argCount >= 2u) {
+                    stackArgs[1] = runtime::detachFrameSliceValue(ctx->frameBase[fi.src1Slot]);
+                }
+                if (argCount >= 3u) {
+                    stackArgs[2] = runtime::detachFrameSliceValue(ctx->frameBase[fi.src2Slot]);
+                }
+                argsPtr = stackArgs.data();
+            } else {
+                if (!cold.bytecode || cold.bytecode->operands.empty()) {
+                    return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "CallPolledFast missing operands metadata");
+                }
+                const auto& ops = cold.bytecode->operands;
+                argCount = static_cast<std::uint32_t>(ops.size());
+                if (argCount <= stackArgs.size()) {
+                    for (std::uint32_t i = 0; i < argCount; ++i) {
+                        stackArgs[i] = runtime::detachFrameSliceValue(
+                            ctx->frameBase[execFunc.registerOffset + ops[i]]);
+                    }
+                    argsPtr = stackArgs.data();
+                } else {
+                    heapArgs.resize(argCount);
+                    for (std::uint32_t i = 0; i < argCount; ++i) {
+                        heapArgs[i] = runtime::detachFrameSliceValue(
+                            ctx->frameBase[execFunc.registerOffset + ops[i]]);
+                    }
+                    argsPtr = heapArgs.data();
+                }
+            }
+        }
+
+        ctx->remainingBudget -= fi.span;
+        runtime::Value callResult{};
+        const std::uint32_t subStatus = session.directInvokeFn(
+            session.moduleImpl,
+            ctx,
+            targetSymId,
+            argsPtr,
+            argCount,
+            &callResult,
+            session.forceSimulateArm64);
+        invalidateJitArrayCaches(*ctx);
+        if (subStatus != 0u) {
+            ctx->errorCodeRaw = subStatus;
+            ctx->errorFlatIndex = flatIdx;
+            return subStatus;
+        }
+        if (fi.dstSlot != runtime::detail::InvalidCompactReg) {
+            ctx->frameBase[fi.dstSlot] = std::move(callResult);
+        }
+        return 0u;
     }
     if (session.flatBankId == 0u || session.values == nullptr) {
         return setHelperError(ctx, flatIdx, runtime::ErrorCode::InvalidProgram, "flat stack bank is inactive in StencilJit");
@@ -2599,6 +3318,95 @@ std::uint32_t jitPartialSuperBudgetHelper(JitAbiContext* ctx, std::uint32_t flat
         default:
             return false;
         }
+    }
+    case FO::ConstantNullTagFast:
+        return validSlot(fi.dstSlot) &&
+               (fi.aux0Slot == 0u || (fi.aux0Slot <= 3u && validSlot(fi.src0Slot)));
+    case FO::ConstantEnumFast:
+    case FO::ConstantStringFast:
+        return validSlot(fi.dstSlot);
+    case FO::EqualValueFast:
+        return validSlot(fi.dstSlot) && validSlot(fi.src0Slot) && validSlot(fi.src1Slot);
+    case FO::CallIntrinsicFast: {
+        if (fi.inlineArgCount > 3u) return false;
+        if (fi.dstSlot != runtime::detail::InvalidCompactReg) {
+            if (!validSlot(fi.dstSlot) ||
+                (fi.dstSlot < execFunc.slotStructSchemaIds.size() &&
+                 execFunc.slotStructSchemaIds[fi.dstSlot] != 0u)) {
+                return false;
+            }
+        }
+        if (fi.inlineArgCount >= 1u && !validSlot(fi.src0Slot)) return false;
+        if (fi.inlineArgCount >= 2u && !validSlot(fi.src1Slot)) return false;
+        if (fi.inlineArgCount >= 3u && !validSlot(fi.src2Slot)) return false;
+        const auto ikind = static_cast<runtime::detail::FastIntrinsicKind>(
+            static_cast<std::uint8_t>(fi.binaryOpcode1));
+        if (ikind == runtime::detail::FastIntrinsicKind::None) return false;
+        if (ikind == runtime::detail::FastIntrinsicKind::StaticHas ||
+            ikind == runtime::detail::FastIntrinsicKind::StaticGet) {
+            return validSlot(fi.dstSlot);
+        }
+        if (ikind == runtime::detail::FastIntrinsicKind::StaticSet) {
+            return fi.inlineArgCount >= 1u;
+        }
+        if (ikind == runtime::detail::FastIntrinsicKind::ArrayPush ||
+            ikind == runtime::detail::FastIntrinsicKind::ArrayRemoveAt) {
+            return fi.inlineArgCount == 2u;
+        }
+        return true;
+    }
+    case FO::CallDirect0:
+    case FO::CallDirect1:
+    case FO::CallDirect2:
+    case FO::CallDirectN: {
+        const auto idx = static_cast<std::size_t>(&fi - execFunc.flatStream.data());
+        if (idx >= execFunc.flatCold.size()) return false;
+        if (fi.dstSlot != runtime::detail::InvalidCompactReg) {
+            if (!validSlot(fi.dstSlot) ||
+                (fi.dstSlot < execFunc.slotStructSchemaIds.size() &&
+                 execFunc.slotStructSchemaIds[fi.dstSlot] != 0u)) {
+                return false;
+            }
+        }
+        const auto& cold = execFunc.flatCold[idx];
+        if (cold.inlinedCallee != nullptr ||
+            !cold.directTarget ||
+            !cold.directTarget->function) {
+            return false;
+        }
+        if (fi.flatOpcode == FO::CallDirect1) return validSlot(fi.src0Slot);
+        if (fi.flatOpcode == FO::CallDirect2) return validSlot(fi.src0Slot) && validSlot(fi.src1Slot);
+        if (fi.flatOpcode == FO::CallDirectN) {
+            if (!cold.bytecode) return false;
+            for (const auto opReg : cold.bytecode->operands) {
+                const auto slot = static_cast<std::size_t>(execFunc.registerOffset) + opReg;
+                if (slot >= execFunc.totalFrameSlots) return false;
+            }
+        }
+        return true;
+    }
+    case FO::CallPolledFast: {
+        const auto idx = static_cast<std::size_t>(&fi - execFunc.flatStream.data());
+        if (idx >= execFunc.flatCold.size() || !validSlot(fi.src0Slot)) return false;
+        if (fi.dstSlot != runtime::detail::InvalidCompactReg) {
+            if (!validSlot(fi.dstSlot) ||
+                (fi.dstSlot < execFunc.slotStructSchemaIds.size() &&
+                 execFunc.slotStructSchemaIds[fi.dstSlot] != 0u)) {
+                return false;
+            }
+        }
+        const auto& cold = execFunc.flatCold[idx];
+        if (cold.inlinedCallee != nullptr) return false;
+        if (fi.inlineArgCount >= 1u && fi.inlineArgCount <= 3u) {
+            return (fi.inlineArgCount < 2u || validSlot(fi.src1Slot)) &&
+                   (fi.inlineArgCount < 3u || validSlot(fi.src2Slot));
+        }
+        if (!cold.bytecode || cold.bytecode->operands.empty()) return false;
+        for (const auto opReg : cold.bytecode->operands) {
+            const auto slot = static_cast<std::size_t>(execFunc.registerOffset) + opReg;
+            if (slot >= execFunc.totalFrameSlots) return false;
+        }
+        return true;
     }
     case FO::InlineCallEnter:
         return validSlot(fi.dstSlot) && fi.inlineArgCount <= 4u;

@@ -23,13 +23,6 @@ enum {
     RS_HOST_ABI_MINOR_V1 = 0,
 };
 
-enum {
-    RS_STATUS_V1_OUT_OF_MEMORY = 4,
-    RS_STATUS_V1_CROSS_HEAP_VIOLATION = 5,
-    RS_STATUS_V1_STALE_REFERENCE = 6,
-    RS_STATUS_V1_BUFFER_TOO_SMALL = 7,
-};
-
 typedef uint8_t RsValueKindV1;
 enum {
     RS_VALUE_KIND_V1_VOID = 0,

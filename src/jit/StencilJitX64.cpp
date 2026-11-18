@@ -1105,6 +1105,16 @@ private:
         case FO::LoadFieldFast:
         case FO::StoreFieldExactFast:
         case FO::StoreFieldFast:
+        case FO::ConstantNullTagFast:
+        case FO::ConstantEnumFast:
+        case FO::ConstantStringFast:
+        case FO::EqualValueFast:
+        case FO::CallIntrinsicFast:
+        case FO::CallDirect0:
+        case FO::CallDirect1:
+        case FO::CallDirect2:
+        case FO::CallDirectN:
+        case FO::CallPolledFast:
         case FO::GenericBytecode:
             emitHelperCallInline(&jitFlatStructAndStackRefHelper, i32Idx);
             break;

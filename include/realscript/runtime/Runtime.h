@@ -2710,6 +2710,7 @@ public:
     [[nodiscard]] bool tryBindFlatStructArrayFastView(ObjectRef reference, FlatStructArrayFastView& outView) const noexcept;
     void recordFlatStructArrayWriteBarrier(ObjectRef arrayRef, std::size_t elementIndex) noexcept;
     [[nodiscard]] std::uint64_t gcEpoch() const noexcept;
+    [[nodiscard]] std::uint64_t stringInternEpoch() const noexcept;
     void pinFlatStructArrayElement(ObjectRef arrayRef, std::size_t elementIndex) noexcept;
     [[nodiscard]] bool tryBindPackedInt32Array(
         ObjectRef reference,

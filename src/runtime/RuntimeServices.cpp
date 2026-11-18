@@ -2432,6 +2432,11 @@ bool executeFastIntrinsicCore(
             }
         };
         const auto hashVal = [&](const auto& self, const Value& v) -> void {
+            if (const auto sv = extractIntrinsicStringView(v, heap)) {
+                mixU64(Value{ObjectRef{}}.index());
+                mixStr(*sv);
+                return;
+            }
             mixU64(v.index());
             if (const auto* b = std::get_if<bool>(&v)) mixU64(*b ? 1u : 0u);
             else if (const auto* i = std::get_if<std::int64_t>(&v)) mixU64(static_cast<std::uint64_t>(*i));

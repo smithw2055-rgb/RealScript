@@ -179,9 +179,21 @@ inline void invalidateJitArrayCaches(JitAbiContext& ctx) noexcept {
     }
 }
 
+struct JitAbiContext;
+
+using JitDirectInvokeFn = std::uint32_t (*)(
+    const void* moduleImpl,
+    JitAbiContext* callerCtx,
+    semantic::SymbolId targetSymbolId,
+    const runtime::Value* args,
+    std::uint32_t argCount,
+    runtime::Value* outResult,
+    bool forceSimulateArm64) noexcept;
+
 struct JitRuntimeSession {
     const runtime::ProgramImage* program = nullptr;
     runtime::ManagedHeap* heap = nullptr;
+    runtime::IExecutionPolicy* executionPolicy = nullptr;
     runtime::Limits limits{};
     runtime::RuntimeStatistics stats{};
     runtime::RuntimeError error{};
@@ -194,10 +206,19 @@ struct JitRuntimeSession {
     std::uint8_t flatBankId = 0;
     runtime::ShadowStack shadowStack{};
     runtime::FrameTelemetryCollector* telemetry = runtime::activeFrameTelemetry();
+    const void* moduleImpl = nullptr;
+    JitDirectInvokeFn directInvokeFn = nullptr;
+    bool forceSimulateArm64 = false;
+    std::vector<runtime::ObjectRef>* stringLiteralCache = nullptr;
+    std::uint64_t* stringLiteralCacheEpoch = nullptr;
+    std::uint64_t* stringLiteralCacheHeapId = nullptr;
 };
 
 struct StencilTlsScratch {
     std::vector<runtime::Value> values;
+    std::vector<runtime::ObjectRef> stringLiterals;
+    std::uint64_t strCacheEpoch = 0;
+    std::uint64_t strCacheHeapId = 0;
     bool inUse = false;
 };
 
