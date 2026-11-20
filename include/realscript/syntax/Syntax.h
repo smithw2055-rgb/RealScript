@@ -1,6 +1,7 @@
 #pragma once
 
 #include "realscript/diagnostics/Diagnostic.h"
+#include "realscript/syntax/TokenValue.h"
 #include "realscript/text/Text.h"
 
 #include <cstdint>
@@ -206,8 +207,6 @@ enum class SyntaxKind {
     PropertyPattern,
     ParenthesizedPattern,
 };
-
-using TokenValue = std::variant<std::monostate, std::int64_t, double, bool, std::string>;
 
 struct SyntaxToken {
     SyntaxKind kind = SyntaxKind::BadToken;

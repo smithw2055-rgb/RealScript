@@ -1157,7 +1157,7 @@ std::unordered_map<mir::BlockId, VectorizedEcsLoopPlan> analyzeVectorizedEcsLoop
         bool bodyValid = true;
         for (std::size_t i = plan.bodyPreambleCount; i < bodyBlock->instructions.size(); ++i) {
             const auto& inst = bodyBlock->instructions[i];
-            if (!isPureVectorizableBodyInstruction(inst)) {
+            if (inst.checkedArithmetic || !isPureVectorizableBodyInstruction(inst)) {
                 bodyValid = false;
                 break;
             }
@@ -1268,6 +1268,14 @@ std::unordered_map<mir::BlockId, VectorizedEcsLoopPlan> analyzeVectorizedEcsLoop
         const auto oneIt = constantInts.find(addInc.operands[1]);
         if (oneIt == constantInts.end() || oneIt->second != 1) continue;
 
+        plan.headerIterInsts =
+            1ULL + 4ULL * static_cast<std::uint64_t>(plan.columns.size());
+        plan.bodyInstsWithTerminator =
+            static_cast<std::uint64_t>(bodyBlock->instructions.size()) + 1ULL;
+        plan.incInstsWithTerminator =
+            static_cast<std::uint64_t>(incBlock->instructions.size()) + 1ULL;
+        plan.iterBranches = static_cast<std::uint64_t>(plan.columns.size()) + 2ULL;
+
         plans.emplace(plan.headerBlockId, std::move(plan));
     }
     return plans;
@@ -1280,8 +1288,8 @@ void emitVectorizedBodyInstruction(
     Emitter& source,
     const mir::Instruction& instruction,
     const std::vector<TypedSlotType>& types,
+    const std::map<semantic::SymbolId, TypeView>& allTypes,
     const std::string& indent) {
-    (void)types;
     const auto result = instruction.result >= 0
         ? typedValueExpression(instruction.result)
         : std::string{};
@@ -1294,6 +1302,10 @@ void emitVectorizedBodyInstruction(
             source.line(indent + result + " = runtime::EnumValue{0x" +
                 hexId(instruction.resultTypeId) + "ULL, " +
                 int64Literal(instruction.integerImmediate) + "};");
+        } else if (instruction.resultType == semantic::PrimitiveType::ULong) {
+            source.line(indent + result + " = std::uint64_t{" +
+                std::to_string(static_cast<std::uint64_t>(instruction.integerImmediate)) +
+                "ULL};");
         } else {
             source.line(indent + result + " = std::int64_t{" +
                 int64Literal(instruction.integerImmediate) + "};");
@@ -1336,20 +1348,12 @@ void emitVectorizedBodyInstruction(
         const auto operation = instruction.opcode == mir::Opcode::AddInt
             ? " + "
             : (instruction.opcode == mir::Opcode::SubtractInt ? " - " : " * ");
-        if (!instruction.checkedArithmetic) {
-            source.line(indent + result + " = aot::typedWrapInt32(" +
-                operand(0) + operation + operand(1) + ");");
-        } else {
-            source.line(indent + result + " = " + operand(0) + operation + operand(1) + ";");
-        }
+        source.line(indent + result + " = aot::typedWrapInt32(" +
+            operand(0) + operation + operand(1) + ");");
         break;
     }
     case mir::Opcode::NegateInt:
-        if (!instruction.checkedArithmetic) {
-            source.line(indent + result + " = aot::typedWrapInt32(-" + operand(0) + ");");
-        } else {
-            source.line(indent + result + " = -" + operand(0) + ";");
-        }
+        source.line(indent + result + " = aot::typedWrapInt32(-" + operand(0) + ");");
         break;
     case mir::Opcode::AddLong:
     case mir::Opcode::SubtractLong:
@@ -1357,17 +1361,32 @@ void emitVectorizedBodyInstruction(
         const auto operation = instruction.opcode == mir::Opcode::AddLong
             ? " + "
             : (instruction.opcode == mir::Opcode::SubtractLong ? " - " : " * ");
+        const bool isULong =
+            (instruction.result >= 0 &&
+             static_cast<std::size_t>(instruction.result) < types.size() &&
+             types[static_cast<std::size_t>(instruction.result)].primitive ==
+                 semantic::PrimitiveType::ULong) ||
+            instruction.resultType == semantic::PrimitiveType::ULong;
         source.line(indent + result +
-            " = static_cast<std::int64_t>(static_cast<std::uint64_t>(" +
+            " = static_cast<" + std::string(isULong ? "std::uint64_t" : "std::int64_t") +
+            ">(static_cast<std::uint64_t>(" +
             operand(0) + ")" + operation + "static_cast<std::uint64_t>(" +
             operand(1) + "));");
         break;
     }
-    case mir::Opcode::NegateLong:
+    case mir::Opcode::NegateLong: {
+        const bool isULong =
+            (instruction.result >= 0 &&
+             static_cast<std::size_t>(instruction.result) < types.size() &&
+             types[static_cast<std::size_t>(instruction.result)].primitive ==
+                 semantic::PrimitiveType::ULong) ||
+            instruction.resultType == semantic::PrimitiveType::ULong;
         source.line(indent + result +
-            " = static_cast<std::int64_t>(0ULL - static_cast<std::uint64_t>(" +
+            " = static_cast<" + std::string(isULong ? "std::uint64_t" : "std::int64_t") +
+            ">(0ULL - static_cast<std::uint64_t>(" +
             operand(0) + "));");
         break;
+    }
     case mir::Opcode::NegateDouble:
         source.line(indent + result + " = -" + operand(0) + ";");
         break;
@@ -1455,6 +1474,9 @@ void emitVectorizedBodyInstruction(
                 source.line(indent + result + " = runtime::FixedValue{" +
                     operand(0) + "." + member + "};");
             }
+        } else if (instruction.resultType == semantic::PrimitiveType::Int) {
+            source.line(indent + result + " = static_cast<std::int64_t>(" + operand(0) + ".f_" +
+                std::to_string(instruction.fieldIndex) + ");");
         } else {
             source.line(indent + result + " = " + operand(0) + ".f_" +
                 std::to_string(instruction.fieldIndex) + ";");
@@ -1486,8 +1508,27 @@ void emitVectorizedBodyInstruction(
             if (result != operand(0)) {
                 source.line(indent + result + " = " + operand(0) + ";");
             }
+            bool isInt32Field = false;
+            if (!instruction.operands.empty() && instruction.operands.size() > 1 &&
+                instruction.operands[1] >= 0 &&
+                static_cast<std::size_t>(instruction.operands[1]) < types.size()) {
+                isInt32Field =
+                    (types[static_cast<std::size_t>(instruction.operands[1])].primitive ==
+                     semantic::PrimitiveType::Int);
+            }
+            if (const auto tvIt = allTypes.find(instruction.typeId);
+                tvIt != allTypes.end() && tvIt->second.type != nullptr &&
+                instruction.fieldIndex < tvIt->second.type->fields.size()) {
+                isInt32Field =
+                    (tvIt->second.type->fields[instruction.fieldIndex].type ==
+                     semantic::PrimitiveType::Int);
+            }
             source.line(indent + result + ".f_" +
-                std::to_string(instruction.fieldIndex) + " = " + operand(1) + ";");
+                std::to_string(instruction.fieldIndex) + " = " +
+                (isInt32Field
+                    ? ("static_cast<std::int32_t>(" + operand(1) + ")")
+                    : operand(1)) +
+                ";");
         }
         break;
     }
@@ -1504,6 +1545,7 @@ void emitVectorizedEcsLoop(
     const mir::Module& module,
     const mir::Function& function,
     const std::vector<TypedSlotType>& types,
+    const std::map<semantic::SymbolId, TypeView>& allTypes,
     const VectorizedEcsLoopPlan& plan,
     bool emitLineDirectives) {
     const auto* bodyBlock = findBlock(function, plan.bodyBlockId);
@@ -1523,6 +1565,16 @@ void emitVectorizedEcsLoop(
             rawCond += " && !" + rawCol + ".readOnly";
         }
     }
+    for (std::size_t i = 0; i < plan.columns.size(); ++i) {
+        for (std::size_t j = i + 1u; j < plan.columns.size(); ++j) {
+            if (!plan.columns[i].isWrite && !plan.columns[j].isWrite) continue;
+            const auto rawColI = "typedLocalRawCol_" + std::to_string(plan.columns[i].colLocalIndex);
+            const auto rawColJ = "typedLocalRawCol_" + std::to_string(plan.columns[j].colLocalIndex);
+            exactCond += " && aot::packedBuffersDisjoint(" +
+                rawColI + ".basePtr, static_cast<std::size_t>(" + rawColI + ".count) * " + rawColI + ".strideBytes, " +
+                rawColJ + ".basePtr, static_cast<std::size_t>(" + rawColJ + ".count) * " + rawColJ + ".strideBytes)";
+        }
+    }
     exactCond += " && (" + idxLocalExpr + " >= 0)";
     rawCond += " && (" + idxLocalExpr + " >= 0)";
     if (plan.hasSparseWritebackCall) {
@@ -1532,23 +1584,40 @@ void emitVectorizedEcsLoop(
 
     const auto firstRawCol = "typedLocalRawCol_" + std::to_string(plan.columns[0].colLocalIndex);
 
-    source.line("            // Reconstructed Vectorized ECS Query Fast-Loop (__restrict + #pragma GCC ivdep)");
-    source.line("            if constexpr (TrustedRelease) {");
+    const std::uint64_t ecsIterInsts =
+        plan.headerIterInsts + plan.bodyInstsWithTerminator + plan.incInstsWithTerminator;
+
+    source.line("            // Reconstructed Vectorized ECS Query Fast-Loop (RS_AOT_RESTRICT + ivdep)");
+    source.line("            if constexpr (TrustedRelease || FastAccounting) {");
     source.line("                if (RS_AOT_LIKELY(" + exactCond + ")) {");
     source.line("                    std::int64_t ecsFastCount = " + firstRawCol + ".count;");
+    source.line("                    std::uint64_t ecsExitHeaderChecks = 1ULL;");
     for (std::size_t c = 1; c < plan.columns.size(); ++c) {
         const auto rawCol = "typedLocalRawCol_" + std::to_string(plan.columns[c].colLocalIndex);
-        source.line("                    if (" + rawCol + ".count < ecsFastCount) ecsFastCount = " + rawCol + ".count;");
+        source.line("                    if (" + rawCol + ".count < ecsFastCount) { ecsFastCount = " +
+            rawCol + ".count; ecsExitHeaderChecks = " + std::to_string(c + 1u) + "ULL; }");
     }
+    source.line("                    const std::uint64_t ecsTrips = (ecsFastCount > " + idxLocalExpr + ") "
+        "? static_cast<std::uint64_t>(ecsFastCount - " + idxLocalExpr + ") : 0ULL;");
+    source.line("                    if (ecsTrips == 0ULL) ecsExitHeaderChecks = 1ULL;");
+    source.line("                    const std::uint64_t ecsTotalInsts = ecsTrips * " +
+        std::to_string(ecsIterInsts) + "ULL + (1ULL + 4ULL * ecsExitHeaderChecks);");
+    source.line("                    const std::uint64_t ecsTotalBranches = ecsTrips * " +
+        std::to_string(plan.iterBranches) + "ULL + ecsExitHeaderChecks;");
+    source.line("                    if ([&]() noexcept { if constexpr (TrustedRelease) return true; else return rawAccounting.canConsume(ecsTotalInsts); }()) {");
+    source.line("                        if constexpr (FastAccounting && !TrustedRelease) {");
+    source.line("                            (void)rawAccounting.consume(ecsTotalInsts);");
+    source.line("                            rawAccounting.addBranches(ecsTotalBranches);");
+    source.line("                        }");
     for (const auto& col : plan.columns) {
         const auto rawCol = "typedLocalRawCol_" + std::to_string(col.colLocalIndex);
         const std::string structName = "AotStruct_" + hexId(col.elemTypeId);
         const std::string ptrName = "ecsPtr_" + std::to_string(col.colLocalIndex);
         if (col.isWrite) {
-            source.line("                    auto* __restrict " + ptrName +
+            source.line("                        auto* RS_AOT_RESTRICT " + ptrName +
                 " = reinterpret_cast<" + structName + "*>(" + rawCol + ".basePtr);");
         } else {
-            source.line("                    const auto* __restrict " + ptrName +
+            source.line("                        const auto* RS_AOT_RESTRICT " + ptrName +
                 " = reinterpret_cast<const " + structName + "*>(" + rawCol + ".basePtr);");
         }
     }
@@ -1559,13 +1628,13 @@ void emitVectorizedEcsLoop(
     source.line("#elif defined(_MSC_VER) && !defined(__clang__)");
     source.line("#pragma loop(ivdep)");
     source.line("#endif");
-    source.line("                    for (std::int64_t ecsIdx = " + idxLocalExpr + "; ecsIdx < ecsFastCount; ++ecsIdx) {");
+    source.line("                        for (std::int64_t ecsIdx = " + idxLocalExpr + "; ecsIdx < ecsFastCount; ++ecsIdx) {");
     if (plan.usesIndexInsideBody) {
-        source.line("                        " + idxLocalExpr + " = ecsIdx;");
+        source.line("                            " + idxLocalExpr + " = ecsIdx;");
     }
     for (const auto& col : plan.columns) {
         const std::string ptrName = "ecsPtr_" + std::to_string(col.colLocalIndex);
-        source.line("                        " + typedLocalExpression(col.iterLocalIndex) +
+        source.line("                            " + typedLocalExpression(col.iterLocalIndex) +
             " = " + ptrName + "[ecsIdx];");
     }
     for (std::size_t i = plan.bodyPreambleCount; i < bodyBlock->instructions.size(); ++i) {
@@ -1583,32 +1652,47 @@ void emitVectorizedEcsLoop(
             nullptr,
             function.symbolId,
             false);
-        emitVectorizedBodyInstruction(source, bodyBlock->instructions[i], types, "                        ");
+        emitVectorizedBodyInstruction(source, bodyBlock->instructions[i], types, allTypes, "                            ");
     }
     emitGeneratedLineReset(source, emitLineDirectives);
     for (const auto& col : plan.columns) {
         if (!col.isWrite) continue;
         const std::string ptrName = "ecsPtr_" + std::to_string(col.colLocalIndex);
-        source.line("                        " + ptrName + "[ecsIdx] = " +
+        source.line("                            " + ptrName + "[ecsIdx] = " +
             typedLocalExpression(col.iterLocalIndex) + ";");
     }
+    source.line("                        }");
+    source.line("                        if (ecsFastCount > " + idxLocalExpr + ") " + idxLocalExpr + " = ecsFastCount;");
+    source.line("                        goto typedBlock_" + std::to_string(plan.exitBlockId) + ";");
     source.line("                    }");
-    source.line("                    if (ecsFastCount > " + idxLocalExpr + ") " + idxLocalExpr + " = ecsFastCount;");
-    source.line("                    goto typedBlock_" + std::to_string(plan.exitBlockId) + ";");
     source.line("                } else if (RS_AOT_LIKELY(" + rawCond + ")) {");
     source.line("                    std::int64_t ecsFastCount = " + firstRawCol + ".count;");
+    source.line("                    std::uint64_t ecsExitHeaderChecks = 1ULL;");
     for (std::size_t c = 1; c < plan.columns.size(); ++c) {
         const auto rawCol = "typedLocalRawCol_" + std::to_string(plan.columns[c].colLocalIndex);
-        source.line("                    if (" + rawCol + ".count < ecsFastCount) ecsFastCount = " + rawCol + ".count;");
+        source.line("                    if (" + rawCol + ".count < ecsFastCount) { ecsFastCount = " +
+            rawCol + ".count; ecsExitHeaderChecks = " + std::to_string(c + 1u) + "ULL; }");
     }
-    source.line("                    for (std::int64_t ecsIdx = " + idxLocalExpr + "; ecsIdx < ecsFastCount; ++ecsIdx) {");
+    source.line("                    const std::uint64_t ecsTrips = (ecsFastCount > " + idxLocalExpr + ") "
+        "? static_cast<std::uint64_t>(ecsFastCount - " + idxLocalExpr + ") : 0ULL;");
+    source.line("                    if (ecsTrips == 0ULL) ecsExitHeaderChecks = 1ULL;");
+    source.line("                    const std::uint64_t ecsTotalInsts = ecsTrips * " +
+        std::to_string(ecsIterInsts) + "ULL + (1ULL + 4ULL * ecsExitHeaderChecks);");
+    source.line("                    const std::uint64_t ecsTotalBranches = ecsTrips * " +
+        std::to_string(plan.iterBranches) + "ULL + ecsExitHeaderChecks;");
+    source.line("                    if ([&]() noexcept { if constexpr (TrustedRelease) return true; else return rawAccounting.canConsume(ecsTotalInsts); }()) {");
+    source.line("                        if constexpr (FastAccounting && !TrustedRelease) {");
+    source.line("                            (void)rawAccounting.consume(ecsTotalInsts);");
+    source.line("                            rawAccounting.addBranches(ecsTotalBranches);");
+    source.line("                        }");
+    source.line("                        for (std::int64_t ecsIdx = " + idxLocalExpr + "; ecsIdx < ecsFastCount; ++ecsIdx) {");
     if (plan.usesIndexInsideBody) {
-        source.line("                        " + idxLocalExpr + " = ecsIdx;");
+        source.line("                            " + idxLocalExpr + " = ecsIdx;");
     }
     for (const auto& col : plan.columns) {
         const auto rawCol = "typedLocalRawCol_" + std::to_string(col.colLocalIndex);
         const std::string structName = "AotStruct_" + hexId(col.elemTypeId);
-        source.line("                        (void)" + structName + "::loadFromRawColumn(" +
+        source.line("                            (void)" + structName + "::loadFromRawColumn(" +
             rawCol + ", ecsIdx, " + typedLocalExpression(col.iterLocalIndex) + ");");
     }
     for (std::size_t i = plan.bodyPreambleCount; i < bodyBlock->instructions.size(); ++i) {
@@ -1626,19 +1710,20 @@ void emitVectorizedEcsLoop(
             nullptr,
             function.symbolId,
             false);
-        emitVectorizedBodyInstruction(source, bodyBlock->instructions[i], types, "                        ");
+        emitVectorizedBodyInstruction(source, bodyBlock->instructions[i], types, allTypes, "                            ");
     }
     emitGeneratedLineReset(source, emitLineDirectives);
     for (const auto& col : plan.columns) {
         if (!col.isWrite) continue;
         const auto rawCol = "typedLocalRawCol_" + std::to_string(col.colLocalIndex);
         const std::string structName = "AotStruct_" + hexId(col.elemTypeId);
-        source.line("                        (void)" + structName + "::storeToRawColumn(" +
+        source.line("                            (void)" + structName + "::storeToRawColumn(" +
             rawCol + ", ecsIdx, " + typedLocalExpression(col.iterLocalIndex) + ");");
     }
+    source.line("                        }");
+    source.line("                        if (ecsFastCount > " + idxLocalExpr + ") " + idxLocalExpr + " = ecsFastCount;");
+    source.line("                        goto typedBlock_" + std::to_string(plan.exitBlockId) + ";");
     source.line("                    }");
-    source.line("                    if (ecsFastCount > " + idxLocalExpr + ") " + idxLocalExpr + " = ecsFastCount;");
-    source.line("                    goto typedBlock_" + std::to_string(plan.exitBlockId) + ";");
     source.line("                }");
     source.line("            }");
 }
@@ -2319,7 +2404,7 @@ void emitVectorizedPackedArrayLoop(
         std::to_string(plan.headerInstsWithTerminator) + "ULL;");
     source.line("                    const std::uint64_t vecTotalBranches = vecTrips * " +
         std::to_string(plan.iterBranches) + "ULL + 1ULL;");
-    source.line("                    if (TrustedRelease || rawAccounting.canConsume(vecTotalInsts)) {");
+    source.line("                    if ([&]() noexcept { if constexpr (TrustedRelease) return true; else return rawAccounting.canConsume(vecTotalInsts); }()) {");
     source.line("                        if constexpr (FastAccounting && !TrustedRelease) {");
     source.line("                            (void)rawAccounting.consume(vecTotalInsts);");
     source.line("                            rawAccounting.addBranches(vecTotalBranches);");
@@ -2429,13 +2514,16 @@ void emitVectorizedPackedArrayLoop(
             break;
         }
         case mir::Opcode::ConstantInt:
-            if (inst.resultType == semantic::PrimitiveType::Long ||
-                inst.resultType == semantic::PrimitiveType::ULong ||
-                inst.resultType == semantic::PrimitiveType::UInt ||
-                inst.resultType == semantic::PrimitiveType::Byte ||
-                inst.resultType == semantic::PrimitiveType::SByte ||
-                inst.resultType == semantic::PrimitiveType::Short ||
-                inst.resultType == semantic::PrimitiveType::UShort) {
+            if (inst.resultType == semantic::PrimitiveType::ULong) {
+                source.line(ind + resDecl + " = std::uint64_t{" +
+                    std::to_string(static_cast<std::uint64_t>(inst.integerImmediate)) +
+                    "ULL};");
+            } else if (inst.resultType == semantic::PrimitiveType::Long ||
+                       inst.resultType == semantic::PrimitiveType::UInt ||
+                       inst.resultType == semantic::PrimitiveType::Byte ||
+                       inst.resultType == semantic::PrimitiveType::SByte ||
+                       inst.resultType == semantic::PrimitiveType::Short ||
+                       inst.resultType == semantic::PrimitiveType::UShort) {
                 source.line(ind + resDecl + " = std::int64_t{" +
                     int64Literal(inst.integerImmediate) + "};");
             } else {
@@ -2495,15 +2583,30 @@ void emitVectorizedPackedArrayLoop(
             const char* sym = inst.opcode == mir::Opcode::AddLong
                 ? " + "
                 : (inst.opcode == mir::Opcode::SubtractLong ? " - " : " * ");
+            const bool isULong =
+                (inst.result >= 0 &&
+                 static_cast<std::size_t>(inst.result) < types.size() &&
+                 types[static_cast<std::size_t>(inst.result)].primitive ==
+                     semantic::PrimitiveType::ULong) ||
+                inst.resultType == semantic::PrimitiveType::ULong;
             source.line(ind + resDecl +
-                " = static_cast<std::int64_t>(static_cast<std::uint64_t>(" + op(0) + ")" +
+                " = static_cast<" + std::string(isULong ? "std::uint64_t" : "std::int64_t") +
+                ">(static_cast<std::uint64_t>(" + op(0) + ")" +
                 sym + "static_cast<std::uint64_t>(" + op(1) + "));");
             break;
         }
-        case mir::Opcode::NegateLong:
+        case mir::Opcode::NegateLong: {
+            const bool isULong =
+                (inst.result >= 0 &&
+                 static_cast<std::size_t>(inst.result) < types.size() &&
+                 types[static_cast<std::size_t>(inst.result)].primitive ==
+                     semantic::PrimitiveType::ULong) ||
+                inst.resultType == semantic::PrimitiveType::ULong;
             source.line(ind + resDecl +
-                " = static_cast<std::int64_t>(0ULL - static_cast<std::uint64_t>(" + op(0) + "));");
+                " = static_cast<" + std::string(isULong ? "std::uint64_t" : "std::int64_t") +
+                ">(0ULL - static_cast<std::uint64_t>(" + op(0) + "));");
             break;
+        }
         case mir::Opcode::AddDouble:
         case mir::Opcode::SubtractDouble:
         case mir::Opcode::MultiplyDouble:

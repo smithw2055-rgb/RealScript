@@ -629,6 +629,7 @@ public:
     }
 
     [[nodiscard]] bool allLabelsBound() const noexcept {
+        if (overflowed_) return false;
         for (const auto& lbl : labels_) {
             if (!lbl.patches.empty() && !lbl.bound()) return false;
         }
@@ -651,12 +652,18 @@ private:
         const std::ptrdiff_t rel =
             static_cast<std::ptrdiff_t>(targetOffset) -
             static_cast<std::ptrdiff_t>(patchPos + 4u);
+        if (rel < std::numeric_limits<std::int32_t>::min() ||
+            rel > std::numeric_limits<std::int32_t>::max()) {
+            overflowed_ = true;
+            return;
+        }
         const auto rel32 = static_cast<std::int32_t>(rel);
         std::memcpy(buf_.data() + patchPos, &rel32, 4);
     }
 
     std::vector<std::uint8_t> buf_;
     std::vector<Label> labels_;
+    bool overflowed_ = false;
 };
 
 } // namespace
@@ -1109,12 +1116,15 @@ private:
         case FO::ConstantEnumFast:
         case FO::ConstantStringFast:
         case FO::EqualValueFast:
+        case FO::ConvertNumericFast:
+        case FO::BinaryUIntFast:
         case FO::CallIntrinsicFast:
         case FO::CallDirect0:
         case FO::CallDirect1:
         case FO::CallDirect2:
         case FO::CallDirectN:
         case FO::CallPolledFast:
+        case FO::SuperCheckNotNullCallPolledFast:
         case FO::GenericBytecode:
             emitHelperCallInline(&jitFlatStructAndStackRefHelper, i32Idx);
             break;
@@ -1256,14 +1266,22 @@ private:
             break;
         }
 
-        case FO::NegateIntUnchecked:
-            emitBudgetDeduct(i32Idx, fi.span, false);
+        case FO::NegateIntChecked:
+        case FO::NegateIntUnchecked: {
+            const bool isChecked = (fi.flatOpcode == FO::NegateIntChecked && fi.checked1());
+            emitBudgetDeduct(i32Idx, fi.span, isChecked && fi.span > 1u);
             emitCheckTagOrTrap(fi.src0Slot, kTagInt64, i32Idx, unexecAfter);
             as.loadMem32(X64Reg::RAX, X64Reg::RBX, slotOff(fi.src0Slot));
+            if (isChecked) {
+                as.cmpReg32Imm(X64Reg::RAX, std::numeric_limits<std::int32_t>::min());
+                const auto ovfStub = addColdStub(ColdTrapStub::Kind::IntegerOverflow, i32Idx, unexecAfter);
+                as.jcc(X64Cond::E, ovfStub);
+            }
             as.negReg32(X64Reg::RAX);
             as.movsxd64From32(X64Reg::RAX, X64Reg::RAX);
             emitWriteTaggedResult(fi.dstSlot, kTagInt64);
             break;
+        }
 
         case FO::LogicalNot:
             emitBudgetDeduct(i32Idx, fi.span, false);
@@ -1449,7 +1467,9 @@ private:
                 instLabels[fi.trueTargetOffset],
                 instLabels[fi.falseTargetOffset]);
 
-            // Verify lhs is Int64 & array hits inline cache
+            // Verify policy inactive, lhs is Int64 & array hits inline cache
+            as.cmpMem8Imm(X64Reg::R12, static_cast<std::int32_t>(offsetof(JitAbiContext, hasExecutionPolicy)), 0);
+            as.jcc(X64Cond::NE, slowStub);
             as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src0Slot) + 15, kTagInt64);
             as.jcc(X64Cond::NE, slowStub);
             as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src1Slot) + 15, kTagObjectRef);
@@ -1479,6 +1499,8 @@ private:
             const auto slowStub = addColdStub(
                 ColdTrapStub::Kind::ArrayLengthSlow, i32Idx, 0, doneLbl);
 
+            as.cmpMem8Imm(X64Reg::R12, static_cast<std::int32_t>(offsetof(JitAbiContext, hasExecutionPolicy)), 0);
+            as.jcc(X64Cond::NE, slowStub);
             as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src0Slot) + 15, kTagObjectRef);
             as.jcc(X64Cond::NE, slowStub);
             as.loadMem64(X64Reg::RAX, X64Reg::RBX, slotOff(fi.src0Slot));
@@ -1535,6 +1557,8 @@ private:
                             ColdTrapStub::Kind::ArrayLoadSlow, i32Idx, 0, doneLbl);
 
                         // 1. Inline FlatStruct[] (isPacked == 2u) cache hit check
+                        as.cmpMem8Imm(X64Reg::R12, static_cast<std::int32_t>(offsetof(JitAbiContext, hasExecutionPolicy)), 0);
+                        as.jcc(X64Cond::NE, slowStub);
                         as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src0Slot) + 15, kTagObjectRef);
                         as.jcc(X64Cond::NE, slowStub);
                         as.loadMem64(X64Reg::RAX, X64Reg::RBX, slotOff(fi.src0Slot));
@@ -1604,7 +1628,12 @@ private:
             const auto slowStub = addColdStub(
                 ColdTrapStub::Kind::ArrayLoadSlow, i32Idx, 0, doneLbl);
 
-            // 1. Inline PackedArrayFastView cache hit check
+            // 1. ExecutionPolicy guard & inline PackedArrayFastView cache hit check
+            as.cmpMem8Imm(
+                X64Reg::R12,
+                static_cast<std::int32_t>(offsetof(JitAbiContext, hasExecutionPolicy)),
+                0u);
+            as.jcc(X64Cond::NE, slowStub);
             as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src0Slot) + 15, kTagObjectRef);
             as.jcc(X64Cond::NE, slowStub);
             as.loadMem64(X64Reg::RAX, X64Reg::RBX, slotOff(fi.src0Slot));
@@ -1670,7 +1699,12 @@ private:
                 const auto slowStub = addColdStub(
                     ColdTrapStub::Kind::ArrayStoreSlow, i32Idx, 0, doneLbl);
 
-                // 1. Inline FlatStruct[] (isPacked == 2u) cache hit check
+                // 1. ExecutionPolicy guard & inline FlatStruct[] (isPacked == 2u) cache hit check
+                as.cmpMem8Imm(
+                    X64Reg::R12,
+                    static_cast<std::int32_t>(offsetof(JitAbiContext, hasExecutionPolicy)),
+                    0u);
+                as.jcc(X64Cond::NE, slowStub);
                 as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src0Slot) + 15, kTagObjectRef);
                 as.jcc(X64Cond::NE, slowStub);
                 as.loadMem64(X64Reg::RAX, X64Reg::RBX, slotOff(fi.src0Slot));
@@ -1743,7 +1777,12 @@ private:
             const auto slowStub = addColdStub(
                 ColdTrapStub::Kind::ArrayStoreSlow, i32Idx, 0, doneLbl);
 
-            // 1. Inline PackedArrayFastView cache hit check
+            // 1. ExecutionPolicy guard & inline PackedArrayFastView cache hit check
+            as.cmpMem8Imm(
+                X64Reg::R12,
+                static_cast<std::int32_t>(offsetof(JitAbiContext, hasExecutionPolicy)),
+                0u);
+            as.jcc(X64Cond::NE, slowStub);
             as.cmpMem8Imm(X64Reg::RBX, slotOff(fi.src0Slot) + 15, kTagObjectRef);
             as.jcc(X64Cond::NE, slowStub);
             as.loadMem64(X64Reg::RAX, X64Reg::RBX, slotOff(fi.src0Slot));
@@ -2158,13 +2197,21 @@ private:
         case FO::InlineCallEnter: {
             emitHelperCallInline(&jitInlineCallEnterHelper, i32Idx);
             const std::size_t fastTarget = idx + 1u + fi.inlineArgCount;
-            if (fi.inlineArgCount > 0u && fastTarget < nInst) {
+            const bool hasFastTarget = (fi.inlineArgCount > 0u && fastTarget < nInst);
+            const bool hasSkipTarget = (fi.auxImm32 < nInst);
+            if (hasFastTarget || hasSkipTarget) {
                 as.loadMem32(
                     X64Reg::RAX,
                     X64Reg::R12,
                     static_cast<std::int32_t>(offsetof(JitAbiContext, nextFlatOffsetOut)));
-                as.testReg32(X64Reg::RAX, X64Reg::RAX);
-                as.jcc(X64Cond::NE, instLabels[fastTarget]);
+                if (hasSkipTarget) {
+                    as.cmpReg32Imm(X64Reg::RAX, 2);
+                    as.jcc(X64Cond::E, instLabels[fi.auxImm32]);
+                }
+                if (hasFastTarget) {
+                    as.testReg32(X64Reg::RAX, X64Reg::RAX);
+                    as.jcc(X64Cond::NE, instLabels[fastTarget]);
+                }
             }
             break;
         }
@@ -2228,7 +2275,7 @@ private:
             break;
 
         case FO::TermBranchGeneric: {
-            const auto& cold = execFunc.flatCold[idx];
+            const auto cold = execFunc.resolveCold(idx);
             if (cold.blockIndex >= execFunc.blocks.size()) return {};
             const auto& blk = execFunc.blocks[cold.blockIndex];
             const auto& term = blk.bytecode->terminator;
@@ -2315,7 +2362,7 @@ private:
 
         case FO::TermReturnGeneric: {
             emitBudgetDeduct(i32Idx, fi.span, false);
-            const auto& cold = execFunc.flatCold[idx];
+            const auto cold = execFunc.resolveCold(idx);
             const auto retReg = execFunc.blocks[cold.blockIndex].bytecode->terminator.value;
             const auto retSlot = static_cast<std::uint16_t>(execFunc.registerOffset + retReg);
             as.movupsLoad(0, X64Reg::RBX, slotOff(retSlot));

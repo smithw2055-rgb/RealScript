@@ -1,12 +1,18 @@
 #include "RuntimeInternal.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <utility>
 
 namespace realscript::runtime {
 namespace {
+
+std::uint64_t nextBindingRegistryId() noexcept {
+    static std::atomic<std::uint64_t> next{1};
+    return next.fetch_add(1u, std::memory_order_relaxed);
+}
 
 std::mutex& bindingCacheMutexFor(const BindingRegistry* reg) noexcept {
     static auto* stripes = new std::array<std::mutex, 64>();
@@ -15,6 +21,60 @@ std::mutex& bindingCacheMutexFor(const BindingRegistry* reg) noexcept {
 }
 
 } // namespace
+
+BindingRegistry::BindingRegistry() noexcept
+    : instanceId_(nextBindingRegistryId()) {}
+
+BindingRegistry::BindingRegistry(const BindingRegistry& other)
+    : bySymbol_(other.bySymbol_),
+      byName_(other.byName_),
+      entryCount_(other.entryCount_),
+      instanceId_(nextBindingRegistryId()),
+      mutationEpoch_(1) {}
+
+BindingRegistry& BindingRegistry::operator=(const BindingRegistry& other) {
+    if (this == &other) return *this;
+    {
+        std::lock_guard<std::mutex> cacheLock(bindingCacheMutexFor(this));
+        resolvedBySymbolCache_.clear();
+    }
+    bySymbol_ = other.bySymbol_;
+    byName_ = other.byName_;
+    entryCount_ = other.entryCount_;
+    ++mutationEpoch_;
+    return *this;
+}
+
+BindingRegistry::BindingRegistry(BindingRegistry&& other) noexcept
+    : bySymbol_(std::move(other.bySymbol_)),
+      byName_(std::move(other.byName_)),
+      entryCount_(other.entryCount_),
+      instanceId_(nextBindingRegistryId()),
+      mutationEpoch_(1) {
+    std::lock_guard<std::mutex> cacheLock(bindingCacheMutexFor(&other));
+    other.resolvedBySymbolCache_.clear();
+    other.entryCount_ = 0;
+    ++other.mutationEpoch_;
+}
+
+BindingRegistry& BindingRegistry::operator=(BindingRegistry&& other) noexcept {
+    if (this == &other) return *this;
+    {
+        std::lock_guard<std::mutex> cacheLock(bindingCacheMutexFor(this));
+        resolvedBySymbolCache_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> otherCacheLock(bindingCacheMutexFor(&other));
+        other.resolvedBySymbolCache_.clear();
+    }
+    bySymbol_ = std::move(other.bySymbol_);
+    byName_ = std::move(other.byName_);
+    entryCount_ = other.entryCount_;
+    other.entryCount_ = 0;
+    ++mutationEpoch_;
+    ++other.mutationEpoch_;
+    return *this;
+}
 
 bool BindingRegistry::bind(
     semantic::SymbolId symbolId,
@@ -25,7 +85,10 @@ bool BindingRegistry::bind(
     const bool inserted = bySymbol_.emplace(
         symbolId,
         Entry{std::move(function), determinism, std::move(requiredCapability)}).second;
-    if (inserted) ++entryCount_;
+    if (inserted) {
+        ++entryCount_;
+        ++mutationEpoch_;
+    }
     return inserted;
 }
 
@@ -40,7 +103,10 @@ bool BindingRegistry::bind(
     const auto symId = semantic::stableTypeId(canonicalName);
     bySymbol_.try_emplace(symId, entry);
     const bool inserted = byName_.emplace(canonicalName, std::move(entry)).second;
-    if (inserted) ++entryCount_;
+    if (inserted) {
+        ++entryCount_;
+        ++mutationEpoch_;
+    }
     return inserted;
 }
 

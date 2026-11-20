@@ -2711,6 +2711,7 @@ public:
     void recordFlatStructArrayWriteBarrier(ObjectRef arrayRef, std::size_t elementIndex) noexcept;
     [[nodiscard]] std::uint64_t gcEpoch() const noexcept;
     [[nodiscard]] std::uint64_t stringInternEpoch() const noexcept;
+    [[nodiscard]] std::uint64_t restoreEpoch() const noexcept;
     void pinFlatStructArrayElement(ObjectRef arrayRef, std::size_t elementIndex) noexcept;
     [[nodiscard]] bool tryBindPackedInt32Array(
         ObjectRef reference,
@@ -3708,6 +3709,12 @@ struct ResolvedBinding {
 
 class BindingRegistry {
 public:
+    BindingRegistry() noexcept;
+    BindingRegistry(const BindingRegistry& other);
+    BindingRegistry& operator=(const BindingRegistry& other);
+    BindingRegistry(BindingRegistry&& other) noexcept;
+    BindingRegistry& operator=(BindingRegistry&& other) noexcept;
+
     bool bind(
         semantic::SymbolId symbolId,
         ExternalFunction function,
@@ -3726,6 +3733,8 @@ public:
         const bytecode::FunctionReference& reference) const;
     [[nodiscard]] std::size_t size() const noexcept;
     [[nodiscard]] std::size_t cachedSymbolCount() const noexcept;
+    [[nodiscard]] std::uint64_t instanceId() const noexcept { return instanceId_; }
+    [[nodiscard]] std::uint64_t mutationEpoch() const noexcept { return mutationEpoch_; }
 
 private:
     struct Entry {
@@ -3737,6 +3746,8 @@ private:
     std::unordered_map<std::string, Entry> byName_;
     mutable std::unordered_map<semantic::SymbolId, const Entry*> resolvedBySymbolCache_;
     std::size_t entryCount_ = 0;
+    std::uint64_t instanceId_ = 0;
+    std::uint64_t mutationEpoch_ = 1;
 };
 
 class DeterminismSession {
@@ -3811,8 +3822,10 @@ using ParallelBatchKernelFactory = std::function<ParallelNativeBatchKernel(
 
 namespace detail {
 struct ExecutionMirror;
-[[nodiscard]] const ExecutionMirror& executionMirror(
-    const ProgramImage& program) noexcept;
+[[nodiscard]] const ExecutionMirror& executionMirrorSlow(
+    const ProgramImage& program);
+[[nodiscard]] inline const ExecutionMirror& executionMirror(
+    const ProgramImage& program);
 }
 
 class ProgramImage {
@@ -3866,8 +3879,31 @@ public:
 
 private:
     friend class ManagedHeap;
+    friend const detail::ExecutionMirror& detail::executionMirrorSlow(
+        const ProgramImage& program);
     friend const detail::ExecutionMirror& detail::executionMirror(
-        const ProgramImage& program) noexcept;
+        const ProgramImage& program);
+
+    struct AtomicMirrorCache {
+        mutable std::atomic<const detail::ExecutionMirror*> ptr{nullptr};
+        AtomicMirrorCache() noexcept = default;
+        AtomicMirrorCache(const AtomicMirrorCache&) noexcept : ptr(nullptr) {}
+        AtomicMirrorCache& operator=(const AtomicMirrorCache&) noexcept {
+            ptr.store(nullptr, std::memory_order_relaxed);
+            return *this;
+        }
+        AtomicMirrorCache(AtomicMirrorCache&& other) noexcept
+            : ptr(other.ptr.load(std::memory_order_acquire)) {
+            other.ptr.store(nullptr, std::memory_order_relaxed);
+        }
+        AtomicMirrorCache& operator=(AtomicMirrorCache&& other) noexcept {
+            if (this != &other) {
+                ptr.store(other.ptr.load(std::memory_order_acquire), std::memory_order_release);
+                other.ptr.store(nullptr, std::memory_order_relaxed);
+            }
+            return *this;
+        }
+    };
 
     explicit ProgramImage(std::vector<bytecode::Module> modules);
 
@@ -3875,8 +3911,20 @@ private:
     std::unordered_map<semantic::SymbolId, FunctionLocation> functions_;
     std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> types_;
     std::unordered_map<std::string, semantic::SymbolId> names_;
-    std::shared_ptr<const detail::ExecutionMirror> executionMirror_;
+    mutable std::shared_ptr<std::once_flag> executionMirrorOnce_ = std::make_shared<std::once_flag>();
+    mutable std::shared_ptr<const detail::ExecutionMirror> executionMirror_;
+    AtomicMirrorCache executionMirrorFast_{};
 };
+
+namespace detail {
+[[nodiscard]] inline const ExecutionMirror& executionMirror(
+    const ProgramImage& program) {
+    if (const auto* cached = program.executionMirrorFast_.ptr.load(std::memory_order_acquire)) {
+        return *cached;
+    }
+    return executionMirrorSlow(program);
+}
+}
 
 class Interpreter {
 public:
@@ -3941,7 +3989,9 @@ private:
     std::shared_ptr<const BindingRegistry> bindings_;
     std::shared_ptr<ManagedHeap> heap_;
     IExecutionPolicy* executionPolicy_ = nullptr;
-    std::shared_ptr<AsyncRuntimeContext> asyncRuntime_;
+    mutable std::mutex runtimeStateMutex_;
+    mutable std::shared_ptr<AsyncRuntimeContext> asyncRuntime_;
+    mutable std::atomic<bool> hasExplicitAsyncRuntime_{false};
     mutable std::shared_ptr<void> resumeEnv_;
     std::shared_ptr<DispatchTarget> dispatchTarget_;
 };
@@ -3977,6 +4027,7 @@ public:
 
 private:
     void registerValueLifecycleHooks();
+    [[nodiscard]] std::shared_ptr<const Interpreter> getOrCreateInterpreter() const;
 
     mutable std::mutex programMutex_;
     std::shared_ptr<const ProgramImage> program_;
@@ -3984,7 +4035,8 @@ private:
     std::shared_ptr<const BindingRegistry> bindings_;
     std::shared_ptr<ManagedHeap> heap_;
     std::shared_ptr<NativeHandleRegistry> nativeHandles_;
-    std::shared_ptr<AsyncRuntimeContext> asyncRuntime_;
+    mutable std::shared_ptr<AsyncRuntimeContext> asyncRuntime_;
+    mutable std::shared_ptr<Interpreter> cachedInterpreter_;
     std::shared_ptr<Interpreter::DispatchTarget> lifecycleTarget_;
 };
 

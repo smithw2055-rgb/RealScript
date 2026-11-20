@@ -420,3 +420,40 @@ public void ParallelRangeStep(int start, int count, float[] dst, float[] src, fl
         dst[idx] = src[idx] * scale + 2.0f;
     }
 }
+
+// ---------------------------------------------------------------------------
+// 6. Audit Regression: ulong Arithmetic / Div / Overflow / SIMD & Async String GC
+// ---------------------------------------------------------------------------
+public struct AotAuditLabelPair {
+    public string Label;
+    public int Code;
+}
+
+public ulong ULongArithAndDiv(ulong a, ulong b) {
+    ulong hi = 9223372036854775808UL;
+    ulong mx = 18446744073709551615UL;
+    ulong q = hi / mx;
+    ulong r = hi % mx;
+    ulong halfHi = hi / 2UL;
+    ulong prod = unchecked((a + b) * 3UL - b);
+    return unchecked(prod + q + (r / 16UL) + halfHi);
+}
+
+public ulong ULongCheckedAdd(ulong a, ulong b) {
+    return a + b;
+}
+
+public void ULongSimdScale(ulong[] dst, ulong[] src, int n) {
+    for (int i = 0; i < n; i = i + 1) {
+        dst[i] = unchecked(src[i] * 3UL + 7UL);
+    }
+}
+
+public async AotSchedTaskInt ComputeAsyncStringGcSurvival(string prefix, int tagSeed, long waitTag) {
+    string dyn = prefix + "_alive";
+    AotAuditLabelPair pair = new AotAuditLabelPair();
+    pair.Label = dyn + "_pair";
+    pair.Code = tagSeed * 10;
+    int resumed = await AotSchedTaskInt.Pending(waitTag);
+    return pair.Label.Length + dyn.Length + pair.Code + resumed;
+}

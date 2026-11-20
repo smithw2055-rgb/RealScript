@@ -194,6 +194,10 @@ function(realscript_add_aot_library target)
         "${generated_source}"
         PROPERTIES GENERATED TRUE
     )
+    set_source_files_properties(
+        "${generated_source}"
+        PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON
+    )
     add_library(${target} STATIC
         "${generated_source}"
         "${generated_header}"

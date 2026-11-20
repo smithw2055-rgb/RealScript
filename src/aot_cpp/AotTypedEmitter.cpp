@@ -151,23 +151,22 @@ void emitTypedPrimitiveFunction(
         ? "true"
         : "!FastAccounting && !DeterminismAccounting && !TrustedRelease";
     if (totalGcGuardSlots > 0) {
-        source.line("    std::conditional_t<" + gcGuardCond + ", std::array<runtime::PersistentRoot, " +
+        source.line("    std::conditional_t<" + gcGuardCond + ", std::array<runtime::Value, " +
             std::to_string(totalGcGuardSlots) + ">, aot::EmptyGcGuards> typedLocalGcGuards{};");
     } else {
         source.line("    aot::EmptyGcGuards typedLocalGcGuards{};");
     }
     source.line("    (void)typedLocalGcGuards;");
+    source.line("    aot::ScopedTypedGcRootSpan<" + gcGuardCond + "> typedLocalGcRootScope(context, typedLocalGcGuards);");
     if (hasRefParams) {
         source.line("    if constexpr (" + gcGuardCond + ") {");
-        source.line("        if (auto* rawH = context.rawHeap()) {");
         for (std::size_t pIdx = 0; pIdx < function.parameterTypes.size(); ++pIdx) {
             if (paramGuardSlot[pIdx] != std::numeric_limits<std::size_t>::max()) {
-                source.line("            aot::retainTypedGcSlot(rawH, &typedLocalGcGuards[" +
+                source.line("        aot::retainTypedGcSlot(nullptr, &typedLocalGcGuards[" +
                     std::to_string(paramGuardSlot[pIdx]) + "], typedArg_" +
                     std::to_string(pIdx) + ");");
             }
         }
-        source.line("        }");
         source.line("    }");
     }
     source.line("    std::uint32_t typedActiveGenLine = 0;");
@@ -385,6 +384,7 @@ void emitTypedPrimitiveFunction(
         std::string memberName;
         std::size_t guardSlot = std::numeric_limits<std::size_t>::max();
         std::size_t arrayLocalIndex = std::numeric_limits<std::size_t>::max();
+        std::string structCppType{};
     };
     std::vector<CoroSavedField> podCoroFields;
     std::vector<CoroSavedField> refCoroFields;
@@ -455,10 +455,15 @@ void emitTypedPrimitiveFunction(
                 slot.primitive == semantic::PrimitiveType::Error) {
                 return;
             }
+            const bool isBoxedStruct =
+                slot.primitive == semantic::PrimitiveType::Struct &&
+                countSlotGcGuards(countSlotGcGuards, slot, 0) > 0;
             const bool isRef =
                 slot.primitive == semantic::PrimitiveType::Object ||
                 slot.primitive == semantic::PrimitiveType::Array ||
-                slot.primitive == semantic::PrimitiveType::Null;
+                slot.primitive == semantic::PrimitiveType::String ||
+                slot.primitive == semantic::PrimitiveType::Null ||
+                isBoxedStruct;
             if (isRef) {
                 refCoroFields.push_back({
                     typedCppType(slot),
@@ -466,6 +471,7 @@ void emitTypedPrimitiveFunction(
                     member,
                     guardSlot,
                     arrayLocIdx,
+                    isBoxedStruct ? typedCppType(slot) : std::string{},
                 });
             } else {
                 podCoroFields.push_back({
@@ -537,8 +543,16 @@ void emitTypedPrimitiveFunction(
                 source.line("            " + f.exprName + " = restoredPod." + f.memberName + ";");
             }
             for (std::size_t rfIdx = 0; rfIdx < refCoroFields.size(); ++rfIdx) {
-                source.line("            " + refCoroFields[rfIdx].exprName +
-                    " = restoredRefs[" + std::to_string(rfIdx) + "];");
+                if (!refCoroFields[rfIdx].structCppType.empty()) {
+                    source.line("            if (!" + refCoroFields[rfIdx].structCppType +
+                        "::unboxFromValue(restoredRefs[" + std::to_string(rfIdx) +
+                        "], " + refCoroFields[rfIdx].exprName +
+                        ")) return typedFail(runtime::ErrorCode::TypeMismatch, "
+                        "\"coroutine struct restore failed\");");
+                } else {
+                    source.line("            " + refCoroFields[rfIdx].exprName +
+                        " = restoredRefs[" + std::to_string(rfIdx) + "];");
+                }
             }
             bool anyHeapRefField = false;
             for (const auto& rf : refCoroFields) {
@@ -549,13 +563,11 @@ void emitTypedPrimitiveFunction(
             }
             if (anyHeapRefField) {
                 source.line("            if constexpr (" + gcGuardCond + ") {");
-                source.line("                if (auto* rawH = context.rawHeap()) {");
                 for (const auto& rf : refCoroFields) {
                     if (rf.guardSlot == std::numeric_limits<std::size_t>::max()) continue;
-                    source.line("                    aot::retainTypedGcSlot(rawH, &typedLocalGcGuards[" +
+                    source.line("                aot::retainTypedGcSlot(nullptr, &typedLocalGcGuards[" +
                         std::to_string(rf.guardSlot) + "], " + rf.exprName + ");");
                 }
-                source.line("                }");
                 source.line("            }");
             }
             for (const auto& rf : refCoroFields) {
@@ -568,7 +580,7 @@ void emitTypedPrimitiveFunction(
                         " = context.acquireRawColumnCache(" + typedLocalExpression(lIdx) +
                         ", 0x" + hexId(elemTypeIt->second) + "ULL, sizeof(" +
                         structName + "), " + structName + "_layout, " +
-                        structName + "::kFieldCount);");
+                        structName + "::kFieldCount, alignof(" + structName + "));");
                     source.line("            typedLocalStructArr_" + std::to_string(lIdx) +
                         " = context.acquireStructArrayCache(0x" + hexId(elemTypeIt->second) +
                         "ULL, " + typedLocalExpression(lIdx) + ");");
@@ -661,7 +673,7 @@ void emitTypedPrimitiveFunction(
         const auto vecLoopIt = vectorizedEcsLoops.find(block.id);
         if (vecLoopIt != vectorizedEcsLoops.end()) {
             emitVectorizedEcsLoop(
-                source, module, function, types, vecLoopIt->second, options.emitLineDirectives);
+                source, module, function, types, allTypes, vecLoopIt->second, options.emitLineDirectives);
             if (remarks != nullptr) {
                 OptimizationRemark r;
                 r.kind = OptimizationRemarkKind::Passed;
@@ -788,10 +800,19 @@ void emitTypedPrimitiveFunction(
                     source.line("            " + result + " = runtime::EnumValue{0x" +
                         hexId(instruction.resultTypeId) + "ULL, " +
                         int64Literal(instruction.integerImmediate) + "};");
+                } else if (instruction.resultType == semantic::PrimitiveType::ULong) {
+                    source.line("            " + result + " = std::uint64_t{" +
+                        std::to_string(static_cast<std::uint64_t>(instruction.integerImmediate)) +
+                        "ULL};");
                 } else {
                     source.line("            " + result + " = std::int64_t{" +
                         int64Literal(instruction.integerImmediate) + "};");
                 }
+                break;
+            case mir::Opcode::ConstantTypeId:
+                source.line("            " + result + " = std::uint64_t{0x" +
+                    hexId(static_cast<semantic::SymbolId>(instruction.integerImmediate)) +
+                    "ULL};");
                 break;
             case mir::Opcode::ConstantString:
                 if (stringLiteralIndices != nullptr) {
@@ -1224,7 +1245,7 @@ void emitTypedPrimitiveFunction(
                             typedLocalExpression(instruction.localIndex) +
                             ", 0x" + hexId(elemTypeIt->second) + "ULL, sizeof(" +
                             structName + "), " + structName + "_layout, " +
-                            structName + "::kFieldCount);");
+                            structName + "::kFieldCount, alignof(" + structName + "));");
                         const auto parStructIt = valueToArrayParam.find(instruction.operands[0]);
                         if (parStructIt != valueToArrayParam.end() &&
                             arrayParamStructElemType.find(parStructIt->second) != arrayParamStructElemType.end() &&
@@ -1367,11 +1388,14 @@ void emitTypedPrimitiveFunction(
             case mir::Opcode::AddLong:
             case mir::Opcode::SubtractLong:
             case mir::Opcode::MultiplyLong: {
+                const bool isULong =
+                    (instruction.resultType == semantic::PrimitiveType::ULong) ||
+                    (operandSlot(0).primitive == semantic::PrimitiveType::ULong);
                 const char* helper = instruction.opcode == mir::Opcode::AddLong
-                    ? "aot::typedAddLong"
+                    ? (isULong ? "aot::typedAddULong" : "aot::typedAddLong")
                     : (instruction.opcode == mir::Opcode::SubtractLong
-                        ? "aot::typedSubLong"
-                        : "aot::typedMulLong");
+                        ? (isULong ? "aot::typedSubULong" : "aot::typedSubLong")
+                        : (isULong ? "aot::typedMulULong" : "aot::typedMulLong"));
                 source.line("            if (!" + std::string(helper) + "<" +
                     (instruction.checkedArithmetic ? "true" : "false") + ">(" +
                     operand(0) + ", " + operand(1) + ", " + result +
@@ -1381,12 +1405,20 @@ void emitTypedPrimitiveFunction(
             }
             case mir::Opcode::DivideLong:
             case mir::Opcode::RemainderLong: {
+                const bool isULong =
+                    (instruction.resultType == semantic::PrimitiveType::ULong) ||
+                    (operandSlot(0).primitive == semantic::PrimitiveType::ULong);
                 source.line("            if (" + operand(1) +
-                    " == 0) return typedFail(runtime::ErrorCode::DivisionByZero, \"" +
+                    (isULong ? " == 0ULL" : " == 0") +
+                    ") return typedFail(runtime::ErrorCode::DivisionByZero, \"" +
                     (instruction.opcode == mir::Opcode::DivideLong
                         ? "division by zero"
                         : "remainder by zero") + "\");");
-                if (instruction.opcode == mir::Opcode::DivideLong) {
+                if (isULong) {
+                    source.line("            " + result + " = " + operand(0) +
+                        (instruction.opcode == mir::Opcode::DivideLong ? " / " : " % ") +
+                        operand(1) + ";");
+                } else if (instruction.opcode == mir::Opcode::DivideLong) {
                     source.line("            if (" + operand(0) +
                         " == std::numeric_limits<std::int64_t>::min() && " +
                         operand(1) +
@@ -1402,8 +1434,20 @@ void emitTypedPrimitiveFunction(
                 }
                 break;
             }
-            case mir::Opcode::NegateLong:
-                if (!instruction.checkedArithmetic) {
+            case mir::Opcode::NegateLong: {
+                const bool isULong =
+                    (instruction.resultType == semantic::PrimitiveType::ULong) ||
+                    (operandSlot(0).primitive == semantic::PrimitiveType::ULong);
+                if (isULong) {
+                    if (instruction.checkedArithmetic) {
+                        source.line("            if (" + operand(0) +
+                            " != 0ULL) return typedFail(runtime::ErrorCode::IntegerOverflow, "
+                            "\"ulong negation overflow\");");
+                        source.line("            " + result + " = 0ULL;");
+                    } else {
+                        source.line("            " + result + " = 0ULL - " + operand(0) + ";");
+                    }
+                } else if (!instruction.checkedArithmetic) {
                     source.line("            " + result + " = (" + operand(0) +
                         " == std::numeric_limits<std::int64_t>::min()) ? " +
                         operand(0) + " : -" + operand(0) + ";");
@@ -1415,6 +1459,7 @@ void emitTypedPrimitiveFunction(
                     source.line("            " + result + " = -" + operand(0) + ";");
                 }
                 break;
+            }
             case mir::Opcode::AddDouble:
             case mir::Opcode::SubtractDouble:
             case mir::Opcode::MultiplyDouble:
@@ -1532,6 +1577,9 @@ void emitTypedPrimitiveFunction(
                             " = runtime::FixedValue{" + operand(0) + "." +
                             member + "};");
                     }
+                } else if (instruction.resultType == semantic::PrimitiveType::Int) {
+                    source.line("            " + result + " = static_cast<std::int64_t>(" + operand(0) +
+                        ".f_" + std::to_string(instruction.fieldIndex) + ");");
                 } else {
                     source.line("            " + result + " = " + operand(0) +
                         ".f_" + std::to_string(instruction.fieldIndex) + ";");
@@ -1566,8 +1614,20 @@ void emitTypedPrimitiveFunction(
                     if (result != operand(0)) {
                         source.line("            " + result + " = " + operand(0) + ";");
                     }
+                    bool isInt32Field = (operandSlot(1).primitive == semantic::PrimitiveType::Int);
+                    if (const auto tvIt = allTypes.find(instruction.typeId);
+                        tvIt != allTypes.end() && tvIt->second.type != nullptr &&
+                        instruction.fieldIndex < tvIt->second.type->fields.size()) {
+                        isInt32Field =
+                            (tvIt->second.type->fields[instruction.fieldIndex].type ==
+                             semantic::PrimitiveType::Int);
+                    }
                     source.line("            " + result + ".f_" +
-                        std::to_string(instruction.fieldIndex) + " = " + operand(1) + ";");
+                        std::to_string(instruction.fieldIndex) + " = " +
+                        (isInt32Field
+                            ? ("static_cast<std::int32_t>(" + operand(1) + ")")
+                            : operand(1)) +
+                        ";");
                 }
                 emitRetainRegResult();
                 break;
@@ -1675,6 +1735,7 @@ void emitTypedPrimitiveFunction(
                         source.line("            " + typedCppType(retSlot) + " polyCallRes_" + suffix + "{};");
                     }
                     if (!polyTargets.empty()) {
+                        source.line("            if (TrustedRelease || RS_AOT_LIKELY(context.executionPolicy() == nullptr)) {");
                         source.line("            switch (polyActualTid_" + suffix + ") {");
                         for (const auto& [candTid, calleeView] : polyTargets) {
                             source.line("            case 0x" + hexId(candTid) + "ULL: {");
@@ -1726,6 +1787,7 @@ void emitTypedPrimitiveFunction(
                             source.line("            }");
                         }
                         source.line("            default: break;");
+                        source.line("            }");
                         source.line("            }");
                     }
                     source.line("            if (RS_AOT_UNLIKELY(!polyDispatched_" + suffix + ")) {");
@@ -1779,21 +1841,9 @@ void emitTypedPrimitiveFunction(
                     }
                 } else if (targetIt != typedFunctions.end()) {
                     const auto* calleeView = targetIt->second;
-                    source.line("            semantic::SymbolId prevFn_" + suffix + " = 0;");
-                    source.line("            (void)prevFn_" + suffix + ";");
-                    source.line("            if (!context.enterTypedDirectCall<FastAccounting, DeterminismAccounting, TrustedRelease>(0x" +
-                        hexId(calleeView->function->symbolId) + "ULL, \"" +
-                        escapeCppString(calleeView->qualifiedName) + "\", prevFn_" + suffix + ", typedActiveGenLine)) {");
-                    source.line("                if constexpr (!TrustedRelease) {");
-                    source.line("                    rawAccounting.resumeAfterCall();");
-                    source.line("                    determinismAccounting.resumeAfterCall();");
-                    source.line("                }");
-                    source.line("                return false;");
-                    source.line("            }");
-                    std::string callArgs = "context";
-                    for (std::size_t argIndex = 0; argIndex < instruction.operands.size(); ++argIndex) {
-                        callArgs += ", " + callOperandExpr(argIndex);
-                    }
+                    const auto callId = callIds.at(&instruction);
+                    source.line("            bool directHandledByPolicy_" + suffix + " = false;");
+                    source.line("            bool directCallOk_" + suffix + " = false;");
                     if (instruction.resultType != semantic::PrimitiveType::Void) {
                         const TypedSlotType retSlot{
                             instruction.resultType,
@@ -1801,21 +1851,80 @@ void emitTypedPrimitiveFunction(
                         };
                         source.line("            " + typedCppType(retSlot) +
                             " directCallRes_" + suffix + "{};");
+                    }
+                    source.line("            if constexpr (!TrustedRelease) {");
+                    source.line("                if (RS_AOT_UNLIKELY(context.executionPolicy() != nullptr)) {");
+                    source.line("                    directHandledByPolicy_" + suffix + " = true;");
+                    std::string policyArgPtr = "nullptr";
+                    if (!instruction.operands.empty()) {
+                        source.line("                    std::array<runtime::Value, " +
+                            std::to_string(instruction.operands.size()) +
+                            "> policyArgs_" + suffix + "{{");
+                        for (std::size_t argIndex = 0; argIndex < instruction.operands.size(); ++argIndex) {
+                            const auto argSlot = operandSlot(argIndex);
+                            const auto boxPrim = (argIndex < instruction.parameterTypes.size() &&
+                                                  argSlot.primitive == semantic::PrimitiveType::Null)
+                                ? instruction.parameterTypes[argIndex]
+                                : argSlot.primitive;
+                            source.line("                        aot::typedBoxScalar(" +
+                                primitiveExpression(boxPrim) + ", " +
+                                callOperandExpr(argIndex) + "),");
+                        }
+                        source.line("                    }};");
+                        policyArgPtr = "policyArgs_" + suffix + ".data()";
+                    }
+                    source.line("                    context.setActiveGeneratedLine(typedActiveGenLine);");
+                    source.line("                    runtime::Value policyRes_" + suffix + ";");
+                    source.line("                    directCallOk_" + suffix +
+                        " = context.call(call_" + std::to_string(callId) +
+                        "_signature, " + policyArgPtr + ", " +
+                        std::to_string(instruction.operands.size()) +
+                        "u, policyRes_" + suffix + ");");
+                    if (instruction.resultType != semantic::PrimitiveType::Void) {
+                        source.line("                    if (directCallOk_" + suffix +
+                            " && !aot::typedUnboxScalar(" +
+                            primitiveExpression(instruction.resultType) +
+                            ", policyRes_" + suffix + ", directCallRes_" + suffix + ")) {");
+                        source.line("                        if constexpr (!TrustedRelease) {");
+                        source.line("                            rawAccounting.resumeAfterCall();");
+                        source.line("                            determinismAccounting.resumeAfterCall();");
+                        source.line("                        }");
+                        source.line("                        return typedFail(runtime::ErrorCode::TypeMismatch, \"AOT call return type mismatch\");");
+                        source.line("                    }");
+                    }
+                    source.line("                }");
+                    source.line("            }");
+                    source.line("            if (RS_AOT_LIKELY(!directHandledByPolicy_" + suffix + ")) {");
+                    source.line("                semantic::SymbolId prevFn_" + suffix + " = 0;");
+                    source.line("                (void)prevFn_" + suffix + ";");
+                    source.line("                if (!context.enterTypedDirectCall<FastAccounting, DeterminismAccounting, TrustedRelease>(0x" +
+                        hexId(calleeView->function->symbolId) + "ULL, \"" +
+                        escapeCppString(calleeView->qualifiedName) + "\", prevFn_" + suffix + ", typedActiveGenLine)) {");
+                    source.line("                    if constexpr (!TrustedRelease) {");
+                    source.line("                        rawAccounting.resumeAfterCall();");
+                    source.line("                        determinismAccounting.resumeAfterCall();");
+                    source.line("                    }");
+                    source.line("                    return false;");
+                    source.line("                }");
+                    std::string callArgs = "context";
+                    for (std::size_t argIndex = 0; argIndex < instruction.operands.size(); ++argIndex) {
+                        callArgs += ", " + callOperandExpr(argIndex);
+                    }
+                    if (instruction.resultType != semantic::PrimitiveType::Void) {
                         callArgs += ", directCallRes_" + suffix;
                     }
                     const auto hpIt = options.emitHotPatchThunks
                         ? hotPatchSlots.find(calleeView->function->symbolId)
                         : hotPatchSlots.end();
                     if (options.emitHotPatchThunks && hpIt != hotPatchSlots.end()) {
-                        source.line("            bool directCallOk_" + suffix + " = false;");
-                        source.line("            if (RS_AOT_UNLIKELY(context.hasHotPatchOverride(0x" +
+                        source.line("                if (RS_AOT_UNLIKELY(context.hasHotPatchOverride(0x" +
                             hexId(calleeView->function->symbolId) + "ULL) || "
                             "programHotPatchSlots[" + std::to_string(hpIt->second) +
                             "u].patchedImplementation != programHotPatchSlots[" +
                             std::to_string(hpIt->second) + "u].originalImplementation)) {");
                         std::string hpArgPtr = "nullptr";
                         if (!instruction.operands.empty()) {
-                            source.line("                std::array<runtime::Value, " +
+                            source.line("                    std::array<runtime::Value, " +
                                 std::to_string(instruction.operands.size()) +
                                 "> hpArgs_" + suffix + "{{");
                             for (std::size_t argIndex = 0; argIndex < instruction.operands.size(); ++argIndex) {
@@ -1824,50 +1933,51 @@ void emitTypedPrimitiveFunction(
                                                       argSlot.primitive == semantic::PrimitiveType::Null)
                                     ? instruction.parameterTypes[argIndex]
                                     : argSlot.primitive;
-                                source.line("                    aot::typedBoxScalar(" +
+                                source.line("                        aot::typedBoxScalar(" +
                                     primitiveExpression(boxPrim) + ", " +
                                     callOperandExpr(argIndex) + "),");
                             }
-                            source.line("                }};");
+                            source.line("                    }};");
                             hpArgPtr = "hpArgs_" + suffix + ".data()";
                         }
-                        source.line("                runtime::Value hpRet_" + suffix + "{};");
-                        source.line("                directCallOk_" + suffix + " = " + calleeView->cppName +
+                        source.line("                    runtime::Value hpRet_" + suffix + "{};");
+                        source.line("                    directCallOk_" + suffix + " = " + calleeView->cppName +
                             "(context, " + hpArgPtr + ", " +
                             std::to_string(instruction.operands.size()) + "u, hpRet_" + suffix + ");");
                         if (instruction.resultType != semantic::PrimitiveType::Void) {
-                            source.line("                if (directCallOk_" + suffix +
+                            source.line("                    if (directCallOk_" + suffix +
                                 " && !aot::typedUnboxScalar(" +
                                 primitiveExpression(instruction.resultType) +
                                 ", hpRet_" + suffix + ", directCallRes_" + suffix + ")) {");
-                            source.line("                    directCallOk_" + suffix +
+                            source.line("                        directCallOk_" + suffix +
                                 " = context.fail(runtime::ErrorCode::TypeMismatch, "
                                 "\"AOT hot-patch call return type mismatch\");");
-                            source.line("                }");
+                            source.line("                    }");
                         }
-                        source.line("            } else {");
-                        source.line("                directCallOk_" + suffix +
+                        source.line("                } else {");
+                        source.line("                    directCallOk_" + suffix +
                             " = " + calleeView->cppName +
                             "_scalar<FastAccounting, DeterminismAccounting, TrustedRelease>(" +
                             callArgs + ");");
-                        source.line("            }");
+                        source.line("                }");
                     } else {
-                        source.line("            const bool directCallOk_" + suffix +
+                        source.line("                directCallOk_" + suffix +
                             " = " + calleeView->cppName +
                             "_scalar<FastAccounting, DeterminismAccounting, TrustedRelease>(" +
                             callArgs + ");");
                     }
                     if (instruction.resultType != semantic::PrimitiveType::Void) {
-                        source.line("            context.exitTypedDirectCall<FastAccounting, DeterminismAccounting, TrustedRelease>(prevFn_" +
+                        source.line("                context.exitTypedDirectCall<FastAccounting, DeterminismAccounting, TrustedRelease>(prevFn_" +
                             suffix + ", directCallOk_" + suffix +
                             ", [&]() { return aot::typedBoxScalar(" +
                             primitiveExpression(instruction.resultType) +
                             ", directCallRes_" + suffix + "); });");
                     } else {
-                        source.line("            context.exitTypedDirectCall<FastAccounting, DeterminismAccounting, TrustedRelease>(prevFn_" +
+                        source.line("                context.exitTypedDirectCall<FastAccounting, DeterminismAccounting, TrustedRelease>(prevFn_" +
                             suffix + ", directCallOk_" + suffix +
                             ", []() { return runtime::Value{std::monostate{}}; });");
                     }
+                    source.line("            }");
                     source.line("            if constexpr (!TrustedRelease) {");
                     source.line("                rawAccounting.resumeAfterCall();");
                     source.line("                determinismAccounting.resumeAfterCall();");
@@ -2245,7 +2355,8 @@ void emitTypedPrimitiveFunction(
                                 source.line("                    }");
                             }
                         }
-                        std::string recvGuard = cand.expectsReceiver ? "leaf.hasReceiver" : "!leaf.hasReceiver";
+                        std::string recvGuard = "(TrustedRelease || context.executionPolicy() == nullptr) && ";
+                        recvGuard += cand.expectsReceiver ? "leaf.hasReceiver" : "!leaf.hasReceiver";
                         if (cand.expectsReceiver && cand.recvTypeId != 0) {
                             const auto rHex = "0x" + hexId(cand.recvTypeId) + "ULL";
                             recvGuard += " && (leaf.receiver.rawTag() == runtime::ValueTag::NullObject || "
@@ -2390,7 +2501,8 @@ void emitTypedPrimitiveFunction(
                     source.line("                std::array<runtime::Value, " +
                         std::to_string(refCoroFields.size()) + "> savedRefs{{");
                     for (const auto& rf : refCoroFields) {
-                        source.line("                    " + rf.exprName + ",");
+                        source.line("                    " +
+                            (!rf.structCppType.empty() ? (rf.exprName + ".boxToValue()") : rf.exprName) + ",");
                     }
                     source.line("                }};");
                     savedRefPtr = "savedRefs.data()";
@@ -2626,25 +2738,19 @@ void emitTypedPrimitiveFunction(
     source.line("    (void)arguments;");
     source.line("    (void)argumentCount;");
     source.line("    (void)result;");
-    source.line("    std::conditional_t<!FastAccounting && !DeterminismAccounting && !TrustedRelease, std::vector<runtime::PersistentRoot>, aot::EmptyGcGuards> typedGcGuards;");
     const bool guardResumeArgs = isAsyncFunction && !function.parameterTypes.empty();
+    const std::string wrapperArgGuardCond = (hasRefParams && hasHeapAllocOrCallInFn)
+        ? std::string("true")
+        : std::string("!FastAccounting && !DeterminismAccounting && !TrustedRelease");
     if (guardResumeArgs) {
         source.line("    const bool isResumingCoro = context.isResumingCoroutine(0x" +
             hexId(function.symbolId) + "ULL);");
-    }
-    source.line("    if constexpr (!FastAccounting && !DeterminismAccounting && !TrustedRelease) {");
-    if (guardResumeArgs) {
-        source.line("        if (RS_AOT_LIKELY(!isResumingCoro) && context.heap() != nullptr) {");
+        source.line("    aot::ScopedTypedGcRootSpan<" + wrapperArgGuardCond + "> typedArgGcRootScope(");
+        source.line("        context, isResumingCoro ? nullptr : arguments, isResumingCoro ? 0u : argumentCount);");
     } else {
-        source.line("        if (context.heap() != nullptr) {");
+        source.line("    aot::ScopedTypedGcRootSpan<" + wrapperArgGuardCond + "> typedArgGcRootScope(");
+        source.line("        context, arguments, argumentCount);");
     }
-    source.line("            for (std::size_t idx = 0; idx < argumentCount; ++idx) {");
-    source.line("                if ((std::holds_alternative<runtime::ObjectRef>(arguments[idx]) && !std::get<runtime::ObjectRef>(arguments[idx]).isStackSlotRef()) || arguments[idx].rawTag() == runtime::ValueTag::String) {");
-    source.line("                    typedGcGuards.push_back(context.heap()->retain(arguments[idx]));");
-    source.line("                }");
-    source.line("            }");
-    source.line("        }");
-    source.line("    }");
     for (std::size_t index = 0; index < function.parameterTypes.size(); ++index) {
         const auto typeId = index < function.parameterTypeIds.size()
             ? function.parameterTypeIds[index]
@@ -2742,6 +2848,8 @@ void emitTypedPrimitiveFunction(
         source.line("    runtime::ParallelNativeBatchContext& batch) {");
         source.line("    const bool isRange = (batch.kernelKind == runtime::ParallelKernelKind::Range);");
         source.line("    const std::size_t userArgCount = batch.userArguments ? batch.userArguments->size() : 0u;");
+        source.line("    aot::ScopedTypedGcRootSpan<true> batchArgsGcScope(");
+        source.line("        context, batch.userArguments ? batch.userArguments->data() : nullptr, userArgCount);");
         for (std::size_t index = 0; index < function.parameterTypes.size(); ++index) {
             const auto typeId = index < function.parameterTypeIds.size()
                 ? function.parameterTypeIds[index]
@@ -2818,6 +2926,7 @@ void emitTypedPrimitiveFunction(
             source.line("    const bool strictDet = batch.config && (batch.config->executionOptions.determinism.mode == runtime::DeterminismMode::Strict);");
             source.line("    bool hasAcc = false;");
             source.line("    runtime::Value accValue{std::monostate{}};");
+            source.line("    aot::ScopedTypedGcRootSpan<true> batchAccGcScope(context, &accValue, 1u);");
             source.line("    for (std::size_t batchOff = 0u; batchOff < batch.count; ++batchOff) {");
             source.line("        unboxedArg_0 = static_cast<std::int64_t>(batch.start + batchOff);");
             source.line("        " + retDecl);

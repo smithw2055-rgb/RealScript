@@ -2444,6 +2444,30 @@ struct ArrayLayoutKeyHash {
     }
 };
 
+struct SmallStructVisitedSet {
+    static constexpr std::size_t kStackCap = 8u;
+    std::array<const StructStorage*, kStackCap> stack{};
+    std::size_t count = 0u;
+    std::unique_ptr<std::unordered_set<const StructStorage*>> overflow;
+
+    bool insert(const StructStorage* ptr) {
+        for (std::size_t i = 0; i < count; ++i) {
+            if (stack[i] == ptr) {
+                return false;
+            }
+        }
+        if (count < kStackCap) {
+            stack[count++] = ptr;
+            return true;
+        }
+        if (!overflow) {
+            overflow = std::make_unique<std::unordered_set<const StructStorage*>>(
+                stack.begin(), stack.end());
+        }
+        return overflow->insert(ptr).second;
+    }
+};
+
 #if defined(_MSC_VER)
 #pragma warning(push)
 #pragma warning(disable : 4324)
@@ -2451,7 +2475,7 @@ struct ArrayLayoutKeyHash {
 struct alignas(32) CompactSlot {
     static constexpr std::uint32_t kInvalidHandle = 0xFFFFFFFFu;
     static constexpr std::size_t kMaxSsoBytes = 23;
-    static constexpr std::size_t kInlineValueCapacity = 4;
+    static constexpr std::size_t kInlineValueCapacity = 8;
 
     std::uint32_t generation = 1;
     std::uint8_t kindAndStorage = 0;
@@ -2501,7 +2525,7 @@ public:
     static constexpr std::uint16_t kZeroClass = 0xFFFFu;
 
     [[nodiscard]] static constexpr std::uint16_t sizeToClass(std::size_t count) noexcept {
-        return count <= 1 ? 0 : (count <= 2 ? 1 : 2);
+        return count <= 1 ? 0 : (count <= 2 ? 1 : (count <= 4 ? 2 : 3));
     }
     [[nodiscard]] static constexpr std::size_t classStride(std::uint16_t cls) noexcept {
         return std::size_t{1} << cls;
@@ -2656,7 +2680,7 @@ private:
         std::size_t cursor = kBlocksPerPage;
         std::uint32_t currentPageIdx = 0xFFFFFFFFu;
     };
-    std::array<ClassArena, 3> classes_;
+    std::array<ClassArena, 4> classes_;
     Value emptyValue_{};
 };
 
@@ -3615,6 +3639,8 @@ struct ManagedHeap::Impl {
     std::atomic<std::uint64_t> gcAndLayoutEpoch{1};
     std::atomic<std::uint64_t> stringInternEpoch{1};
     std::atomic<std::uint64_t> objectViewEpoch{1};
+    std::atomic<std::uint64_t> restoreEpoch{1};
+    std::uint32_t minFreshGeneration = 1;
     std::uint64_t dirtyConfigEpoch = 1;
     std::vector<CompactSlot> slots;
     std::vector<std::uint32_t> freeSlots;
@@ -3672,7 +3698,27 @@ struct ManagedHeap::Impl {
     };
     std::atomic<bool> allocationProfilingEnabled{false};
     std::unordered_map<AllocationSiteKey, AllocationSiteCounters, AllocationSiteKeyHash> allocationProfile;
-    std::unordered_map<std::string, ObjectRef> internedStrings;
+    struct InternedStringBucket {
+        ObjectRef primary{};
+        std::vector<ObjectRef> overflow;
+    };
+    struct UInt64IdentityHash {
+        std::size_t operator()(std::uint64_t h) const noexcept {
+            return static_cast<std::size_t>(h);
+        }
+    };
+    [[nodiscard]] static std::uint64_t fnv1aStringHash(std::string_view sv) noexcept {
+        std::uint64_t h = 14695981039346656037ULL;
+        for (const unsigned char ch : sv) {
+            h ^= static_cast<std::uint64_t>(ch);
+            h *= 1099511628211ULL;
+        }
+        h ^= (h >> 33u);
+        h *= 0xff51afd7ed558ccdULL;
+        h ^= (h >> 33u);
+        return h;
+    }
+    std::unordered_map<std::uint64_t, InternedStringBucket, UInt64IdentityHash> internedStrings;
     std::array<ObjectRef, 128> asciiCharInterns{};
     ObjectRef emptyStringIntern{};
     bool hasDirtyTrackingTypes = false;
@@ -4059,6 +4105,8 @@ struct ManagedHeap::Impl {
     RootToken nextRootToken = 1;
     GcPhase phase = GcPhase::Idle;
     bool requested = false;
+    std::atomic<GcPhase> atomicPhase{GcPhase::Idle};
+    std::atomic<bool> atomicRequested{false};
     bool resumeSweep = false;
     bool wallClockCycleActive = false;
     bool hasSparseEcsStaticFields = false;
@@ -4068,9 +4116,19 @@ struct ManagedHeap::Impl {
     std::size_t nextCollectionThreshold = 0;
     GcStatistics statistics;
 
+    void setPhaseUnlocked(GcPhase next) noexcept {
+        phase = next;
+        atomicPhase.store(next, std::memory_order_release);
+    }
+
+    void setRequestedUnlocked(bool next) noexcept {
+        requested = next;
+        atomicRequested.store(next, std::memory_order_release);
+    }
+
     void reopenMarkFromSweep() noexcept {
         if (phase == GcPhase::Sweep) {
-            phase = GcPhase::Mark;
+            setPhaseUnlocked(GcPhase::Mark);
             resumeSweep = true;
             lastScannedShadowStackId = 0;
         }
@@ -4111,7 +4169,7 @@ struct ManagedHeap::Impl {
             statistics.liveBytes > config.maximumHeapBytes - sizeBytes) {
             setHeapError(error, ErrorCode::OutOfMemory,
                 "managed heap allocation exceeds the configured heap limit");
-            requested = true;
+            setRequestedUnlocked(true);
             return std::nullopt;
         }
         if (!freeSlots.empty()) {
@@ -4135,6 +4193,7 @@ struct ManagedHeap::Impl {
         }
         const auto slotIndex = static_cast<std::uint32_t>(slots.size());
         slots.emplace_back();
+        slots.back().generation = minFreshGeneration;
         return slotIndex;
     }
 
@@ -4164,7 +4223,7 @@ struct ManagedHeap::Impl {
             ++entry.allocationCount;
             entry.allocatedBytes += static_cast<std::uint64_t>(sizeBytes);
         }
-        if (statistics.liveBytes >= nextCollectionThreshold) requested = true;
+        if (statistics.liveBytes >= nextCollectionThreshold) setRequestedUnlocked(true);
         if (phase != GcPhase::Idle) {
             markStack.push_back(reference);
             reopenMarkFromSweep();
@@ -4300,7 +4359,7 @@ struct ManagedHeap::Impl {
                 statistics.bytesAllocated += delta;
                 statistics.liveBytes += delta;
                 statistics.peakLiveBytes = std::max(statistics.peakLiveBytes, statistics.liveBytes);
-                if (statistics.liveBytes >= nextCollectionThreshold) requested = true;
+                if (statistics.liveBytes >= nextCollectionThreshold) setRequestedUnlocked(true);
             } else {
                 const std::size_t delta = oldTotalBytes - newTotalBytes;
                 statistics.liveBytes = (statistics.liveBytes >= delta) ? (statistics.liveBytes - delta) : 0;
@@ -4346,6 +4405,14 @@ struct ManagedHeap::Impl {
                     view.packedEncoding,
                     view.elementTypeId,
                     view.blittableSchemaId);
+            }
+            if (view.fields.size() <= 8u) {
+                std::array<Value, 8> fields{};
+                for (std::size_t i = 0; i < view.fields.size(); ++i) {
+                    fields[i] = readNativeFieldFromBytes(elemBase, view.fields[i]);
+                }
+                return Value{makeStructValueFromFields(
+                    view.structTypeId, ValueSpan(fields.data(), view.fields.size()))};
             }
             std::vector<Value> fields(view.fields.size());
             for (std::size_t i = 0; i < view.fields.size(); ++i) {
@@ -4435,7 +4502,7 @@ struct ManagedHeap::Impl {
                     : 0u;
                 if (delta > budget) {
                     if (outOom) *outOom = true;
-                    requested = true;
+                    setRequestedUnlocked(true);
                     return nullptr;
                 }
             }
@@ -4474,7 +4541,7 @@ struct ManagedHeap::Impl {
                     statistics.bytesAllocated += delta;
                     statistics.liveBytes += delta;
                     statistics.peakLiveBytes = std::max(statistics.peakLiveBytes, statistics.liveBytes);
-                    if (statistics.liveBytes >= nextCollectionThreshold) requested = true;
+                    if (statistics.liveBytes >= nextCollectionThreshold) setRequestedUnlocked(true);
                 } else {
                     const std::size_t delta = oldTotalBytes - newTotalBytes;
                     statistics.liveBytes = (statistics.liveBytes >= delta) ? (statistics.liveBytes - delta) : 0u;
@@ -4523,7 +4590,7 @@ struct ManagedHeap::Impl {
                     statistics.bytesAllocated += delta;
                     statistics.liveBytes += delta;
                     statistics.peakLiveBytes = std::max(statistics.peakLiveBytes, statistics.liveBytes);
-                    if (statistics.liveBytes >= nextCollectionThreshold) requested = true;
+                    if (statistics.liveBytes >= nextCollectionThreshold) setRequestedUnlocked(true);
                 } else {
                     const std::size_t delta = oldTotalBytes - newTotalBytes;
                     statistics.liveBytes = (statistics.liveBytes >= delta) ? (statistics.liveBytes - delta) : 0u;
@@ -5012,12 +5079,31 @@ struct ManagedHeap::Impl {
                     entry = ObjectRef{};
                 }
             }
-            const std::string key(sv);
-            const auto it = internedStrings.find(key);
-            if (it != internedStrings.end() &&
-                it->second.slot == slotIdx &&
-                it->second.generation == slot.generation) {
-                internedStrings.erase(it);
+            const std::uint64_t hashKey = fnv1aStringHash(sv);
+            const auto it = internedStrings.find(hashKey);
+            if (it != internedStrings.end()) {
+                auto& bucket = it->second;
+                if (bucket.primary.slot == slotIdx &&
+                    bucket.primary.generation == slot.generation) {
+                    if (!bucket.overflow.empty()) {
+                        bucket.primary = bucket.overflow.back();
+                        bucket.overflow.pop_back();
+                    } else {
+                        internedStrings.erase(it);
+                    }
+                } else {
+                    for (std::size_t oi = 0; oi < bucket.overflow.size(); ++oi) {
+                        if (bucket.overflow[oi].slot == slotIdx &&
+                            bucket.overflow[oi].generation == slot.generation) {
+                            bucket.overflow[oi] = bucket.overflow.back();
+                            bucket.overflow.pop_back();
+                            break;
+                        }
+                    }
+                    if (!bucket.primary.valid() && bucket.overflow.empty()) {
+                        internedStrings.erase(it);
+                    }
+                }
             }
             gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
             stringInternEpoch.fetch_add(1, std::memory_order_release);
@@ -5092,7 +5178,7 @@ struct ManagedHeap::Impl {
 
     void markValue(
         const Value& value,
-        std::unordered_set<const StructStorage*>& visitedStructs) {
+        SmallStructVisitedSet& visitedStructs) {
         if (!value.isTraceable()) return;
         const auto t = value.rawTag();
         if (t == ValueTag::ObjectRef) {
@@ -5102,7 +5188,7 @@ struct ManagedHeap::Impl {
         if (t == ValueTag::Struct) {
             const auto& structure = value.asStructUnchecked();
             if (!structure.isInline && structure.storage &&
-                visitedStructs.insert(structure.storage.get()).second) {
+                visitedStructs.insert(structure.storage.get())) {
                 for (const auto& field : structure.storage->fields) {
                     markValue(field, visitedStructs);
                 }
@@ -5120,7 +5206,7 @@ struct ManagedHeap::Impl {
         if (t == ValueTag::Struct) {
             const auto& structure = value.asStructUnchecked();
             if (!structure.isInline && structure.storage) {
-                std::unordered_set<const StructStorage*> visitedStructs;
+                SmallStructVisitedSet visitedStructs;
                 visitedStructs.insert(structure.storage.get());
                 for (const auto& field : structure.storage->fields) {
                     markValue(field, visitedStructs);
@@ -5131,14 +5217,14 @@ struct ManagedHeap::Impl {
 
     [[nodiscard]] bool validRootValue(
         const Value& value,
-        std::unordered_set<const StructStorage*>& visitedStructs) const {
+        SmallStructVisitedSet& visitedStructs) const {
         if (const auto* reference = std::get_if<ObjectRef>(&value)) {
             return getSlot(*reference) != nullptr;
         }
         if (const auto* structure = std::get_if<StructValue>(&value)) {
             if (!structure->valid()) return false;
             if (structure->isInline || !structure->storage) return true;
-            if (!visitedStructs.insert(structure->storage.get()).second) return true;
+            if (!visitedStructs.insert(structure->storage.get())) return true;
             for (const auto& field : structure->storage->fields) {
                 if (!validRootValue(field, visitedStructs)) return false;
             }
@@ -5153,7 +5239,7 @@ struct ManagedHeap::Impl {
         if (const auto* structure = std::get_if<StructValue>(&value)) {
             if (!structure->valid()) return false;
             if (structure->isInline || !structure->storage) return true;
-            std::unordered_set<const StructStorage*> visitedStructs;
+            SmallStructVisitedSet visitedStructs;
             visitedStructs.insert(structure->storage.get());
             for (const auto& field : structure->storage->fields) {
                 if (!validRootValue(field, visitedStructs)) return false;
@@ -5190,7 +5276,7 @@ struct ManagedHeap::Impl {
         sweepLimit = slots.size();
         resumeSweep = false;
         lastScannedShadowStackId = 0;
-        phase = GcPhase::Mark;
+        setPhaseUnlocked(GcPhase::Mark);
         ++statistics.collectionsStarted;
         markRoots(shadowStack);
     }
@@ -5307,8 +5393,8 @@ struct ManagedHeap::Impl {
     }
 
     [[nodiscard]] bool finishCollectionUnlocked() {
-        phase = GcPhase::Idle;
-        requested = false;
+        setPhaseUnlocked(GcPhase::Idle);
+        setRequestedUnlocked(false);
         resumeSweep = false;
         wallClockCycleActive = false;
         lastScannedShadowStackId = 0;
@@ -5379,7 +5465,7 @@ struct ManagedHeap::Impl {
                 if (markStack.empty()) {
                     markRoots(shadowStack);
                     if (!markStack.empty()) continue;
-                    phase = GcPhase::Sweep;
+                    setPhaseUnlocked(GcPhase::Sweep);
                     if (!resumeSweep) sweepIndex = 0;
                     resumeSweep = false;
                     continue;
@@ -5486,7 +5572,7 @@ struct ManagedHeap::Impl {
                 if (markStack.empty()) {
                     markRoots(roots);
                     if (!markStack.empty()) continue;
-                    phase = GcPhase::Sweep;
+                    setPhaseUnlocked(GcPhase::Sweep);
                     if (!resumeSweep) sweepIndex = 0;
                     resumeSweep = false;
                     if (sweepIndex >= sweepLimit) {
@@ -5813,32 +5899,66 @@ std::optional<ObjectRef> ManagedHeap::internString(
             fastRef = ObjectRef{};
         }
     }
-    const std::string key(value);
-    const auto found = impl_->internedStrings.find(key);
+    const std::uint64_t hashKey = Impl::fnv1aStringHash(value);
+    const auto found = impl_->internedStrings.find(hashKey);
     if (found != impl_->internedStrings.end()) {
-        if (impl_->getSlot(found->second) != nullptr) {
+        auto& bucket = found->second;
+        ObjectRef matchedRef{};
+        if (bucket.primary.valid()) {
+            if (const auto* slot = impl_->getSlot(bucket.primary)) {
+                if (impl_->slotStringView(*slot) == value) {
+                    matchedRef = bucket.primary;
+                }
+            } else {
+                bucket.primary = ObjectRef{};
+            }
+        }
+        if (!matchedRef.valid() && !bucket.overflow.empty()) {
+            for (std::size_t oi = 0; oi < bucket.overflow.size();) {
+                const ObjectRef ovRef = bucket.overflow[oi];
+                const auto* slot = impl_->getSlot(ovRef);
+                if (!slot) {
+                    bucket.overflow[oi] = bucket.overflow.back();
+                    bucket.overflow.pop_back();
+                    continue;
+                }
+                if (impl_->slotStringView(*slot) == value) {
+                    matchedRef = ovRef;
+                    break;
+                }
+                ++oi;
+            }
+        }
+        if (matchedRef.valid()) {
             if (impl_->phase != GcPhase::Idle) {
-                impl_->mark(found->second);
+                impl_->mark(matchedRef);
                 impl_->reopenMarkFromSweep();
             }
-            if (key.empty()) {
-                impl_->emptyStringIntern = found->second;
-            } else if (key.size() == 1u && static_cast<unsigned char>(key[0]) < 128u) {
-                impl_->asciiCharInterns[static_cast<unsigned char>(key[0])] = found->second;
+            if (value.empty()) {
+                impl_->emptyStringIntern = matchedRef;
+            } else if (value.size() == 1u && static_cast<unsigned char>(value[0]) < 128u) {
+                impl_->asciiCharInterns[static_cast<unsigned char>(value[0])] = matchedRef;
             }
-            return found->second;
+            return matchedRef;
         }
-        impl_->internedStrings.erase(found);
+        if (!bucket.primary.valid() && bucket.overflow.empty()) {
+            impl_->internedStrings.erase(found);
+        }
     }
-    const auto size = Impl::BaseObjectSizeBytes + key.size();
-    auto allocated = impl_->allocateStringSlot(key, size, error);
+    const auto size = Impl::BaseObjectSizeBytes + value.size();
+    auto allocated = impl_->allocateStringSlot(std::string(value), size, error);
     if (allocated) {
         impl_->slots[allocated->slot].gcFlags |= GcFlag::IsInterned;
-        impl_->internedStrings[key] = *allocated;
-        if (key.empty()) {
+        auto& bucket = impl_->internedStrings[hashKey];
+        if (!bucket.primary.valid()) {
+            bucket.primary = *allocated;
+        } else {
+            bucket.overflow.push_back(*allocated);
+        }
+        if (value.empty()) {
             impl_->emptyStringIntern = *allocated;
-        } else if (key.size() == 1u && static_cast<unsigned char>(key[0]) < 128u) {
-            impl_->asciiCharInterns[static_cast<unsigned char>(key[0])] = *allocated;
+        } else if (value.size() == 1u && static_cast<unsigned char>(value[0]) < 128u) {
+            impl_->asciiCharInterns[static_cast<unsigned char>(value[0])] = *allocated;
         }
     }
     return allocated;
@@ -5847,9 +5967,14 @@ std::optional<ObjectRef> ManagedHeap::internString(
 std::size_t ManagedHeap::internedStringCount() const noexcept {
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
     std::size_t aliveCount = 0;
-    for (const auto& [k, ref] : impl_->internedStrings) {
-        (void)k;
-        if (impl_->getSlot(ref) != nullptr) ++aliveCount;
+    for (const auto& [h, bucket] : impl_->internedStrings) {
+        (void)h;
+        if (bucket.primary.valid() && impl_->getSlot(bucket.primary) != nullptr) {
+            ++aliveCount;
+        }
+        for (const auto& ovRef : bucket.overflow) {
+            if (impl_->getSlot(ovRef) != nullptr) ++aliveCount;
+        }
     }
     return aliveCount;
 }
@@ -6941,6 +7066,10 @@ std::uint64_t ManagedHeap::stringInternEpoch() const noexcept {
     return impl_->stringInternEpoch.load(std::memory_order_acquire);
 }
 
+std::uint64_t ManagedHeap::restoreEpoch() const noexcept {
+    return impl_->restoreEpoch.load(std::memory_order_acquire);
+}
+
 void ManagedHeap::pinFlatStructArrayElement(
     ObjectRef arrayRef,
     std::size_t elementIndex) noexcept {
@@ -7331,7 +7460,7 @@ bool ManagedHeap::arrayReserve(
         extraBytes == std::numeric_limits<std::size_t>::max() ||
         extraBytes > budget) {
         setHeapError(error, ErrorCode::OutOfMemory, "managed array reserve exceeds heap limit");
-        impl_->requested = true;
+        impl_->setRequestedUnlocked(true);
         return false;
     }
     if (slot->storage() == SlotStorage::HeapValues) {
@@ -7387,7 +7516,7 @@ bool ManagedHeap::arrayPush(
         if (impl_->config.maximumHeapBytes < sizeof(Value) ||
             impl_->statistics.liveBytes > impl_->config.maximumHeapBytes - sizeof(Value)) {
             setHeapError(error, ErrorCode::OutOfMemory, "managed array push exceeds heap limit");
-            impl_->requested = true;
+            impl_->setRequestedUnlocked(true);
             return false;
         }
         bool oom = false;
@@ -7403,7 +7532,7 @@ bool ManagedHeap::arrayPush(
         if (impl_->config.maximumHeapBytes < sizeof(Value) ||
             impl_->statistics.liveBytes > impl_->config.maximumHeapBytes - sizeof(Value)) {
             setHeapError(error, ErrorCode::OutOfMemory, "managed array push exceeds heap limit");
-            impl_->requested = true;
+            impl_->setRequestedUnlocked(true);
             return false;
         }
         impl_->pinHeapValueIfNeededUnlocked(value);
@@ -7428,7 +7557,7 @@ bool ManagedHeap::arrayPush(
             }
         }
         if (impl_->statistics.liveBytes >= impl_->nextCollectionThreshold) {
-            impl_->requested = true;
+            impl_->setRequestedUnlocked(true);
         }
         impl_->syncOldGenArrayCardsAfterResizeUnlocked(*slot);
         impl_->writeBarrierArrayElement(reference, oldLen, vec->back());
@@ -7480,7 +7609,7 @@ bool ManagedHeap::arrayInsert(
         if (impl_->config.maximumHeapBytes < sizeof(Value) ||
             impl_->statistics.liveBytes > impl_->config.maximumHeapBytes - sizeof(Value)) {
             setHeapError(error, ErrorCode::OutOfMemory, "managed array insert exceeds heap limit");
-            impl_->requested = true;
+            impl_->setRequestedUnlocked(true);
             return false;
         }
         bool oom = false;
@@ -7496,7 +7625,7 @@ bool ManagedHeap::arrayInsert(
         if (impl_->config.maximumHeapBytes < sizeof(Value) ||
             impl_->statistics.liveBytes > impl_->config.maximumHeapBytes - sizeof(Value)) {
             setHeapError(error, ErrorCode::OutOfMemory, "managed array insert exceeds heap limit");
-            impl_->requested = true;
+            impl_->setRequestedUnlocked(true);
             return false;
         }
         impl_->pinHeapValueIfNeededUnlocked(value);
@@ -7520,7 +7649,7 @@ bool ManagedHeap::arrayInsert(
             }
         }
         if (impl_->statistics.liveBytes >= impl_->nextCollectionThreshold) {
-            impl_->requested = true;
+            impl_->setRequestedUnlocked(true);
         }
         impl_->syncOldGenArrayCardsAfterResizeUnlocked(*slot);
         if (layout.mayContainReferences && !slot->hasFlag(GcFlag::InNursery) &&
@@ -8329,6 +8458,14 @@ struct SanitizedValueTree {
             return copiedStringValues[stringIndex];
         }
         if (isRebuiltStruct) {
+            if (fields.size() <= 8u) {
+                std::array<Value, 8> builtFields{};
+                for (std::size_t i = 0; i < fields.size(); ++i) {
+                    builtFields[i] = fields[i].materialize(copiedStringValues);
+                }
+                return Value{makeStructValueFromFields(
+                    structTypeId, ValueSpan(builtFields.data(), fields.size()))};
+            }
             std::vector<Value> builtFields;
             builtFields.reserve(fields.size());
             for (const auto& child : fields) {
@@ -9159,15 +9296,13 @@ Value ManagedHeap::makeNativeSpanValue(
 
 void ManagedHeap::requestCollection() noexcept {
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
-    impl_->requested = true;
+    impl_->setRequestedUnlocked(true);
 }
 bool ManagedHeap::collectionRequested() const noexcept {
-    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
-    return impl_->requested;
+    return impl_->atomicRequested.load(std::memory_order_acquire);
 }
 GcPhase ManagedHeap::phase() const noexcept {
-    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
-    return impl_->phase;
+    return impl_->atomicPhase.load(std::memory_order_acquire);
 }
 
 std::size_t ManagedHeap::step(
@@ -9302,7 +9437,7 @@ void ManagedHeap::collectFull(const ShadowStack& shadowStack) {
             }
         };
         if (impl_->phase != GcPhase::Idle) drainUnlocked();
-        impl_->requested = true;
+        impl_->setRequestedUnlocked(true);
         drainUnlocked();
     }
     if (shouldSweepPools) {
@@ -9351,7 +9486,7 @@ std::size_t ManagedHeap::collectYoung(
 
     auto& youngQueue = impl_->youngWorkQueue;
     youngQueue.clear();
-    std::optional<std::unordered_set<const StructStorage*>> visitedStructs;
+    SmallStructVisitedSet visitedStructs;
     const auto markYoungValue = [&](const auto& self, const Value& val) -> void {
         if (!val.isTraceable()) return;
         const auto t = val.rawTag();
@@ -9366,12 +9501,10 @@ std::size_t ManagedHeap::collectYoung(
         }
         if (t == ValueTag::Struct) {
             const auto& structure = val.asStructUnchecked();
-            if (!structure.isInline && structure.storage) {
-                if (!visitedStructs.has_value()) visitedStructs.emplace();
-                if (visitedStructs->insert(structure.storage.get()).second) {
-                    for (const auto& field : structure.storage->fields) {
-                        self(self, field);
-                    }
+            if (!structure.isInline && structure.storage &&
+                visitedStructs.insert(structure.storage.get())) {
+                for (const auto& field : structure.storage->fields) {
+                    self(self, field);
                 }
             }
         }
@@ -9511,7 +9644,7 @@ std::size_t ManagedHeap::collectYoung(
             impl_->gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
             impl_->objectViewEpoch.fetch_add(1, std::memory_order_release);
             if (impl_->statistics.liveBytes < impl_->nextCollectionThreshold) {
-                impl_->requested = false;
+                impl_->setRequestedUnlocked(false);
             }
             stepResult = processed;
         }
@@ -10178,6 +10311,7 @@ bool ManagedHeap::restore(
     impl_->gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
     impl_->stringInternEpoch.fetch_add(1, std::memory_order_release);
     impl_->objectViewEpoch.fetch_add(1, std::memory_order_release);
+    impl_->restoreEpoch.fetch_add(1, std::memory_order_release);
     impl_->typeLayouts.assign(1, TypeLayoutEntry{});
     impl_->sharedRecordLayoutByTypeId.clear();
     impl_->arrayLayoutByKey.clear();
@@ -10188,6 +10322,17 @@ bool ManagedHeap::restore(
     impl_->hasLastArrayLayout = false;
     impl_->lastArrayLayoutKey = {};
     impl_->lastArrayLayoutId = 0;
+    std::uint32_t maxRestoredGen = impl_->minFreshGeneration;
+    for (const auto& info : snapshot.objects) {
+        if (info.reference.generation > maxRestoredGen &&
+            info.reference.generation < 0xFFFFFF00u) {
+            maxRestoredGen = info.reference.generation;
+        }
+    }
+    impl_->minFreshGeneration = maxRestoredGen + 1u;
+    if (impl_->minFreshGeneration == 0u || impl_->minFreshGeneration >= 0xFFFFFF00u) {
+        impl_->minFreshGeneration = 1u;
+    }
     impl_->slots.assign(slotCount, CompactSlot{});
 
     for (const auto& info : snapshot.objects) {
@@ -10376,8 +10521,9 @@ bool ManagedHeap::restore(
 
     std::vector<std::uint32_t> freeSlots;
     for (std::size_t index = 0; index < impl_->slots.size(); ++index) {
-        const auto& slot = impl_->slots[index];
+        auto& slot = impl_->slots[index];
         if (!slot.occupied()) {
+            slot.generation = impl_->minFreshGeneration;
             freeSlots.push_back(static_cast<std::uint32_t>(index));
         } else {
             const auto count = Impl::slotValueCount(slot);
@@ -10399,8 +10545,8 @@ bool ManagedHeap::restore(
     impl_->markStack.clear();
     impl_->nurserySlots.clear();
     impl_->rememberedSet.clear();
-    impl_->phase = GcPhase::Idle;
-    impl_->requested = false;
+    impl_->setPhaseUnlocked(GcPhase::Idle);
+    impl_->setRequestedUnlocked(false);
     impl_->sweepIndex = 0;
     impl_->resumeSweep = false;
     impl_->wallClockCycleActive = false;
@@ -11712,7 +11858,7 @@ bool ManagedHeap::migrateTypeLayouts(
                 error,
                 ErrorCode::OutOfMemory,
                 "managed heap type layout migration exceeds the configured heap limit");
-            impl_->requested = true;
+            impl_->setRequestedUnlocked(true);
             return false;
         }
     }
@@ -11926,7 +12072,7 @@ bool ManagedHeap::migrateTypeLayouts(
             impl_->statistics.bytesReclaimed += delta;
         }
         if (impl_->statistics.liveBytes >= impl_->nextCollectionThreshold) {
-            impl_->requested = true;
+            impl_->setRequestedUnlocked(true);
         }
         ++localStats.objectsMigrated;
     }

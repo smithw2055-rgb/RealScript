@@ -1046,6 +1046,379 @@ public int TryCatchFallback(int x) {
     require(sawFast && sawTryFallback, "Missing expected functions in StencilModule::functionDiagnostics");
 }
 
+void testWaveRegressionStencilJitPolicyAndFastOps() {
+    const std::string src = R"RS(
+module Kernel.StencilWave;
+
+public class Box {
+    public int v = 5;
+}
+
+public int NegCheck(int x) {
+    return -x;
+}
+
+public int ConvAndUInt(double d, int a, int b) {
+    uint ua = (uint)a;
+    uint ub = (uint)b;
+    uint diff = (ua + ub) - (uint)2;
+    return (int)d + (int)diff;
+}
+
+public int LeafBump(int x) {
+    return x + 4;
+}
+
+public int PolicyTarget(Box b, int delta) {
+    int bump = LeafBump(delta);
+    b.v = b.v + bump;
+    return b.v;
+}
+)RS";
+
+    auto bundle = compileAndLink({{"stencil_wave.rscript", src}}, optimization::Level::Basic);
+    auto heap = std::make_shared<runtime::ManagedHeap>();
+
+    jit::StencilJit sjit;
+    jit::StencilJitOptions nativeOpts;
+    nativeOpts.enableNativeCodegen = true;
+    auto nativeCompiled = sjit.compile(bundle.program, nativeOpts);
+    require(nativeCompiled.succeeded(), "StencilJit native compile failed: " + nativeCompiled.error);
+    nativeCompiled.module->setHeap(heap);
+
+    jit::StencilJitOptions threadedOpts;
+    threadedOpts.enableNativeCodegen = false;
+    auto threadedCompiled = sjit.compile(bundle.program, threadedOpts);
+    require(threadedCompiled.succeeded(), "StencilJit threaded compile failed");
+    threadedCompiled.module->setHeap(heap);
+
+    runtime::Interpreter interp(bundle.program);
+    interp.setHeap(heap);
+
+    const std::int64_t iMin = std::numeric_limits<std::int32_t>::min();
+    const auto expNegOk = interp.invoke("Kernel.StencilWave::NegCheck", {runtime::Value{std::int64_t{-19}}});
+    const auto expNegOv = interp.invoke("Kernel.StencilWave::NegCheck", {runtime::Value{iMin}});
+    const auto expConv = interp.invoke("Kernel.StencilWave::ConvAndUInt",
+        {runtime::Value{12.75}, runtime::Value{std::int64_t{10}}, runtime::Value{std::int64_t{5}}});
+
+    require(expNegOk.succeeded && std::get<std::int64_t>(expNegOk.value) == 19,
+        "Interpreter NegCheck(-19) mismatch");
+    require(!expNegOv.succeeded, "Interpreter NegCheck(INT32_MIN) should fail overflow");
+    require(expConv.succeeded && std::get<std::int64_t>(expConv.value) == 25,
+        "Interpreter ConvAndUInt mismatch");
+
+    assertParity("StencilNative NegCheck ok",
+        nativeCompiled.module->invoke("Kernel.StencilWave::NegCheck", {runtime::Value{std::int64_t{-19}}}),
+        expNegOk);
+    assertParity("StencilNative NegCheck overflow",
+        nativeCompiled.module->invoke("Kernel.StencilWave::NegCheck", {runtime::Value{iMin}}),
+        expNegOv);
+    assertParity("StencilNative ConvAndUInt",
+        nativeCompiled.module->invoke("Kernel.StencilWave::ConvAndUInt",
+            {runtime::Value{12.75}, runtime::Value{std::int64_t{10}}, runtime::Value{std::int64_t{5}}}),
+        expConv);
+    assertParity("StencilThreaded ConvAndUInt",
+        threadedCompiled.module->invoke("Kernel.StencilWave::ConvAndUInt",
+            {runtime::Value{12.75}, runtime::Value{std::int64_t{10}}, runtime::Value{std::int64_t{5}}}),
+        expConv);
+    assertParity("StencilSimArm64 ConvAndUInt",
+        nativeCompiled.module->invokeSimulatedArm64("Kernel.StencilWave::ConvAndUInt",
+            {runtime::Value{12.75}, runtime::Value{std::int64_t{10}}, runtime::Value{std::int64_t{5}}}),
+        expConv);
+
+    struct JPolicy final : public runtime::IExecutionPolicy {
+        semantic::SymbolId bumpSymId = 0;
+        bool denyWrite = false;
+        bool intercept = false;
+        std::size_t writeChecks = 0;
+        std::size_t intercepts = 0;
+
+        bool checkFieldWrite(
+            const runtime::ManagedHeap*,
+            const runtime::ManagedHeap*,
+            runtime::ObjectRef,
+            semantic::SymbolId,
+            std::size_t,
+            std::string_view,
+            const runtime::Value&,
+            runtime::RuntimeError& err) const override {
+            const_cast<JPolicy*>(this)->writeChecks += 1u;
+            if (denyWrite) {
+                err.code = runtime::ErrorCode::CapabilityDenied;
+                err.message = "stencil policy denied field write";
+                return false;
+            }
+            return true;
+        }
+
+        bool interceptCall(
+            semantic::SymbolId fnId,
+            runtime::ValueSpan arguments,
+            bool& outIntercepted,
+            runtime::Value& outResult,
+            runtime::RuntimeError&) override {
+            if (intercept && fnId == bumpSymId) {
+                ++intercepts;
+                outIntercepted = true;
+                const std::int64_t x = (!arguments.empty() && std::holds_alternative<std::int64_t>(arguments[0]))
+                    ? std::get<std::int64_t>(arguments[0])
+                    : 0;
+                outResult = runtime::Value{x + 100};
+                return true;
+            }
+            outIntercepted = false;
+            return true;
+        }
+    };
+
+    const auto boxTid = semantic::stableTypeId("Kernel.StencilWave::Box");
+    auto boxObj = heap->allocateObject(boxTid, {runtime::Value{std::int64_t{5}}}, {});
+    require(boxObj.has_value(), "Box allocation failed");
+    auto pinBox = heap->retain(runtime::Value{*boxObj});
+
+    JPolicy policy;
+    const auto bumpSym = bundle.program->findFunction("Kernel.StencilWave::LeafBump");
+    require(bumpSym.has_value(), "Missing LeafBump symbol");
+    policy.bumpSymId = *bumpSym;
+    runtime::ExecutionOptions polOpts;
+    polOpts.executionPolicy = &policy;
+
+    policy.denyWrite = true;
+    const auto denyRes = nativeCompiled.module->invoke(
+        "Kernel.StencilWave::PolicyTarget",
+        {runtime::Value{*boxObj}, runtime::Value{std::int64_t{3}}},
+        polOpts);
+    require(!denyRes.succeeded &&
+            denyRes.error.code == runtime::ErrorCode::CapabilityDenied &&
+            policy.writeChecks >= 1u &&
+            heap->fieldGet(*boxObj, 0u) == std::optional<runtime::Value>{runtime::Value{std::int64_t{5}}},
+        "StencilJit must enforce IExecutionPolicy::checkFieldWrite on fast path");
+
+    policy.denyWrite = false;
+    policy.intercept = true;
+    const auto intRes = nativeCompiled.module->invoke(
+        "Kernel.StencilWave::PolicyTarget",
+        {runtime::Value{*boxObj}, runtime::Value{std::int64_t{3}}},
+        polOpts);
+    require(intRes.succeeded &&
+            std::get<std::int64_t>(intRes.value) == 108 &&
+            policy.intercepts >= 1u,
+        "StencilJit must enforce IExecutionPolicy::interceptCall when policy attached");
+}
+
+void testAuditRegressionStencilStructsPoolDomainEnumAndCompactHr() {
+    // A. Struct-returning CallDirect, StaticGet struct, Enum -> int, and ValuePoolDomain GC survival.
+    {
+        const std::string src = R"RS(
+module Kernel.StencilAudit;
+import RealScript.Math;
+
+public enum Mode {
+    Idle = 0,
+    Active = 7,
+    Turbo = 42
+}
+
+public struct Pair {
+    public int a;
+    public int b;
+    public Pair(int x, int y) {
+        a = x;
+        b = y;
+    }
+}
+
+public class Config {
+    public static Pair BasePair = new Pair(100, 25);
+}
+
+public Pair MakeOffset(int x, int y) {
+    return new Pair(x + 1, y + 2);
+}
+
+public int EvalStructAndEnum(int x, Mode m) {
+    Pair p = MakeOffset(x, x * 2);
+    Pair b = Config.BasePair;
+    return p.a + p.b + b.a + b.b + (m == Mode.Turbo ? 42 : 0);
+}
+
+public int EvalPoolDomainQuat(int seed) {
+    Quatf q = new Quatf((float)seed, -1.5f, 2.25f, 0.1234567f);
+    Quatf[] arr = new Quatf[4];
+    arr[0] = q;
+    return (int)arr[0].x + 100;
+}
+)RS";
+
+        auto bundle = compileAndLink({{"stencil_audit.rscript", src}}, optimization::Level::Basic);
+        auto domain = runtime::ValuePoolDomain::create();
+        require(domain != nullptr, "ValuePoolDomain::create failed");
+        runtime::HeapConfig hcfg;
+        hcfg.valuePoolDomain = domain;
+        auto heap = std::make_shared<runtime::ManagedHeap>(hcfg);
+
+        jit::StencilJit sjit;
+        jit::StencilJitOptions nativeOpts;
+        nativeOpts.enableNativeCodegen = true;
+        auto nativeCompiled = sjit.compile(bundle.program, nativeOpts);
+        require(nativeCompiled.succeeded(), "Audit StencilJit native compile failed: " + nativeCompiled.error);
+        nativeCompiled.module->setHeap(heap);
+
+        jit::StencilJitOptions threadedOpts;
+        threadedOpts.enableNativeCodegen = false;
+        auto threadedCompiled = sjit.compile(bundle.program, threadedOpts);
+        require(threadedCompiled.succeeded(), "Audit StencilJit threaded compile failed");
+        threadedCompiled.module->setHeap(heap);
+
+#if UINTPTR_MAX == 0xffffffffffffffffULL
+        require(nativeCompiled.module->functionTier("Kernel.StencilAudit::EvalStructAndEnum") ==
+                jit::StencilTier::NativeMachineCode,
+            "Expected EvalStructAndEnum to run as NativeMachineCode (no struct-call fallback)");
+#endif
+
+        runtime::Interpreter interp(bundle.program, heap);
+        const std::vector<runtime::Value> evalArgs{
+            runtime::Value{std::int64_t{10}},
+            runtime::Value{runtime::EnumValue{semantic::stableTypeId("Kernel.StencilAudit::Mode"), 42}},
+        };
+        const auto expEval = interp.invoke("Kernel.StencilAudit::EvalStructAndEnum", evalArgs);
+        require(expEval.succeeded && std::get<std::int64_t>(expEval.value) == 200,
+            "Interpreter EvalStructAndEnum baseline mismatch: " + expEval.error.message);
+
+        assertParity("StencilAudit Native EvalStructAndEnum",
+            nativeCompiled.module->invoke("Kernel.StencilAudit::EvalStructAndEnum", evalArgs),
+            expEval);
+        assertParity("StencilAudit Threaded EvalStructAndEnum",
+            threadedCompiled.module->invoke("Kernel.StencilAudit::EvalStructAndEnum", evalArgs),
+            expEval);
+        assertParity("StencilAudit SimArm64 EvalStructAndEnum",
+            nativeCompiled.module->invokeSimulatedArm64("Kernel.StencilAudit::EvalStructAndEnum", evalArgs),
+            expEval);
+
+        const auto expQuat = interp.invoke("Kernel.StencilAudit::EvalPoolDomainQuat", {runtime::Value{std::int64_t{17}}});
+        require(expQuat.succeeded && std::get<std::int64_t>(expQuat.value) == 117,
+            "Interpreter EvalPoolDomainQuat mismatch");
+        assertParity("StencilAudit Native EvalPoolDomainQuat",
+            nativeCompiled.module->invoke("Kernel.StencilAudit::EvalPoolDomainQuat", {runtime::Value{std::int64_t{17}}}),
+            expQuat);
+        heap->collect(runtime::RootSet{});
+        assertParity("StencilAudit Native EvalPoolDomainQuat post-GC",
+            nativeCompiled.module->invoke("Kernel.StencilAudit::EvalPoolDomainQuat", {runtime::Value{std::int64_t{17}}}),
+            expQuat);
+    }
+
+    // A2. Direct bytecode ConvertNumeric(Enum -> Int) in StencilJit (Native, Threaded, SimArm64).
+    {
+        const semantic::SymbolId enumTid = semantic::stableTypeId("Kernel.BcEnum::AuditBcEnum");
+        bytecode::Module mod;
+        mod.name = "Kernel.BcEnum";
+        mod.version = bytecode::Version{};
+
+        semantic::TypeSymbol enumType;
+        enumType.id = enumTid;
+        enumType.kind = semantic::TypeKind::Enum;
+        enumType.moduleName = "Kernel.BcEnum";
+        enumType.name = "AuditBcEnum";
+        mod.types.push_back(enumType);
+
+        bytecode::Function fn;
+        fn.symbolId = semantic::stableTypeId("Kernel.BcEnum::EnumToInt");
+        fn.accessibility = semantic::Accessibility::Public;
+        fn.name = "EnumToInt";
+        fn.returnType = semantic::PrimitiveType::Int;
+        fn.parameterTypes = {semantic::PrimitiveType::Enum};
+        fn.parameterTypeIds = {enumTid};
+        fn.registerTypes = {semantic::PrimitiveType::Enum, semantic::PrimitiveType::Int};
+        fn.registerTypeIds = {enumTid, 0u};
+
+        bytecode::BasicBlock bb;
+        bb.id = 0;
+
+        bytecode::Instruction p0;
+        p0.opcode = bytecode::Opcode::LoadParameter;
+        p0.result = 0;
+        p0.integerImmediate = 0;
+
+        bytecode::Instruction c1;
+        c1.opcode = bytecode::Opcode::ConvertNumeric;
+        c1.result = 1;
+        c1.operands.push_back(0);
+        c1.checkedArithmetic = true;
+
+        bb.instructions.push_back(p0);
+        bb.instructions.push_back(c1);
+        bb.terminator.kind = bytecode::TerminatorKind::ReturnValue;
+        bb.terminator.value = 1;
+        fn.blocks.push_back(std::move(bb));
+        mod.functions.push_back(std::move(fn));
+
+        runtime::RuntimeError linkErr;
+        auto linked = runtime::ProgramImage::link({std::move(mod)}, linkErr, false);
+        require(linked.has_value(), "Link EnumToInt failed: " + linkErr.message);
+        auto enumProg = std::make_shared<const runtime::ProgramImage>(std::move(*linked));
+
+        jit::StencilJit sjit;
+        jit::StencilJitOptions nativeOpts;
+        nativeOpts.enableNativeCodegen = true;
+        auto nativeEnum = sjit.compile(enumProg, nativeOpts);
+        require(nativeEnum.succeeded(), "EnumToInt native compile failed: " + nativeEnum.error);
+
+        jit::StencilJitOptions threadedOpts;
+        threadedOpts.enableNativeCodegen = false;
+        auto threadedEnum = sjit.compile(enumProg, threadedOpts);
+        require(threadedEnum.succeeded(), "EnumToInt threaded compile failed");
+
+        runtime::Interpreter interp(enumProg);
+        const std::vector<runtime::Value> enumArgs{runtime::Value{runtime::EnumValue{enumTid, 42}}};
+        const auto exp = interp.invoke("Kernel.BcEnum::EnumToInt", enumArgs);
+        require(exp.succeeded && std::get<std::int64_t>(exp.value) == 42,
+            "Interpreter EnumToInt baseline mismatch: " + exp.error.message);
+
+        assertParity("StencilAudit Native EnumToInt",
+            nativeEnum.module->invoke("Kernel.BcEnum::EnumToInt", enumArgs),
+            exp);
+        assertParity("StencilAudit Threaded EnumToInt",
+            threadedEnum.module->invoke("Kernel.BcEnum::EnumToInt", enumArgs),
+            exp);
+        assertParity("StencilAudit SimArm64 EnumToInt",
+            nativeEnum.module->invokeSimulatedArm64("Kernel.BcEnum::EnumToInt", enumArgs),
+            exp);
+    }
+
+    // B. ProgramImage::compactForRuntime() + hot_reload::prepare with imported cross-module types.
+    {
+        const std::string modA = R"RS(
+module Kernel.HrCompactA;
+public class SharedItem {
+    public int x = 1;
+}
+)RS";
+        const std::string modBV1 = R"RS(
+module Kernel.HrCompactB;
+import Kernel.HrCompactA;
+public class Worker {
+    public int Run(SharedItem s) { return s.x + 10; }
+}
+)RS";
+        const std::string modBV2 = R"RS(
+module Kernel.HrCompactB;
+import Kernel.HrCompactA;
+public class Worker {
+    public int Run(SharedItem s) { return s.x + 20; }
+}
+)RS";
+        auto v1 = compileAndLink({{"a.rscript", modA}, {"b.rscript", modBV1}}, optimization::Level::Basic);
+        auto v2 = compileAndLink({{"a.rscript", modA}, {"b.rscript", modBV2}}, optimization::Level::Basic);
+
+        runtime::ProgramImage compacted(*v1.program);
+        compacted.compactForRuntime();
+
+        const auto plan = hot_reload::prepare(compacted, v2.bytecodeModules);
+        require(plan.compatible && !plan.changedFunctions.empty(),
+            "hot_reload::prepare failed after compactForRuntime() on imported module types");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1059,6 +1432,8 @@ int main() {
             {"StencilJit active incremental GC, ProfileCollector & FrameTelemetryCollector (zero fallback)", testStencilJitActiveIncrementalGcProfileAndTelemetry},
             {"StencilJit native ParallelJobScheduler element reduction & range execution", testStencilJitParallelBatchExecution},
             {"StencilJit GC.Alloc attribution & per-function diagnostics", testStencilJitAllocAttributionAndFunctionDiagnostics},
+            {"Wave 2 regression: StencilJit IExecutionPolicy & NegateIntChecked/ConvertNumeric/BinaryUInt", testWaveRegressionStencilJitPolicyAndFastOps},
+            {"Audit regression: StencilJit struct calls, ValuePoolDomain, Enum->Int & compactForRuntime HotReload", testAuditRegressionStencilStructsPoolDomainEnumAndCompactHr},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

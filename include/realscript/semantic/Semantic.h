@@ -1,7 +1,10 @@
 #pragma once
 
 #include "realscript/diagnostics/Diagnostic.h"
+#include "realscript/syntax/TokenValue.h"
+#ifndef REALSCRIPT_AOT_GENERATED_TU
 #include "realscript/syntax/Syntax.h"
+#endif
 
 #include <cstddef>
 #include <cstdint>
@@ -403,12 +406,14 @@ struct BlittableStructLayout {
     const std::vector<TypeSymbol>& moduleTypes,
     std::string* outReason = nullptr);
 
+#ifndef REALSCRIPT_AOT_GENERATED_TU
 [[nodiscard]] bool hasModifier(
     const std::vector<syntax::SyntaxToken>& modifiers,
     syntax::SyntaxKind kind) noexcept;
 [[nodiscard]] Accessibility accessibilityFromModifiers(
     const std::vector<syntax::SyntaxToken>& modifiers,
     Accessibility fallback = Accessibility::Public) noexcept;
+#endif
 [[nodiscard]] bool isAssignable(
     const TypeSymbolMap& visibleTypes,
     const std::string& sourceTypeName,
@@ -439,6 +444,7 @@ bool propagateStackOnlyTypes(
     const TypeSymbol& type,
     const TypeSymbolMap& visibleTypes,
     diagnostics::DiagnosticBag& diagnostics);
+#ifndef REALSCRIPT_AOT_GENERATED_TU
 [[nodiscard]] TypeSymbol declareTypeShell(
     const std::string& moduleName,
     const syntax::ClassDeclarationSyntax& syntax);
@@ -1635,5 +1641,6 @@ private:
     std::unordered_map<SymbolId, CtorDelegationEdge> ctorThisEdges_;
     std::unordered_map<SymbolId, ObsoleteInfo> obsoleteSymbols_;
 };
+#endif
 
 } // namespace realscript::semantic

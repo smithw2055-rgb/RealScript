@@ -444,6 +444,11 @@ public:
 
 [[nodiscard]] std::vector<std::uint8_t> encodeModule(const Module& module);
 [[nodiscard]] bool decodeModule(
+    const std::uint8_t* data,
+    std::size_t size,
+    Module& module,
+    diagnostics::DiagnosticBag& diagnostics);
+[[nodiscard]] bool decodeModule(
     const std::vector<std::uint8_t>& bytes,
     Module& module,
     diagnostics::DiagnosticBag& diagnostics);

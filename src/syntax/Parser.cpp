@@ -2731,10 +2731,13 @@ std::unique_ptr<ExpressionSyntax> Parser::parsePrimaryExpression() {
                         }
                         if (raw[j] == '\'') {
                             ++j;
-                            if (j < end && raw[j] == '\\' && j + 1 < end) {
-                                j += 2;
-                            } else if (j < end) {
-                                ++j;
+                            while (j < end && raw[j] != '\'' &&
+                                   raw[j] != '\r' && raw[j] != '\n') {
+                                if (raw[j] == '\\' && j + 1 < end) {
+                                    j += 2;
+                                } else {
+                                    ++j;
+                                }
                             }
                             if (j < end && raw[j] == '\'') {
                                 ++j;

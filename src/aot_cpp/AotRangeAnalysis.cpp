@@ -84,7 +84,10 @@ TypedRangeAnalysis analyzeTypedIntegerRanges(const mir::Function& function) {
         TypedIntMinimum, 0, TypedIntMaximum};
     for (const auto& block : function.blocks) {
         for (const auto& instruction : block.instructions) {
-            if (instruction.opcode != mir::Opcode::ConstantInt) continue;
+            if (instruction.opcode != mir::Opcode::ConstantInt ||
+                instruction.resultType != semantic::PrimitiveType::Int) {
+                continue;
+            }
             const auto value = std::clamp(
                 instruction.integerImmediate,
                 TypedIntMinimum,
@@ -220,8 +223,13 @@ TypedRangeAnalysis analyzeTypedIntegerRanges(const mir::Function& function) {
                 setValue(instruction.result, typedFullIntRange());
                 break;
             case mir::Opcode::ConstantInt:
-                setValue(instruction.result,
-                    {instruction.integerImmediate, instruction.integerImmediate});
+                setValue(
+                    instruction.result,
+                    instruction.resultType == semantic::PrimitiveType::Int
+                        ? TypedIntRange{
+                              instruction.integerImmediate,
+                              instruction.integerImmediate}
+                        : typedFullIntRange());
                 break;
             case mir::Opcode::LoadLocal:
                 if (instruction.localIndex < locals.size()) {
@@ -233,7 +241,12 @@ TypedRangeAnalysis analyzeTypedIntegerRanges(const mir::Function& function) {
             case mir::Opcode::StoreLocal:
                 if (instruction.localIndex < locals.size() &&
                     !instruction.operands.empty()) {
-                    locals[instruction.localIndex] = operand(0);
+                    locals[instruction.localIndex] =
+                        (instruction.localIndex < function.localTypes.size() &&
+                         function.localTypes[instruction.localIndex] ==
+                             semantic::PrimitiveType::Int)
+                        ? operand(0)
+                        : typedFullIntRange();
                     ++localVersions[instruction.localIndex];
                 }
                 break;

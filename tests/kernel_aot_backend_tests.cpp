@@ -1580,6 +1580,280 @@ public int BoxedTryCatch(int x) {
 #endif
 }
 
+void testWaveRegressionAttributedTypedAndStructInt32() {
+    const std::string src = R"RS(
+module Kernel.AotWaveReg;
+
+public struct GridCoord {
+    public int x;
+    public int y;
+}
+
+public class AttrTagAttribute {
+    public AttrTagAttribute() {}
+}
+
+[AttrTag]
+public int TaggedScale(int v) {
+    GridCoord c = new GridCoord();
+    c.x = v;
+    c.y = v * 2;
+    return c.x + c.y;
+}
+
+public int CallTagged(int v) {
+    return TaggedScale(v) + 1;
+}
+
+public void VecAddLoop(int[] dst, int[] src, int n) {
+    for (int i = 0; i < n; i = i + 1) {
+        dst[i] = unchecked(dst[i] + src[i]);
+    }
+}
+)RS";
+
+    compiler::Compilation comp({{"aot_wave_reg.rscript", src}});
+    auto build = comp.build();
+    require(!build.diagnostics.hasErrors(), "Kernel.AotWaveReg compile failed");
+
+    diagnostics::DiagnosticBag optDiag;
+    optimization::Options optOpts;
+    optOpts.level = optimization::Level::Aggressive;
+    optOpts.enableInlining = false;
+    auto optResult = optimization::Optimizer{}.optimize(std::move(build.modules), optDiag, optOpts);
+    require(!optDiag.hasErrors(), "Kernel.AotWaveReg optimization failed");
+
+    diagnostics::DiagnosticBag genDiag;
+    aot::GenerationOptions genOpts;
+    genOpts.programName = "WaveRegAot";
+    genOpts.cppNamespace = "wave_reg_aot_ns";
+    const auto generated = aot::CppGenerator{}.generate(optResult.modules, genDiag, genOpts);
+    require(!genDiag.hasErrors(), "Kernel.AotWaveReg codegen failed");
+
+    require(generated.source.find("#define REALSCRIPT_AOT_GENERATED_TU 1") != std::string::npos,
+        "Expected REALSCRIPT_AOT_GENERATED_TU guard at top of generated AOT .cpp");
+    require(generated.header.find("REALSCRIPT_AOT_GENERATED_TU") == std::string::npos,
+        "Generated public AOT .h must NOT define REALSCRIPT_AOT_GENERATED_TU");
+    require(generated.source.find("std::int32_t f_0 = std::int32_t{0}; // x") != std::string::npos,
+        "Expected std::int32_t field f_0 inside generated AotStruct_ for GridCoord");
+
+    const std::string srcWithFn = generated.source;
+    require(srcWithFn.find("_typed(") != std::string::npos &&
+            srcWithFn.find("TaggedScale") != std::string::npos,
+        "Expected custom-attributed TaggedScale to emit typed AOT implementation");
+    require(srcWithFn.find("context.executionPolicy() != nullptr") != std::string::npos,
+        "Expected typed direct call to check context.executionPolicy() != nullptr");
+    require(srcWithFn.find("TrustedRelease || FastAccounting") != std::string::npos,
+        "Expected vectorized ECS loop to allow FastAccounting fast path");
+}
+
+bool auditHotPatchLiteralProbe(
+    aot::ExecutionContext& ctx,
+    const runtime::Value*,
+    std::size_t,
+    runtime::Value& result) {
+    runtime::Value firstVal;
+    runtime::Value secondVal;
+    if (!ctx.constantStringIndexed(0u, "tu_alpha_literal", firstVal)) {
+        return false;
+    }
+    if (!ctx.constantStringIndexed(0u, "tu_beta_patched_literal", secondVal)) {
+        return false;
+    }
+    const auto heap = ctx.heap();
+    if (!heap ||
+        firstVal.rawTag() != runtime::ValueTag::ObjectRef ||
+        secondVal.rawTag() != runtime::ValueTag::ObjectRef) {
+        return false;
+    }
+    const auto s1 = heap->stringView(firstVal.asObjectRefUnchecked());
+    const auto s2 = heap->stringView(secondVal.asObjectRefUnchecked());
+    const bool ok = s1.has_value() && s2.has_value() &&
+        *s1 == std::string_view("tu_alpha_literal") &&
+        *s2 == std::string_view("tu_beta_patched_literal");
+    result = runtime::Value{ok};
+    return true;
+}
+
+void testAuditRegressionULongAsyncCoroAndHotPatchStrings() {
+    const std::string src = readFixtureFile("tests/fixtures/kernel_aot_suite.rscript");
+    auto vmProg = compileFixtureForVm("tests/fixtures/kernel_aot_suite.rscript", src);
+
+    runtime::EngineRuntime vm(vmProg);
+    aot::Program aotProg(kernel_aot_ns::KernelAotSuiteProgram());
+    auto aotHeap = std::make_shared<runtime::ManagedHeap>();
+    auto aotAsync = std::make_shared<runtime::AsyncRuntimeContext>();
+    aotProg.setHeap(aotHeap);
+    aotProg.setAsyncRuntime(aotAsync);
+
+    // 1. VM vs AOT unsigned ulong arithmetic, division/remainder, checked overflow & SIMD parity.
+    {
+        const std::vector<runtime::Value> arithArgs{
+            runtime::Value{runtime::ULongValue{0x8000000000000005ULL}},
+            runtime::Value{runtime::ULongValue{19ULL}},
+        };
+        const auto vmArith = vm.invoke("Kernel.AotSuite::ULongArithAndDiv", arithArgs);
+        const auto aotArith = aotProg.invoke("Kernel.AotSuite::ULongArithAndDiv", arithArgs);
+        require(vmArith.succeeded && aotArith.succeeded &&
+                std::holds_alternative<runtime::ULongValue>(vmArith.value) &&
+                std::holds_alternative<runtime::ULongValue>(aotArith.value) &&
+                std::get<runtime::ULongValue>(vmArith.value).value ==
+                    std::get<runtime::ULongValue>(aotArith.value).value,
+            "ULongArithAndDiv VM vs AOT parity mismatch");
+
+        const auto vmOkAdd = vm.invoke("Kernel.AotSuite::ULongCheckedAdd",
+            {runtime::Value{runtime::ULongValue{100ULL}}, runtime::Value{runtime::ULongValue{200ULL}}});
+        const auto aotOkAdd = aotProg.invoke("Kernel.AotSuite::ULongCheckedAdd",
+            {runtime::Value{runtime::ULongValue{100ULL}}, runtime::Value{runtime::ULongValue{200ULL}}});
+        require(vmOkAdd.succeeded && aotOkAdd.succeeded &&
+                std::get<runtime::ULongValue>(vmOkAdd.value).value == 300ULL &&
+                std::get<runtime::ULongValue>(aotOkAdd.value).value == 300ULL,
+            "ULongCheckedAdd(100, 200) parity mismatch");
+
+        const std::vector<runtime::Value> ovArgs{
+            runtime::Value{runtime::ULongValue{std::numeric_limits<std::uint64_t>::max()}},
+            runtime::Value{runtime::ULongValue{1ULL}},
+        };
+        const auto vmOv = vm.invoke("Kernel.AotSuite::ULongCheckedAdd", ovArgs);
+        const auto aotOv = aotProg.invoke("Kernel.AotSuite::ULongCheckedAdd", ovArgs);
+        require(!vmOv.succeeded && vmOv.error.code == runtime::ErrorCode::IntegerOverflow &&
+                !aotOv.succeeded && aotOv.error.code == runtime::ErrorCode::IntegerOverflow,
+            "ULongCheckedAdd(UINT64_MAX, 1) must trap with IntegerOverflow on both VM and AOT");
+
+        const auto ulongArrTid = semantic::stableTypeId(
+            semantic::arrayTypeName(semantic::PrimitiveType::ULong, ""));
+        auto vmSrc = vm.heap()->allocateTypedArray(
+            ulongArrTid, semantic::PrimitiveType::ULong, 0, 16u, runtime::Value{runtime::ULongValue{0ULL}});
+        auto vmDst = vm.heap()->allocateTypedArray(
+            ulongArrTid, semantic::PrimitiveType::ULong, 0, 16u, runtime::Value{runtime::ULongValue{0ULL}});
+        auto aotSrc = aotHeap->allocateTypedArray(
+            ulongArrTid, semantic::PrimitiveType::ULong, 0, 16u, runtime::Value{runtime::ULongValue{0ULL}});
+        auto aotDst = aotHeap->allocateTypedArray(
+            ulongArrTid, semantic::PrimitiveType::ULong, 0, 16u, runtime::Value{runtime::ULongValue{0ULL}});
+        require(vmSrc && vmDst && aotSrc && aotDst, "Failed to allocate ulong[] arrays");
+        for (std::size_t i = 0; i < 16u; ++i) {
+            const auto v = runtime::Value{runtime::ULongValue{0x8000000000000000ULL + i}};
+            require(vm.heap()->arraySet(*vmSrc, i, v) && aotHeap->arraySet(*aotSrc, i, v),
+                "arraySet failed for ULongSimdScale");
+        }
+        const auto vmSimd = vm.invoke("Kernel.AotSuite::ULongSimdScale",
+            {runtime::Value{*vmDst}, runtime::Value{*vmSrc}, runtime::Value{std::int64_t{16}}});
+        const auto aotSimd = aotProg.invoke("Kernel.AotSuite::ULongSimdScale",
+            {runtime::Value{*aotDst}, runtime::Value{*aotSrc}, runtime::Value{std::int64_t{16}}});
+        require(vmSimd.succeeded && aotSimd.succeeded,
+            "ULongSimdScale execution failed");
+        for (std::size_t i = 0; i < 16u; ++i) {
+            const auto ev = vm.heap()->arrayGet(*vmDst, i);
+            const auto ea = aotHeap->arrayGet(*aotDst, i);
+            require(ev && ea &&
+                    std::get<runtime::ULongValue>(*ev).value == std::get<runtime::ULongValue>(*ea).value,
+                "ULongSimdScale element parity mismatch");
+        }
+    }
+
+    // 2. Suspended AOT typed async coroutine keeps string + string-holding struct live across GC.
+    {
+        const auto taskTid = semantic::stableTypeId("Kernel.AotSuite::AotSchedTaskInt");
+        const auto runAsyncWithGc = [&](auto& exec, runtime::ManagedHeap& targetHeap) -> std::int64_t {
+            ParityCustomAwaitScheduler sched;
+            sched.targetTaskTypeId = taskTid;
+            sched.allowCompleted = false;
+            sched.nextValue = 5;
+            auto dynPrefix = targetHeap.allocateString("coro_gc_prefix");
+            require(dynPrefix.has_value(), "allocateString prefix failed");
+            runtime::ExecutionOptions opts;
+            opts.awaitScheduler = &sched;
+            const auto res = exec.invoke(
+                "Kernel.AotSuite::ComputeAsyncStringGcSurvival",
+                {runtime::Value{*dynPrefix}, runtime::Value{std::int64_t{3}}, runtime::Value{runtime::LongValue{77}}},
+                opts);
+            require(res.succeeded && res.value.rawTag() == runtime::ValueTag::Struct &&
+                    sched.suspendCount == 1 && sched.savedResume != nullptr,
+                "ComputeAsyncStringGcSurvival did not suspend as expected: " + res.error.message);
+            const auto f0 = runtime::structValueFieldAt(res.value.asStructUnchecked(), 0);
+            require(f0 && std::holds_alternative<runtime::LongValue>(*f0), "Missing task handle");
+            const auto h = runtime::AwaitableHandle::unpack64(
+                static_cast<std::uint64_t>(std::get<runtime::LongValue>(*f0).value));
+
+            // Collect while coroutine frame holds the only references to dyn & pair.Label!
+            targetHeap.collect(runtime::RootSet{});
+            targetHeap.collect(runtime::RootSet{});
+
+            sched.allowCompleted = true;
+            sched.savedResume();
+            exec.asyncRuntime()->stepResumeQueue(runtime::ResumeQueue::Update);
+            exec.asyncRuntime()->stepResumeQueue(runtime::ResumeQueue::Update);
+            runtime::Value got;
+            runtime::RuntimeError gotErr;
+            require(exec.asyncRuntime()->awaitables().getResult(h, got, gotErr) == runtime::AwaitStatus::Succeeded &&
+                    std::holds_alternative<std::int64_t>(got),
+                "Resumed ComputeAsyncStringGcSurvival failed: " + gotErr.message);
+            return std::get<std::int64_t>(got);
+        };
+        const auto vmVal = runAsyncWithGc(vm, *vm.heap());
+        const auto aotVal = runAsyncWithGc(aotProg, *aotHeap);
+        require(vmVal == 80 && aotVal == 80,
+            "ComputeAsyncStringGcSurvival expected 80 (string GC survival across await)");
+    }
+
+    // 3. ExecutionContext::constantStringIndexed collision safety across distinct strings in slot 0.
+    {
+        const semantic::SymbolId probeFnId = semantic::stableTypeId("Kernel.AuditStringSlot::Probe");
+        const aot::FunctionDescriptor fns[] = {
+            {probeFnId, "Kernel.AuditStringSlot::Probe", semantic::PrimitiveType::Bool, 0u,
+             nullptr, nullptr, 0u, &auditHotPatchLiteralProbe, nullptr},
+        };
+        static const char* const mods[] = {"Kernel.AuditStringSlot"};
+        const aot::ProgramDescriptor desc{
+            aot::RuntimeAbiMajor, aot::RuntimeAbiMinor, "AuditStrSlot", 0x9999u,
+            mods, 1u, nullptr, 0u, fns, 1u, nullptr, 0u, nullptr, 0u, nullptr, 0u,
+        };
+        aot::Program probeProg(desc);
+        probeProg.setHeap(aotHeap);
+        const auto res = probeProg.invoke(probeFnId);
+        require(res.succeeded && std::holds_alternative<bool>(res.value) && std::get<bool>(res.value),
+            "ExecutionContext::constantStringIndexed slot collision overwrote or returned wrong string literal");
+    }
+
+    // 4. Direct ExecutionContext with contentHash == 0 must still populate type/function maps
+    // and never hit stale descriptorCache entries across reused stack descriptors.
+    {
+        const semantic::SymbolId zeroFnA = semantic::stableTypeId("Kernel.AuditZeroHash::FnA");
+        const semantic::SymbolId zeroFnB = semantic::stableTypeId("Kernel.AuditZeroHash::FnB");
+        auto probeImpl = +[](
+            aot::ExecutionContext&,
+            const runtime::Value*,
+            std::size_t,
+            runtime::Value& result) -> bool {
+            result = runtime::Value{true};
+            return true;
+        };
+        auto runZeroHash = [&](semantic::SymbolId activeFnId, semantic::SymbolId otherFnId) {
+            const aot::FunctionDescriptor fn{
+                activeFnId, "Kernel.AuditZeroHash::Probe", semantic::PrimitiveType::Bool, 0u,
+                nullptr, nullptr, 0u, probeImpl, nullptr,
+            };
+            aot::ProgramDescriptor desc{};
+            desc.name = "ZeroHashProgram";
+            desc.contentHash = 0u;
+            desc.functions = &fn;
+            desc.functionCount = 1u;
+
+            aot::ExecutionContext ctx(desc, aotHeap, nullptr);
+            runtime::Value outVal{};
+            require(ctx.invoke(activeFnId, nullptr, 0u, outVal) &&
+                    std::holds_alternative<bool>(outVal) &&
+                    std::get<bool>(outVal),
+                "ExecutionContext(contentHash == 0) failed to populate/invoke active function");
+            runtime::Value staleVal{};
+            require(!ctx.invoke(otherFnId, nullptr, 0u, staleVal),
+                "ExecutionContext(contentHash == 0) unexpectedly resolved wrong/stale function");
+        };
+        runZeroHash(zeroFnA, zeroFnB);
+        runZeroHash(zeroFnB, zeroFnA);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1595,6 +1869,8 @@ int main() {
             {"AotRuntime active GC, ProfileCollector & ActiveFrameTelemetryScope (incl. TrustedRelease)", testAotActiveGcProfileAndTelemetry},
             {"AotRuntime native ParallelJobScheduler _parallel_batch & SIMD range execution", testAotParallelBatchExecution},
             {"AotRuntime GC.Alloc attribution, CppGenerator optimization remarks & rsaot CLI", testAotAllocAttributionRemarksAndCli},
+            {"Wave 3 regression: AOT typed attributed call, int32 AotStruct & FastAccounting SIMD", testWaveRegressionAttributedTypedAndStructInt32},
+            {"Audit regression: ulong arithmetic/overflow/SIMD, async string GC & literal slot collision", testAuditRegressionULongAsyncCoroAndHotPatchStrings},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

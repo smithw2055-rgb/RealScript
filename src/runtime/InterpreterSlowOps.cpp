@@ -1020,15 +1020,98 @@ bool executeCall(
         return true;
     }
     if (reference.name.rfind("$intrinsic::", 0) == 0) {
+        const std::string_view op = std::string_view(reference.name).substr(12u);
+        ManagedHeap* targetHeap = state.heap;
+        std::vector<Value> sanitizedArgs;
+        ValueSpan effArgs = argSpan;
+        bool isArrayMutator = false;
+        if (op.rfind("array_", 0) == 0 &&
+            !argSpan.empty() &&
+            std::holds_alternative<ObjectRef>(argSpan[0])) {
+            const ObjectRef arrRef = std::get<ObjectRef>(argSpan[0]);
+            isArrayMutator =
+                op.rfind("array_push::", 0) == 0 ||
+                op.rfind("array_insert::", 0) == 0 ||
+                op.rfind("array_remove_at::", 0) == 0 ||
+                op.rfind("array_pop::", 0) == 0 ||
+                op.rfind("array_clear::", 0) == 0 ||
+                op.rfind("array_reserve::", 0) == 0 ||
+                op.rfind("array_reverse::", 0) == 0 ||
+                op.rfind("array_sort::", 0) == 0 ||
+                op.rfind("array_sort_range::", 0) == 0;
+            if (!checkCrossHeapRefAccess(state, arrRef, isArrayMutator, "array intrinsic")) {
+                return false;
+            }
+            targetHeap = resolveHeap(state, arrRef);
+            if (isArrayMutator && state.executionPolicy != nullptr) {
+                Value writeVal{std::monostate{}};
+                if (op.rfind("array_insert::", 0) == 0 && argSpan.size() >= 3u) {
+                    writeVal = argSpan[2];
+                } else if (op.rfind("array_push::", 0) == 0 && argSpan.size() >= 2u) {
+                    writeVal = argSpan[1];
+                }
+                RuntimeError policyErr;
+                if (!state.executionPolicy->checkArrayWrite(
+                        state.heap, targetHeap, arrRef, writeVal, policyErr)) {
+                    return fail(
+                        state,
+                        policyErr.code == ErrorCode::None
+                            ? ErrorCode::CapabilityDenied
+                            : policyErr.code,
+                        policyErr.message.empty()
+                            ? "array mutation denied by active execution policy"
+                            : policyErr.message);
+                }
+            }
+        }
+        if (state.executionPolicy != nullptr) {
+            bool copied = false;
+            for (std::size_t ai = 0; ai < argSpan.size(); ++ai) {
+                if (argSpan[ai].rawTag() == ValueTag::ObjectRef &&
+                    argSpan[ai].u_.objectRef.kind == ObjectKind::String) {
+                    const ObjectRef strRef = argSpan[ai].u_.objectRef;
+                    ManagedHeap* strHeap = resolveHeap(state, strRef);
+                    if (strHeap != nullptr && strHeap != targetHeap) {
+                        if (!checkCrossHeapRefAccess(state, strRef, false, "intrinsic string argument")) {
+                            return false;
+                        }
+                        if (const auto sv = strHeap->stringView(strRef)) {
+                            if (!copied) {
+                                sanitizedArgs.assign(argSpan.begin(), argSpan.end());
+                                copied = true;
+                            }
+                            sanitizedArgs[ai] = Value{StringValue(std::string(*sv))};
+                        }
+                    }
+                }
+            }
+            if (copied) {
+                effArgs = ValueSpan(sanitizedArgs);
+            }
+        }
+
         RuntimeError intrinsicError;
-        if (!tryExecuteRuntimeIntrinsic(
-                reference.name, argSpan, state.heap, result, intrinsicError)) {
+        bool ranGc = false;
+        const bool ok = (targetHeap == state.heap)
+            ? allocateWithOomGcRetry(state, intrinsicError, ranGc, [&]() {
+                  return tryExecuteRuntimeIntrinsic(
+                      reference.name, effArgs, targetHeap, result, intrinsicError);
+              })
+            : tryExecuteRuntimeIntrinsic(
+                  reference.name, effArgs, targetHeap, result, intrinsicError);
+        if (!ok) {
             const auto code = intrinsicError.code != ErrorCode::None
                 ? intrinsicError.code
                 : (intrinsicError.message.find("null") != std::string::npos
                     ? ErrorCode::NullReference
                     : ErrorCode::InvalidProgram);
             return fail(state, code, intrinsicError.message);
+        }
+        if (state.executionPolicy != nullptr &&
+            targetHeap != state.heap &&
+            result.rawTag() == ValueTag::ObjectRef &&
+            result.u_.objectRef.kind == ObjectKind::String) {
+            result = sanitizeCrossHeapValue(state, targetHeap, result);
         }
         return true;
     }
@@ -2718,11 +2801,13 @@ bool executeInstruction(
             return fail(state, ErrorCode::InvalidProgram,
                 "array allocation result type metadata is missing");
         }
-        const Value initArrVal = (instruction.elementType == semantic::PrimitiveType::Struct &&
-                                  instruction.elementTypeId != 0 &&
-                                  findFlatStructSchemaByTypeId(instruction.elementTypeId) != nullptr)
-            ? Value{}
-            : defaultValue(module, instruction.elementType, instruction.elementTypeId);
+        const auto buildInitArrVal = [&]() -> Value {
+            return (instruction.elementType == semantic::PrimitiveType::Struct &&
+                    instruction.elementTypeId != 0 &&
+                    findFlatStructSchemaByTypeId(instruction.elementTypeId) != nullptr)
+                ? Value{}
+                : defaultValue(module, instruction.elementType, instruction.elementTypeId);
+        };
         bool ranGc = false;
         RuntimeError allocationError;
         const auto reference = allocateWithOomGcRetry(
@@ -2732,7 +2817,7 @@ bool executeInstruction(
                     instruction.elementType,
                     instruction.elementTypeId,
                     static_cast<std::size_t>(length),
-                    initArrVal,
+                    buildInitArrVal(),
                     &allocationError);
             });
         if (!reference) {
@@ -3305,8 +3390,14 @@ bool executeInstruction(
             return fail(state, ErrorCode::TypeMismatch,
                 "delegate invocation received an incompatible value");
         }
+        const semantic::TypeSymbol* methodOwner = type;
+        if (methodOwner->methods.empty() && state.program) {
+            if (const auto* primary = state.program->resolveType(type->id)) {
+                methodOwner = primary;
+            }
+        }
         const semantic::FunctionSymbol* invoke = nullptr;
-        for (const auto& method : type->methods) {
+        for (const auto& method : methodOwner->methods) {
             if (method.name == "Invoke") {
                 invoke = &method;
                 break;
@@ -4023,6 +4114,7 @@ bool executeBlockVmFunction(
         CoroutineFrameHandle* prev;
         ~RestoreBlockCoroPtr() { st.currentBlockVmCoroutinePtr = prev; }
     } restoreBlockCoroPtr{state, prevBlockCoroPtr};
+    detail::ensureSlowInstructions(*execution);
     const detail::ExecutionBlock* block = activeCoroutineFrame
         ? detail::findExecutionBlock(*execution, activeCoroutineFrame->resumeBlockId)
         : &execution->blocks[execution->entry];

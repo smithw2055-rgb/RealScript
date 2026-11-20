@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <exception>
 #include <functional>
 #include <map>
 #include <memory>
@@ -17,6 +18,63 @@
 namespace realscript::compiler {
 
 using namespace detail;
+
+namespace {
+
+template <typename Fn>
+void runParallelIndexedWork(std::size_t itemCount, Fn&& fn) {
+    if (itemCount == 0u) return;
+    std::atomic<std::size_t> nextIdx{0};
+    const unsigned hw = std::thread::hardware_concurrency();
+    const std::size_t workerCount = (std::min)(
+        itemCount,
+        static_cast<std::size_t>(hw > 0u ? (std::min)(hw, 8u) : 4u));
+    std::mutex excMutex;
+    std::exception_ptr firstException;
+
+    struct JoinGuard {
+        std::vector<std::thread> workers;
+        ~JoinGuard() noexcept {
+            for (auto& t : workers) {
+                if (t.joinable()) t.join();
+            }
+        }
+    } guard;
+    guard.workers.reserve(workerCount);
+    for (std::size_t w = 0; w < workerCount; ++w) {
+        guard.workers.emplace_back([&]() {
+            try {
+                while (true) {
+                    const std::size_t idx = nextIdx.fetch_add(1u, std::memory_order_relaxed);
+                    if (idx >= itemCount) break;
+                    fn(idx);
+                }
+            } catch (...) {
+                nextIdx.store(itemCount, std::memory_order_relaxed);
+                std::lock_guard<std::mutex> lock(excMutex);
+                if (!firstException) {
+                    firstException = std::current_exception();
+                }
+            }
+        });
+    }
+    for (auto& t : guard.workers) {
+        if (t.joinable()) t.join();
+    }
+    if (firstException) {
+        std::rethrow_exception(firstException);
+    }
+}
+
+void clearInitializerSyntaxPointers(std::vector<semantic::TypeSymbol>& types) noexcept {
+    for (auto& type : types) {
+        for (auto& field : type.fields) {
+            field.initializerSyntax = nullptr;
+        }
+    }
+}
+
+} // namespace
 
 std::uint64_t stableFingerprint(const std::string& value) noexcept {
     std::uint64_t hash = 14695981039346656037ull;
@@ -653,11 +711,111 @@ template <typename Fn>
 void scanIdentifiersInSource(std::string_view text, Fn&& onIdent) {
     const std::size_t n = text.size();
     std::size_t i = 0;
-    bool inString = false;
-    bool inChar = false;
-    while (i < n) {
+
+    enum class ScanMode {
+        Code,
+        InterpText,
+        VerbatimInterpText,
+        InterpHole,
+        NormalString,
+        VerbatimString,
+    };
+    struct ModeState {
+        ScanMode mode = ScanMode::Code;
+        int braceDepth = 0;
+    };
+    std::vector<ModeState> stack{{ScanMode::Code, 0}};
+
+    while (i < n && !stack.empty()) {
+        const ScanMode mode = stack.back().mode;
         const char c = text[i];
-        if (!inString && !inChar && c == '/' && i + 1 < n) {
+
+        if (mode == ScanMode::VerbatimString) {
+            if (c == '"') {
+                if (i + 1 < n && text[i + 1] == '"') {
+                    i += 2;
+                    continue;
+                }
+                stack.pop_back();
+                ++i;
+                continue;
+            }
+            ++i;
+            continue;
+        }
+        if (mode == ScanMode::NormalString) {
+            if (c == '\\' && i + 1 < n) {
+                i += 2;
+                continue;
+            }
+            if (c == '"' || c == '\r' || c == '\n') {
+                stack.pop_back();
+                ++i;
+                continue;
+            }
+            ++i;
+            continue;
+        }
+        if (mode == ScanMode::VerbatimInterpText) {
+            if (c == '"') {
+                if (i + 1 < n && text[i + 1] == '"') {
+                    i += 2;
+                    continue;
+                }
+                stack.pop_back();
+                ++i;
+                continue;
+            }
+            if (c == '{') {
+                if (i + 1 < n && text[i + 1] == '{') {
+                    i += 2;
+                    continue;
+                }
+                stack.push_back({ScanMode::InterpHole, 1});
+                ++i;
+                continue;
+            }
+            if (c == '}' && i + 1 < n && text[i + 1] == '}') {
+                i += 2;
+                continue;
+            }
+            ++i;
+            continue;
+        }
+        if (mode == ScanMode::InterpText) {
+            if (c == '"') {
+                stack.pop_back();
+                ++i;
+                continue;
+            }
+            if (c == '\r' || c == '\n') {
+                stack.pop_back();
+                ++i;
+                continue;
+            }
+            if (c == '\\' && i + 1 < n) {
+                i += 2;
+                continue;
+            }
+            if (c == '{') {
+                if (i + 1 < n && text[i + 1] == '{') {
+                    i += 2;
+                    continue;
+                }
+                stack.push_back({ScanMode::InterpHole, 1});
+                ++i;
+                continue;
+            }
+            if (c == '}' && i + 1 < n && text[i + 1] == '}') {
+                i += 2;
+                continue;
+            }
+            ++i;
+            continue;
+        }
+
+        // Code or InterpHole mode:
+        if (c == '/' && i + 1 < n) {
             if (text[i + 1] == '/') {
                 i += 2;
                 while (i < n && text[i] != '\n') ++i;
@@ -670,42 +828,51 @@ void scanIdentifiersInSource(std::string_view text, Fn&& onIdent) {
                 continue;
             }
         }
-        if (inString) {
-            if (c == '\\' && i + 1 < n) {
-                i += 2;
-                continue;
-            }
-            if (c == '"') {
-                inString = false;
-                ++i;
-                continue;
-            }
+        if (((c == '$' && i + 2 < n && text[i + 1] == '@' && text[i + 2] == '"') ||
+             (c == '@' && i + 2 < n && text[i + 1] == '$' && text[i + 2] == '"'))) {
+            stack.push_back({ScanMode::VerbatimInterpText, 0});
+            i += 3;
+            continue;
+        }
+        if (c == '$' && i + 1 < n && text[i + 1] == '"') {
+            stack.push_back({ScanMode::InterpText, 0});
+            i += 2;
+            continue;
+        }
+        if (c == '@' && i + 1 < n && text[i + 1] == '"') {
+            stack.push_back({ScanMode::VerbatimString, 0});
+            i += 2;
+            continue;
+        }
+        if (c == '"') {
+            stack.push_back({ScanMode::NormalString, 0});
             ++i;
             continue;
-        } else if (inChar) {
-            if (c == '\\' && i + 1 < n) {
-                i += 2;
-                continue;
-            }
-            if (c == '\'') {
-                inChar = false;
-                ++i;
-                continue;
-            }
+        }
+        if (c == '\'') {
             ++i;
+            while (i < n && text[i] != '\'' && text[i] != '\r' && text[i] != '\n') {
+                i += (text[i] == '\\' && i + 1 < n) ? 2u : 1u;
+            }
+            if (i < n && text[i] == '\'') ++i;
             continue;
-        } else {
-            if (c == '"') {
-                inString = true;
+        }
+        if (mode == ScanMode::InterpHole) {
+            if (c == '{') {
+                ++stack.back().braceDepth;
                 ++i;
                 continue;
             }
-            if (c == '\'') {
-                inChar = true;
+            if (c == '}') {
+                --stack.back().braceDepth;
                 ++i;
+                if (stack.back().braceDepth <= 0) {
+                    stack.pop_back();
+                }
                 continue;
             }
         }
+
         const bool isStart =
             (c >= 'A' && c <= 'Z') ||
             (c >= 'a' && c <= 'z') ||
@@ -732,6 +899,7 @@ void scanIdentifiersInSource(std::string_view text, Fn&& onIdent) {
 void pruneUnreachableAstDeclarations(
     const std::unordered_set<std::string>& pruneModules,
     const std::unordered_set<std::string>& rootSymbols,
+    bool cloneUnconditionally,
     std::vector<std::unique_ptr<ParsedUnit>>& units,
     BuildResult& result) {
     if (pruneModules.empty()) return;
@@ -756,8 +924,8 @@ void pruneUnreachableAstDeclarations(
         const ParsedUnit* unit,
         const std::string& name,
         bool isType,
-        text::TextSpan span) {
-        if (name.empty()) return;
+        text::TextSpan span) -> std::size_t {
+        if (name.empty()) return std::numeric_limits<std::size_t>::max();
         const std::string key = unit->moduleName + '\n' + name;
         auto [it, inserted] = groupIndexByKey.emplace(key, groups.size());
         if (inserted) {
@@ -771,6 +939,7 @@ void pruneUnreachableAstDeclarations(
             groups[it->second].isType = true;
         }
         groups[it->second].slices.push_back(DeclSlice{unit, span});
+        return it->second;
     };
 
     std::vector<const ParsedUnit*> rootUnits;
@@ -784,31 +953,39 @@ void pruneUnreachableAstDeclarations(
         prunableUnits.push_back(uPtr.get());
         const auto& st = *uPtr->syntaxTree;
         for (const auto& c : st.classes) {
-            registerDecl(uPtr.get(), c.identifierToken.text, true, c.span());
+            const std::size_t gIdx = registerDecl(uPtr.get(), c.identifierToken.text, true, c.span());
+            if (gIdx != std::numeric_limits<std::size_t>::max()) {
+                for (const auto& m : c.methods) {
+                    if (!m.parameters.empty() &&
+                        m.parameters[0].hasThisModifier() &&
+                        !m.identifierToken.text.empty()) {
+                        groupsBySimpleName[m.identifierToken.text].push_back(gIdx);
+                    }
+                }
+            }
         }
         for (const auto& s : st.structs) {
-            registerDecl(uPtr.get(), s.identifierToken.text, true, s.span());
+            (void)registerDecl(uPtr.get(), s.identifierToken.text, true, s.span());
         }
         for (const auto& e : st.enums) {
-            registerDecl(uPtr.get(), e.identifierToken.text, true, e.span());
+            (void)registerDecl(uPtr.get(), e.identifierToken.text, true, e.span());
         }
         for (const auto& iface : st.interfaces) {
-            registerDecl(uPtr.get(), iface.identifierToken.text, true, iface.span());
+            (void)registerDecl(uPtr.get(), iface.identifierToken.text, true, iface.span());
         }
         for (const auto& del : st.delegates) {
-            registerDecl(uPtr.get(), del.identifierToken.text, true, del.span());
+            (void)registerDecl(uPtr.get(), del.identifierToken.text, true, del.span());
         }
         for (const auto& fn : st.functions) {
-            registerDecl(uPtr.get(), fn.identifierToken.text, false, fn.span());
+            (void)registerDecl(uPtr.get(), fn.identifierToken.text, false, fn.span());
         }
     }
 
     if (groups.empty() || prunableUnits.empty()) return;
 
     std::vector<std::size_t> worklist;
-    auto markSymbolName = [&](std::string_view ident) {
-        if (ident.empty()) return;
-        const auto it = groupsBySimpleName.find(std::string(ident));
+    auto markExactSimpleName = [&](const std::string& symName) {
+        const auto it = groupsBySimpleName.find(symName);
         if (it == groupsBySimpleName.end()) return;
         for (const std::size_t gIdx : it->second) {
             if (!groups[gIdx].reachable) {
@@ -816,6 +993,13 @@ void pruneUnreachableAstDeclarations(
                 worklist.push_back(gIdx);
             }
         }
+    };
+    auto markSymbolName = [&](std::string_view ident) {
+        if (ident.empty()) return;
+        std::string key(ident);
+        markExactSimpleName(key);
+        key += "Attribute";
+        markExactSimpleName(key);
     };
 
     for (const auto* rootUnit : rootUnits) {
@@ -836,15 +1020,7 @@ void pruneUnreachableAstDeclarations(
         }
     }
     for (const auto& rootSym : rootSymbols) {
-        const auto it = groupsBySimpleName.find(rootSym);
-        if (it != groupsBySimpleName.end()) {
-            for (const std::size_t gIdx : it->second) {
-                if (!groups[gIdx].reachable) {
-                    groups[gIdx].reachable = true;
-                    worklist.push_back(gIdx);
-                }
-            }
-        }
+        markSymbolName(rootSym);
     }
 
     while (!worklist.empty()) {
@@ -923,24 +1099,36 @@ void pruneUnreachableAstDeclarations(
                 ++prunedFunctions;
             }
         }
-        if (!unitHasPruned) continue;
-
-        if (pu->syntaxTree.use_count() > 1) {
-            pu->syntaxTree = cloneCompilationUnitSyntax(*pu->syntaxTree);
+        if (unitHasPruned) {
+            if (cloneUnconditionally || pu->syntaxTree.use_count() > 1) {
+                pu->syntaxTree = cloneCompilationUnitSyntax(*pu->syntaxTree);
+            }
+            auto& mut = *pu->syntaxTree;
+            auto pruneVec = [&](auto& vec) {
+                vec.erase(
+                    std::remove_if(vec.begin(), vec.end(),
+                        [&](const auto& d) { return !isReachableName(modName, d.identifierToken.text); }),
+                    vec.end());
+            };
+            pruneVec(mut.classes);
+            pruneVec(mut.structs);
+            pruneVec(mut.enums);
+            pruneVec(mut.interfaces);
+            pruneVec(mut.delegates);
+            pruneVec(mut.functions);
         }
-        auto& mut = *pu->syntaxTree;
-        auto pruneVec = [&](auto& vec) {
-            vec.erase(
-                std::remove_if(vec.begin(), vec.end(),
-                    [&](const auto& d) { return !isReachableName(modName, d.identifierToken.text); }),
-                vec.end());
-        };
-        pruneVec(mut.classes);
-        pruneVec(mut.structs);
-        pruneVec(mut.enums);
-        pruneVec(mut.interfaces);
-        pruneVec(mut.delegates);
-        pruneVec(mut.functions);
+
+        // Mix the post-prune declaration set into the unit fingerprint so incremental
+        // caches never return an over-pruned build when consumer references grow.
+        std::uint64_t keptFp = 14695981039346656037ull;
+        const auto& finalSt = *pu->syntaxTree;
+        for (const auto& c : finalSt.classes) keptFp = combineFingerprint(keptFp, stableFingerprint("c:" + c.identifierToken.text));
+        for (const auto& s : finalSt.structs) keptFp = combineFingerprint(keptFp, stableFingerprint("s:" + s.identifierToken.text));
+        for (const auto& e : finalSt.enums) keptFp = combineFingerprint(keptFp, stableFingerprint("e:" + e.identifierToken.text));
+        for (const auto& iface : finalSt.interfaces) keptFp = combineFingerprint(keptFp, stableFingerprint("i:" + iface.identifierToken.text));
+        for (const auto& del : finalSt.delegates) keptFp = combineFingerprint(keptFp, stableFingerprint("d:" + del.identifierToken.text));
+        for (const auto& fn : finalSt.functions) keptFp = combineFingerprint(keptFp, stableFingerprint("f:" + fn.identifierToken.text));
+        pu->sourceFingerprint = combineFingerprint(pu->sourceFingerprint, keptFp);
     }
 
     result.prunedFrontendTypes += prunedTypes;
@@ -1131,23 +1319,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
 
     if (sources_.size() >= 4u) {
         std::vector<std::unique_ptr<ParsedUnit>> parsedSlots(sources_.size());
-        std::atomic<std::size_t> nextIdx{0};
-        const unsigned hw = std::thread::hardware_concurrency();
-        const std::size_t workerCount = (std::min)(
-            sources_.size(),
-            static_cast<std::size_t>(hw > 0u ? (std::min)(hw, 8u) : 4u));
-        std::vector<std::thread> workers;
-        workers.reserve(workerCount);
-        for (std::size_t w = 0; w < workerCount; ++w) {
-            workers.emplace_back([&]() {
-                while (true) {
-                    const std::size_t idx = nextIdx.fetch_add(1u, std::memory_order_relaxed);
-                    if (idx >= sources_.size()) break;
-                    parsedSlots[idx] = parseOneSource(sources_[idx]);
-                }
-            });
-        }
-        for (auto& t : workers) t.join();
+        runParallelIndexedWork(sources_.size(), [&](std::size_t idx) {
+            parsedSlots[idx] = parseOneSource(sources_[idx]);
+        });
         for (std::size_t idx = 0; idx < sources_.size(); ++idx) {
             registerParsedUnit(std::move(parsedSlots[idx]), sources_[idx].path);
         }
@@ -1222,6 +1396,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         pruneUnreachableAstDeclarations(
             options_.pruneUnreachableModules,
             options_.reachabilityRootSymbols,
+            sessionImpl != nullptr,
             units,
             result);
     }
@@ -1374,6 +1549,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                     module.interfaces = fc.interfaces;
                     module.delegates = fc.delegates;
                     module.declarations = fc.declarations;
+                    module.keptSyntaxTrees = fc.keptSyntaxTrees;
                 }
             }
         }
@@ -1632,6 +1808,14 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                                 if (!dup) partialMod.types.push_back(visTypeInner);
                             }
                         }
+                        std::sort(
+                            partialMod.types.begin(),
+                            partialMod.types.end(),
+                            [](const semantic::TypeSymbol& left, const semantic::TypeSymbol& right) {
+                                return semantic::canonicalTypeName(left) <
+                                    semantic::canonicalTypeName(right);
+                            });
+                        clearInitializerSyntaxPointers(partialMod.types);
                         if (options_.emitDebugInfo) {
                             std::unordered_set<std::string> seenPaths;
                             for (const auto* u : module.units) {
@@ -1651,6 +1835,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             }
             mir::Lowerer lowerer;
             mirModule = lowerer.lower(semanticModel);
+            clearInitializerSyntaxPointers(mirModule.types);
         }
 
         if (options_.emitDebugInfo) {
@@ -1693,23 +1878,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
     };
 
     if (uncachedIndices.size() >= 2u) {
-        std::atomic<std::size_t> nextWork{0};
-        const unsigned hw = std::thread::hardware_concurrency();
-        const std::size_t workerCount = (std::min)(
-            uncachedIndices.size(),
-            static_cast<std::size_t>(hw > 0u ? (std::min)(hw, 8u) : 4u));
-        std::vector<std::thread> workers;
-        workers.reserve(workerCount);
-        for (std::size_t w = 0; w < workerCount; ++w) {
-            workers.emplace_back([&]() {
-                while (true) {
-                    const std::size_t k = nextWork.fetch_add(1u, std::memory_order_relaxed);
-                    if (k >= uncachedIndices.size()) break;
-                    compileOneModule(uncachedIndices[k]);
-                }
-            });
-        }
-        for (auto& t : workers) t.join();
+        runParallelIndexedWork(uncachedIndices.size(), [&](std::size_t k) {
+            compileOneModule(uncachedIndices[k]);
+        });
     } else if (uncachedIndices.size() == 1u) {
         compileOneModule(uncachedIndices.front());
     }

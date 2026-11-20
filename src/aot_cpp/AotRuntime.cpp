@@ -256,52 +256,108 @@ ExecutionContext::ExecutionContext(
     fastAccounting_ = !determinismEventsEnabled_ &&
         options_.profile == nullptr && telemetry_ == nullptr &&
         !diagnosticEventsEnabled_;
-    if (prebuiltTypes) {
+    if (prebuiltTypes && prebuiltFunctions) {
         typesPtr_ = prebuiltTypes;
+        functionsPtr_ = prebuiltFunctions;
     } else {
-        ownedTypes_.reserve(program.typeCount);
-        std::vector<std::pair<semantic::SymbolId, std::vector<runtime::BlittableFieldInput>>> structSpecs;
-        for (std::uint32_t index = 0; index < program.typeCount; ++index) {
-            const auto& type = program.types[index];
-            ownedTypes_.emplace(type.id, &type);
-            if (type.kind == semantic::TypeKind::Struct &&
-                !type.hasValueLifecycle &&
-                type.fields && type.fieldCount > 0) {
-                std::vector<runtime::BlittableFieldInput> fInputs;
-                fInputs.reserve(type.fieldCount);
-                for (std::uint32_t fi = 0; fi < type.fieldCount; ++fi) {
-                    if (type.fields[fi].staticField || type.fields[fi].constField) continue;
-                    fInputs.push_back(runtime::BlittableFieldInput{
-                        type.fields[fi].type, type.fields[fi].typeId});
-                }
-                if (!fInputs.empty()) {
-                    structSpecs.emplace_back(type.id, std::move(fInputs));
+        struct CachedDescriptorMaps {
+            std::uint64_t contentHash = 0;
+            const TypeDescriptor* types = nullptr;
+            std::uint32_t typeCount = 0;
+            const FunctionDescriptor* functions = nullptr;
+            std::uint32_t functionCount = 0;
+            std::unordered_map<semantic::SymbolId, const TypeDescriptor*> typeMap;
+            std::unordered_map<semantic::SymbolId, const FunctionDescriptor*> functionMap;
+        };
+        static std::mutex descriptorCacheMutex;
+        static std::unordered_map<const ProgramDescriptor*, std::shared_ptr<CachedDescriptorMaps>>
+            descriptorCache;
+
+        std::shared_ptr<CachedDescriptorMaps> cached;
+        if (program.contentHash != 0) {
+            std::lock_guard<std::mutex> lock(descriptorCacheMutex);
+            auto it = descriptorCache.find(&program);
+            if (it != descriptorCache.end()) {
+                const auto& e = *it->second;
+                if (e.contentHash == program.contentHash &&
+                    e.types == program.types &&
+                    e.typeCount == program.typeCount &&
+                    e.functions == program.functions &&
+                    e.functionCount == program.functionCount) {
+                    cached = it->second;
+                } else {
+                    descriptorCache.erase(it);
                 }
             }
         }
-        if (!structSpecs.empty()) {
-            runtime::registerBlittableStructTypes(structSpecs);
+        if (!cached) {
+            auto entry = std::make_shared<CachedDescriptorMaps>();
+            entry->contentHash = program.contentHash;
+            entry->types = program.types;
+            entry->typeCount = program.typeCount;
+            entry->functions = program.functions;
+            entry->functionCount = program.functionCount;
+            entry->typeMap.reserve(program.types ? program.typeCount : 0u);
+            std::vector<std::pair<semantic::SymbolId, std::vector<runtime::BlittableFieldInput>>> structSpecs;
+            if (program.types) {
+                for (std::uint32_t index = 0; index < program.typeCount; ++index) {
+                    const auto& type = program.types[index];
+                    entry->typeMap.emplace(type.id, &type);
+                    if (type.kind == semantic::TypeKind::Struct &&
+                        !type.hasValueLifecycle &&
+                        type.fields && type.fieldCount > 0) {
+                        bool hasStaticOrConstField = false;
+                        std::vector<runtime::BlittableFieldInput> fInputs;
+                        fInputs.reserve(type.fieldCount);
+                        for (std::uint32_t fi = 0; fi < type.fieldCount; ++fi) {
+                            if (type.fields[fi].staticField || type.fields[fi].constField) {
+                                hasStaticOrConstField = true;
+                                break;
+                            }
+                            fInputs.push_back(runtime::BlittableFieldInput{
+                                type.fields[fi].type, type.fields[fi].typeId});
+                        }
+                        if (!hasStaticOrConstField && !fInputs.empty()) {
+                            structSpecs.emplace_back(type.id, std::move(fInputs));
+                        }
+                    }
+                }
+            }
+            if (!structSpecs.empty()) {
+                runtime::registerBlittableStructTypes(structSpecs);
+            }
+            entry->functionMap.reserve(program.functions ? program.functionCount : 0u);
+            if (program.functions) {
+                for (std::uint32_t index = 0; index < program.functionCount; ++index) {
+                    const auto& function = program.functions[index];
+                    entry->functionMap.emplace(function.symbolId, &function);
+                }
+            }
+            cached = entry;
+            if (program.contentHash != 0) {
+                std::lock_guard<std::mutex> lock(descriptorCacheMutex);
+                if (descriptorCache.size() >= 256u) {
+                    descriptorCache.clear();
+                }
+                descriptorCache.insert_or_assign(&program, entry);
+            }
         }
-        typesPtr_ = &ownedTypes_;
+        descriptorMapsOwner_ = cached;
+        typesPtr_ = prebuiltTypes ? prebuiltTypes : &cached->typeMap;
+        functionsPtr_ = prebuiltFunctions ? prebuiltFunctions : &cached->functionMap;
     }
     stack_.reserve(64);
     stackSites_.reserve(64);
-    if (prebuiltFunctions) {
-        functionsPtr_ = prebuiltFunctions;
-    } else {
-        ownedFunctions_.reserve(program.functionCount);
-        for (std::uint32_t index = 0; index < program.functionCount; ++index) {
-            const auto& function = program.functions[index];
-            ownedFunctions_.emplace(function.symbolId, &function);
-        }
-        functionsPtr_ = &ownedFunctions_;
-    }
     stackRefBankId_ = runtime::detail::acquireFlatStackBank(&stackRefSlots_);
     shadowStack_.pushFrame(&stackRefEmptyRoot_, &stackRefSlots_, &stackRefEmptyRoot_);
     stackRefRootPushed_ = true;
+    if (heap_) {
+        activeShadowStackScope_.emplace(heap_.get(), &shadowStack_);
+    }
 }
 
 ExecutionContext::~ExecutionContext() {
+    activeShadowStackScope_.reset();
     if (stackRefRootPushed_) {
         shadowStack_.popFrame();
         stackRefRootPushed_ = false;
@@ -902,6 +958,18 @@ runtime::Value ExecutionContext::defaultValue(
         const auto* descriptor = findType(typeId);
         if (!descriptor || descriptor->kind != semantic::TypeKind::Struct) {
             return runtime::StructValue{};
+        }
+        if (descriptor->fieldCount <= 8u) {
+            std::array<runtime::Value, 8> fields{};
+            for (std::uint32_t index = 0; index < descriptor->fieldCount; ++index) {
+                const auto& field = descriptor->fields[index];
+                fields[index] = defaultValue(
+                    field.type,
+                    field.typeId,
+                    depth + 1);
+            }
+            return runtime::makeStructValueFromFields(
+                typeId, runtime::ValueSpan(fields.data(), descriptor->fieldCount));
         }
         std::vector<runtime::Value> fields;
         fields.reserve(descriptor->fieldCount);
@@ -1670,29 +1738,21 @@ bool ExecutionContext::newDelegate(
         word(signature.interfaceTypeId, true),
         runtime::NullObject{},
     }};
-    maybeStepGcBeforeAllocation();
     runtime::RuntimeError allocationError;
-    auto reference = heap_->allocateObjectFromTemplate(
-        delegateTypeId,
-        fields.data(),
-        fields.size(),
-        aotDelegateReferenceFields(),
-        &allocationError);
-    if (RS_AOT_UNLIKELY(!reference.has_value()) &&
-        (allocationError.code == runtime::ErrorCode::None ||
-         allocationError.code == runtime::ErrorCode::OutOfMemory)) {
-        (void)heap_->collectYoung(shadowStack_);
-        allocationError = {};
+    std::optional<runtime::ObjectRef> reference;
+    {
+        ScopedTypedGcRootSpan<true> fieldsRoot(*this, fields);
+        maybeStepGcBeforeAllocation();
         reference = heap_->allocateObjectFromTemplate(
             delegateTypeId,
             fields.data(),
             fields.size(),
             aotDelegateReferenceFields(),
             &allocationError);
-        if (!reference.has_value() &&
+        if (RS_AOT_UNLIKELY(!reference.has_value()) &&
             (allocationError.code == runtime::ErrorCode::None ||
              allocationError.code == runtime::ErrorCode::OutOfMemory)) {
-            heap_->collectFull(shadowStack_);
+            (void)heap_->collectYoung(shadowStack_);
             allocationError = {};
             reference = heap_->allocateObjectFromTemplate(
                 delegateTypeId,
@@ -1700,6 +1760,18 @@ bool ExecutionContext::newDelegate(
                 fields.size(),
                 aotDelegateReferenceFields(),
                 &allocationError);
+            if (!reference.has_value() &&
+                (allocationError.code == runtime::ErrorCode::None ||
+                 allocationError.code == runtime::ErrorCode::OutOfMemory)) {
+                heap_->collectFull(shadowStack_);
+                allocationError = {};
+                reference = heap_->allocateObjectFromTemplate(
+                    delegateTypeId,
+                    fields.data(),
+                    fields.size(),
+                    aotDelegateReferenceFields(),
+                    &allocationError);
+            }
         }
     }
     if (RS_AOT_UNLIKELY(!reference.has_value())) {
@@ -1798,9 +1870,32 @@ bool ExecutionContext::combineDelegates(
             r,
         }};
         runtime::RuntimeError allocationError;
-        const auto allocated = heap_->allocateObjectFromTemplate(
-            delegateTypeId, fields.data(), fields.size(),
-            aotDelegateReferenceFields(), &allocationError);
+        std::optional<runtime::ObjectRef> allocated;
+        {
+            ScopedTypedGcRootSpan<true> fieldsRoot(*this, fields);
+            maybeStepGcBeforeAllocation();
+            allocated = heap_->allocateObjectFromTemplate(
+                delegateTypeId, fields.data(), fields.size(),
+                aotDelegateReferenceFields(), &allocationError);
+            if (RS_AOT_UNLIKELY(!allocated.has_value()) &&
+                (allocationError.code == runtime::ErrorCode::None ||
+                 allocationError.code == runtime::ErrorCode::OutOfMemory)) {
+                (void)heap_->collectYoung(shadowStack_);
+                allocationError = {};
+                allocated = heap_->allocateObjectFromTemplate(
+                    delegateTypeId, fields.data(), fields.size(),
+                    aotDelegateReferenceFields(), &allocationError);
+                if (!allocated.has_value() &&
+                    (allocationError.code == runtime::ErrorCode::None ||
+                     allocationError.code == runtime::ErrorCode::OutOfMemory)) {
+                    heap_->collectFull(shadowStack_);
+                    allocationError = {};
+                    allocated = heap_->allocateObjectFromTemplate(
+                        delegateTypeId, fields.data(), fields.size(),
+                        aotDelegateReferenceFields(), &allocationError);
+                }
+            }
+        }
         if (RS_AOT_UNLIKELY(!allocated.has_value())) {
             return fail(
                 allocationError.code == runtime::ErrorCode::None
@@ -1934,7 +2029,10 @@ bool ExecutionContext::combineDelegates(
         }
         std::vector<runtime::Value> rightLeaves;
         if (!flattenFast(right, rightLeaves)) return false;
+        ScopedTypedGcRootSpan<true> rightLeavesRoot(
+            *this, rightLeaves.data(), rightLeaves.size());
         runtime::Value cur = left;
+        ScopedTypedGcRootSpan<true> curRoot(*this, &cur, 1u);
         for (const auto& rLeaf : rightLeaves) {
             runtime::Value nextNode;
             if (!allocCombineNode(cur, rLeaf, nextNode)) return false;
@@ -2015,7 +2113,10 @@ bool ExecutionContext::combineDelegates(
         result = runtime::NullObject{};
         return true;
     }
+    ScopedTypedGcRootSpan<true> leftLeavesRoot(
+        *this, leftLeaves.data(), leftLeaves.size());
     result = leftLeaves.front();
+    ScopedTypedGcRootSpan<true> resultRoot(*this, &result, 1u);
     for (std::size_t index = 1; index < leftLeaves.size(); ++index) {
         runtime::Value nextNode;
         if (!allocCombineNode(result, leftLeaves[index], nextNode)) return false;
@@ -2737,16 +2838,22 @@ bool ExecutionContext::constantStringIndexed(
             stringLiteralCacheEpoch_ = epoch;
         }
         if (RS_AOT_LIKELY(heap_->phase() == runtime::GcPhase::Idle &&
-                          literalSlot < stringLiteralCache_.size() &&
-                          stringLiteralCache_[literalSlot].valid())) {
-            result = stringLiteralCache_[literalSlot];
-            return true;
+                          literalSlot < stringLiteralCache_.size())) {
+            const auto& entry = stringLiteralCache_[literalSlot];
+            if (entry.ref.valid() &&
+                entry.data == value.data() &&
+                entry.size == value.size()) {
+                result = entry.ref;
+                return true;
+            }
         }
     }
     if (!constantString(value, result)) {
         return false;
     }
-    if (heap_ != nullptr && result.rawTag() == runtime::ValueTag::ObjectRef) {
+    if (heap_ != nullptr &&
+        result.rawTag() == runtime::ValueTag::ObjectRef &&
+        literalSlot < 1048576u) {
         const std::uint64_t heapId = static_cast<std::uint64_t>(heap_->heapId());
         const std::uint64_t epoch = heap_->stringInternEpoch();
         if (heapId != stringLiteralCacheHeapId_ || epoch != stringLiteralCacheEpoch_) {
@@ -2757,7 +2864,13 @@ bool ExecutionContext::constantStringIndexed(
         if (literalSlot >= stringLiteralCache_.size()) {
             stringLiteralCache_.resize(static_cast<std::size_t>(literalSlot) + 1u);
         }
-        stringLiteralCache_[literalSlot] = result.u_.objectRef;
+        auto& entry = stringLiteralCache_[literalSlot];
+        if (!entry.ref.valid() ||
+            (entry.data == value.data() && entry.size == value.size())) {
+            entry.ref = result.u_.objectRef;
+            entry.data = value.data();
+            entry.size = value.size();
+        }
     }
     return true;
 }
@@ -3561,82 +3674,6 @@ bool ExecutionContext::storeStructField(
     return true;
 }
 
-bool ExecutionContext::initUnboxedStruct(
-    semantic::SymbolId typeId,
-    UnboxedCustomStruct& result) {
-    const auto* descriptor = findType(typeId);
-    if (!descriptor || descriptor->kind != semantic::TypeKind::Struct ||
-        descriptor->fieldCount > 16) {
-        return fail(
-            runtime::ErrorCode::InvalidProgram,
-            "AOT unboxed struct allocation references an invalid struct descriptor");
-    }
-    result.typeId = typeId;
-    result.fieldCount = static_cast<std::uint8_t>(descriptor->fieldCount);
-    for (std::uint32_t index = 0; index < descriptor->fieldCount; ++index) {
-        const auto& field = descriptor->fields[index];
-        result.fields[index] = defaultValue(field.type, field.typeId, 1);
-    }
-    return true;
-}
-
-bool ExecutionContext::loadUnboxedStructField(
-    semantic::SymbolId typeId,
-    std::size_t fieldIndex,
-    const UnboxedCustomStruct& receiver,
-    runtime::Value& result) {
-    const auto* type = findType(typeId);
-    if (!type || type->kind != semantic::TypeKind::Struct ||
-        receiver.typeId != typeId ||
-        fieldIndex >= type->fieldCount ||
-        fieldIndex >= receiver.fieldCount) {
-        return fail(
-            runtime::ErrorCode::InvalidProgram,
-            "struct field load references an invalid field slot");
-    }
-    const auto& field = type->fields[fieldIndex];
-    const auto& value = receiver.fields[fieldIndex];
-    if (!expectSignatureType(
-            value,
-            field.type,
-            field.typeId,
-            "struct field load value")) {
-        return false;
-    }
-    result = value;
-    return true;
-}
-
-bool ExecutionContext::storeUnboxedStructField(
-    semantic::SymbolId typeId,
-    std::size_t fieldIndex,
-    const UnboxedCustomStruct& receiver,
-    const runtime::Value& value,
-    UnboxedCustomStruct& result) {
-    const auto* type = findType(typeId);
-    if (!type || type->kind != semantic::TypeKind::Struct ||
-        receiver.typeId != typeId ||
-        fieldIndex >= type->fieldCount ||
-        fieldIndex >= receiver.fieldCount) {
-        return fail(
-            runtime::ErrorCode::InvalidProgram,
-            "struct field store references an invalid field slot");
-    }
-    const auto& field = type->fields[fieldIndex];
-    if (!expectSignatureType(
-            value,
-            field.type,
-            field.typeId,
-            "struct field store value")) {
-        return false;
-    }
-    if (&result != &receiver) {
-        result = receiver;
-    }
-    result.fields[fieldIndex] = value;
-    return true;
-}
-
 bool ExecutionContext::ecsWritebackBoxed(
     const CallSignature& signature,
     std::int64_t index,
@@ -3669,13 +3706,14 @@ TypedRawColumnCache ExecutionContext::acquireRawColumnCache(
     semantic::SymbolId expectedStructTypeId,
     std::size_t generatedStructSize,
     const GeneratedFieldLayout* generatedFields,
-    std::size_t generatedFieldCount) const noexcept {
+    std::size_t generatedFieldCount,
+    std::size_t generatedStructAlign) const noexcept {
     TypedRawColumnCache cache{};
-    if (!heap_) return cache;
+    if (!heap_ || executionPolicy_ != nullptr) return cache;
     const auto* ref = std::get_if<runtime::ObjectRef>(&arrayValue);
     if (!ref) return cache;
     const auto* view = heap_->rawColumnView(*ref);
-    if (!view) return cache;
+    if (!view || view->basePtr == nullptr) return cache;
     if (expectedStructTypeId != 0 && view->structTypeId != expectedStructTypeId) {
         return cache;
     }
@@ -3696,7 +3734,11 @@ TypedRawColumnCache ExecutionContext::acquireRawColumnCache(
             view->fields[i].kind,
         };
     }
-    if (generatedFields &&
+    const std::size_t alignBytes = std::max<std::size_t>(1u, generatedStructAlign);
+    const bool baseAligned =
+        (reinterpret_cast<std::uintptr_t>(view->basePtr) % alignBytes) == 0u;
+    if (baseAligned &&
+        generatedFields &&
         generatedFieldCount == view->fields.size() &&
         generatedStructSize == view->strideBytes) {
         const auto nativeKindSize = [](runtime::NativeFieldKind kind) noexcept -> std::size_t {
@@ -4334,14 +4376,18 @@ Program::Program(const ProgramDescriptor& descriptor)
             if (type.kind == semantic::TypeKind::Struct &&
                 !type.hasValueLifecycle &&
                 type.fields && type.fieldCount > 0) {
+                bool hasStaticOrConstField = false;
                 std::vector<runtime::BlittableFieldInput> fInputs;
                 fInputs.reserve(type.fieldCount);
                 for (std::uint32_t fi = 0; fi < type.fieldCount; ++fi) {
-                    if (type.fields[fi].staticField || type.fields[fi].constField) continue;
+                    if (type.fields[fi].staticField || type.fields[fi].constField) {
+                        hasStaticOrConstField = true;
+                        break;
+                    }
                     fInputs.push_back(runtime::BlittableFieldInput{
                         type.fields[fi].type, type.fields[fi].typeId});
                 }
-                if (!fInputs.empty()) {
+                if (!hasStaticOrConstField && !fInputs.empty()) {
                     structSpecs.emplace_back(type.id, std::move(fInputs));
                 }
             }

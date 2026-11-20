@@ -93,6 +93,10 @@ inline constexpr std::uint8_t kPackedFloat64 = static_cast<std::uint8_t>(runtime
     return static_cast<std::int64_t>(static_cast<std::int32_t>(static_cast<std::uint32_t>(v)));
 }
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 struct alignas(16) JitArrayCacheEntry {
     std::uint64_t slotAndGen;        // offset 0  (0xffffffffffffffffULL when invalid)
     std::uint32_t heapId;            // offset 8
@@ -144,7 +148,12 @@ struct alignas(16) JitAbiContext {
     std::uint32_t branchCondOut;               // offset 56 (used by slow array-length branch helper)
     std::uint32_t nextFlatOffsetOut;           // offset 60 (used by InlineCallEnter / slow helpers)
     JitArrayCacheEntry arrayCache[4];          // offset 64 .. 319
+    std::uint8_t hasExecutionPolicy;           // offset 320
+    std::uint8_t abiPad_[15];                  // offset 321 .. 335
 };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 static_assert(std::is_standard_layout_v<JitAbiContext>, "JitAbiContext must be standard layout");
 static_assert(offsetof(JitAbiContext, frameBase) == 0);
 static_assert(offsetof(JitAbiContext, remainingBudget) == 8);
@@ -157,6 +166,7 @@ static_assert(offsetof(JitAbiContext, compiledFn) == 48);
 static_assert(offsetof(JitAbiContext, branchCondOut) == 56);
 static_assert(offsetof(JitAbiContext, nextFlatOffsetOut) == 60);
 static_assert(offsetof(JitAbiContext, arrayCache) == 64);
+static_assert(offsetof(JitAbiContext, hasExecutionPolicy) == 320);
 
 using NativeJitEntryFn = std::uint32_t (*)(JitAbiContext* ctx);
 
@@ -270,6 +280,8 @@ struct CompiledFunctionRecord {
     std::string fallbackReason;
     std::vector<std::uint8_t> unexecutedAfterOp;
     std::vector<ThreadedStencilOp> threadedStream;
+    mutable std::vector<std::uint8_t> simulatedArm64Bytes;
+    mutable std::atomic<bool> simulatedArm64Ready{false};
 };
 
 // ============================================================================
@@ -306,6 +318,22 @@ void populateJitErrorDiagnostics(
     std::uint32_t flatIdx,
     runtime::ErrorCode code,
     std::string message);
+
+void appendJitCallerErrorFrame(
+    JitRuntimeSession& session,
+    const runtime::ProgramImage::FunctionLocation& location,
+    const runtime::detail::ExecutionFunction& execFunc,
+    std::uint32_t flatIdx);
+
+[[nodiscard]] bool normalizeAndValidateJitInterceptedReturn(
+    const runtime::ProgramImage::FunctionLocation& targetLoc,
+    const runtime::ProgramImage* program,
+    runtime::ManagedHeap* heap,
+    runtime::IExecutionPolicy* executionPolicy,
+    const runtime::Value& interceptedResult,
+    runtime::Value& outVal,
+    runtime::ErrorCode& outCode,
+    std::string& outMsg);
 
 [[nodiscard]] std::uint32_t setHelperError(
     JitAbiContext* ctx,

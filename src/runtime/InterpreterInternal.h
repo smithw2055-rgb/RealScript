@@ -283,8 +283,8 @@ struct InterpreterResumeEnv {
 };
 
 struct FastNativeBindEntry {
-    const BindingRegistry* registry = nullptr;
-    std::size_t registrySize = 0;
+    std::uint64_t registryId = 0;
+    std::uint64_t registryEpoch = 0;
     semantic::SymbolId symbolId = 0;
     const ExternalFunction* function = nullptr;
 };
@@ -299,12 +299,16 @@ struct ThreadInvokeScratch {
         std::uint64_t stringLiteralHeapId = 0;
         std::uint64_t stringLiteralGcEpoch = 0;
         std::uint64_t stringMirrorId = 0;
+        std::uint64_t inlineCacheHeapId = 0;
+        std::uint64_t inlineCacheRestoreEpoch = 0;
     };
     enum : std::size_t { MaxDepth = 8 };
     std::array<Buffers, MaxDepth> pool{};
     std::vector<PolymorphicPicSite> sharedPolyCallCache;
     std::vector<DelegateCallSiteCache> sharedDelegateCallCache;
     std::uint64_t sharedMirrorId = 0;
+    std::uint64_t sharedDelegateHeapId = 0;
+    std::uint64_t sharedDelegateRestoreEpoch = 0;
     std::size_t depth = 0;
 };
 

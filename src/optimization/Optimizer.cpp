@@ -211,7 +211,12 @@ std::optional<Constant> foldInstruction(
     };
     const auto unaryInt = [&](auto operation) -> std::optional<Constant> {
         const auto* value = operand(0);
-        if (!value) return std::nullopt;
+        if (!value ||
+            (value->type != semantic::PrimitiveType::Int &&
+             value->type != semantic::PrimitiveType::Long) ||
+            instruction.resultType != value->type) {
+            return std::nullopt;
+        }
         const auto* integer = std::get_if<std::int64_t>(&value->data);
         if (!integer) return std::nullopt;
         Constant result{instruction.resultType, instruction.resultTypeId, std::int64_t{0}};
@@ -223,7 +228,13 @@ std::optional<Constant> foldInstruction(
     const auto binaryInt = [&](auto operation) -> std::optional<Constant> {
         const auto* left = operand(0);
         const auto* right = operand(1);
-        if (!left || !right) return std::nullopt;
+        if (!left || !right ||
+            left->type != right->type ||
+            (left->type != semantic::PrimitiveType::Int &&
+             left->type != semantic::PrimitiveType::Long) ||
+            instruction.resultType != left->type) {
+            return std::nullopt;
+        }
         const auto* l = std::get_if<std::int64_t>(&left->data);
         const auto* r = std::get_if<std::int64_t>(&right->data);
         if (!l || !r) return std::nullopt;
@@ -234,7 +245,12 @@ std::optional<Constant> foldInstruction(
     const auto compareInt = [&](auto comparison) -> std::optional<Constant> {
         const auto* left = operand(0);
         const auto* right = operand(1);
-        if (!left || !right) return std::nullopt;
+        if (!left || !right ||
+            left->type != right->type ||
+            (left->type != semantic::PrimitiveType::Int &&
+             left->type != semantic::PrimitiveType::Long)) {
+            return std::nullopt;
+        }
         const auto* l = std::get_if<std::int64_t>(&left->data);
         const auto* r = std::get_if<std::int64_t>(&right->data);
         if (!l || !r) return std::nullopt;
@@ -404,6 +420,67 @@ std::optional<Constant> foldInstruction(
         return Constant{semantic::PrimitiveType::Bool, 0,
             instruction.opcode == mir::Opcode::Equal ? equal : !equal};
     }
+    case mir::Opcode::ConvertNumeric: {
+        const auto* value = operand(0);
+        if (!value) return std::nullopt;
+        if (instruction.resultType != semantic::PrimitiveType::Int &&
+            instruction.resultType != semantic::PrimitiveType::Long &&
+            instruction.resultType != semantic::PrimitiveType::Double) {
+            return std::nullopt;
+        }
+        if (const auto* integer = std::get_if<std::int64_t>(&value->data)) {
+            if (value->type != semantic::PrimitiveType::Int &&
+                value->type != semantic::PrimitiveType::Long) {
+                return std::nullopt;
+            }
+            const std::int64_t srcVal = (value->type == semantic::PrimitiveType::Int)
+                ? static_cast<std::int64_t>(static_cast<std::int32_t>(*integer))
+                : *integer;
+            if (instruction.resultType == semantic::PrimitiveType::Long) {
+                return Constant{semantic::PrimitiveType::Long, 0, srcVal};
+            }
+            if (instruction.resultType == semantic::PrimitiveType::Int) {
+                if (instruction.checkedArithmetic &&
+                    (srcVal < std::numeric_limits<std::int32_t>::min() ||
+                     srcVal > std::numeric_limits<std::int32_t>::max())) {
+                    return std::nullopt;
+                }
+                return Constant{
+                    semantic::PrimitiveType::Int,
+                    0,
+                    static_cast<std::int64_t>(static_cast<std::int32_t>(srcVal))};
+            }
+            return Constant{semantic::PrimitiveType::Double, 0, static_cast<double>(srcVal)};
+        }
+        if (const auto* number = std::get_if<double>(&value->data)) {
+            if (value->type != semantic::PrimitiveType::Double) {
+                return std::nullopt;
+            }
+            if (instruction.resultType == semantic::PrimitiveType::Double) {
+                return Constant{semantic::PrimitiveType::Double, 0, *number};
+            }
+            if (!std::isfinite(*number)) {
+                return std::nullopt;
+            }
+            if (instruction.resultType == semantic::PrimitiveType::Int) {
+                if (*number < -2147483648.0 ||
+                    (instruction.checkedArithmetic
+                         ? (*number > 2147483647.0)
+                         : (*number >= 2147483648.0))) {
+                    return std::nullopt;
+                }
+                return Constant{
+                    semantic::PrimitiveType::Int,
+                    0,
+                    static_cast<std::int64_t>(static_cast<std::int32_t>(*number))};
+            }
+            if (*number < -9223372036854775808.0 || *number >= 9223372036854775808.0) {
+                return std::nullopt;
+            }
+            return Constant{semantic::PrimitiveType::Long, 0, static_cast<std::int64_t>(*number)};
+        }
+        return std::nullopt;
+    }
     default:
         return std::nullopt;
     }
@@ -414,6 +491,19 @@ bool foldConstants(
     Statistics& statistics,
     bool enableStructFieldForwarding = true) {
     bool changed = false;
+    std::unordered_map<mir::ValueId, std::pair<semantic::PrimitiveType, semantic::SymbolId>> valueStaticTypes;
+    for (const auto& b : function.blocks) {
+        for (const auto& p : b.parameters) {
+            if (p.value >= 0) {
+                valueStaticTypes[p.value] = {p.type, p.typeId};
+            }
+        }
+        for (const auto& inst : b.instructions) {
+            if (inst.result >= 0 && isValueInstruction(inst)) {
+                valueStaticTypes[inst.result] = {inst.resultType, inst.resultTypeId};
+            }
+        }
+    }
     std::unordered_map<mir::ValueId, Constant> constants;
     std::unordered_map<mir::ValueId, std::unordered_map<std::size_t, Constant>> structFieldConstants;
     std::unordered_map<mir::ValueId, std::unordered_map<std::size_t, mir::ValueId>> blockStructFieldValues;
@@ -439,6 +529,27 @@ bool foldConstants(
     std::unordered_map<mir::BlockId, std::unordered_map<std::size_t, Constant>> outLocalConstants;
     std::unordered_map<mir::BlockId, std::unordered_map<std::size_t, std::unordered_map<std::size_t, Constant>>> outLocalStructFields;
     std::unordered_map<mir::BlockId, std::unordered_map<std::size_t, std::unordered_map<std::size_t, mir::ValueId>>> outLocalStructFieldValues;
+    std::unordered_map<mir::ValueId, mir::ValueId> valueReplacements;
+    std::unordered_set<mir::ValueId> pendingAlgebraicCount;
+    const auto resolveReplacement = [&](mir::ValueId v) {
+        while (v >= 0) {
+            const auto it = valueReplacements.find(v);
+            if (it == valueReplacements.end() || it->second == v) break;
+            v = it->second;
+        }
+        return v;
+    };
+    const auto rewriteOperandUse = [&](mir::ValueId& v) -> bool {
+        if (v < 0) return false;
+        const auto replaced = resolveReplacement(v);
+        if (replaced == v) return false;
+        if (pendingAlgebraicCount.erase(v) > 0u) {
+            ++statistics.constantsFolded;
+        }
+        v = replaced;
+        changed = true;
+        return true;
+    };
     for (auto& block : function.blocks) {
         std::unordered_map<std::size_t, Constant> localConstants;
         std::unordered_map<std::size_t, std::unordered_map<std::size_t, Constant>> localStructFields;
@@ -454,24 +565,10 @@ bool foldConstants(
                 localStructFieldValues = it->second;
             }
         }
-        std::unordered_map<mir::ValueId, mir::ValueId> valueReplacements;
-
-        const auto resolveReplacement = [&](mir::ValueId v) {
-            while (v >= 0) {
-                const auto it = valueReplacements.find(v);
-                if (it == valueReplacements.end() || it->second == v) break;
-                v = it->second;
-            }
-            return v;
-        };
 
         for (auto& instruction : block.instructions) {
             for (auto& op : instruction.operands) {
-                const auto replaced = resolveReplacement(op);
-                if (replaced != op) {
-                    op = replaced;
-                    changed = true;
-                }
+                (void)rewriteOperandUse(op);
             }
             if (instruction.opcode == mir::Opcode::StoreLocal &&
                 instruction.operands.size() == 1) {
@@ -580,10 +677,15 @@ bool foldConstants(
                         if (const auto fieldValIt = structValIt->second.find(instruction.fieldIndex);
                             fieldValIt != structValIt->second.end() &&
                             fieldValIt->second >= 0) {
-                            valueReplacements[instruction.result] =
-                                resolveReplacement(fieldValIt->second);
-                            ++statistics.structFieldsForwarded;
-                            changed = true;
+                            const auto repl = resolveReplacement(fieldValIt->second);
+                            const auto typeIt = valueStaticTypes.find(repl);
+                            if (typeIt != valueStaticTypes.end() &&
+                                typeIt->second.first == instruction.resultType &&
+                                typeIt->second.second == instruction.resultTypeId) {
+                                valueReplacements[instruction.result] = repl;
+                                ++statistics.structFieldsForwarded;
+                                changed = true;
+                            }
                         }
                     }
                 }
@@ -592,6 +694,53 @@ bool foldConstants(
                 instruction = makeConstant(instruction, *folded);
                 ++statistics.constantsFolded;
                 changed = true;
+            } else if (instruction.operands.size() == 2 &&
+                       instruction.resultTypeId == 0 &&
+                       (instruction.resultType == semantic::PrimitiveType::Int ||
+                        instruction.resultType == semantic::PrimitiveType::Long)) {
+                const auto c0 = constants.find(instruction.operands[0]);
+                const auto c1 = constants.find(instruction.operands[1]);
+                const auto isIntConstEq = [](
+                    const std::unordered_map<mir::ValueId, Constant>::const_iterator& it,
+                    const std::unordered_map<mir::ValueId, Constant>& map,
+                    std::int64_t target) noexcept -> bool {
+                    return it != map.end() &&
+                        std::holds_alternative<std::int64_t>(it->second.data) &&
+                        std::get<std::int64_t>(it->second.data) == target;
+                };
+                mir::ValueId replacementId = -1;
+                if (instruction.opcode == mir::Opcode::AddInt ||
+                    instruction.opcode == mir::Opcode::AddLong) {
+                    if (isIntConstEq(c1, constants, 0)) {
+                        replacementId = resolveReplacement(instruction.operands[0]);
+                    } else if (isIntConstEq(c0, constants, 0)) {
+                        replacementId = resolveReplacement(instruction.operands[1]);
+                    }
+                } else if (instruction.opcode == mir::Opcode::SubtractInt ||
+                           instruction.opcode == mir::Opcode::SubtractLong) {
+                    if (isIntConstEq(c1, constants, 0)) {
+                        replacementId = resolveReplacement(instruction.operands[0]);
+                    }
+                } else if (instruction.opcode == mir::Opcode::MultiplyInt ||
+                           instruction.opcode == mir::Opcode::MultiplyLong) {
+                    if (isIntConstEq(c1, constants, 1)) {
+                        replacementId = resolveReplacement(instruction.operands[0]);
+                    } else if (isIntConstEq(c0, constants, 1)) {
+                        replacementId = resolveReplacement(instruction.operands[1]);
+                    }
+                }
+                if (replacementId >= 0 &&
+                    instruction.result >= 0 &&
+                    replacementId != instruction.result) {
+                    valueReplacements[instruction.result] = replacementId;
+                    if (instruction.checkedArithmetic) {
+                        instruction.checkedArithmetic = false;
+                        ++statistics.constantsFolded;
+                        changed = true;
+                    } else {
+                        pendingAlgebraicCount.insert(instruction.result);
+                    }
+                }
             }
             if (isValueInstruction(instruction)) {
                 if (const auto constant = constantFromInstruction(instruction)) {
@@ -602,10 +751,10 @@ bool foldConstants(
             }
         }
         if (!valueReplacements.empty()) {
-            block.terminator.condition = resolveReplacement(block.terminator.condition);
-            block.terminator.value = resolveReplacement(block.terminator.value);
-            for (auto& arg : block.terminator.arguments) arg = resolveReplacement(arg);
-            for (auto& arg : block.terminator.falseArguments) arg = resolveReplacement(arg);
+            (void)rewriteOperandUse(block.terminator.condition);
+            (void)rewriteOperandUse(block.terminator.value);
+            for (auto& arg : block.terminator.arguments) (void)rewriteOperandUse(arg);
+            for (auto& arg : block.terminator.falseArguments) (void)rewriteOperandUse(arg);
         }
         if (block.terminator.kind == mir::TerminatorKind::Branch) {
             const auto found = constants.find(block.terminator.condition);
@@ -632,6 +781,19 @@ bool foldConstants(
             outLocalConstants[block.terminator.target] = localConstants;
             outLocalStructFields[block.terminator.target] = localStructFields;
             outLocalStructFieldValues[block.terminator.target] = localStructFieldValues;
+        }
+    }
+    if (!valueReplacements.empty()) {
+        for (auto& block : function.blocks) {
+            for (auto& instruction : block.instructions) {
+                for (auto& op : instruction.operands) {
+                    (void)rewriteOperandUse(op);
+                }
+            }
+            (void)rewriteOperandUse(block.terminator.condition);
+            (void)rewriteOperandUse(block.terminator.value);
+            for (auto& arg : block.terminator.arguments) (void)rewriteOperandUse(arg);
+            for (auto& arg : block.terminator.falseArguments) (void)rewriteOperandUse(arg);
         }
     }
     return changed;
@@ -699,35 +861,81 @@ bool removeUnreachableBlocks(mir::Function& function, Statistics& statistics) {
 }
 
 bool eliminateDeadInstructions(mir::Function& function, Statistics& statistics) {
-    std::unordered_set<mir::ValueId> used;
+    mir::ValueId maxValId = -1;
+    for (const auto& block : function.blocks) {
+        for (const auto& param : block.parameters) {
+            if (param.value > maxValId) maxValId = param.value;
+        }
+        for (const auto& instruction : block.instructions) {
+            if (instruction.result > maxValId) maxValId = instruction.result;
+            for (const auto op : instruction.operands) {
+                if (op > maxValId) maxValId = op;
+            }
+        }
+        if (block.terminator.condition > maxValId) maxValId = block.terminator.condition;
+        if (block.terminator.value > maxValId) maxValId = block.terminator.value;
+        for (const auto arg : block.terminator.arguments) {
+            if (arg > maxValId) maxValId = arg;
+        }
+        for (const auto arg : block.terminator.falseArguments) {
+            if (arg > maxValId) maxValId = arg;
+        }
+    }
+    if (maxValId < 0) return false;
+
+    const std::size_t numValues = static_cast<std::size_t>(maxValId) + 1u;
+    std::vector<std::uint32_t> useCount(numValues, 0u);
+    std::vector<const mir::Instruction*> defInst(numValues, nullptr);
+    std::vector<std::uint8_t> deadVal(numValues, 0u);
+
     for (const auto& block : function.blocks) {
         for (const auto& instruction : block.instructions) {
-            if (!isRemovableWhenUnused(instruction)) {
-                used.insert(instruction.operands.begin(), instruction.operands.end());
+            if (isValueInstruction(instruction) && instruction.result >= 0) {
+                defInst[static_cast<std::size_t>(instruction.result)] = &instruction;
+            }
+            for (const auto operand : instruction.operands) {
+                if (operand >= 0) {
+                    ++useCount[static_cast<std::size_t>(operand)];
+                }
             }
         }
         const auto& terminator = block.terminator;
-        if (terminator.condition >= 0) used.insert(terminator.condition);
-        if (terminator.value >= 0) used.insert(terminator.value);
-        used.insert(terminator.arguments.begin(), terminator.arguments.end());
-        used.insert(terminator.falseArguments.begin(), terminator.falseArguments.end());
+        if (terminator.condition >= 0) ++useCount[static_cast<std::size_t>(terminator.condition)];
+        if (terminator.value >= 0) ++useCount[static_cast<std::size_t>(terminator.value)];
+        for (const auto arg : terminator.arguments) {
+            if (arg >= 0) ++useCount[static_cast<std::size_t>(arg)];
+        }
+        for (const auto arg : terminator.falseArguments) {
+            if (arg >= 0) ++useCount[static_cast<std::size_t>(arg)];
+        }
     }
 
-    // Follow pure value dependencies to a fixed point. Block storage order is
-    // not guaranteed to be reverse dominance order, especially after CFG
-    // simplification, so a single reverse traversal can remove a producer that
-    // is consumed by a live value in another block.
-    bool expanded = true;
-    while (expanded) {
-        expanded = false;
-        for (const auto& block : function.blocks) {
-            for (const auto& instruction : block.instructions) {
-                if (!isValueInstruction(instruction) ||
-                    used.find(instruction.result) == used.end()) {
-                    continue;
-                }
-                for (const auto operand : instruction.operands) {
-                    expanded |= used.insert(operand).second;
+    std::vector<mir::ValueId> worklist;
+    for (const auto& block : function.blocks) {
+        for (const auto& instruction : block.instructions) {
+            if (isValueInstruction(instruction) &&
+                isRemovableWhenUnused(instruction) &&
+                instruction.result >= 0 &&
+                useCount[static_cast<std::size_t>(instruction.result)] == 0u) {
+                worklist.push_back(instruction.result);
+            }
+        }
+    }
+
+    while (!worklist.empty()) {
+        const mir::ValueId val = worklist.back();
+        worklist.pop_back();
+        const std::size_t vIdx = static_cast<std::size_t>(val);
+        if (deadVal[vIdx] != 0u || defInst[vIdx] == nullptr) continue;
+        deadVal[vIdx] = 1u;
+        for (const auto op : defInst[vIdx]->operands) {
+            if (op < 0) continue;
+            const std::size_t opIdx = static_cast<std::size_t>(op);
+            if (useCount[opIdx] > 0u && --useCount[opIdx] == 0u) {
+                if (deadVal[opIdx] == 0u &&
+                    defInst[opIdx] != nullptr &&
+                    isRemovableWhenUnused(*defInst[opIdx])) {
+                    worklist.push_back(op);
                 }
             }
         }
@@ -742,8 +950,8 @@ bool eliminateDeadInstructions(mir::Function& function, Statistics& statistics) 
                 block.instructions.end(),
                 [&](const mir::Instruction& instruction) {
                     return isValueInstruction(instruction) &&
-                        isRemovableWhenUnused(instruction) &&
-                        used.find(instruction.result) == used.end();
+                        instruction.result >= 0 &&
+                        deadVal[static_cast<std::size_t>(instruction.result)] != 0u;
                 }),
             block.instructions.end());
         const auto removed = before - block.instructions.size();
@@ -897,6 +1105,15 @@ bool hoistLoopInvariants(mir::Function& function, Statistics& statistics) {
         }
     }
 
+    std::unordered_set<mir::ValueId> newArrayValues;
+    for (const auto& blk : function.blocks) {
+        for (const auto& inst : blk.instructions) {
+            if (inst.opcode == mir::Opcode::NewArray && inst.result >= 0) {
+                newArrayValues.insert(inst.result);
+            }
+        }
+    }
+
     for (std::size_t headerIdx = 1; headerIdx < function.blocks.size(); ++headerIdx) {
         const auto headerId = function.blocks[headerIdx].id;
         if (!function.blocks[headerIdx].parameters.empty()) continue;
@@ -971,6 +1188,49 @@ bool hoistLoopInvariants(mir::Function& function, Statistics& statistics) {
             }
         }
 
+        std::unordered_set<mir::ValueId> guaranteedNonNullArrays;
+        for (const auto& pInst : preheader.instructions) {
+            if ((pInst.opcode == mir::Opcode::ArrayLength ||
+                 pInst.opcode == mir::Opcode::LoadElement ||
+                 pInst.opcode == mir::Opcode::StoreElement) &&
+                !pInst.operands.empty()) {
+                guaranteedNonNullArrays.insert(pInst.operands[0]);
+            }
+        }
+        {
+            const auto isSafePureHeaderPrefixOp = [](mir::Opcode op) noexcept {
+                switch (op) {
+                case mir::Opcode::ConstantNull:
+                case mir::Opcode::ConstantBool:
+                case mir::Opcode::ConstantInt:
+                case mir::Opcode::ConstantDouble:
+                case mir::Opcode::ConstantString:
+                case mir::Opcode::ConstantTypeId:
+                case mir::Opcode::LoadLocal:
+                case mir::Opcode::Parameter:
+                case mir::Opcode::ConvertIntToLong:
+                case mir::Opcode::ConvertIntToDouble:
+                case mir::Opcode::ConvertLongToDouble:
+                case mir::Opcode::LogicalNot:
+                    return true;
+                default:
+                    return false;
+                }
+            };
+            for (const auto& hInst : function.blocks[headerIdx].instructions) {
+                if ((hInst.opcode == mir::Opcode::ArrayLength ||
+                     hInst.opcode == mir::Opcode::LoadElement ||
+                     hInst.opcode == mir::Opcode::StoreElement) &&
+                    !hInst.operands.empty()) {
+                    guaranteedNonNullArrays.insert(hInst.operands[0]);
+                    break;
+                }
+                if (!isSafePureHeaderPrefixOp(hInst.opcode)) {
+                    break;
+                }
+            }
+        }
+
         for (std::size_t blkIdx = headerIdx; blkIdx <= latchIdx; ++blkIdx) {
             if (!inNaturalLoop[blkIdx]) continue;
             auto& loopBlock = function.blocks[blkIdx];
@@ -979,7 +1239,14 @@ bool hoistLoopInvariants(mir::Function& function, Statistics& statistics) {
             for (auto& inst : loopBlock.instructions) {
                 bool canHoist = false;
                 if (isValueInstruction(inst)) {
+                    const bool isInnerBodySafeArrayLength =
+                        (blkIdx != headerIdx) &&
+                        inst.opcode == mir::Opcode::ArrayLength &&
+                        !inst.operands.empty() &&
+                        (newArrayValues.count(inst.operands[0]) > 0u ||
+                         guaranteedNonNullArrays.count(inst.operands[0]) > 0u);
                     if (isLicmSafeOpcode(inst.opcode) ||
+                        isInnerBodySafeArrayLength ||
                         ((inst.opcode == mir::Opcode::AddInt ||
                           inst.opcode == mir::Opcode::SubtractInt ||
                           inst.opcode == mir::Opcode::MultiplyInt ||
@@ -1014,6 +1281,259 @@ bool hoistLoopInvariants(mir::Function& function, Statistics& statistics) {
             loopBlock.instructions = std::move(remaining);
         }
     }
+    return changed;
+}
+
+bool eliminateRedundantNullChecks(mir::Function& function, Statistics& statistics) {
+    const std::size_t nBlocks = function.blocks.size();
+    if (nBlocks == 0u || nBlocks > 2048u || !function.exceptionHandlers.empty()) {
+        return false;
+    }
+    bool hasAnyCheckNotNull = false;
+    for (const auto& blk : function.blocks) {
+        for (const auto& inst : blk.instructions) {
+            if (inst.opcode == mir::Opcode::CheckNotNull) {
+                hasAnyCheckNotNull = true;
+                break;
+            }
+        }
+        if (hasAnyCheckNotNull) break;
+    }
+    if (!hasAnyCheckNotNull) return false;
+
+    std::unordered_map<mir::BlockId, std::size_t> blockIndexById;
+    blockIndexById.reserve(nBlocks);
+    std::size_t entryIdx = 0u;
+    for (std::size_t i = 0u; i < nBlocks; ++i) {
+        blockIndexById.emplace(function.blocks[i].id, i);
+        if (function.blocks[i].id == 0u) entryIdx = i;
+    }
+
+    std::vector<std::vector<std::size_t>> succs(nBlocks);
+    std::vector<std::vector<std::size_t>> preds(nBlocks);
+    for (std::size_t i = 0u; i < nBlocks; ++i) {
+        const auto& term = function.blocks[i].terminator;
+        auto addEdge = [&](mir::BlockId targetId) {
+            const auto it = blockIndexById.find(targetId);
+            if (it != blockIndexById.end()) {
+                succs[i].push_back(it->second);
+                preds[it->second].push_back(i);
+            }
+        };
+        if (term.kind == mir::TerminatorKind::Jump) {
+            addEdge(term.target);
+        } else if (term.kind == mir::TerminatorKind::Branch) {
+            addEdge(term.target);
+            if (term.falseTarget != term.target) {
+                addEdge(term.falseTarget);
+            }
+        }
+    }
+
+    std::vector<std::uint8_t> reachable(nBlocks, 0u);
+    std::vector<std::size_t> bfsOrder;
+    bfsOrder.reserve(nBlocks);
+    reachable[entryIdx] = 1u;
+    bfsOrder.push_back(entryIdx);
+    for (std::size_t q = 0u; q < bfsOrder.size(); ++q) {
+        const std::size_t u = bfsOrder[q];
+        for (const std::size_t v : succs[u]) {
+            if (reachable[v] == 0u) {
+                reachable[v] = 1u;
+                bfsOrder.push_back(v);
+            }
+        }
+    }
+
+    const std::size_t wordCount = (nBlocks + 63u) / 64u;
+    std::vector<std::uint64_t> allReachableMask(wordCount, 0u);
+    for (std::size_t i = 0u; i < nBlocks; ++i) {
+        if (reachable[i] != 0u) {
+            allReachableMask[i >> 6u] |= (std::uint64_t{1} << (i & 63u));
+        }
+    }
+    std::vector<std::vector<std::uint64_t>> dom(nBlocks, std::vector<std::uint64_t>(wordCount, 0u));
+    dom[entryIdx][entryIdx >> 6u] |= (std::uint64_t{1} << (entryIdx & 63u));
+    for (std::size_t i = 0u; i < nBlocks; ++i) {
+        if (i != entryIdx && reachable[i] != 0u) {
+            dom[i] = allReachableMask;
+        }
+    }
+    bool domChanged = true;
+    while (domChanged) {
+        domChanged = false;
+        for (const std::size_t b : bfsOrder) {
+            if (b == entryIdx) continue;
+            std::vector<std::uint64_t> nextDom;
+            bool firstPred = true;
+            for (const std::size_t p : preds[b]) {
+                if (reachable[p] == 0u) continue;
+                if (firstPred) {
+                    nextDom = dom[p];
+                    firstPred = false;
+                } else {
+                    for (std::size_t w = 0u; w < wordCount; ++w) {
+                        nextDom[w] &= dom[p][w];
+                    }
+                }
+            }
+            if (firstPred) {
+                nextDom.assign(wordCount, 0u);
+            }
+            nextDom[b >> 6u] |= (std::uint64_t{1} << (b & 63u));
+            if (nextDom != dom[b]) {
+                dom[b] = std::move(nextDom);
+                domChanged = true;
+            }
+        }
+    }
+
+    std::vector<std::size_t> domCount(nBlocks, 0u);
+    for (std::size_t i = 0u; i < nBlocks; ++i) {
+        if (reachable[i] == 0u) continue;
+        std::size_t cnt = 0u;
+        for (const std::uint64_t word : dom[i]) {
+            std::uint64_t w = word;
+            while (w != 0u) {
+                w &= (w - 1u);
+                ++cnt;
+            }
+        }
+        domCount[i] = cnt;
+    }
+
+    std::vector<std::vector<std::size_t>> domChildren(nBlocks);
+    for (const std::size_t b : bfsOrder) {
+        if (b == entryIdx) continue;
+        std::size_t bestIdom = entryIdx;
+        std::size_t bestCount = 0u;
+        for (std::size_t d = 0u; d < nBlocks; ++d) {
+            if (d == b || reachable[d] == 0u) continue;
+            if ((dom[b][d >> 6u] & (std::uint64_t{1} << (d & 63u))) != 0u) {
+                if (domCount[d] > bestCount) {
+                    bestCount = domCount[d];
+                    bestIdom = d;
+                }
+            }
+        }
+        domChildren[bestIdom].push_back(b);
+    }
+
+    std::unordered_map<mir::ValueId, semantic::SymbolId> defTypeId;
+    for (const auto& blk : function.blocks) {
+        for (const auto& param : blk.parameters) {
+            if (param.value >= 0) defTypeId[param.value] = param.typeId;
+        }
+        for (const auto& inst : blk.instructions) {
+            if (isValueInstruction(inst) && inst.result >= 0) {
+                defTypeId[inst.result] = inst.resultTypeId;
+            }
+        }
+    }
+
+    struct SrcTidKey {
+        mir::ValueId src = -1;
+        semantic::SymbolId typeId = 0;
+        [[nodiscard]] bool operator==(const SrcTidKey& other) const noexcept {
+            return src == other.src && typeId == other.typeId;
+        }
+    };
+    struct SrcTidHash {
+        std::size_t operator()(const SrcTidKey& k) const noexcept {
+            std::uint64_t h = static_cast<std::uint64_t>(static_cast<std::uint32_t>(k.src));
+            h ^= k.typeId * 0x9e3779b97f4a7c15ULL + (h << 6u) + (h >> 2u);
+            return static_cast<std::size_t>(h);
+        }
+    };
+
+    std::unordered_set<mir::ValueId> nonNullValues;
+    std::unordered_map<SrcTidKey, mir::ValueId, SrcTidHash> domCheckedResults;
+    std::unordered_map<mir::ValueId, mir::ValueId> replacements;
+    const auto resolveRep = [&](mir::ValueId v) noexcept -> mir::ValueId {
+        while (v >= 0) {
+            const auto it = replacements.find(v);
+            if (it == replacements.end() || it->second == v) break;
+            v = it->second;
+        }
+        return v;
+    };
+
+    bool changed = false;
+    const auto visitDom = [&](const auto& self, std::size_t bIdx) -> void {
+        std::vector<mir::ValueId> addedNonNull;
+        std::vector<SrcTidKey> addedChecked;
+        auto& blk = function.blocks[bIdx];
+        std::vector<mir::Instruction> kept;
+        kept.reserve(blk.instructions.size());
+        for (auto& inst : blk.instructions) {
+            for (auto& op : inst.operands) {
+                op = resolveRep(op);
+            }
+            if (inst.opcode == mir::Opcode::NewObject && inst.result >= 0) {
+                if (nonNullValues.insert(inst.result).second) {
+                    addedNonNull.push_back(inst.result);
+                }
+                kept.push_back(std::move(inst));
+                continue;
+            }
+            if (inst.opcode == mir::Opcode::CheckNotNull &&
+                inst.operands.size() == 1u &&
+                inst.result >= 0 &&
+                inst.typeId != 0 &&
+                inst.resultTypeId == inst.typeId) {
+                const mir::ValueId src = inst.operands[0];
+                if (nonNullValues.count(src) > 0u) {
+                    const auto tidIt = defTypeId.find(src);
+                    if (tidIt != defTypeId.end() &&
+                        tidIt->second != 0 &&
+                        tidIt->second == inst.typeId) {
+                        replacements[inst.result] = src;
+                        ++statistics.instructionsRemoved;
+                        changed = true;
+                        continue;
+                    }
+                    const auto chkIt = domCheckedResults.find(SrcTidKey{src, inst.typeId});
+                    if (chkIt != domCheckedResults.end()) {
+                        replacements[inst.result] = chkIt->second;
+                        ++statistics.instructionsRemoved;
+                        changed = true;
+                        continue;
+                    }
+                }
+                if (nonNullValues.insert(src).second) {
+                    addedNonNull.push_back(src);
+                }
+                if (nonNullValues.insert(inst.result).second) {
+                    addedNonNull.push_back(inst.result);
+                }
+                const SrcTidKey k1{src, inst.typeId};
+                if (domCheckedResults.find(k1) == domCheckedResults.end()) {
+                    domCheckedResults.emplace(k1, inst.result);
+                    addedChecked.push_back(k1);
+                }
+                kept.push_back(std::move(inst));
+                continue;
+            }
+            kept.push_back(std::move(inst));
+        }
+        blk.instructions = std::move(kept);
+        if (blk.terminator.condition >= 0) {
+            blk.terminator.condition = resolveRep(blk.terminator.condition);
+        }
+        if (blk.terminator.value >= 0) {
+            blk.terminator.value = resolveRep(blk.terminator.value);
+        }
+        for (auto& arg : blk.terminator.arguments) arg = resolveRep(arg);
+        for (auto& arg : blk.terminator.falseArguments) arg = resolveRep(arg);
+
+        for (const std::size_t child : domChildren[bIdx]) {
+            self(self, child);
+        }
+        for (const auto& k : addedChecked) domCheckedResults.erase(k);
+        for (const auto v : addedNonNull) nonNullValues.erase(v);
+    };
+
+    visitDom(visitDom, entryIdx);
     return changed;
 }
 
@@ -1316,7 +1836,7 @@ bool inlineSmallFunctions(
     collectFromModule(module);
     if (allModules) {
         for (const auto& m : *allModules) {
-            if (&m != &module) collectFromModule(m);
+            if (&m != &module && m.name != module.name) collectFromModule(m);
         }
     }
     if (inlineCandidates.empty()) return false;
@@ -1337,7 +1857,7 @@ bool inlineSmallFunctions(
     ingestModuleDeps(module);
     if (allModules) {
         for (const auto& m : *allModules) {
-            if (&m != &module) ingestModuleDeps(m);
+            if (&m != &module && m.name != module.name) ingestModuleDeps(m);
         }
     }
 
@@ -1794,7 +2314,7 @@ bool devirtualizeCalls(
     }
     if (allModules) {
         for (const auto& m : *allModules) {
-            if (&m == &module) continue;
+            if (&m == &module || m.name == module.name) continue;
             for (const auto& t : m.types) {
                 if (t.id != 0) allTypes.emplace(t.id, &t);
             }
@@ -1912,13 +2432,16 @@ bool devirtualizeCalls(
                 }
             } else if (inst.opcode == mir::Opcode::AsType && !inst.operands.empty()) {
                 const auto opIt = exactMap.find(inst.operands[0]);
+                const semantic::SymbolId targetTid =
+                    inst.elementTypeId != 0 ? inst.elementTypeId : stTid;
                 if (opIt != exactMap.end() &&
                     opIt->second.exactTypeId != 0 &&
-                    (stTid == 0 || devirtualizeTypeAssignable(opIt->second.exactTypeId, stTid, allTypes))) {
+                    targetTid != 0 &&
+                    devirtualizeTypeAssignable(opIt->second.exactTypeId, targetTid, allTypes)) {
                     exactMap[inst.result] = opIt->second;
                 } else if (inst.resultType == semantic::PrimitiveType::Object &&
-                           isSealedConcreteClass(stTid)) {
-                    exactMap[inst.result] = {stTid, inst.result, blkId, inEntry, false};
+                           isSealedConcreteClass(targetTid)) {
+                    exactMap[inst.result] = {targetTid, inst.result, blkId, inEntry, false};
                 }
             } else if (inst.opcode == mir::Opcode::CheckNotNull && !inst.operands.empty()) {
                 const auto opIt = exactMap.find(inst.operands[0]);
@@ -2332,6 +2855,7 @@ bool optimizeFunction(
             if (options.enableLicm) {
                 changed |= hoistLoopInvariants(function, statistics);
             }
+            changed |= eliminateRedundantNullChecks(function, statistics);
             changed |= eliminateDeadInstructions(function, statistics);
         }
         ++statistics.iterations;
@@ -2361,20 +2885,34 @@ Result Optimizer::optimize(
     if (options.level == Level::Aggressive &&
         (options.enableInlining || options.enableDevirtualization) &&
         modules.size() > 1) {
+        std::vector<std::uint8_t> moduleValid(modules.size(), 0u);
+        for (std::size_t mi = 0; mi < modules.size(); ++mi) {
+            diagnostics::DiagnosticBag checkDiag;
+            if (mir::verifyModule(modules[mi], checkDiag)) {
+                moduleValid[mi] = 1u;
+            }
+        }
+        std::vector<mir::Module> validSnapshot;
         for (std::size_t inlinePass = 0; inlinePass < 3; ++inlinePass) {
-            const auto snapshot = modules;
+            validSnapshot.clear();
+            validSnapshot.reserve(modules.size());
+            for (std::size_t mi = 0; mi < modules.size(); ++mi) {
+                if (moduleValid[mi] != 0u) {
+                    validSnapshot.push_back(modules[mi]);
+                }
+            }
+            if (validSnapshot.empty()) break;
             bool anyPassChanged = false;
-            for (auto& module : modules) {
-                diagnostics::DiagnosticBag checkDiag;
-                if (mir::verifyModule(module, checkDiag)) {
-                    if (options.enableDevirtualization &&
-                        devirtualizeCalls(module, options, result.statistics, &snapshot)) {
-                        anyPassChanged = true;
-                    }
-                    if (options.enableInlining &&
-                        inlineSmallFunctions(module, options, result.statistics, &snapshot)) {
-                        anyPassChanged = true;
-                    }
+            for (std::size_t mi = 0; mi < modules.size(); ++mi) {
+                if (moduleValid[mi] == 0u) continue;
+                auto& module = modules[mi];
+                if (options.enableDevirtualization &&
+                    devirtualizeCalls(module, options, result.statistics, &validSnapshot)) {
+                    anyPassChanged = true;
+                }
+                if (options.enableInlining &&
+                    inlineSmallFunctions(module, options, result.statistics, &validSnapshot)) {
+                    anyPassChanged = true;
                 }
             }
             if (!anyPassChanged) break;

@@ -1782,13 +1782,107 @@ private:
     std::string error_;
 };
 
+template <typename ResolveTypeFn, typename LocationMapT>
+void populateBoundProgramMetadata(
+    const std::vector<bytecode::Module>& modules,
+    ResolveTypeFn&& resolvePrimaryType,
+    LocationMapT& executableLocations,
+    std::unordered_map<semantic::SymbolId, semantic::TypeSymbol>& types,
+    std::unordered_map<std::string, semantic::SymbolId>& typesByName,
+    std::vector<Breakpoint>& breakpoints,
+    std::unordered_map<std::string, std::string>& clientPathAliases,
+    bool& entryPending,
+    bool stopOnEntry) {
+    using BoundLocationT = typename LocationMapT::mapped_type::value_type;
+    const bool hadModulesBefore = !executableLocations.empty();
+    executableLocations.clear();
+    types.clear();
+    typesByName.clear();
+    for (const auto& module : modules) {
+        for (const auto& type : module.types) {
+            const auto* primary = resolvePrimaryType(type.id);
+            const auto& effectiveType = primary ? *primary : type;
+            auto [it, inserted] = types.emplace(type.id, effectiveType);
+            if (!inserted && (primary != nullptr || type.moduleName == module.name)) {
+                it->second = effectiveType;
+            }
+            typesByName[semantic::canonicalTypeName(effectiveType)] = type.id;
+            if (!effectiveType.synthetic || effectiveType.name.find("__") == std::string::npos) {
+                typesByName.emplace(effectiveType.name, type.id);
+            }
+        }
+        for (const auto& function : module.functions) {
+            for (const auto& point : function.debugInfo.sequencePoints) {
+                if (point.hidden) continue;
+                std::string effectivePath = sequencePointSourcePath(module, point);
+                if (effectivePath.empty()) continue;
+                executableLocations[effectivePath].push_back({
+                    effectivePath,
+                    point.range.start.line,
+                    point.range.start.column,
+                });
+            }
+        }
+    }
+    for (auto& [path, locations] : executableLocations) {
+        (void)path;
+        std::sort(locations.begin(), locations.end(),
+            [](const BoundLocationT& left, const BoundLocationT& right) {
+                if (left.line != right.line) return left.line < right.line;
+                return left.column < right.column;
+            });
+        locations.erase(std::unique(locations.begin(), locations.end(),
+            [](const BoundLocationT& left, const BoundLocationT& right) {
+                return left.line == right.line && left.column == right.column;
+            }), locations.end());
+    }
+    for (auto& breakpoint : breakpoints) {
+        breakpoint.verified = false;
+        auto found = executableLocations.find(breakpoint.sourcePath);
+        if (found == executableLocations.end()) {
+            for (auto it = executableLocations.begin(); it != executableLocations.end(); ++it) {
+                if (debugPathsMatch(breakpoint.sourcePath, it->first)) {
+                    found = it;
+                    clientPathAliases[it->first] = breakpoint.sourcePath;
+                    break;
+                }
+            }
+        }
+        if (found == executableLocations.end()) continue;
+        const std::size_t targetLine =
+            breakpoint.requestedLine != 0 ? breakpoint.requestedLine : breakpoint.line;
+        const auto location = std::lower_bound(
+            found->second.begin(), found->second.end(), targetLine,
+            [](const BoundLocationT& value, std::size_t line) {
+                return value.line < line;
+            });
+        if (location != found->second.end()) {
+            breakpoint.line = location->line;
+            breakpoint.column = location->column;
+            breakpoint.verified = true;
+        }
+    }
+    if (!hadModulesBefore) {
+        entryPending = stopOnEntry;
+    }
+}
+
 } // namespace
 
 void DebugController::bindProgram(const runtime::ProgramImage& program) {
-    bindModules(program.modules());
     std::lock_guard<std::mutex> lock(mutex_);
     boundProgram_ = &program;
     synthesizedProgram_.reset();
+    populateBoundProgramMetadata(
+        program.modules(),
+        [&](semantic::SymbolId id) { return program.resolveType(id); },
+        executableLocations_,
+        types_,
+        typesByName_,
+        breakpoints_,
+        clientPathAliases_,
+        entryPending_,
+        stopOnEntry_);
 }
 
 void DebugController::bindModules(const std::vector<bytecode::Module>& modules) {
@@ -1800,74 +1894,21 @@ void DebugController::bindModules(const std::vector<bytecode::Module>& modules) 
         }
     }
     std::lock_guard<std::mutex> lock(mutex_);
-    const bool hadModulesBefore = !executableLocations_.empty();
-    executableLocations_.clear();
-    types_.clear();
-    typesByName_.clear();
     boundProgram_ = nullptr;
     synthesizedProgram_ = std::move(linkedFallback);
-    for (const auto& module : modules) {
-        for (const auto& type : module.types) {
-            types_[type.id] = type;
-            typesByName_[semantic::canonicalTypeName(type)] = type.id;
-            if (!type.synthetic || type.name.find("__") == std::string::npos) {
-                typesByName_.emplace(type.name, type.id);
-            }
-        }
-        for (const auto& function : module.functions) {
-            for (const auto& point : function.debugInfo.sequencePoints) {
-                if (point.hidden) continue;
-                std::string effectivePath = sequencePointSourcePath(module, point);
-                if (effectivePath.empty()) continue;
-                executableLocations_[effectivePath].push_back({
-                    effectivePath,
-                    point.range.start.line,
-                    point.range.start.column,
-                });
-            }
-        }
-    }
-    for (auto& [path, locations] : executableLocations_) {
-        (void)path;
-        std::sort(locations.begin(), locations.end(),
-            [](const BoundLocation& left, const BoundLocation& right) {
-                if (left.line != right.line) return left.line < right.line;
-                return left.column < right.column;
-            });
-        locations.erase(std::unique(locations.begin(), locations.end(),
-            [](const BoundLocation& left, const BoundLocation& right) {
-                return left.line == right.line && left.column == right.column;
-            }), locations.end());
-    }
-    for (auto& breakpoint : breakpoints_) {
-        breakpoint.verified = false;
-        auto found = executableLocations_.find(breakpoint.sourcePath);
-        if (found == executableLocations_.end()) {
-            for (auto it = executableLocations_.begin(); it != executableLocations_.end(); ++it) {
-                if (debugPathsMatch(breakpoint.sourcePath, it->first)) {
-                    found = it;
-                    clientPathAliases_[it->first] = breakpoint.sourcePath;
-                    break;
-                }
-            }
-        }
-        if (found == executableLocations_.end()) continue;
-        const std::size_t targetLine =
-            breakpoint.requestedLine != 0 ? breakpoint.requestedLine : breakpoint.line;
-        const auto location = std::lower_bound(
-            found->second.begin(), found->second.end(), targetLine,
-            [](const BoundLocation& value, std::size_t line) {
-                return value.line < line;
-            });
-        if (location != found->second.end()) {
-            breakpoint.line = location->line;
-            breakpoint.column = location->column;
-            breakpoint.verified = true;
-        }
-    }
-    if (!hadModulesBefore) {
-        entryPending_ = stopOnEntry_;
-    }
+    const auto* fallbackPtr = synthesizedProgram_.get();
+    populateBoundProgramMetadata(
+        modules,
+        [fallbackPtr](semantic::SymbolId id) -> const semantic::TypeSymbol* {
+            return fallbackPtr ? fallbackPtr->resolveType(id) : nullptr;
+        },
+        executableLocations_,
+        types_,
+        typesByName_,
+        breakpoints_,
+        clientPathAliases_,
+        entryPending_,
+        stopOnEntry_);
 }
 
 std::vector<Breakpoint> DebugController::setBreakpoints(

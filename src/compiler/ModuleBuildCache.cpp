@@ -45,9 +45,9 @@ namespace {
 constexpr std::uint32_t kCacheFormatVersion = 3u;
 constexpr std::uint32_t kMirOverlayVersion = 2u;
 constexpr std::uint32_t kStandaloneMirVersion = 1u;
-constexpr std::uint32_t kOptArtifactVersion = 1u;
+constexpr std::uint32_t kOptArtifactVersion = 2u;
 constexpr std::uint32_t kGraphMetaVersion = 1u;
-constexpr std::uint32_t kAotBundleVersion = 3u;
+constexpr std::uint32_t kAotBundleVersion = 4u;
 
 void mixBytes(std::uint64_t& state, const void* data, std::size_t length) noexcept {
     const auto* ptr = static_cast<const unsigned char*>(data);

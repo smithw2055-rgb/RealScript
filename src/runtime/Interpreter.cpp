@@ -30,6 +30,7 @@ struct InvokeScratchGuard {
         state.mirror = &mirror;
         outHeapImplToken = detail::lookupHeapImplFast(heap);
         const std::uint64_t heapId = heap ? heap->heapId() : 0u;
+        const std::uint64_t restoreEpoch = heap ? heap->restoreEpoch() : 0u;
         const std::uint64_t stringEpoch = outHeapImplToken
             ? detail::heapStringInternEpochWithToken(outHeapImplToken)
             : (heap ? heap->gcEpoch() : 0u);
@@ -42,23 +43,35 @@ struct InvokeScratchGuard {
             if (buf.values.size() < 256) buf.values.resize(256);
             if (buf.stack.capacity() < 32) buf.stack.reserve(32);
             const bool bufMirrorChanged = (buf.stringMirrorId != mirrorId);
-            if (bufMirrorChanged) {
+            if (bufMirrorChanged ||
+                buf.inlineCacheHeapId != heapId ||
+                buf.inlineCacheRestoreEpoch != restoreEpoch) {
                 buf.inlineCallCache.fill(InlineCallCacheEntry{});
+                buf.inlineCacheHeapId = heapId;
+                buf.inlineCacheRestoreEpoch = restoreEpoch;
             }
-            const bool sharedMismatch =
+            const bool sharedPolyMismatch =
                 (scratch.sharedMirrorId != mirrorId ||
-                 scratch.sharedPolyCallCache.size() != polyCount ||
-                 scratch.sharedDelegateCallCache.size() != delCount);
+                 scratch.sharedPolyCallCache.size() != polyCount);
+            const bool sharedDelegateMismatch =
+                (sharedPolyMismatch ||
+                 scratch.sharedDelegateCallCache.size() != delCount ||
+                 scratch.sharedDelegateHeapId != heapId ||
+                 scratch.sharedDelegateRestoreEpoch != restoreEpoch);
             if (depthBefore == 0) {
-                if (sharedMismatch) {
+                if (sharedPolyMismatch) {
                     scratch.sharedPolyCallCache.assign(polyCount, PolymorphicPicSite{});
-                    scratch.sharedDelegateCallCache.assign(delCount, DelegateCallSiteCache{});
                     scratch.sharedMirrorId = mirrorId;
+                }
+                if (sharedDelegateMismatch) {
+                    scratch.sharedDelegateCallCache.assign(delCount, DelegateCallSiteCache{});
+                    scratch.sharedDelegateHeapId = heapId;
+                    scratch.sharedDelegateRestoreEpoch = restoreEpoch;
                 }
                 state.inlineCallCache = &buf.inlineCallCache;
                 state.polyCallCache = &scratch.sharedPolyCallCache;
                 state.delegateCallCache = &scratch.sharedDelegateCallCache;
-            } else if (!sharedMismatch) {
+            } else if (!sharedDelegateMismatch) {
                 state.inlineCallCache = &buf.inlineCallCache;
                 state.polyCallCache = &scratch.sharedPolyCallCache;
                 state.delegateCallCache = &scratch.sharedDelegateCallCache;
@@ -379,8 +392,10 @@ void Interpreter::installValueLifecycleHooks(
 
             heap->registerValueLifecycleType(ts.id);
 
+            const auto* primaryType = program->resolveType(ts.id);
+            const auto& typeForMethods = primaryType ? *primaryType : ts;
             semantic::SymbolId disposeId = 0;
-            for (const auto& m : ts.methods) {
+            for (const auto& m : typeForMethods.methods) {
                 // Non-static struct methods may include an implicit `this` entry in `m.parameters`.
                 if (m.staticMethod || m.parameters.size() > 1u || m.id == 0) {
                     continue;
@@ -557,18 +572,16 @@ Interpreter::Interpreter(
     : program_(std::move(program)),
       bindings_(std::move(bindings)),
       heap_(heap ? std::move(heap) : std::make_shared<ManagedHeap>()),
-      asyncRuntime_(std::move(asyncRuntime)) {
-    if (!asyncRuntime_) {
-        asyncRuntime_ = std::make_shared<AsyncRuntimeContext>(heap_.get());
-    }
-    if (heap_ && asyncRuntime_->awaitables().heap() == nullptr) {
+      asyncRuntime_(std::move(asyncRuntime)),
+      hasExplicitAsyncRuntime_(asyncRuntime_ != nullptr) {
+    if (asyncRuntime_ && heap_ && asyncRuntime_->awaitables().heap() == nullptr) {
         asyncRuntime_->setHeap(heap_.get());
     }
 }
 
 Interpreter::Interpreter(std::vector<bytecode::Module> modules)
     : heap_(std::make_shared<ManagedHeap>()),
-      asyncRuntime_(std::make_shared<AsyncRuntimeContext>(heap_.get())),
+      asyncRuntime_(nullptr),
       dispatchTarget_(std::make_shared<DispatchTarget>(this)) {
     auto linked = ProgramImage::link(std::move(modules), programError_);
     if (linked) {
@@ -586,7 +599,7 @@ Interpreter::Interpreter(
     std::shared_ptr<ManagedHeap> heap)
     : program_(std::move(program)),
       heap_(heap ? std::move(heap) : std::make_shared<ManagedHeap>()),
-      asyncRuntime_(std::make_shared<AsyncRuntimeContext>(heap_.get())),
+      asyncRuntime_(nullptr),
       dispatchTarget_(std::make_shared<DispatchTarget>(this)) {
     if (!program_) {
         programError_.code = ErrorCode::InvalidProgram;
@@ -609,8 +622,13 @@ Interpreter::Interpreter(const Interpreter& other)
       externalResolver_(other.externalResolver_),
       bindings_(other.bindings_),
       heap_(other.heap_),
-      asyncRuntime_(other.asyncRuntime_),
+      executionPolicy_(other.executionPolicy_),
+      hasExplicitAsyncRuntime_(other.hasExplicitAsyncRuntime_.load(std::memory_order_acquire)),
       dispatchTarget_(std::make_shared<DispatchTarget>(this)) {
+    {
+        std::lock_guard<std::mutex> lock(other.runtimeStateMutex_);
+        asyncRuntime_ = other.asyncRuntime_;
+    }
     registerValueLifecycleHooks();
 }
 
@@ -621,13 +639,25 @@ Interpreter& Interpreter::operator=(const Interpreter& other) {
     if (dispatchTarget_) {
         dispatchTarget_->detachSweepHandler(true);
     }
-    program_ = other.program_;
-    programError_ = other.programError_;
-    externalResolver_ = other.externalResolver_;
-    bindings_ = other.bindings_;
-    heap_ = other.heap_;
-    asyncRuntime_ = other.asyncRuntime_;
-    resumeEnv_.reset();
+    std::shared_ptr<AsyncRuntimeContext> copiedAsync;
+    {
+        std::lock_guard<std::mutex> otherLock(other.runtimeStateMutex_);
+        copiedAsync = other.asyncRuntime_;
+    }
+    {
+        std::lock_guard<std::mutex> selfLock(runtimeStateMutex_);
+        program_ = other.program_;
+        programError_ = other.programError_;
+        externalResolver_ = other.externalResolver_;
+        bindings_ = other.bindings_;
+        heap_ = other.heap_;
+        executionPolicy_ = other.executionPolicy_;
+        asyncRuntime_ = std::move(copiedAsync);
+        hasExplicitAsyncRuntime_.store(
+            other.hasExplicitAsyncRuntime_.load(std::memory_order_acquire),
+            std::memory_order_release);
+        resumeEnv_.reset();
+    }
     dispatchTarget_ = std::make_shared<DispatchTarget>(this);
     registerValueLifecycleHooks();
     return *this;
@@ -639,7 +669,9 @@ Interpreter::Interpreter(Interpreter&& other) noexcept
       externalResolver_(std::move(other.externalResolver_)),
       bindings_(std::move(other.bindings_)),
       heap_(std::move(other.heap_)),
+      executionPolicy_(other.executionPolicy_),
       asyncRuntime_(std::move(other.asyncRuntime_)),
+      hasExplicitAsyncRuntime_(other.hasExplicitAsyncRuntime_.load(std::memory_order_acquire)),
       resumeEnv_(std::move(other.resumeEnv_)),
       dispatchTarget_(std::move(other.dispatchTarget_)) {
     if (dispatchTarget_) {
@@ -660,7 +692,11 @@ Interpreter& Interpreter::operator=(Interpreter&& other) noexcept {
     externalResolver_ = std::move(other.externalResolver_);
     bindings_ = std::move(other.bindings_);
     heap_ = std::move(other.heap_);
+    executionPolicy_ = other.executionPolicy_;
     asyncRuntime_ = std::move(other.asyncRuntime_);
+    hasExplicitAsyncRuntime_.store(
+        other.hasExplicitAsyncRuntime_.load(std::memory_order_acquire),
+        std::memory_order_release);
     resumeEnv_ = std::move(other.resumeEnv_);
     dispatchTarget_ = std::move(other.dispatchTarget_);
     if (dispatchTarget_) {
@@ -672,6 +708,7 @@ Interpreter& Interpreter::operator=(Interpreter&& other) noexcept {
 
 void Interpreter::setExternalResolver(ExternalFunction resolver) {
     externalResolver_ = std::move(resolver);
+    std::lock_guard<std::mutex> lock(runtimeStateMutex_);
     resumeEnv_.reset();
 }
 
@@ -684,6 +721,7 @@ void Interpreter::setHeap(std::shared_ptr<ManagedHeap> heap) {
         heap_->registerTypeHierarchy(*program_);
         registerValueLifecycleHooks();
     }
+    std::lock_guard<std::mutex> lock(runtimeStateMutex_);
     if (asyncRuntime_) asyncRuntime_->setHeap(heap_.get());
     resumeEnv_.reset();
 }
@@ -692,6 +730,8 @@ std::shared_ptr<ManagedHeap> Interpreter::heap() const noexcept { return heap_; 
 
 void Interpreter::setExecutionPolicy(IExecutionPolicy* policy) noexcept {
     executionPolicy_ = policy;
+    std::lock_guard<std::mutex> lock(runtimeStateMutex_);
+    resumeEnv_.reset();
 }
 
 IExecutionPolicy* Interpreter::executionPolicy() const noexcept {
@@ -699,20 +739,27 @@ IExecutionPolicy* Interpreter::executionPolicy() const noexcept {
 }
 
 void Interpreter::setAsyncRuntime(std::shared_ptr<AsyncRuntimeContext> asyncRuntime) {
-    asyncRuntime_ = asyncRuntime
-        ? std::move(asyncRuntime)
-        : std::make_shared<AsyncRuntimeContext>(heap_.get());
-    if (heap_ && asyncRuntime_->awaitables().heap() == nullptr) {
+    std::lock_guard<std::mutex> lock(runtimeStateMutex_);
+    asyncRuntime_ = std::move(asyncRuntime);
+    hasExplicitAsyncRuntime_.store(asyncRuntime_ != nullptr, std::memory_order_release);
+    if (asyncRuntime_ && heap_ && asyncRuntime_->awaitables().heap() == nullptr) {
         asyncRuntime_->setHeap(heap_.get());
     }
+    resumeEnv_.reset();
 }
 
 std::shared_ptr<AsyncRuntimeContext> Interpreter::asyncRuntime() const noexcept {
+    std::lock_guard<std::mutex> lock(runtimeStateMutex_);
+    if (!asyncRuntime_) {
+        asyncRuntime_ = std::make_shared<AsyncRuntimeContext>(heap_.get());
+    }
+    hasExplicitAsyncRuntime_.store(true, std::memory_order_release);
     return asyncRuntime_;
 }
 
 void Interpreter::setBindingRegistry(std::shared_ptr<const BindingRegistry> bindings) {
     bindings_ = std::move(bindings);
+    std::lock_guard<std::mutex> lock(runtimeStateMutex_);
     resumeEnv_.reset();
 }
 
@@ -744,7 +791,10 @@ ExecutionResult Interpreter::invoke(
         missing.error.message = "entry function was not found";
         return missing;
     }
-    if (asyncRuntime_ != nullptr) {
+    if (activeMirror.hasAsyncOperations ||
+        (foundExec != nullptr && foundExec->isAsyncFunction) ||
+        hasExplicitAsyncRuntime_.load(std::memory_order_acquire)) {
+        (void)asyncRuntime();
         ExecutionOptions options;
         options.limits = limits;
         return invoke(symbolId, arguments, std::move(options));
@@ -874,27 +924,55 @@ ExecutionResult Interpreter::invoke(
         }
     }
     state.enforceCapabilities = options.determinism.enforceCapabilities;
+    IExecutionPolicy* const effPolicy = options.executionPolicy
+        ? options.executionPolicy
+        : executionPolicy_;
     const bool needsResumeEnv =
-        (asyncRuntime_ != nullptr || options.awaitScheduler != nullptr);
+        activeMirror.hasAsyncOperations ||
+        (foundExec != nullptr && foundExec->isAsyncFunction) ||
+        options.awaitScheduler != nullptr ||
+        hasExplicitAsyncRuntime_.load(std::memory_order_acquire);
+    std::shared_ptr<AsyncRuntimeContext> activeAsyncRt;
     std::shared_ptr<const void> resumeOwnerRef;
-    if (needsResumeEnv) {
-        if (!resumeEnv_ ||
-            static_cast<const InterpreterResumeEnv*>(resumeEnv_.get())->options.awaitScheduler !=
-                options.awaitScheduler) {
-            auto env = std::make_shared<InterpreterResumeEnv>();
-            env->program = program_;
-            env->heap = heap_;
-            env->bindings = bindings_;
-            env->externalResolver = externalResolver_;
-            env->options = options;
-            env->asyncRuntimeWeak = asyncRuntime_;
-            resumeEnv_ = env;
-        } else {
-            auto* env = static_cast<InterpreterResumeEnv*>(resumeEnv_.get());
-            env->options = options;
-            env->asyncRuntimeWeak = asyncRuntime_;
+    {
+        std::lock_guard<std::mutex> lock(runtimeStateMutex_);
+        if (needsResumeEnv && !asyncRuntime_) {
+            asyncRuntime_ = std::make_shared<AsyncRuntimeContext>(heap_.get());
         }
-        resumeOwnerRef = resumeEnv_;
+        activeAsyncRt = asyncRuntime_;
+        if (needsResumeEnv) {
+            const auto* existingEnv = static_cast<const InterpreterResumeEnv*>(resumeEnv_.get());
+            const bool canReuseEnv =
+                existingEnv != nullptr &&
+                existingEnv->program == program_ &&
+                existingEnv->heap == heap_ &&
+                existingEnv->bindings == bindings_ &&
+                existingEnv->options.awaitScheduler == options.awaitScheduler &&
+                existingEnv->options.executionPolicy == effPolicy &&
+                existingEnv->options.crossHeapPolicy == options.crossHeapPolicy &&
+                existingEnv->options.limits.instructionBudget == options.limits.instructionBudget &&
+                existingEnv->options.limits.recursionLimit == options.limits.recursionLimit &&
+                existingEnv->options.limits.gcWorkBudget == options.limits.gcWorkBudget &&
+                existingEnv->options.debugger == options.debugger &&
+                existingEnv->options.profile == options.profile &&
+                !static_cast<bool>(existingEnv->options.trace) &&
+                !static_cast<bool>(options.trace) &&
+                existingEnv->options.determinism.mode == DeterminismMode::Off &&
+                options.determinism.mode == DeterminismMode::Off &&
+                existingEnv->asyncRuntimeWeak.lock() == activeAsyncRt;
+            if (!canReuseEnv) {
+                auto env = std::make_shared<InterpreterResumeEnv>();
+                env->program = program_;
+                env->heap = heap_;
+                env->bindings = bindings_;
+                env->externalResolver = externalResolver_;
+                env->options = options;
+                env->options.executionPolicy = effPolicy;
+                env->asyncRuntimeWeak = activeAsyncRt;
+                resumeEnv_ = std::move(env);
+            }
+            resumeOwnerRef = resumeEnv_;
+        }
     }
     state.determinism.emplace(std::move(options.determinism));
     state.heap = heap_.get();
@@ -904,20 +982,14 @@ ExecutionResult Interpreter::invoke(
             ? state.heap->valuePoolDomain()->domainId()
             : 0u);
     state.debugger = options.debugger.get();
-    state.asyncRuntime = asyncRuntime_.get();
+    state.asyncRuntime = activeAsyncRt.get();
     state.awaitScheduler = options.awaitScheduler;
     state.crossHeapPolicy = options.crossHeapPolicy;
-    state.executionPolicy = options.executionPolicy
-        ? options.executionPolicy
-        : executionPolicy_;
-    if (needsResumeEnv && resumeEnv_) {
-        static_cast<InterpreterResumeEnv*>(resumeEnv_.get())->options.executionPolicy =
-            state.executionPolicy;
-    }
+    state.executionPolicy = effPolicy;
     if (state.asyncRuntime && state.heap && state.asyncRuntime->awaitables().heap() == nullptr) {
         state.asyncRuntime->setHeap(state.heap);
     }
-    state.resumeEnvRaw = needsResumeEnv ? resumeEnv_.get() : nullptr;
+    state.resumeEnvRaw = needsResumeEnv ? const_cast<void*>(resumeOwnerRef.get()) : nullptr;
     state.resumeEnvOwner = needsResumeEnv ? &resumeOwnerRef : nullptr;
     void* const prevAsyncBridge = state.asyncRuntime
         ? state.asyncRuntime->activeInterpreterState()

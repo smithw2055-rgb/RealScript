@@ -272,6 +272,18 @@ void collectUnboxableCustomStructs(
     }
 }
 
+[[nodiscard]] bool isValueLifecycleAttrName(std::string_view attrName) noexcept {
+    if (attrName == "ValueLifecycle" || attrName == "ValueLifecycleAttribute") {
+        return true;
+    }
+    const auto sep = attrName.rfind("::");
+    if (sep != std::string_view::npos) {
+        const auto tail = attrName.substr(sep + 2);
+        return tail == "ValueLifecycle" || tail == "ValueLifecycleAttribute";
+    }
+    return false;
+}
+
 struct AttributedFunctionFilter {
     std::unordered_set<std::string> exactAttrTargets;
     std::unordered_set<std::string> methodOrFnAttrStems;
@@ -280,7 +292,9 @@ struct AttributedFunctionFilter {
     void populate(const std::vector<mir::Module>& modules) {
         for (const auto& module : modules) {
             for (const auto& attr : module.languageMetadata.attributes) {
-                if (attr.target.empty()) continue;
+                if (attr.target.empty() || !isValueLifecycleAttrName(attr.name)) {
+                    continue;
+                }
                 exactAttrTargets.insert(attr.target);
                 if (const auto hashPos = attr.target.find('#');
                     hashPos != std::string::npos) {
@@ -489,17 +503,6 @@ GeneratedProgram CppGenerator::generate(
     std::map<semantic::SymbolId, TypeView> types;
     std::set<std::string> lifecycleTargets;
     std::set<semantic::SymbolId> symbols;
-    const auto isValueLifecycleAttrName = [](std::string_view attrName) noexcept {
-        if (attrName == "ValueLifecycle" || attrName == "ValueLifecycleAttribute") {
-            return true;
-        }
-        const auto sep = attrName.rfind("::");
-        if (sep != std::string_view::npos) {
-            const auto tail = attrName.substr(sep + 2);
-            return tail == "ValueLifecycle" || tail == "ValueLifecycleAttribute";
-        }
-        return false;
-    };
     for (const auto& module : modules) {
         for (const auto& attr : module.languageMetadata.attributes) {
             if (isValueLifecycleAttrName(attr.name) && !attr.target.empty()) {
@@ -594,10 +597,12 @@ GeneratedProgram CppGenerator::generate(
     }
 
     Emitter source;
+    source.line("#define REALSCRIPT_AOT_GENERATED_TU 1");
     if (!usesAsyncRuntimeInlines) {
         source.line("#define REALSCRIPT_AOT_NO_ASYNC_INLINES 1");
     }
     source.line("#include \"realscript_aot_generated.h\"");
+    source.line("#undef REALSCRIPT_AOT_GENERATED_TU");
     source.line();
     source.line("#include <array>");
     source.line("#include <limits>");
@@ -756,13 +761,17 @@ GeneratedProgram CppGenerator::generate(
         }
         structGcSlotCounts[type.id] = gcSlots;
         const std::string structName = "AotStruct_" + hexId(type.id);
+        source.line("#if defined(_MSC_VER)");
+        source.line("#pragma warning(push)");
+        source.line("#pragma warning(disable : 4324)");
+        source.line("#endif");
         source.line("struct " + structName + " {");
         source.line("    // RealScript struct: " + semantic::canonicalTypeName(type));
         source.line("    static constexpr bool kIsGeneratedAotStruct = true;");
         source.line("    static constexpr semantic::SymbolId kTypeId = 0x" + hexId(type.id) + "ULL;");
         source.line("    static constexpr std::size_t kFieldCount = " + std::to_string(type.fields.size()) + "u;");
         source.line("    static constexpr std::size_t kGcSlotCount = " + std::to_string(gcSlots) + "u;");
-        source.line("    static void retainGcSlots(runtime::ManagedHeap* rawH, runtime::PersistentRoot*& slotCursor, const " + structName + "& val) {");
+        source.line("    static void retainGcSlots(runtime::ManagedHeap* rawH, runtime::Value*& slotCursor, const " + structName + "& val) {");
         if (gcSlots == 0) {
             source.line("        (void)rawH; (void)slotCursor; (void)val;");
         } else {
@@ -787,8 +796,14 @@ GeneratedProgram CppGenerator::generate(
             const auto& field = type.fields[i];
             const auto fTypeId = exactTypeId(field.type, field.typeName);
             const TypedSlotType fSlot{field.type, fTypeId};
-            source.line("    " + typedCppType(fSlot) + " f_" + std::to_string(i) +
-                " = " + typedDefaultValue(fSlot) + "; // " + field.name);
+            const std::string fieldCppType = (field.type == semantic::PrimitiveType::Int)
+                ? std::string("std::int32_t")
+                : typedCppType(fSlot);
+            const std::string fieldDefault = (field.type == semantic::PrimitiveType::Int)
+                ? std::string("std::int32_t{0}")
+                : typedDefaultValue(fSlot);
+            source.line("    " + fieldCppType + " f_" + std::to_string(i) +
+                " = " + fieldDefault + "; // " + field.name);
         }
         std::string eqExpr = "true";
         for (std::size_t i = 0; i < type.fields.size(); ++i) {
@@ -925,6 +940,9 @@ GeneratedProgram CppGenerator::generate(
         }
         source.line("    }");
         source.line("};");
+        source.line("#if defined(_MSC_VER)");
+        source.line("#pragma warning(pop)");
+        source.line("#endif");
         source.line("static constexpr aot::GeneratedFieldLayout " + structName + "_layout[] = {");
         for (std::size_t i = 0; i < type.fields.size(); ++i) {
             const auto& field = type.fields[i];
@@ -932,11 +950,11 @@ GeneratedProgram CppGenerator::generate(
             std::string expectedKind = "runtime::NativeFieldKind::Int64";
             switch (field.type) {
             case semantic::PrimitiveType::Bool: expectedKind = "runtime::NativeFieldKind::Bool"; break;
+            case semantic::PrimitiveType::Int: expectedKind = "runtime::NativeFieldKind::Int32"; break;
             case semantic::PrimitiveType::SByte:
             case semantic::PrimitiveType::Byte:
             case semantic::PrimitiveType::Short:
             case semantic::PrimitiveType::UShort:
-            case semantic::PrimitiveType::Int:
             case semantic::PrimitiveType::UInt:
             case semantic::PrimitiveType::Long: expectedKind = "runtime::NativeFieldKind::Int64"; break;
             case semantic::PrimitiveType::ULong: expectedKind = "runtime::NativeFieldKind::UInt64"; break;
@@ -1605,6 +1623,11 @@ GeneratedProgram CppGenerator::generate(
                             source.line("            " + resExpr +
                                 " = runtime::LongValue{" +
                                 int64Literal(instruction.integerImmediate) + "};");
+                        } else if (instruction.resultType == semantic::PrimitiveType::ULong) {
+                            source.line("            " + resExpr +
+                                " = runtime::ULongValue{std::uint64_t{" +
+                                std::to_string(static_cast<std::uint64_t>(instruction.integerImmediate)) +
+                                "ULL}};");
                         } else if (instruction.resultType == semantic::PrimitiveType::Enum) {
                             const auto enumTidExpr = nextSpecTypeExpr();
                             source.line("            " + resExpr +
@@ -2308,6 +2331,11 @@ GeneratedProgram CppGenerator::generate(
                         source.line("            " + result +
                             " = runtime::LongValue{" +
                             int64Literal(instruction.integerImmediate) + "};");
+                    } else if (instruction.resultType == semantic::PrimitiveType::ULong) {
+                        source.line("            " + result +
+                            " = runtime::ULongValue{std::uint64_t{" +
+                            std::to_string(static_cast<std::uint64_t>(instruction.integerImmediate)) +
+                            "ULL}};");
                     } else if (instruction.resultType == semantic::PrimitiveType::Enum) {
                         source.line("            " + result +
                             " = runtime::EnumValue{0x" +

@@ -110,17 +110,18 @@ private:
 
 class Reader {
 public:
-    Reader(const std::vector<std::uint8_t>& data, std::size_t begin, std::size_t size) noexcept {
-        if (begin > data.size() || size > data.size() - begin) {
+    Reader(const std::uint8_t* base, std::size_t totalSize, std::size_t begin, std::size_t size) noexcept {
+        if ((!base && (begin != 0u || size != 0u)) || begin > totalSize || size > totalSize - begin) {
             valid_ = false;
             ptr_ = nullptr;
             end_ = nullptr;
         } else {
-            const std::uint8_t* base = data.data();
             ptr_ = base ? (base + begin) : nullptr;
             end_ = base ? (base + begin + size) : nullptr;
         }
     }
+    Reader(const std::vector<std::uint8_t>& data, std::size_t begin, std::size_t size) noexcept
+        : Reader(data.data(), data.size(), begin, size) {}
     [[nodiscard]] bool valid() const noexcept { return valid_; }
     [[nodiscard]] bool empty() const noexcept { return ptr_ == end_; }
     [[nodiscard]] std::size_t remaining() const noexcept {
@@ -1319,13 +1320,21 @@ bool decodeModule(
     const std::vector<std::uint8_t>& bytes,
     Module& module,
     diagnostics::DiagnosticBag& diagnostics) {
+    return decodeModule(bytes.data(), bytes.size(), module, diagnostics);
+}
+
+bool decodeModule(
+    const std::uint8_t* data,
+    std::size_t dataSize,
+    Module& module,
+    diagnostics::DiagnosticBag& diagnostics) {
     module = {};
-    if (bytes.size() < 16) {
+    if (!data || dataSize < 16) {
         diagnostics.report("RS5003", "truncated bytecode header", {});
         return false;
     }
 
-    Reader header(bytes, 0, bytes.size());
+    Reader header(data, dataSize, 0, dataSize);
     if (header.string(4) != "RSBC") {
         diagnostics.report("RS5000", "invalid bytecode magic", {});
         return false;
@@ -1360,8 +1369,8 @@ bool decodeModule(
         entry.kind = header.u32();
         entry.offset = header.u32();
         entry.size = header.u32();
-        if (!header.valid() || entry.offset > bytes.size() ||
-            entry.size > bytes.size() - entry.offset ||
+        if (!header.valid() || entry.offset > dataSize ||
+            entry.size > dataSize - entry.offset ||
             !sections.emplace(entry.kind, entry).second) {
             diagnostics.report("RS5002", "invalid bytecode section directory", {});
             return false;
@@ -1413,7 +1422,7 @@ bool decodeModule(
     std::vector<std::string> strings;
     {
         const auto section = sections.at(SectionStrings);
-        Reader reader(bytes, section.offset, section.size);
+        Reader reader(data, dataSize, section.offset, section.size);
         const auto count = reader.u32();
         if (!reader.valid() || count > reader.remaining() / 4) {
             diagnostics.report("RS5003", "truncated string section", {});
@@ -1453,7 +1462,7 @@ bool decodeModule(
 
     {
         const auto section = sections.at(SectionMetadata);
-        Reader reader(bytes, section.offset, section.size);
+        Reader reader(data, dataSize, section.offset, section.size);
         const auto readStringValue = [&](std::string& value,
                                          const char* message) -> bool {
             const auto index = reader.u32();
@@ -1729,7 +1738,7 @@ bool decodeModule(
 
     {
         const auto section = sections.at(SectionTypes);
-        Reader reader(bytes, section.offset, section.size);
+        Reader reader(data, dataSize, section.offset, section.size);
         const auto count = reader.u32();
         if (!reader.valid() || count > reader.remaining() / 24 + 1) {
             diagnostics.report("RS5003", "truncated type descriptor section", {});
@@ -1834,7 +1843,7 @@ bool decodeModule(
 
     {
         const auto section = sections.at(SectionReferences);
-        Reader reader(bytes, section.offset, section.size);
+        Reader reader(data, dataSize, section.offset, section.size);
         const auto count = reader.u32();
         if (!reader.valid() || count > reader.remaining() / 17) {
             diagnostics.report("RS5003", "truncated function reference section", {});
@@ -1868,7 +1877,7 @@ bool decodeModule(
 
     if (hasObjectModelSection(module.version)) {
         const auto section = sections.at(SectionObjectModel);
-        Reader reader(bytes, section.offset, section.size);
+        Reader reader(data, dataSize, section.offset, section.size);
         const auto typeCount = reader.u32();
         if (!reader.valid() || typeCount != module.types.size()) {
             diagnostics.report(
@@ -2129,7 +2138,7 @@ bool decodeModule(
     std::vector<FunctionRecord> records;
     {
         const auto section = sections.at(SectionFunctions);
-        Reader reader(bytes, section.offset, section.size);
+        Reader reader(data, dataSize, section.offset, section.size);
         const auto count = reader.u32();
         if (!reader.valid() || count > reader.remaining() / 33) {
             diagnostics.report("RS5003", "truncated function metadata section", {});
@@ -2191,7 +2200,11 @@ bool decodeModule(
 
     module.functions.reserve(records.size());
     for (auto& record : records) {
-        Reader reader(bytes, codeSection.offset + record.codeOffset, record.codeSize);
+        Reader reader(
+            data,
+            dataSize,
+            static_cast<std::size_t>(codeSection.offset) + static_cast<std::size_t>(record.codeOffset),
+            record.codeSize);
         const auto blockCount = reader.u32();
         if (!reader.valid() || blockCount > reader.remaining() / 37 + 1) {
             diagnostics.report("RS5003", "invalid bytecode block count", {});
@@ -2352,7 +2365,7 @@ bool decodeModule(
 
     {
         const auto section = sections.at(SectionDebug);
-        Reader reader(bytes, section.offset, section.size);
+        Reader reader(data, dataSize, section.offset, section.size);
         const auto sourceCount = reader.u32();
         if (!reader.valid() || sourceCount > reader.remaining() / 20 + 1) {
             diagnostics.report("RS5003", "invalid debug source-file count", {});

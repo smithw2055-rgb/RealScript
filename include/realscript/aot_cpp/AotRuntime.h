@@ -125,108 +125,6 @@ struct TypedStructArrayCache {
     return aEnd <= bStart || bEnd <= aStart;
 }
 
-template <typename UnaryFn>
-inline void simdTransformPackedInt32(
-    std::int32_t* RS_AOT_RESTRICT dst,
-    const std::int32_t* RS_AOT_RESTRICT src,
-    std::size_t count,
-    UnaryFn&& op) noexcept {
-    RS_AOT_PRAGMA_SIMD_LOOP
-    for (std::size_t i = 0; i < count; ++i) {
-        dst[i] = op(src[i]);
-    }
-}
-
-template <typename BinaryFn>
-inline void simdZipPackedInt32(
-    std::int32_t* RS_AOT_RESTRICT dst,
-    const std::int32_t* RS_AOT_RESTRICT lhs,
-    const std::int32_t* RS_AOT_RESTRICT rhs,
-    std::size_t count,
-    BinaryFn&& op) noexcept {
-    RS_AOT_PRAGMA_SIMD_LOOP
-    for (std::size_t i = 0; i < count; ++i) {
-        dst[i] = op(lhs[i], rhs[i]);
-    }
-}
-
-inline void simdFmaPackedInt32(
-    std::int32_t* RS_AOT_RESTRICT dst,
-    const std::int32_t* RS_AOT_RESTRICT x,
-    const std::int32_t* RS_AOT_RESTRICT y,
-    std::size_t count,
-    std::int32_t alpha) noexcept {
-    const auto uAlpha = static_cast<std::uint32_t>(alpha);
-    RS_AOT_PRAGMA_SIMD_LOOP
-    for (std::size_t i = 0; i < count; ++i) {
-        const auto prod = uAlpha * static_cast<std::uint32_t>(x[i]);
-        dst[i] = static_cast<std::int32_t>(prod + static_cast<std::uint32_t>(y[i]));
-    }
-}
-
-inline void simdScaleBiasPackedInt32(
-    std::int32_t* RS_AOT_RESTRICT dst,
-    const std::int32_t* RS_AOT_RESTRICT src,
-    std::size_t count,
-    std::int32_t scale,
-    std::int32_t bias) noexcept {
-    const auto uScale = static_cast<std::uint32_t>(scale);
-    const auto uBias = static_cast<std::uint32_t>(bias);
-    RS_AOT_PRAGMA_SIMD_LOOP
-    for (std::size_t i = 0; i < count; ++i) {
-        dst[i] = static_cast<std::int32_t>(uScale * static_cast<std::uint32_t>(src[i]) + uBias);
-    }
-}
-
-template <typename UnaryFn>
-inline void simdTransformPackedDouble(
-    double* RS_AOT_RESTRICT dst,
-    const double* RS_AOT_RESTRICT src,
-    std::size_t count,
-    UnaryFn&& op) noexcept {
-    RS_AOT_PRAGMA_SIMD_LOOP
-    for (std::size_t i = 0; i < count; ++i) {
-        dst[i] = op(src[i]);
-    }
-}
-
-template <typename BinaryFn>
-inline void simdZipPackedDouble(
-    double* RS_AOT_RESTRICT dst,
-    const double* RS_AOT_RESTRICT lhs,
-    const double* RS_AOT_RESTRICT rhs,
-    std::size_t count,
-    BinaryFn&& op) noexcept {
-    RS_AOT_PRAGMA_SIMD_LOOP
-    for (std::size_t i = 0; i < count; ++i) {
-        dst[i] = op(lhs[i], rhs[i]);
-    }
-}
-
-inline void simdFmaPackedDouble(
-    double* RS_AOT_RESTRICT dst,
-    const double* RS_AOT_RESTRICT x,
-    const double* RS_AOT_RESTRICT y,
-    std::size_t count,
-    double alpha) noexcept {
-    RS_AOT_PRAGMA_SIMD_LOOP
-    for (std::size_t i = 0; i < count; ++i) {
-        dst[i] = alpha * x[i] + y[i];
-    }
-}
-
-inline void simdScaleBiasPackedDouble(
-    double* RS_AOT_RESTRICT dst,
-    const double* RS_AOT_RESTRICT src,
-    std::size_t count,
-    double scale,
-    double bias) noexcept {
-    RS_AOT_PRAGMA_SIMD_LOOP
-    for (std::size_t i = 0; i < count; ++i) {
-        dst[i] = src[i] * scale + bias;
-    }
-}
-
 template <typename FieldT>
 [[nodiscard]] inline FieldT readRawColumnField(
     const std::uint8_t* elemBase,
@@ -291,6 +189,97 @@ template <typename FieldT>
             std::int32_t i32 = 0;
             std::memcpy(&i32, ptr, sizeof(i32));
             return static_cast<std::int64_t>(i32);
+        }
+        }
+    } else if constexpr (std::is_same_v<FieldT, std::int32_t>) {
+        if (RS_AOT_LIKELY(field.kind == runtime::NativeFieldKind::Int32)) {
+            std::int32_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return v;
+        }
+        switch (field.kind) {
+        case runtime::NativeFieldKind::Int8: {
+            std::int8_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return static_cast<std::int32_t>(v);
+        }
+        case runtime::NativeFieldKind::UInt8: {
+            std::uint8_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return static_cast<std::int32_t>(v);
+        }
+        case runtime::NativeFieldKind::Int16: {
+            std::int16_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return static_cast<std::int32_t>(v);
+        }
+        case runtime::NativeFieldKind::UInt16: {
+            std::uint16_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return static_cast<std::int32_t>(v);
+        }
+        case runtime::NativeFieldKind::UInt32: {
+            std::uint32_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return static_cast<std::int32_t>(v);
+        }
+        case runtime::NativeFieldKind::Int64: {
+            std::int64_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return static_cast<std::int32_t>(v);
+        }
+        case runtime::NativeFieldKind::UInt64: {
+            std::uint64_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return static_cast<std::int32_t>(v);
+        }
+        default: {
+            std::int32_t i32 = 0;
+            std::memcpy(&i32, ptr, sizeof(i32));
+            return i32;
+        }
+        }
+    } else if constexpr (std::is_same_v<FieldT, std::uint64_t>) {
+        if (RS_AOT_LIKELY(field.kind == runtime::NativeFieldKind::UInt64)) {
+            std::uint64_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return v;
+        }
+        switch (field.kind) {
+        case runtime::NativeFieldKind::Int8: {
+            std::int8_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return static_cast<std::uint64_t>(static_cast<std::int64_t>(v));
+        }
+        case runtime::NativeFieldKind::UInt8: {
+            std::uint8_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return static_cast<std::uint64_t>(v);
+        }
+        case runtime::NativeFieldKind::Int16: {
+            std::int16_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return static_cast<std::uint64_t>(static_cast<std::int64_t>(v));
+        }
+        case runtime::NativeFieldKind::UInt16: {
+            std::uint16_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return static_cast<std::uint64_t>(v);
+        }
+        case runtime::NativeFieldKind::Int32: {
+            std::int32_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return static_cast<std::uint64_t>(static_cast<std::int64_t>(v));
+        }
+        case runtime::NativeFieldKind::UInt32: {
+            std::uint32_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            return static_cast<std::uint64_t>(v);
+        }
+        default: {
+            std::int64_t i64 = 0;
+            std::memcpy(&i64, ptr, sizeof(i64));
+            return static_cast<std::uint64_t>(i64);
         }
         }
     } else if constexpr (std::is_same_v<FieldT, runtime::Fixed16Value>) {
@@ -363,6 +352,94 @@ inline void writeRawColumnField(
         default: {
             const std::int32_t i32 = static_cast<std::int32_t>(value);
             std::memcpy(ptr, &i32, sizeof(i32));
+            return;
+        }
+        }
+    } else if constexpr (std::is_same_v<FieldT, std::int32_t>) {
+        if (RS_AOT_LIKELY(field.kind == runtime::NativeFieldKind::Int32)) {
+            std::memcpy(ptr, &value, sizeof(value));
+            return;
+        }
+        switch (field.kind) {
+        case runtime::NativeFieldKind::Int8: {
+            const auto v = static_cast<std::int8_t>(value);
+            std::memcpy(ptr, &v, sizeof(v));
+            return;
+        }
+        case runtime::NativeFieldKind::UInt8: {
+            const auto v = static_cast<std::uint8_t>(value);
+            std::memcpy(ptr, &v, sizeof(v));
+            return;
+        }
+        case runtime::NativeFieldKind::Int16: {
+            const auto v = static_cast<std::int16_t>(value);
+            std::memcpy(ptr, &v, sizeof(v));
+            return;
+        }
+        case runtime::NativeFieldKind::UInt16: {
+            const auto v = static_cast<std::uint16_t>(value);
+            std::memcpy(ptr, &v, sizeof(v));
+            return;
+        }
+        case runtime::NativeFieldKind::UInt32: {
+            const auto v = static_cast<std::uint32_t>(value);
+            std::memcpy(ptr, &v, sizeof(v));
+            return;
+        }
+        case runtime::NativeFieldKind::Int64: {
+            const auto v = static_cast<std::int64_t>(value);
+            std::memcpy(ptr, &v, sizeof(v));
+            return;
+        }
+        case runtime::NativeFieldKind::UInt64: {
+            const auto v = static_cast<std::uint64_t>(static_cast<std::int64_t>(value));
+            std::memcpy(ptr, &v, sizeof(v));
+            return;
+        }
+        default: {
+            std::memcpy(ptr, &value, sizeof(value));
+            return;
+        }
+        }
+    } else if constexpr (std::is_same_v<FieldT, std::uint64_t>) {
+        if (RS_AOT_LIKELY(field.kind == runtime::NativeFieldKind::UInt64)) {
+            std::memcpy(ptr, &value, sizeof(value));
+            return;
+        }
+        switch (field.kind) {
+        case runtime::NativeFieldKind::Int8: {
+            const auto v = static_cast<std::int8_t>(value);
+            std::memcpy(ptr, &v, sizeof(v));
+            return;
+        }
+        case runtime::NativeFieldKind::UInt8: {
+            const auto v = static_cast<std::uint8_t>(value);
+            std::memcpy(ptr, &v, sizeof(v));
+            return;
+        }
+        case runtime::NativeFieldKind::Int16: {
+            const auto v = static_cast<std::int16_t>(value);
+            std::memcpy(ptr, &v, sizeof(v));
+            return;
+        }
+        case runtime::NativeFieldKind::UInt16: {
+            const auto v = static_cast<std::uint16_t>(value);
+            std::memcpy(ptr, &v, sizeof(v));
+            return;
+        }
+        case runtime::NativeFieldKind::Int32: {
+            const auto v = static_cast<std::int32_t>(value);
+            std::memcpy(ptr, &v, sizeof(v));
+            return;
+        }
+        case runtime::NativeFieldKind::UInt32: {
+            const auto v = static_cast<std::uint32_t>(value);
+            std::memcpy(ptr, &v, sizeof(v));
+            return;
+        }
+        default: {
+            const auto v = static_cast<std::int64_t>(value);
+            std::memcpy(ptr, &v, sizeof(v));
             return;
         }
         }
@@ -1169,9 +1246,6 @@ public:
         const runtime::Value& receiver,
         const runtime::Value& value,
         runtime::Value& result);
-    [[nodiscard]] bool initUnboxedStruct(
-        semantic::SymbolId typeId,
-        struct UnboxedCustomStruct& result);
     template <typename T, typename = std::enable_if_t<T::kIsGeneratedAotStruct>>
     [[nodiscard]] constexpr bool initUnboxedStruct(
         semantic::SymbolId,
@@ -1179,17 +1253,6 @@ public:
         result = T{};
         return true;
     }
-    [[nodiscard]] bool loadUnboxedStructField(
-        semantic::SymbolId typeId,
-        std::size_t fieldIndex,
-        const struct UnboxedCustomStruct& receiver,
-        runtime::Value& result);
-    [[nodiscard]] bool storeUnboxedStructField(
-        semantic::SymbolId typeId,
-        std::size_t fieldIndex,
-        const struct UnboxedCustomStruct& receiver,
-        const runtime::Value& value,
-        struct UnboxedCustomStruct& result);
     [[nodiscard]] bool ecsWritebackBoxed(
         const CallSignature& signature,
         std::int64_t index,
@@ -1203,7 +1266,8 @@ public:
         semantic::SymbolId expectedStructTypeId = 0,
         std::size_t generatedStructSize = 0,
         const struct GeneratedFieldLayout* generatedFields = nullptr,
-        std::size_t generatedFieldCount = 0) const noexcept;
+        std::size_t generatedFieldCount = 0,
+        std::size_t generatedStructAlign = 1) const noexcept;
     [[nodiscard]] bool hasSparseEcsState() const noexcept {
         return heap_ != nullptr && heap_->hasSparseEcsState();
     }
@@ -2399,6 +2463,7 @@ private:
     std::vector<FrameSite> stackSites_;
     semantic::SymbolId currentFunctionId_ = 0;
     runtime::ShadowStack shadowStack_;
+    std::optional<runtime::ManagedHeap::ActiveShadowStackScope> activeShadowStackScope_;
 #if defined(_MSC_VER)
 #pragma warning(push)
 #pragma warning(disable : 4324)
@@ -2430,6 +2495,7 @@ private:
     std::uint32_t cachedMulticastPinCount_ = 0;
     std::unordered_map<semantic::SymbolId, const TypeDescriptor*> ownedTypes_;
     std::unordered_map<semantic::SymbolId, const FunctionDescriptor*> ownedFunctions_;
+    std::shared_ptr<const void> descriptorMapsOwner_;
     const std::unordered_map<semantic::SymbolId, const TypeDescriptor*>* typesPtr_ = nullptr;
     const std::unordered_map<semantic::SymbolId, const FunctionDescriptor*>* functionsPtr_ = nullptr;
     struct AssignableCacheEntry {
@@ -2458,7 +2524,12 @@ private:
     runtime::FrameTelemetryCollector* telemetry_ = nullptr;
     std::uint64_t telemetryChildExecuted_ = 0;
     std::vector<TelemetryCallFrame> telemetryFrames_;
-    std::vector<runtime::ObjectRef> stringLiteralCache_;
+    struct IndexedStringCacheEntry {
+        runtime::ObjectRef ref{};
+        const char* data = nullptr;
+        std::size_t size = 0;
+    };
+    std::vector<IndexedStringCacheEntry> stringLiteralCache_;
     std::uint64_t stringLiteralCacheEpoch_ = 0;
     std::uint64_t stringLiteralCacheHeapId_ = 0;
 };
@@ -2812,6 +2883,48 @@ template <bool Checked>
     }
 }
 
+template <bool Checked>
+[[nodiscard]] inline bool typedAddULong(
+    std::uint64_t left,
+    std::uint64_t right,
+    std::uint64_t& out) noexcept {
+    if constexpr (Checked) {
+        if (left > std::numeric_limits<std::uint64_t>::max() - right) {
+            return false;
+        }
+    }
+    out = left + right;
+    return true;
+}
+
+template <bool Checked>
+[[nodiscard]] inline bool typedSubULong(
+    std::uint64_t left,
+    std::uint64_t right,
+    std::uint64_t& out) noexcept {
+    if constexpr (Checked) {
+        if (left < right) {
+            return false;
+        }
+    }
+    out = left - right;
+    return true;
+}
+
+template <bool Checked>
+[[nodiscard]] inline bool typedMulULong(
+    std::uint64_t left,
+    std::uint64_t right,
+    std::uint64_t& out) noexcept {
+    if constexpr (Checked) {
+        if (left != 0 && right > std::numeric_limits<std::uint64_t>::max() / left) {
+            return false;
+        }
+    }
+    out = left * right;
+    return true;
+}
+
 [[nodiscard]] inline runtime::Value typedBoxScalar(
     semantic::PrimitiveType type,
     bool value) noexcept {
@@ -2821,11 +2934,28 @@ template <bool Checked>
 
 [[nodiscard]] inline runtime::Value typedBoxScalar(
     semantic::PrimitiveType type,
+    std::int32_t value) noexcept {
+    (void)type;
+    return runtime::Value{static_cast<std::int64_t>(value)};
+}
+
+[[nodiscard]] inline runtime::Value typedBoxScalar(
+    semantic::PrimitiveType type,
     std::int64_t value) noexcept {
     if (type == semantic::PrimitiveType::Long) {
         return runtime::Value{runtime::LongValue{value}};
     }
+    if (type == semantic::PrimitiveType::ULong) {
+        return runtime::Value{runtime::ULongValue{static_cast<std::uint64_t>(value)}};
+    }
     return runtime::Value{value};
+}
+
+[[nodiscard]] inline runtime::Value typedBoxScalar(
+    semantic::PrimitiveType type,
+    std::uint64_t value) noexcept {
+    (void)type;
+    return runtime::Value{runtime::ULongValue{value}};
 }
 
 [[nodiscard]] inline runtime::Value typedBoxScalar(
@@ -2931,20 +3061,116 @@ template <bool Checked>
 
 struct EmptyGcGuards {};
 
+template <bool Enabled>
+class ScopedTypedGcRootSpan {
+public:
+    template <std::size_t N>
+    ScopedTypedGcRootSpan(
+        ExecutionContext& context,
+        const std::array<runtime::Value, N>& slots) noexcept {
+        if constexpr (Enabled) {
+            if constexpr (N > 0) {
+                context_ = &context;
+                context.shadowStack().pushSpanFrame(
+                    {}, runtime::ValueSpan(slots.data(), N), {});
+            }
+        } else {
+            (void)context;
+            (void)slots;
+        }
+    }
+
+    ScopedTypedGcRootSpan(
+        ExecutionContext& context,
+        EmptyGcGuards) noexcept {
+        (void)context;
+    }
+
+    ScopedTypedGcRootSpan(
+        ExecutionContext& context,
+        const runtime::Value* ptr,
+        std::size_t count) noexcept {
+        if constexpr (Enabled) {
+            if (ptr != nullptr && count > 0) {
+                context_ = &context;
+                context.shadowStack().pushSpanFrame(
+                    runtime::ValueSpan(ptr, count), {}, {});
+            }
+        } else {
+            (void)context;
+            (void)ptr;
+            (void)count;
+        }
+    }
+
+    ~ScopedTypedGcRootSpan() noexcept {
+        if constexpr (Enabled) {
+            if (context_ != nullptr) {
+                context_->shadowStack().popFrame();
+            }
+        }
+    }
+
+    ScopedTypedGcRootSpan(const ScopedTypedGcRootSpan&) = delete;
+    ScopedTypedGcRootSpan& operator=(const ScopedTypedGcRootSpan&) = delete;
+
+private:
+    ExecutionContext* context_ = nullptr;
+};
+
+inline void retainTypedGcSlot(
+    runtime::ManagedHeap* /*rawH*/,
+    runtime::Value& slot,
+    const runtime::Value& value) noexcept {
+    const auto tag = value.rawTag();
+    if (tag == runtime::ValueTag::ObjectRef) {
+        if (value.asObjectRefUnchecked().isStackSlotRef()) {
+            if (slot.rawTag() != runtime::ValueTag::Monostate) {
+                slot = runtime::Value{};
+            }
+            return;
+        }
+        slot = value;
+    } else if (tag == runtime::ValueTag::String) {
+        slot = value;
+    } else if (slot.rawTag() != runtime::ValueTag::Monostate) {
+        slot = runtime::Value{};
+    }
+}
+
+inline void retainTypedGcSlot(
+    runtime::ManagedHeap* rawH,
+    runtime::Value* firstSlot,
+    const runtime::Value& value) noexcept {
+    if (firstSlot != nullptr) {
+        retainTypedGcSlot(rawH, *firstSlot, value);
+    }
+}
+
 inline void retainTypedGcSlot(
     runtime::ManagedHeap* rawH,
     runtime::PersistentRoot& slot,
-    const runtime::Value& value) {
-    if (rawH != nullptr &&
-        (std::holds_alternative<runtime::ObjectRef>(value) ||
-         value.rawTag() == runtime::ValueTag::String)) {
-        if (std::holds_alternative<runtime::ObjectRef>(value) &&
-            std::get<runtime::ObjectRef>(value).isStackSlotRef()) {
+    const runtime::Value& value) noexcept {
+    const auto tag = value.rawTag();
+    if (tag == runtime::ValueTag::ObjectRef) {
+        if (value.asObjectRefUnchecked().isStackSlotRef()) {
             if (slot.valid()) slot.reset();
             return;
         }
-        if (!slot.valid() || !slot.update(value)) {
-            slot = rawH->retain(value);
+        if (rawH != nullptr) {
+            if (slot.valid()) {
+                (void)slot.update(value);
+            } else {
+                slot = rawH->retain(value);
+            }
+        }
+    } else if (tag == runtime::ValueTag::String) {
+        if (rawH != nullptr) {
+            if (slot.valid()) {
+                (void)slot.update(value);
+            } else {
+                slot = rawH->retain(value);
+            }
         }
     } else if (slot.valid()) {
         slot.reset();
@@ -2954,7 +3180,7 @@ inline void retainTypedGcSlot(
 inline void retainTypedGcSlot(
     runtime::ManagedHeap* rawH,
     runtime::PersistentRoot* firstSlot,
-    const runtime::Value& value) {
+    const runtime::Value& value) noexcept {
     if (firstSlot != nullptr) {
         retainTypedGcSlot(rawH, *firstSlot, value);
     }
@@ -2963,10 +3189,10 @@ inline void retainTypedGcSlot(
 template <typename T, typename = std::enable_if_t<T::kIsGeneratedAotStruct>>
 inline void retainTypedGcSlot(
     runtime::ManagedHeap* rawH,
-    runtime::PersistentRoot* firstSlot,
-    const T& value) {
+    runtime::Value* firstSlot,
+    const T& value) noexcept {
     if constexpr (T::kGcSlotCount > 0) {
-        if (rawH != nullptr && firstSlot != nullptr) {
+        if (firstSlot != nullptr) {
             T::retainGcSlots(rawH, firstSlot, value);
         }
     } else {
@@ -3011,71 +3237,6 @@ inline void retainTypedGcSlot(
 #endif
 }
 
-struct UnboxedCustomStruct {
-    semantic::SymbolId typeId = 0;
-    std::array<runtime::Value, 16> fields{};
-    std::uint8_t fieldCount = 0;
-
-    UnboxedCustomStruct() = default;
-    explicit UnboxedCustomStruct(semantic::SymbolId id) noexcept : typeId(id) {}
-
-    UnboxedCustomStruct(const UnboxedCustomStruct& other)
-        : typeId(other.typeId), fieldCount(other.fieldCount) {
-        for (std::uint8_t i = 0; i < fieldCount; ++i) {
-            fields[i] = other.fields[i];
-        }
-    }
-
-    UnboxedCustomStruct& operator=(const UnboxedCustomStruct& other) {
-        if (this != &other) {
-            typeId = other.typeId;
-            fieldCount = other.fieldCount;
-            for (std::uint8_t i = 0; i < fieldCount; ++i) {
-                fields[i] = other.fields[i];
-            }
-        }
-        return *this;
-    }
-
-    UnboxedCustomStruct(UnboxedCustomStruct&& other) noexcept
-        : typeId(other.typeId), fieldCount(other.fieldCount) {
-        for (std::uint8_t i = 0; i < fieldCount; ++i) {
-            fields[i] = std::move(other.fields[i]);
-        }
-    }
-
-    UnboxedCustomStruct& operator=(UnboxedCustomStruct&& other) noexcept {
-        if (this != &other) {
-            typeId = other.typeId;
-            fieldCount = other.fieldCount;
-            for (std::uint8_t i = 0; i < fieldCount; ++i) {
-                fields[i] = std::move(other.fields[i]);
-            }
-        }
-        return *this;
-    }
-
-    friend bool operator==(const UnboxedCustomStruct& left, const UnboxedCustomStruct& right) {
-        if (left.typeId != right.typeId || left.fieldCount != right.fieldCount) return false;
-        for (std::uint8_t i = 0; i < left.fieldCount; ++i) {
-            if (!(left.fields[i] == right.fields[i])) return false;
-        }
-        return true;
-    }
-    friend bool operator!=(const UnboxedCustomStruct& left, const UnboxedCustomStruct& right) {
-        return !(left == right);
-    }
-};
-
-[[nodiscard]] inline runtime::Value typedBoxScalar(
-    semantic::PrimitiveType type,
-    const UnboxedCustomStruct& value) {
-    (void)type;
-    return runtime::Value{runtime::makeStructValueFromFields(
-        value.typeId,
-        runtime::ValueSpan(value.fields.data(), value.fieldCount))};
-}
-
 template <typename T, typename = std::enable_if_t<T::kIsGeneratedAotStruct>>
 [[nodiscard]] inline runtime::Value typedBoxScalar(
     semantic::PrimitiveType,
@@ -3098,6 +3259,22 @@ template <typename T, typename = std::enable_if_t<T::kIsGeneratedAotStruct>>
 [[nodiscard]] inline bool typedUnboxScalar(
     semantic::PrimitiveType type,
     const runtime::Value& value,
+    std::int32_t& out) noexcept {
+    (void)type;
+    if (const auto* p = std::get_if<std::int64_t>(&value)) {
+        if (*p < static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::min()) ||
+            *p > static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max())) {
+            return false;
+        }
+        out = static_cast<std::int32_t>(*p);
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] inline bool typedUnboxScalar(
+    semantic::PrimitiveType type,
+    const runtime::Value& value,
     std::int64_t& out) noexcept {
     if (type == semantic::PrimitiveType::Long) {
         if (const auto* p = std::get_if<runtime::LongValue>(&value)) {
@@ -3106,8 +3283,27 @@ template <typename T, typename = std::enable_if_t<T::kIsGeneratedAotStruct>>
         }
         return false;
     }
+    if (type == semantic::PrimitiveType::ULong) {
+        if (const auto* p = std::get_if<runtime::ULongValue>(&value)) {
+            out = static_cast<std::int64_t>(p->value);
+            return true;
+        }
+        return false;
+    }
     if (const auto* p = std::get_if<std::int64_t>(&value)) {
         out = *p;
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] inline bool typedUnboxScalar(
+    semantic::PrimitiveType type,
+    const runtime::Value& value,
+    std::uint64_t& out) noexcept {
+    (void)type;
+    if (const auto* p = std::get_if<runtime::ULongValue>(&value)) {
+        out = p->value;
         return true;
     }
     return false;
@@ -3289,27 +3485,6 @@ template <typename T, typename = std::enable_if_t<T::kIsGeneratedAotStruct>>
     }
     out = value;
     return true;
-}
-
-[[nodiscard]] inline bool typedUnboxScalar(
-    semantic::PrimitiveType type,
-    const runtime::Value& value,
-    UnboxedCustomStruct& out) {
-    (void)type;
-    if (const auto* s = std::get_if<runtime::StructValue>(&value);
-        s && s->valid() && s->fieldCount() <= 16) {
-        out.typeId = s->typeId;
-        out.fieldCount = static_cast<std::uint8_t>(s->fieldCount());
-        for (std::uint8_t i = 0; i < out.fieldCount; ++i) {
-            if (auto f = runtime::structValueFieldAt(*s, i)) {
-                out.fields[i] = std::move(*f);
-            } else {
-                return false;
-            }
-        }
-        return true;
-    }
-    return false;
 }
 
 template <typename T, typename = std::enable_if_t<T::kIsGeneratedAotStruct>>

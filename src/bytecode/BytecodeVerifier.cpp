@@ -1598,8 +1598,12 @@ bool verifyModule(
                                 diagnostics.report("RS5170", "struct field load type mismatch", {});
                             }
                         } else if (instruction.operands.size() != 2 ||
-                                   registerType(instruction.operands[1]) != field.type ||
-                                   registerTypeId(instruction.operands[1]) != expectedFieldTypeId ||
+                                   !compatibleType(
+                                       registerType(instruction.operands[1]),
+                                       registerTypeId(instruction.operands[1]),
+                                       field.type,
+                                       expectedFieldTypeId,
+                                       typeDescriptors) ||
                                    resultType != semantic::PrimitiveType::Struct ||
                                    registerTypeId(instruction.result) != type.id) {
                             diagnostics.report("RS5171", "struct field store type mismatch", {});

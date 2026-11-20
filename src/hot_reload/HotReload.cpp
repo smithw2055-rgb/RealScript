@@ -47,7 +47,12 @@ FunctionMap functions(const std::vector<bytecode::Module>& modules) {
 TypeMap types(const std::vector<bytecode::Module>& modules) {
     TypeMap result;
     for (const auto& module : modules) {
-        for (const auto& type : module.types) result.emplace(type.id, &type);
+        for (const auto& type : module.types) {
+            auto [it, inserted] = result.emplace(type.id, &type);
+            if (!inserted && type.moduleName == module.name) {
+                it->second = &type;
+            }
+        }
     }
     return result;
 }

@@ -15,10 +15,6 @@ option(REALSCRIPT_ENABLE_TOOLING "Build L1 Formatter, Linter, Fuzzer & LSP appli
 option(REALSCRIPT_ENABLE_EXTENSIBILITY "Build L1 Reflection & Sandboxed ModHost application layer" ON)
 option(REALSCRIPT_ENABLE_BINDGEN "Build L1 C++ Host Binding Generator (BindGen & rsbind) application layer" ON)
 option(REALSCRIPT_SLIM_RUNTIME "Build only slim L0 runtime and AOT runtime targets (zero Compiler/L1)" OFF)
-option(
-    REALSCRIPT_STENCIL_CROSS_ARCH_SIM
-    "Enable cross-arch ARM64 StencilJit simulator on non-ARM64 hosts"
-    ${REALSCRIPT_BUILD_TESTS})
 
 if(REALSCRIPT_SLIM_RUNTIME)
     set(REALSCRIPT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -28,6 +24,11 @@ if(REALSCRIPT_SLIM_RUNTIME)
     set(REALSCRIPT_ENABLE_EXTENSIBILITY OFF CACHE BOOL "" FORCE)
     set(REALSCRIPT_ENABLE_BINDGEN OFF CACHE BOOL "" FORCE)
 endif()
+
+option(
+    REALSCRIPT_STENCIL_CROSS_ARCH_SIM
+    "Enable cross-arch ARM64 StencilJit simulator on non-ARM64 hosts"
+    ${REALSCRIPT_BUILD_TESTS})
 
 function(realscript_enable_cxx_warnings target)
     if(MSVC)

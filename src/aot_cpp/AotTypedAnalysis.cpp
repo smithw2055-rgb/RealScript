@@ -329,6 +329,7 @@ bool isTypedAotSlot(
     case semantic::PrimitiveType::Bool:
     case semantic::PrimitiveType::Int:
     case semantic::PrimitiveType::Long:
+    case semantic::PrimitiveType::ULong:
     case semantic::PrimitiveType::Float:
     case semantic::PrimitiveType::Double:
     case semantic::PrimitiveType::Null:
@@ -482,6 +483,7 @@ std::string explainTypedPrimitiveAotIneligibility(
             case mir::Opcode::ConstantBool:
             case mir::Opcode::ConstantString:
             case mir::Opcode::ConstantNull:
+            case mir::Opcode::ConstantTypeId:
             case mir::Opcode::ConvertNullToString:
             case mir::Opcode::ConvertNullToObject:
             case mir::Opcode::ConvertNullToArray:
@@ -694,33 +696,16 @@ std::string explainTypedPrimitiveAotIneligibility(
                     symName.rfind("$intrinsic::to_string::", 0) == 0 ||
                     symName == "$intrinsic::stable_hash" ||
                     symName.rfind("$intrinsic::stable_hash::", 0) == 0;
-                bool hasPolyOrLoopInFn = function.blocks.size() > 1 || isAsyncFunction;
-                if (!hasPolyOrLoopInFn && usesReferenceSlots && !isEcsIntrinsic && !isAsyncIntrinsic && !isStringOrCoreIntrinsic) {
-                    for (const auto& scanBlk : function.blocks) {
-                        for (const auto& scanInst : scanBlk.instructions) {
-                            if (scanInst.opcode == mir::Opcode::IsType ||
-                                scanInst.opcode == mir::Opcode::AsType ||
-                                scanInst.opcode == mir::Opcode::NewDelegate ||
-                                scanInst.opcode == mir::Opcode::InvokeDelegate ||
-                                scanInst.opcode == mir::Opcode::CombineDelegate ||
-                                scanInst.opcode == mir::Opcode::RemoveDelegate ||
-                                (scanInst.opcode == mir::Opcode::Call &&
-                                 (scanInst.virtualDispatch || scanInst.interfaceDispatch))) {
-                                hasPolyOrLoopInFn = true;
-                                break;
-                            }
-                        }
-                        if (hasPolyOrLoopInFn) break;
-                    }
-                    if (!hasPolyOrLoopInFn) {
-                        return "single-block reference call uses boxed bridge";
-                    }
-                }
+                const bool isStaticFieldIntrinsic =
+                    symName.rfind("$intrinsic::static_get::", 0) == 0 ||
+                    symName.rfind("$intrinsic::static_set::", 0) == 0 ||
+                    symName.rfind("$intrinsic::static_has::", 0) == 0;
                 if (!symName.empty() &&
                     symName.rfind("$intrinsic::", 0) == 0 &&
                     !isEcsIntrinsic &&
                     !isAsyncIntrinsic &&
-                    !isStringOrCoreIntrinsic) {
+                    !isStringOrCoreIntrinsic &&
+                    !isStaticFieldIntrinsic) {
                     return "unsupported runtime intrinsic call: " + instruction.symbolName;
                 }
                 if (instruction.resultType != semantic::PrimitiveType::Void &&
@@ -942,6 +927,8 @@ std::string typedCppType(TypedSlotType slot) {
     case semantic::PrimitiveType::Int:
     case semantic::PrimitiveType::Long:
         return "std::int64_t";
+    case semantic::PrimitiveType::ULong:
+        return "std::uint64_t";
     case semantic::PrimitiveType::Float:
         return "float";
     case semantic::PrimitiveType::Double:
@@ -980,6 +967,8 @@ std::string typedDefaultValue(TypedSlotType slot) {
     case semantic::PrimitiveType::Int:
     case semantic::PrimitiveType::Long:
         return "std::int64_t{0}";
+    case semantic::PrimitiveType::ULong:
+        return "std::uint64_t{0}";
     case semantic::PrimitiveType::Float:
         return "0.0f";
     case semantic::PrimitiveType::Double:

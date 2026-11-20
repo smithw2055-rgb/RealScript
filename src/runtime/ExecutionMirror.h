@@ -368,9 +368,16 @@ struct alignas(8) ExecutionInstruction {
     std::uint16_t storeSlot = InvalidCompactReg;
 };
 
-// Cold side-metadata split out of FlatInstruction so hot dispatch streams pack
-// cleanly at 32 bytes/instruction (exactly 2 instructions per 64-byte L1 cache line).
-struct FlatColdMeta {
+struct FlatColdCallMeta {
+    const ProgramImage::FunctionLocation* directTarget = nullptr;
+    const ExecutionFunction* directExecution = nullptr;
+    const ProgramImage::FunctionLocation* inlinedCallee = nullptr;
+    std::uint32_t callerBlockIndex = 0;
+    std::uint32_t callerInstIndex = 0;
+    std::uint16_t inlineFrameBias = 0;
+};
+
+struct ResolvedFlatColdMeta {
     const bytecode::Instruction* bytecode = nullptr;
     const ProgramImage::FunctionLocation* directTarget = nullptr;
     const ExecutionFunction* directExecution = nullptr;
@@ -381,6 +388,17 @@ struct FlatColdMeta {
     std::uint32_t callerInstIndex = 0;
     std::uint16_t inlineFrameBias = 0;
 };
+
+// Cold side-metadata split out of FlatInstruction so hot dispatch streams pack
+// cleanly at 32 bytes/instruction (exactly 2 instructions per 64-byte L1 cache line),
+// while per-instruction cold records compact to 16 bytes with sparse call/inline tables.
+struct FlatColdMeta {
+    std::uint32_t blockIndex = 0;
+    std::uint32_t instructionIndexInBlock = 0;
+    std::uint32_t bytecodeIndexInBlock = InvalidStreamOffset;
+    std::uint32_t callMetaIdx = InvalidStreamOffset;
+};
+static_assert(sizeof(FlatColdMeta) == 16);
 
 #if defined(_MSC_VER)
 #pragma warning(push)
@@ -587,7 +605,9 @@ struct ExecutionBlock {
 
 struct ExecutionFunction {
     Value trivialConstValue{};
+    const ExecutionMirror* ownerMirror = nullptr;
     const bytecode::Function* bytecode = nullptr;
+    const bytecode::Module* module = nullptr;
     const bytecode::FunctionReference* directNativeReference = nullptr;
     std::uint16_t nativeForwarderInstructionCost = 0;
     std::size_t entry = InvalidBlockIndex;
@@ -624,9 +644,55 @@ struct ExecutionFunction {
     std::vector<ExecutionBlock> blocks;
     std::vector<FlatInstruction> flatStream;
     std::vector<FlatColdMeta> flatCold;
+    std::vector<FlatColdCallMeta> flatColdCalls;
+    mutable std::unique_ptr<std::once_flag> slowInstructionsOnce;
     std::vector<std::uint32_t> blockStreamOffsets;
     std::vector<std::uint32_t> denseBlockIndices;
     std::unique_ptr<std::unordered_map<bytecode::BlockId, std::size_t>> sparseBlockIndices;
+
+    [[nodiscard]] ResolvedFlatColdMeta resolveCold(std::size_t idx) const noexcept {
+        ResolvedFlatColdMeta out;
+        if (idx >= flatCold.size()) {
+            return out;
+        }
+        const auto& compact = flatCold[idx];
+        out.blockIndex = compact.blockIndex;
+        out.instructionIndexInBlock = compact.instructionIndexInBlock;
+        if (compact.callMetaIdx < flatColdCalls.size()) {
+            const auto& call = flatColdCalls[compact.callMetaIdx];
+            out.directTarget = call.directTarget;
+            out.directExecution = call.directExecution;
+            out.inlinedCallee = call.inlinedCallee;
+            out.callerBlockIndex = call.callerBlockIndex;
+            out.callerInstIndex = call.callerInstIndex;
+            out.inlineFrameBias = call.inlineFrameBias;
+        }
+        if (compact.bytecodeIndexInBlock != InvalidStreamOffset) {
+            const ExecutionFunction* owner =
+                (out.inlinedCallee != nullptr && out.directExecution != nullptr)
+                    ? out.directExecution
+                    : this;
+            if (compact.blockIndex < owner->blocks.size()) {
+                const auto* bb = owner->blocks[compact.blockIndex].bytecode;
+                if (bb != nullptr &&
+                    compact.bytecodeIndexInBlock < bb->instructions.size()) {
+                    out.bytecode = &bb->instructions[compact.bytecodeIndexInBlock];
+                }
+            }
+        }
+        return out;
+    }
+
+    [[nodiscard]] const ProgramImage::FunctionLocation* coldInlinedCallee(
+        std::size_t idx) const noexcept {
+        if (idx >= flatCold.size()) {
+            return nullptr;
+        }
+        const std::uint32_t callIdx = flatCold[idx].callMetaIdx;
+        return callIdx < flatColdCalls.size()
+            ? flatColdCalls[callIdx].inlinedCallee
+            : nullptr;
+    }
 
     [[nodiscard]] std::size_t findBlockIndex(bytecode::BlockId id) const noexcept {
         if (id < denseBlockIndices.size()) {
@@ -662,6 +728,7 @@ struct FastFunctionDispatchEntry {
 
 struct ExecutionMirror {
     std::uint64_t instanceId = 0;
+    bool hasAsyncOperations = false;
     std::unordered_map<const bytecode::Function*, ExecutionFunction> functions;
     std::vector<FastFunctionDispatchEntry> fastFunctionTable;
     std::vector<FieldAccessMeta> fieldMetas;
@@ -720,6 +787,8 @@ struct ExecutionMirror {
     const std::size_t idx = function.findBlockIndex(id);
     return idx == InvalidBlockIndex ? nullptr : &function.blocks[idx];
 }
+
+void ensureSlowInstructions(const ExecutionFunction& execFn);
 
 } // namespace realscript::runtime::detail
 

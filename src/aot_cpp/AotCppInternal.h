@@ -111,6 +111,10 @@ struct VectorizedEcsLoopPlan {
     std::size_t bodyPreambleCount = 0;
     bool hasSparseWritebackCall = false;
     bool usesIndexInsideBody = false;
+    std::uint64_t headerIterInsts = 0;
+    std::uint64_t bodyInstsWithTerminator = 0;
+    std::uint64_t incInstsWithTerminator = 0;
+    std::uint64_t iterBranches = 0;
     std::vector<VectorizedEcsColumnBinding> columns;
 };
 
@@ -273,6 +277,7 @@ void emitVectorizedEcsLoop(
     const mir::Module& module,
     const mir::Function& function,
     const std::vector<TypedSlotType>& types,
+    const std::map<semantic::SymbolId, TypeView>& allTypes,
     const VectorizedEcsLoopPlan& plan,
     bool emitLineDirectives);
 [[nodiscard]] std::unordered_map<mir::BlockId, VectorizedPackedArrayLoopPlan>

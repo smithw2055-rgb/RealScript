@@ -1929,6 +1929,336 @@ public int ExerciseFastOpcodes(string raw, int signedIn) {
     }
 }
 
+void testWaveRegressionEnumMirrorSlabsAndStrings() {
+    const std::string src = R"RS(
+module Kernel.WaveReg;
+
+public enum Flags32 {
+    Low = 3,
+    High = 1073741824
+}
+
+public class SixSlot {
+    public int a = 1;
+    public int b = 2;
+    public int c = 3;
+    public int d = 4;
+    public int e = 5;
+    public int f = 6;
+}
+
+public Flags32 PickFlag(int high) {
+    return high != 0 ? Flags32.High : Flags32.Low;
+}
+
+public int SumSix(SixSlot s) {
+    return s.a + s.b + s.c + s.d + s.e + s.f;
+}
+)RS";
+
+    auto prog = compileAndLink({{"wave_reg.rscript", src}}, optimization::Level::Aggressive);
+    auto heap = std::make_shared<runtime::ManagedHeap>();
+
+    // 1. ConstantEnumFast 32-bit sign/mask parity (FlatLoop vs BlockVM slow fallback).
+    {
+        runtime::Interpreter interp(prog);
+        interp.setHeap(heap);
+
+        const auto enumInt = [](const runtime::ExecutionResult& r) -> std::int64_t {
+            require(r.succeeded && std::holds_alternative<runtime::EnumValue>(r.value),
+                "Expected EnumValue result from PickFlag");
+            return std::get<runtime::EnumValue>(r.value).value;
+        };
+
+        const auto flatHi = interp.invoke("Kernel.WaveReg::PickFlag", {runtime::Value{std::int64_t{1}}});
+        const auto flatLo = interp.invoke("Kernel.WaveReg::PickFlag", {runtime::Value{std::int64_t{0}}});
+        require(enumInt(flatHi) == 1073741824 && enumInt(flatLo) == 3,
+            "ConstantEnumFast FlatLoop result mismatch");
+
+        runtime::ExecutionOptions blockOpts;
+        blockOpts.trace = [](const runtime::TraceEvent&) {};
+        const auto blkHi = interp.invoke(
+            "Kernel.WaveReg::PickFlag", {runtime::Value{std::int64_t{1}}}, blockOpts);
+        const auto blkLo = interp.invoke(
+            "Kernel.WaveReg::PickFlag", {runtime::Value{std::int64_t{0}}}, blockOpts);
+        require(enumInt(blkHi) == enumInt(flatHi) && enumInt(blkLo) == enumInt(flatLo),
+            "ConstantEnumFast BlockVM ensureSlowInstructions parity mismatch");
+    }
+
+    // 2. Concurrent ProgramImage::executionMirrorFast_ initialization & reads across threads.
+    {
+        auto freshProg = compileAndLink({{"wave_reg_conc.rscript", src}}, optimization::Level::Basic);
+        constexpr std::size_t kThreads = 4u;
+        std::vector<std::uint8_t> okFlags(kThreads, 0u);
+        std::vector<std::thread> workers;
+        workers.reserve(kThreads);
+        for (std::size_t t = 0u; t < kThreads; ++t) {
+            workers.emplace_back([&, t]() {
+                runtime::Interpreter threadInterp(freshProg);
+                bool allOk = true;
+                for (int iter = 0; iter < 50; ++iter) {
+                    const auto res = threadInterp.invoke(
+                        "Kernel.WaveReg::PickFlag",
+                        {runtime::Value{std::int64_t{(iter & 1) ? 1 : 0}}});
+                    const std::int64_t expected = (iter & 1) ? 1073741824 : 3;
+                    if (!res.succeeded ||
+                        !std::holds_alternative<runtime::EnumValue>(res.value) ||
+                        std::get<runtime::EnumValue>(res.value).value != expected) {
+                        allOk = false;
+                        break;
+                    }
+                }
+                okFlags[t] = allOk ? 1u : 0u;
+            });
+        }
+        for (auto& w : workers) w.join();
+        for (std::size_t t = 0u; t < kThreads; ++t) {
+            require(okFlags[t] == 1u, "Concurrent ProgramImage::executionMirror() call failed");
+        }
+    }
+
+    // 3. >4-field object & array slab class (<= 8 values) + FNV-1a zero-alloc internedStrings & sweep.
+    {
+        const auto sixTid = semantic::stableTypeId("Kernel.WaveReg::SixSlot");
+        auto sixObj = heap->allocateObject(
+            sixTid,
+            {runtime::Value{std::int64_t{10}},
+             runtime::Value{std::int64_t{20}},
+             runtime::Value{std::int64_t{30}},
+             runtime::Value{std::int64_t{40}},
+             runtime::Value{std::int64_t{50}},
+             runtime::Value{std::int64_t{60}}},
+            {});
+        require(sixObj.has_value(), "allocateObject SixSlot (6 fields) failed");
+        auto pinSix = heap->retain(runtime::Value{*sixObj});
+
+        const auto arrTid = semantic::stableTypeId(
+            semantic::arrayTypeName(semantic::PrimitiveType::Int, ""));
+        auto arr6 = heap->allocateTypedArray(arrTid, semantic::PrimitiveType::Int, 0, 6u, runtime::Value{std::int64_t{7}});
+        require(arr6.has_value(), "allocateTypedArray (6 elems) failed");
+        auto pinArr = heap->retain(runtime::Value{*arr6});
+
+        auto keep1 = heap->internString("wave_intern_keep_string_long");
+        auto keep2 = heap->internString("wave_intern_keep_string_long");
+        auto drop1 = heap->internString("wave_intern_drop_string_long");
+        require(keep1.has_value() && keep2.has_value() && drop1.has_value(),
+            "internString failed");
+        require(*keep1 == *keep2, "internedStrings lookup did not deduplicate identical strings");
+        auto pinKeep = heap->retain(runtime::Value{*keep1});
+        const std::size_t beforeSweepCount = heap->internedStringCount();
+
+        runtime::Interpreter interp(prog);
+        interp.setHeap(heap);
+        const auto sumRes = interp.invoke("Kernel.WaveReg::SumSix", {runtime::Value{*sixObj}});
+        require(sumRes.succeeded && std::get<std::int64_t>(sumRes.value) == 210,
+            "SumSix failed on 6-field slab object");
+
+        heap->collect(runtime::RootSet{});
+        require(heap->isAlive(*sixObj) && heap->isAlive(*keep1) && !heap->isAlive(*drop1),
+            "GC did not preserve pinned slab/interned string or reclaim unpinned interned string");
+        require(heap->internedStringCount() < beforeSweepCount,
+            "internedStringCount did not drop after sweeping unpinned interned string");
+        auto keep3 = heap->internString("wave_intern_keep_string_long");
+        require(keep3.has_value() && *keep3 == *keep1,
+            "Pinned interned string lost identity across GC");
+    }
+}
+
+void testAuditRegressionGcCachesAndQuatf() {
+    const std::string src = R"RS(
+module Kernel.AuditRt;
+
+public class Box {
+    public int v;
+    public Box(int x) { v = x; }
+}
+
+public interface ITag {
+    int Id();
+}
+
+public class Alpha : ITag {
+    public int Id() { return 11; }
+}
+
+public class Beta : ITag {
+    public int Id() { return 22; }
+}
+
+public string GetAuditLit() {
+    return "incremental_gc_literal_alive_check";
+}
+
+public string GetAuditLitSweep() {
+    return "incremental_gc_sweep_literal_alive";
+}
+
+public int[] MakeDynArr() {
+    int[] a = new int[2];
+    a[0] = 10;
+    a[1] = 20;
+    return a;
+}
+
+public int MutateDynamicArr(int[] a) {
+    a.Push(99);
+    return a.Length;
+}
+
+public int CallTag(ITag t) {
+    return t.Id();
+}
+)RS";
+
+    auto prog = compileAndLink({{"audit_rt.rscript", src}}, optimization::Level::Basic);
+
+    // A. ConstantStringFast while heap->phase() != GcPhase::Idle (Mark and Sweep phases).
+    {
+        auto heap = std::make_shared<runtime::ManagedHeap>();
+        const auto boxTid = semantic::stableTypeId("Kernel.AuditRt::Box");
+        std::vector<runtime::PersistentRoot> keepBoxes;
+        for (int i = 0; i < 128; ++i) {
+            auto obj = heap->allocateObject(boxTid, {runtime::Value{std::int64_t{i}}}, {});
+            require(obj.has_value(), "Audit seed allocateObject failed");
+            if ((i % 4) == 0) {
+                keepBoxes.push_back(heap->retain(runtime::Value{*obj}));
+            }
+        }
+        heap->requestCollection();
+        runtime::ShadowStack emptyRoots;
+        (void)heap->step(emptyRoots, 1);
+        require(heap->phase() != runtime::GcPhase::Idle,
+            "Expected incremental GC to remain non-Idle after 1 work step");
+
+        runtime::Interpreter interp(prog, heap);
+        runtime::ExecutionOptions noStepOpts;
+        noStepOpts.limits.gcWorkBudget = 0;
+        const auto markRes = interp.invoke("Kernel.AuditRt::GetAuditLit", {}, noStepOpts);
+        require(markRes.succeeded && std::holds_alternative<runtime::ObjectRef>(markRes.value),
+            "ConstantStringFast during incremental GC failed: " + markRes.error.message);
+        const auto strRef = std::get<runtime::ObjectRef>(markRes.value);
+        auto pinStr = heap->retain(markRes.value);
+        while (heap->phase() != runtime::GcPhase::Idle) {
+            (void)heap->step(emptyRoots, 16);
+        }
+        require(heap->isAlive(strRef) &&
+                heap->stringView(strRef) == std::optional<std::string_view>{"incremental_gc_literal_alive_check"},
+            "String literal allocated during incremental GC did not survive cycle finish");
+        pinStr.reset();
+
+        heap->requestCollection();
+        for (int s = 0; s < 512 && heap->phase() != runtime::GcPhase::Sweep && heap->phase() != runtime::GcPhase::Idle; ++s) {
+            (void)heap->step(emptyRoots, 1);
+        }
+        if (heap->phase() == runtime::GcPhase::Sweep) {
+            const auto sweepRes = interp.invoke("Kernel.AuditRt::GetAuditLitSweep", {}, noStepOpts);
+            require(sweepRes.succeeded && std::holds_alternative<runtime::ObjectRef>(sweepRes.value),
+                "ConstantStringFast during Sweep failed: " + sweepRes.error.message);
+            const auto sweepRef = std::get<runtime::ObjectRef>(sweepRes.value);
+            auto pinSweep = heap->retain(sweepRes.value);
+            while (heap->phase() != runtime::GcPhase::Idle) {
+                (void)heap->step(emptyRoots, 16);
+            }
+            require(heap->isAlive(sweepRef) &&
+                    heap->stringView(sweepRef) == std::optional<std::string_view>{"incremental_gc_sweep_literal_alive"},
+                "String literal allocated during GcPhase::Sweep was collected or corrupted");
+        }
+    }
+
+    // B. CallIntrinsicFast a.Push(...) under IExecutionPolicy::checkArrayWrite denial.
+    {
+        struct AuditPolicy final : public runtime::IExecutionPolicy {
+            bool rejectArrayWrite = false;
+            std::size_t seen = 0;
+            bool checkArrayWrite(
+                const runtime::ManagedHeap*,
+                const runtime::ManagedHeap*,
+                runtime::ObjectRef,
+                const runtime::Value&,
+                runtime::RuntimeError& outError) const override {
+                const_cast<AuditPolicy*>(this)->seen += 1u;
+                if (rejectArrayWrite) {
+                    outError.code = runtime::ErrorCode::CapabilityDenied;
+                    outError.message = "audit denied array write";
+                    return false;
+                }
+                return true;
+            }
+        };
+        auto heap = std::make_shared<runtime::ManagedHeap>();
+        runtime::Interpreter interp(prog, heap);
+        const auto arrRes = interp.invoke("Kernel.AuditRt::MakeDynArr");
+        require(arrRes.succeeded && std::holds_alternative<runtime::ObjectRef>(arrRes.value),
+            "MakeDynArr failed");
+        const auto arrRef = std::get<runtime::ObjectRef>(arrRes.value);
+        auto pinArr = heap->retain(arrRes.value);
+
+        AuditPolicy policy;
+        policy.rejectArrayWrite = true;
+        interp.setExecutionPolicy(&policy);
+        const auto pushRes = interp.invoke("Kernel.AuditRt::MutateDynamicArr", {runtime::Value{arrRef}});
+        require(!pushRes.succeeded &&
+                pushRes.error.code == runtime::ErrorCode::CapabilityDenied &&
+                policy.seen >= 1u &&
+                heap->arrayLength(arrRef) == std::optional<std::size_t>{2u},
+            "CallIntrinsicFast array.Push must respect IExecutionPolicy::checkArrayWrite");
+        interp.setExecutionPolicy(nullptr);
+    }
+
+    // C. ManagedHeap::snapshot() + restore() invalidates Interpreter PIC via restoreEpoch().
+    {
+        auto hPic = std::make_shared<runtime::ManagedHeap>();
+        const auto snap = hPic->snapshot();
+        const std::uint64_t initialEpoch = hPic->restoreEpoch();
+        runtime::Interpreter interp(prog, hPic);
+
+        const auto alphaTid = semantic::stableTypeId("Kernel.AuditRt::Alpha");
+        const auto betaTid = semantic::stableTypeId("Kernel.AuditRt::Beta");
+        auto alphaObj = hPic->allocateObject(alphaTid, {}, {});
+        require(alphaObj.has_value(), "allocate Alpha failed");
+
+        const auto r1 = interp.invoke("Kernel.AuditRt::CallTag", {runtime::Value{*alphaObj}});
+        const auto r2 = interp.invoke("Kernel.AuditRt::CallTag", {runtime::Value{*alphaObj}});
+        require(r1.succeeded && std::get<std::int64_t>(r1.value) == 11 &&
+                r2.succeeded && std::get<std::int64_t>(r2.value) == 11,
+            "Warming Alpha PIC failed");
+
+        runtime::RuntimeError restErr;
+        require(hPic->restore(snap, &restErr), "ManagedHeap::restore failed: " + restErr.message);
+        require(hPic->restoreEpoch() > initialEpoch, "ManagedHeap::restore did not bump restoreEpoch");
+
+        auto betaObj = hPic->allocateObject(betaTid, {}, {});
+        require(betaObj.has_value(), "allocate Beta after restore failed");
+        const auto rPost = interp.invoke("Kernel.AuditRt::CallTag", {runtime::Value{*betaObj}});
+        require(rPost.succeeded && std::get<std::int64_t>(rPost.value) == 22,
+            "Post-restore Interpreter PIC used stale pre-restore dispatch entry");
+    }
+
+    // D. internArenaQuatf > 2,048 distinct non-inline QuatfArena entries without TLS cache corruption.
+    {
+        std::vector<runtime::Value> quats;
+        quats.reserve(2400);
+        for (int i = 0; i < 2400; ++i) {
+            const float x = static_cast<float>(i);
+            std::uint32_t wBits = 0x3F000001u + (static_cast<std::uint32_t>(i) * 3u);
+            if ((wBits & 0xFFu) == 0u) {
+                wBits |= 1u;
+            }
+            float w = 0.0f;
+            std::memcpy(&w, &wBits, sizeof(w));
+            runtime::Value q{runtime::QuatfValue{x, -1.5f, 2.25f, w}};
+            require(q.rawTag() == runtime::ValueTag::QuatfArena,
+                "Expected non-inline QuatfArena tag");
+            quats.push_back(q);
+        }
+        for (int i = 0; i < 2400; ++i) {
+            const auto* got = std::get_if<runtime::QuatfValue>(&quats[static_cast<std::size_t>(i)]);
+            require(got != nullptr && got->x == static_cast<float>(i) && got->y == -1.5f && got->z == 2.25f,
+                "QuatfArena value corrupted after >2048 distinct allocations");
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1946,6 +2276,8 @@ int main() {
             {"L0 dirty callbacks, dynamic array ops, UTF-8/borrowed, weak delegates & IExecutionPolicy", testL0DirtyCallbacksArraysUtf8WeakDelegatesAndPolicy},
             {"Zero-lock ProfileCollector RingBuffer & steady_clock ChromeTrace flamegraph", testZeroLockProfileRingBufferAndChromeTrace},
             {"FlatLoop IExecutionPolicy enforcement & new fast opcodes", testFlatLoopExecutionPolicyAndFastOpcodes},
+            {"Waves 1-4 regression: Enum32, concurrent ExecutionMirror, 8-slot slabs & FNV-1a internedStrings", testWaveRegressionEnumMirrorSlabsAndStrings},
+            {"Audit regression: incremental ConstantStringFast, intrinsic policy, restoreEpoch PIC & >2k QuatfArena", testAuditRegressionGcCachesAndQuatf},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

@@ -1892,7 +1892,7 @@ EngineRuntime::EngineRuntime(std::shared_ptr<const ProgramImage> program)
     : program_(std::move(program)),
       heap_(std::make_shared<ManagedHeap>()),
       nativeHandles_(std::make_shared<NativeHandleRegistry>()),
-      asyncRuntime_(std::make_shared<AsyncRuntimeContext>(heap_.get())),
+      asyncRuntime_(nullptr),
       lifecycleTarget_(std::make_shared<Interpreter::DispatchTarget>()) {
     registerValueLifecycleHooks();
 }
@@ -1905,9 +1905,15 @@ EngineRuntime::~EngineRuntime() {
 
 void EngineRuntime::registerValueLifecycleHooks() {
     std::shared_ptr<const ProgramImage> prog;
+    std::shared_ptr<ManagedHeap> currentHeap;
+    std::shared_ptr<const BindingRegistry> currentBindings;
+    std::shared_ptr<AsyncRuntimeContext> currentAsync;
     {
         std::lock_guard<std::mutex> lock(programMutex_);
         prog = program_;
+        currentHeap = heap_;
+        currentBindings = bindings_;
+        currentAsync = asyncRuntime_;
     }
     if (!lifecycleTarget_) {
         lifecycleTarget_ = std::make_shared<Interpreter::DispatchTarget>();
@@ -1916,22 +1922,28 @@ void EngineRuntime::registerValueLifecycleHooks() {
         std::lock_guard<std::mutex> lock(lifecycleTarget_->mutex);
         lifecycleTarget_->interpreter = nullptr;
         lifecycleTarget_->program = prog;
-        lifecycleTarget_->heap = heap_;
-        lifecycleTarget_->bindings = bindings_;
-        lifecycleTarget_->asyncRuntime = asyncRuntime_;
+        lifecycleTarget_->heap = currentHeap;
+        lifecycleTarget_->bindings = std::move(currentBindings);
+        lifecycleTarget_->asyncRuntime = std::move(currentAsync);
         lifecycleTarget_->alive = true;
     }
-    if (prog && heap_) {
-        heap_->registerTypeHierarchy(*prog);
-        Interpreter::installValueLifecycleHooks(prog, heap_, lifecycleTarget_);
+    if (prog && currentHeap) {
+        currentHeap->registerTypeHierarchy(*prog);
+        Interpreter::installValueLifecycleHooks(prog, currentHeap, lifecycleTarget_);
     }
 }
 
 void EngineRuntime::setBindings(std::shared_ptr<const BindingRegistry> bindings) {
-    bindings_ = std::move(bindings);
+    std::shared_ptr<const BindingRegistry> updatedBindings;
+    {
+        std::lock_guard<std::mutex> lock(programMutex_);
+        bindings_ = std::move(bindings);
+        updatedBindings = bindings_;
+        cachedInterpreter_.reset();
+    }
     if (lifecycleTarget_) {
         std::lock_guard<std::mutex> lock(lifecycleTarget_->mutex);
-        lifecycleTarget_->bindings = bindings_;
+        lifecycleTarget_->bindings = std::move(updatedBindings);
     }
 }
 
@@ -1939,55 +1951,122 @@ void EngineRuntime::setHeap(std::shared_ptr<ManagedHeap> heap) {
     if (lifecycleTarget_) {
         lifecycleTarget_->detachSweepHandler(false);
     }
-    auto oldHeap = std::move(heap_);
-    heap_ = heap ? std::move(heap) : std::make_shared<ManagedHeap>();
-    if (asyncRuntime_) {
-        asyncRuntime_->setHeap(heap_.get());
+    auto newHeap = heap ? std::move(heap) : std::make_shared<ManagedHeap>();
+    {
+        std::lock_guard<std::mutex> lock(programMutex_);
+        heap_ = std::move(newHeap);
+        if (asyncRuntime_) {
+            asyncRuntime_->setHeap(heap_.get());
+        }
+        cachedInterpreter_.reset();
     }
     registerValueLifecycleHooks();
 }
 
-std::shared_ptr<ManagedHeap> EngineRuntime::heap() const noexcept { return heap_; }
+std::shared_ptr<ManagedHeap> EngineRuntime::heap() const noexcept {
+    std::lock_guard<std::mutex> lock(programMutex_);
+    return heap_;
+}
 
 void EngineRuntime::setNativeHandles(
     std::shared_ptr<NativeHandleRegistry> handles) {
-    nativeHandles_ = handles
+    auto newHandles = handles
         ? std::move(handles)
         : std::make_shared<NativeHandleRegistry>();
+    std::lock_guard<std::mutex> lock(programMutex_);
+    nativeHandles_ = std::move(newHandles);
 }
 
 std::shared_ptr<NativeHandleRegistry> EngineRuntime::nativeHandles() const noexcept {
+    std::lock_guard<std::mutex> lock(programMutex_);
     return nativeHandles_;
 }
 
 void EngineRuntime::setAsyncRuntime(
     std::shared_ptr<AsyncRuntimeContext> asyncRuntime) {
-    asyncRuntime_ = asyncRuntime
-        ? std::move(asyncRuntime)
-        : std::make_shared<AsyncRuntimeContext>(heap_.get());
-    asyncRuntime_->setHeap(heap_.get());
+    std::shared_ptr<AsyncRuntimeContext> updatedAsync;
+    {
+        std::lock_guard<std::mutex> lock(programMutex_);
+        asyncRuntime_ = std::move(asyncRuntime);
+        if (asyncRuntime_) {
+            asyncRuntime_->setHeap(heap_.get());
+        }
+        updatedAsync = asyncRuntime_;
+        if (cachedInterpreter_) {
+            cachedInterpreter_->setAsyncRuntime(updatedAsync);
+        }
+    }
     if (lifecycleTarget_) {
         std::lock_guard<std::mutex> lock(lifecycleTarget_->mutex);
-        lifecycleTarget_->asyncRuntime = asyncRuntime_;
+        lifecycleTarget_->asyncRuntime = std::move(updatedAsync);
     }
 }
 
 std::shared_ptr<AsyncRuntimeContext> EngineRuntime::asyncRuntime() const noexcept {
-    return asyncRuntime_;
+    std::shared_ptr<AsyncRuntimeContext> createdAsync;
+    {
+        std::lock_guard<std::mutex> lock(programMutex_);
+        if (!asyncRuntime_) {
+            asyncRuntime_ = std::make_shared<AsyncRuntimeContext>(heap_.get());
+            createdAsync = asyncRuntime_;
+            if (cachedInterpreter_) {
+                cachedInterpreter_->setAsyncRuntime(asyncRuntime_);
+            }
+        } else {
+            return asyncRuntime_;
+        }
+    }
+    if (lifecycleTarget_ && createdAsync) {
+        std::lock_guard<std::mutex> lock(lifecycleTarget_->mutex);
+        lifecycleTarget_->asyncRuntime = createdAsync;
+    }
+    return createdAsync;
+}
+
+std::shared_ptr<const Interpreter> EngineRuntime::getOrCreateInterpreter() const {
+    std::shared_ptr<AsyncRuntimeContext> newAsync;
+    std::shared_ptr<const Interpreter> result;
+    {
+        std::lock_guard<std::mutex> lock(programMutex_);
+        if (!program_) {
+            return nullptr;
+        }
+        if (!asyncRuntime_ && detail::executionMirror(*program_).hasAsyncOperations) {
+            asyncRuntime_ = std::make_shared<AsyncRuntimeContext>(heap_.get());
+            newAsync = asyncRuntime_;
+            if (cachedInterpreter_) {
+                cachedInterpreter_->setAsyncRuntime(asyncRuntime_);
+            }
+        }
+        if (!cachedInterpreter_) {
+            cachedInterpreter_ = std::shared_ptr<Interpreter>(new Interpreter(
+                Interpreter::EngineInvokeTag{},
+                program_,
+                heap_,
+                bindings_,
+                asyncRuntime_));
+        }
+        result = cachedInterpreter_;
+    }
+    if (lifecycleTarget_ && newAsync) {
+        std::lock_guard<std::mutex> lock(lifecycleTarget_->mutex);
+        lifecycleTarget_->asyncRuntime = std::move(newAsync);
+    }
+    return result;
 }
 
 ExecutionResult EngineRuntime::invoke(
     const std::string& qualifiedName,
     const std::vector<Value>& arguments,
     ExecutionOptions options) const {
-    auto program = programSnapshot();
-    if (!program) {
+    auto interpreter = getOrCreateInterpreter();
+    if (!interpreter || !interpreter->program_) {
         ExecutionResult result;
         result.error.code = ErrorCode::InvalidProgram;
         result.error.message = "runtime has no linked program image";
         return result;
     }
-    const auto entry = program->findFunction(qualifiedName);
+    const auto entry = interpreter->program_->findFunction(qualifiedName);
     if (!entry) {
         ExecutionResult result;
         result.error.code = ErrorCode::FunctionNotFound;
@@ -1995,33 +2074,45 @@ ExecutionResult EngineRuntime::invoke(
             "entry function '" + qualifiedName + "' was not found";
         return result;
     }
-    Interpreter interpreter(
-        Interpreter::EngineInvokeTag{},
-        std::move(program),
-        heap_,
-        bindings_,
-        asyncRuntime_);
-    return interpreter.invoke(*entry, arguments, std::move(options));
+    if (options.determinism.mode == DeterminismMode::Off &&
+        !options.profile &&
+        !static_cast<bool>(options.trace) &&
+        !options.debugger &&
+        !options.enforceCapabilities &&
+        !options.determinism.enforceCapabilities &&
+        options.grantedCapabilities.empty() &&
+        options.awaitScheduler == nullptr &&
+        options.executionPolicy == nullptr &&
+        options.crossHeapPolicy == CrossHeapAccessPolicy::AllowReadWrite) {
+        return interpreter->invoke(*entry, arguments, options.limits);
+    }
+    return interpreter->invoke(*entry, arguments, std::move(options));
 }
 
 ExecutionResult EngineRuntime::invoke(
     semantic::SymbolId symbolId,
     const std::vector<Value>& arguments,
     ExecutionOptions options) const {
-    auto program = programSnapshot();
-    if (!program) {
+    auto interpreter = getOrCreateInterpreter();
+    if (!interpreter || !interpreter->program_) {
         ExecutionResult result;
         result.error.code = ErrorCode::InvalidProgram;
         result.error.message = "runtime has no linked program image";
         return result;
     }
-    Interpreter interpreter(
-        Interpreter::EngineInvokeTag{},
-        std::move(program),
-        heap_,
-        bindings_,
-        asyncRuntime_);
-    return interpreter.invoke(symbolId, arguments, std::move(options));
+    if (options.determinism.mode == DeterminismMode::Off &&
+        !options.profile &&
+        !static_cast<bool>(options.trace) &&
+        !options.debugger &&
+        !options.enforceCapabilities &&
+        !options.determinism.enforceCapabilities &&
+        options.grantedCapabilities.empty() &&
+        options.awaitScheduler == nullptr &&
+        options.executionPolicy == nullptr &&
+        options.crossHeapPolicy == CrossHeapAccessPolicy::AllowReadWrite) {
+        return interpreter->invoke(symbolId, arguments, options.limits);
+    }
+    return interpreter->invoke(symbolId, arguments, std::move(options));
 }
 
 const ProgramImage& EngineRuntime::program() const noexcept {
@@ -2040,6 +2131,7 @@ void EngineRuntime::replaceProgram(std::shared_ptr<const ProgramImage> program) 
         std::lock_guard<std::mutex> lock(programMutex_);
         if (program_) retiredPrograms_.push_back(program_);
         program_ = std::move(program);
+        cachedInterpreter_.reset();
     }
     registerValueLifecycleHooks();
 }
@@ -2065,6 +2157,7 @@ bool EngineRuntime::replaceProgram(
         }
         if (program_) retiredPrograms_.push_back(program_);
         program_ = std::move(program);
+        cachedInterpreter_.reset();
     }
     registerValueLifecycleHooks();
     return true;
@@ -3652,16 +3745,87 @@ std::uint32_t internArenaQuatf(QuatfValue value) noexcept {
     entry.slots[1].kind = InlineStructSlot::Kind::Quatf;
     std::memcpy(&entry.slots[1].lo, &value.z, sizeof(float));
     std::memcpy(&entry.slots[1].hi, &value.w, sizeof(float));
-    if (const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed)) {
-        if (bridge->internInlineArenaFn) {
-            const std::uint32_t bid = bridge->internInlineArenaFn(entry);
-            if (bid != 0u) return bid;
-        }
+    const auto* bridge = g_externalPoolBridge.load(std::memory_order_relaxed);
+    if (bridge != nullptr && bridge->internInlineArenaFn) {
+        const std::uint32_t bid = bridge->internInlineArenaFn(entry);
+        if (bid != 0u) return bid;
     }
     auto* cur = ValuePoolDomainAccess::currentDomainImpl();
+    struct QuatfTlsEntry {
+        std::uint64_t domainEpoch = 0;
+        std::uint64_t collectionCount = 0;
+        std::uint32_t shardEpoch = 0;
+        std::uint32_t lo0 = 0;
+        std::uint32_t hi0 = 0;
+        std::uint32_t lo1 = 0;
+        std::uint32_t hi1 = 0;
+        std::uint32_t id = 0;
+        std::uint8_t domainId = 0;
+    };
+    static constexpr std::size_t kQuatfTlsCacheSize = 256u;
+    thread_local std::array<QuatfTlsEntry, kQuatfTlsCacheSize> tlsQuatfCache{};
+    const bool allowTlsCache = (bridge == nullptr) && !cur->poolGcMarkInProgress;
+    const std::uint64_t curCollectionCount =
+        allowTlsCache ? cur->collectionCount.load(std::memory_order_acquire) : 0u;
+    std::size_t tlsIdx = 0u;
+    if (allowTlsCache) {
+        std::uint64_t h = (static_cast<std::uint64_t>(entry.slots[0].lo) << 32u) |
+            static_cast<std::uint64_t>(entry.slots[0].hi);
+        h ^= ((static_cast<std::uint64_t>(entry.slots[1].lo) << 32u) |
+            static_cast<std::uint64_t>(entry.slots[1].hi)) * 0x9e3779b97f4a7c15ULL;
+        h ^= (h >> 33u);
+        h *= 0xff51afd7ed558ccdULL;
+        tlsIdx = static_cast<std::size_t>((h >> 33u) & (kQuatfTlsCacheSize - 1u));
+        const auto& cached = tlsQuatfCache[tlsIdx];
+        if (cached.id != 0u &&
+            (cached.id & 0x80000000u) == 0u &&
+            cached.domainEpoch == cur->domainEpoch &&
+            cached.collectionCount == curCollectionCount &&
+            cached.domainId == cur->domainId &&
+            cached.lo0 == entry.slots[0].lo &&
+            cached.hi0 == entry.slots[0].hi &&
+            cached.lo1 == entry.slots[1].lo &&
+            cached.hi1 == entry.slots[1].hi) {
+            std::uint8_t domId = 0u;
+            std::uint32_t shardIdx = 0u;
+            std::uint32_t localSlot = 0u;
+            if (detail::decodeDomainPoolId(cached.id, domId, shardIdx, localSlot) &&
+                domId == cur->domainId &&
+                shardIdx < detail::kPoolShardCount &&
+                cur->inlinePool.shards_[shardIdx].epoch.load(std::memory_order_acquire) == cached.shardEpoch) {
+                if (auto* page = cur->inlinePool.shards_[shardIdx].dir.getPageLockFree(
+                        localSlot >> InlineStructPool::kPageShift)) {
+                    refreshClockBitIfUnset(page->flags[localSlot & InlineStructPool::kPageMask]);
+                }
+                return cached.id;
+            }
+        }
+    }
     const std::uint32_t id = cur->inlinePool.intern(
         entry, false, cur->poolGcMarkInProgress, cur->anyPoolHasPinnedSlots);
-    return id != 0u ? id : cur->scalarOverflowTable.intern(entry);
+    const std::uint32_t outId = id != 0u ? id : cur->scalarOverflowTable.intern(entry);
+    if (allowTlsCache && outId != 0u && (outId & 0x80000000u) == 0u &&
+        cur->collectionCount.load(std::memory_order_acquire) == curCollectionCount &&
+        !cur->poolGcMarkInProgress) {
+        std::uint8_t domId = 0u;
+        std::uint32_t shardIdx = 0u;
+        std::uint32_t localSlot = 0u;
+        if (detail::decodeDomainPoolId(outId, domId, shardIdx, localSlot) &&
+            domId == cur->domainId &&
+            shardIdx < detail::kPoolShardCount) {
+            tlsQuatfCache[tlsIdx] = QuatfTlsEntry{
+                cur->domainEpoch,
+                curCollectionCount,
+                cur->inlinePool.shards_[shardIdx].epoch.load(std::memory_order_acquire),
+                entry.slots[0].lo,
+                entry.slots[0].hi,
+                entry.slots[1].lo,
+                entry.slots[1].hi,
+                outId,
+                cur->domainId};
+        }
+    }
+    return outId;
 }
 
 QuatfValue lookupArenaQuatf(std::uint32_t arenaIdx) noexcept {

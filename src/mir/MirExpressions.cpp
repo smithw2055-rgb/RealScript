@@ -840,11 +840,13 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 std::holds_alternative<std::int64_t>(literal.value)
                     ? std::get<std::int64_t>(literal.value)
                     : 0;
-            return emitValue(
+            const auto conv = emitValue(
                 Opcode::ConvertNumeric,
                 literal.type,
                 {intVal},
                 expression.span);
+            block(*currentBlockId_).instructions.back().checkedArithmetic = false;
+            return conv;
         }
         if (literal.type == semantic::PrimitiveType::Float) {
             const auto dblVal = emitValue(
@@ -854,11 +856,13 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                 expression.span);
             block(*currentBlockId_).instructions.back().doubleImmediate =
                 std::get<double>(literal.value);
-            return emitValue(
+            const auto conv = emitValue(
                 Opcode::ConvertNumeric,
                 semantic::PrimitiveType::Float,
                 {dblVal},
                 expression.span);
+            block(*currentBlockId_).instructions.back().checkedArithmetic = false;
+            return conv;
         }
         if (literal.type == semantic::PrimitiveType::Double) {
             const auto value = emitValue(Opcode::ConstantDouble, literal.type, {}, expression.span);
@@ -1054,7 +1058,9 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                         std::holds_alternative<std::int64_t>(field.constantValue)
                             ? std::get<std::int64_t>(field.constantValue)
                             : 0;
-                    return emitValue(Opcode::ConvertNumeric, field.type, {v}, span);
+                    const auto conv = emitValue(Opcode::ConvertNumeric, field.type, {v}, span);
+                    block(*currentBlockId_).instructions.back().checkedArithmetic = false;
+                    return conv;
                 }
                 if (field.type == semantic::PrimitiveType::Double ||
                     field.type == semantic::PrimitiveType::Float) {
@@ -1067,7 +1073,9 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                                 ? static_cast<double>(std::get<std::int64_t>(field.constantValue))
                                 : 0.0);
                     if (field.type == semantic::PrimitiveType::Float) {
-                        return emitValue(Opcode::ConvertNumeric, field.type, {v}, span);
+                        const auto conv = emitValue(Opcode::ConvertNumeric, field.type, {v}, span);
+                        block(*currentBlockId_).instructions.back().checkedArithmetic = false;
+                        return conv;
                     }
                     return v;
                 }
@@ -1106,7 +1114,9 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
             if (semantic::isIntegralType(field.type)) {
                 const auto v = emitValue(Opcode::ConstantInt, semantic::PrimitiveType::Int, {}, span);
                 block(*currentBlockId_).instructions.back().integerImmediate = 0;
-                return emitValue(Opcode::ConvertNumeric, field.type, {v}, span);
+                const auto conv = emitValue(Opcode::ConvertNumeric, field.type, {v}, span);
+                block(*currentBlockId_).instructions.back().checkedArithmetic = false;
+                return conv;
             }
             if (field.type == semantic::PrimitiveType::Double ||
                 field.type == semantic::PrimitiveType::Float) {
@@ -1114,7 +1124,9 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                     Opcode::ConstantDouble, semantic::PrimitiveType::Double, {}, span);
                 block(*currentBlockId_).instructions.back().doubleImmediate = 0.0;
                 if (field.type == semantic::PrimitiveType::Float) {
-                    return emitValue(Opcode::ConvertNumeric, field.type, {v}, span);
+                    const auto conv = emitValue(Opcode::ConvertNumeric, field.type, {v}, span);
+                    block(*currentBlockId_).instructions.back().checkedArithmetic = false;
+                    return conv;
                 }
                 return v;
             }
@@ -1267,6 +1279,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                         ? std::get<std::int64_t>(field.constantValue)
                         : 0;
                 defaultVal = emitValue(Opcode::ConvertNumeric, field.type, {v}, expression.span);
+                block(*currentBlockId_).instructions.back().checkedArithmetic = false;
             } else if (field.type == semantic::PrimitiveType::Double ||
                        field.type == semantic::PrimitiveType::Float) {
                 const auto v = emitValue(
@@ -1277,9 +1290,12 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                         : (std::holds_alternative<std::int64_t>(field.constantValue)
                             ? static_cast<double>(std::get<std::int64_t>(field.constantValue))
                             : 0.0);
-                defaultVal = field.type == semantic::PrimitiveType::Float
-                    ? emitValue(Opcode::ConvertNumeric, field.type, {v}, expression.span)
-                    : v;
+                if (field.type == semantic::PrimitiveType::Float) {
+                    defaultVal = emitValue(Opcode::ConvertNumeric, field.type, {v}, expression.span);
+                    block(*currentBlockId_).instructions.back().checkedArithmetic = false;
+                } else {
+                    defaultVal = v;
+                }
             } else if (field.type == semantic::PrimitiveType::Bool) {
                 defaultVal = emitValue(Opcode::ConstantBool, field.type, {}, expression.span);
                 block(*currentBlockId_).instructions.back().boolImmediate =
@@ -1437,6 +1453,7 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                             ? std::get<std::int64_t>(field.constantValue)
                             : 0;
                     defaultVal = emitValue(Opcode::ConvertNumeric, field.type, {v}, expression.span);
+                    block(*currentBlockId_).instructions.back().checkedArithmetic = false;
                 } else if (field.type == semantic::PrimitiveType::Double ||
                            field.type == semantic::PrimitiveType::Float) {
                     const auto v = emitValue(
@@ -1447,9 +1464,12 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                             : (std::holds_alternative<std::int64_t>(field.constantValue)
                                 ? static_cast<double>(std::get<std::int64_t>(field.constantValue))
                                 : 0.0);
-                    defaultVal = field.type == semantic::PrimitiveType::Float
-                        ? emitValue(Opcode::ConvertNumeric, field.type, {v}, expression.span)
-                        : v;
+                    if (field.type == semantic::PrimitiveType::Float) {
+                        defaultVal = emitValue(Opcode::ConvertNumeric, field.type, {v}, expression.span);
+                        block(*currentBlockId_).instructions.back().checkedArithmetic = false;
+                    } else {
+                        defaultVal = v;
+                    }
                 } else if (field.type == semantic::PrimitiveType::Bool) {
                     defaultVal = emitValue(Opcode::ConstantBool, field.type, {}, expression.span);
                     block(*currentBlockId_).instructions.back().boolImmediate =
@@ -1476,14 +1496,18 @@ ValueId Lowerer::lowerExpression(const semantic::BoundExpression& expression) {
                         Opcode::ConstantInt, semantic::PrimitiveType::Int, {}, expression.span);
                     block(*currentBlockId_).instructions.back().integerImmediate = 0;
                     defaultVal = emitValue(Opcode::ConvertNumeric, field.type, {v}, expression.span);
+                    block(*currentBlockId_).instructions.back().checkedArithmetic = false;
                 } else if (field.type == semantic::PrimitiveType::Double ||
                            field.type == semantic::PrimitiveType::Float) {
                     const auto v = emitValue(
                         Opcode::ConstantDouble, semantic::PrimitiveType::Double, {}, expression.span);
                     block(*currentBlockId_).instructions.back().doubleImmediate = 0.0;
-                    defaultVal = field.type == semantic::PrimitiveType::Float
-                        ? emitValue(Opcode::ConvertNumeric, field.type, {v}, expression.span)
-                        : v;
+                    if (field.type == semantic::PrimitiveType::Float) {
+                        defaultVal = emitValue(Opcode::ConvertNumeric, field.type, {v}, expression.span);
+                        block(*currentBlockId_).instructions.back().checkedArithmetic = false;
+                    } else {
+                        defaultVal = v;
+                    }
                 } else if (field.type == semantic::PrimitiveType::Bool) {
                     defaultVal = emitValue(Opcode::ConstantBool, field.type, {}, expression.span);
                     block(*currentBlockId_).instructions.back().boolImmediate = false;

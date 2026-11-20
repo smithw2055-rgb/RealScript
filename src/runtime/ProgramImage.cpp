@@ -12,6 +12,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -474,12 +475,747 @@ std::uint64_t nextExecutionMirrorId() noexcept {
     return id;
 }
 
+QuickOpcode computeQuickOpcode(
+    const bytecode::Module& module,
+    const bytecode::Function& function,
+    const bytecode::Instruction& instruction) {
+    const bool validRes =
+        instruction.result < function.registerTypes.size() &&
+        instruction.result < InvalidCompactReg;
+    switch (instruction.opcode) {
+    case bytecode::Opcode::LoadParameter:
+        if (validRes &&
+            instruction.index < function.parameterTypes.size() &&
+            instruction.index < InvalidCompactReg) {
+            return QuickOpcode::LoadParameter;
+        }
+        return QuickOpcode::Generic;
+    case bytecode::Opcode::ConstantInt:
+        if (validRes &&
+            function.registerTypes[instruction.result] ==
+                semantic::PrimitiveType::Int) {
+            return QuickOpcode::ConstantInt;
+        }
+        if (validRes &&
+            function.registerTypes[instruction.result] ==
+                semantic::PrimitiveType::Long) {
+            return QuickOpcode::ConstantLong;
+        }
+        return QuickOpcode::Generic;
+    case bytecode::Opcode::ConstantBool:
+        if (validRes &&
+            function.registerTypes[instruction.result] ==
+                semantic::PrimitiveType::Bool) {
+            return QuickOpcode::ConstantBool;
+        }
+        return QuickOpcode::Generic;
+    case bytecode::Opcode::ConstantDouble:
+        if (validRes &&
+            function.registerTypes[instruction.result] ==
+                semantic::PrimitiveType::Double) {
+            return QuickOpcode::ConstantDouble;
+        }
+        return QuickOpcode::Generic;
+    case bytecode::Opcode::ArrayLength:
+        if (validRes &&
+            instruction.operands.size() == 1 &&
+            instruction.operands[0] < function.registerTypes.size() &&
+            instruction.operands[0] < InvalidCompactReg &&
+            function.registerTypes[instruction.operands[0]] ==
+                semantic::PrimitiveType::Array &&
+            function.registerTypes[instruction.result] ==
+                semantic::PrimitiveType::Int) {
+            return QuickOpcode::ArrayLengthFast;
+        }
+        return QuickOpcode::Generic;
+    case bytecode::Opcode::ConvertIntToLong:
+        if (validRes &&
+            instruction.operands.size() == 1 &&
+            instruction.operands[0] < function.registerTypes.size() &&
+            instruction.operands[0] < InvalidCompactReg &&
+            function.registerTypes[instruction.operands[0]] ==
+                semantic::PrimitiveType::Int &&
+            function.registerTypes[instruction.result] ==
+                semantic::PrimitiveType::Long) {
+            return QuickOpcode::ConvertIntToLongFast;
+        }
+        return QuickOpcode::Generic;
+    case bytecode::Opcode::ConvertIntToDouble:
+        if (validRes &&
+            instruction.operands.size() == 1 &&
+            instruction.operands[0] < function.registerTypes.size() &&
+            instruction.operands[0] < InvalidCompactReg &&
+            function.registerTypes[instruction.operands[0]] ==
+                semantic::PrimitiveType::Int &&
+            function.registerTypes[instruction.result] ==
+                semantic::PrimitiveType::Double) {
+            return QuickOpcode::ConvertIntToDoubleFast;
+        }
+        return QuickOpcode::Generic;
+    case bytecode::Opcode::ConvertLongToDouble:
+        if (validRes &&
+            instruction.operands.size() == 1 &&
+            instruction.operands[0] < function.registerTypes.size() &&
+            instruction.operands[0] < InvalidCompactReg &&
+            function.registerTypes[instruction.operands[0]] ==
+                semantic::PrimitiveType::Long &&
+            function.registerTypes[instruction.result] ==
+                semantic::PrimitiveType::Double) {
+            return QuickOpcode::ConvertLongToDoubleFast;
+        }
+        return QuickOpcode::Generic;
+    case bytecode::Opcode::ConvertNumeric:
+        if (validRes &&
+            instruction.operands.size() == 1 &&
+            instruction.operands[0] < function.registerTypes.size() &&
+            instruction.operands[0] < InvalidCompactReg) {
+            const auto srcType = function.registerTypes[instruction.operands[0]];
+            const auto dstType = function.registerTypes[instruction.result];
+            if (srcType == semantic::PrimitiveType::Int &&
+                dstType == semantic::PrimitiveType::Float) {
+                return QuickOpcode::ConvertIntToFloatFast;
+            }
+            if (srcType == semantic::PrimitiveType::Double &&
+                dstType == semantic::PrimitiveType::Float) {
+                return QuickOpcode::ConvertDoubleToFloatFast;
+            }
+            if (srcType == semantic::PrimitiveType::Float &&
+                dstType == semantic::PrimitiveType::Int) {
+                return QuickOpcode::ConvertFloatToIntFast;
+            }
+            if (srcType == semantic::PrimitiveType::Float &&
+                dstType == semantic::PrimitiveType::Double) {
+                return QuickOpcode::ConvertFloatToDoubleFast;
+            }
+            if (srcType == semantic::PrimitiveType::Int &&
+                dstType == semantic::PrimitiveType::Long) {
+                return QuickOpcode::ConvertIntToLongFast;
+            }
+            if (srcType == semantic::PrimitiveType::Long &&
+                dstType == semantic::PrimitiveType::Int) {
+                return QuickOpcode::ConvertLongToIntFast;
+            }
+            if (srcType == semantic::PrimitiveType::Int &&
+                dstType == semantic::PrimitiveType::Double) {
+                return QuickOpcode::ConvertIntToDoubleFast;
+            }
+            if (srcType == semantic::PrimitiveType::Long &&
+                dstType == semantic::PrimitiveType::Double) {
+                return QuickOpcode::ConvertLongToDoubleFast;
+            }
+        }
+        return QuickOpcode::Generic;
+    case bytecode::Opcode::NewStruct:
+        if (validRes &&
+            function.registerTypes[instruction.result] ==
+                semantic::PrimitiveType::Struct &&
+            instruction.result < function.registerTypeIds.size() &&
+            instruction.typeIndex < module.types.size() &&
+            module.types[instruction.typeIndex].kind == semantic::TypeKind::Struct) {
+            const auto tid = module.types[instruction.typeIndex].id;
+            if (function.registerTypeIds[instruction.result] == tid &&
+                (tid == fixedTypeId() ||
+                 tid == fixed16TypeId() ||
+                 tid == fixed64TypeId() ||
+                 tid == vec2TypeId() ||
+                 tid == vec3TypeId() ||
+                 tid == quatTypeId() ||
+                 tid == vec2fTypeId() ||
+                 tid == vec3fTypeId() ||
+                 tid == quatfTypeId())) {
+                return QuickOpcode::NewStructFast;
+            }
+        }
+        return QuickOpcode::Generic;
+    case bytecode::Opcode::NegateInt:
+        if (validRes &&
+            !instruction.checkedArithmetic &&
+            instruction.operands.size() == 1 &&
+            instruction.operands[0] < function.registerTypes.size() &&
+            instruction.operands[0] < InvalidCompactReg &&
+            function.registerTypes[instruction.operands[0]] ==
+                semantic::PrimitiveType::Int &&
+            function.registerTypes[instruction.result] ==
+                semantic::PrimitiveType::Int) {
+            return QuickOpcode::NegateIntUnchecked;
+        }
+        return QuickOpcode::Generic;
+    case bytecode::Opcode::NegateDouble:
+        if (validRes &&
+            instruction.operands.size() == 1 &&
+            instruction.operands[0] < function.registerTypes.size() &&
+            instruction.operands[0] < InvalidCompactReg) {
+            if (function.registerTypes[instruction.operands[0]] ==
+                    semantic::PrimitiveType::Double &&
+                function.registerTypes[instruction.result] ==
+                    semantic::PrimitiveType::Double) {
+                return QuickOpcode::NegateDouble;
+            }
+            if (function.registerTypes[instruction.operands[0]] ==
+                    semantic::PrimitiveType::Float &&
+                function.registerTypes[instruction.result] ==
+                    semantic::PrimitiveType::Float) {
+                return QuickOpcode::NegateFloat;
+            }
+        }
+        return QuickOpcode::Generic;
+    case bytecode::Opcode::LogicalNot:
+        if (validRes &&
+            instruction.operands.size() == 1 &&
+            instruction.operands[0] < function.registerTypes.size() &&
+            instruction.operands[0] < InvalidCompactReg &&
+            function.registerTypes[instruction.operands[0]] ==
+                semantic::PrimitiveType::Bool &&
+            function.registerTypes[instruction.result] ==
+                semantic::PrimitiveType::Bool) {
+            return QuickOpcode::LogicalNot;
+        }
+        return QuickOpcode::Generic;
+    case bytecode::Opcode::LoadLocal:
+        if (validRes &&
+            instruction.index < function.localTypes.size() &&
+            instruction.index < InvalidCompactReg &&
+            function.registerTypes[instruction.result] ==
+                function.localTypes[instruction.index]) {
+            return QuickOpcode::LoadLocal;
+        }
+        return QuickOpcode::Generic;
+    case bytecode::Opcode::StoreLocal:
+        if (instruction.index < function.localTypes.size() &&
+            instruction.index < InvalidCompactReg &&
+            instruction.operands.size() == 1 &&
+            instruction.operands[0] < function.registerTypes.size() &&
+            instruction.operands[0] < InvalidCompactReg &&
+            function.registerTypes[instruction.operands[0]] ==
+                function.localTypes[instruction.index]) {
+            return QuickOpcode::StoreLocal;
+        }
+        return QuickOpcode::Generic;
+    case bytecode::Opcode::CheckNotNull:
+        if (validRes &&
+            instruction.operands.size() == 1 &&
+            instruction.operands[0] < function.registerTypes.size() &&
+            instruction.operands[0] < InvalidCompactReg &&
+            function.registerTypes[instruction.operands[0]] ==
+                semantic::PrimitiveType::Object) {
+            return QuickOpcode::CheckNotNullFast;
+        }
+        return QuickOpcode::Generic;
+    case bytecode::Opcode::LoadElement:
+        if (validRes &&
+            instruction.elementType == semantic::PrimitiveType::Int &&
+            instruction.operands.size() == 2 &&
+            instruction.operands[0] < function.registerTypes.size() &&
+            instruction.operands[0] < InvalidCompactReg &&
+            instruction.operands[1] < function.registerTypes.size() &&
+            instruction.operands[1] < InvalidCompactReg &&
+            function.registerTypes[instruction.operands[0]] ==
+                semantic::PrimitiveType::Array &&
+            function.registerTypes[instruction.operands[1]] ==
+                semantic::PrimitiveType::Int) {
+            return QuickOpcode::LoadElementIntFast;
+        }
+        return QuickOpcode::Generic;
+    case bytecode::Opcode::StoreElement:
+        if (instruction.elementType == semantic::PrimitiveType::Int &&
+            instruction.operands.size() == 3 &&
+            instruction.operands[0] < function.registerTypes.size() &&
+            instruction.operands[0] < InvalidCompactReg &&
+            instruction.operands[1] < function.registerTypes.size() &&
+            instruction.operands[1] < InvalidCompactReg &&
+            instruction.operands[2] < function.registerTypes.size() &&
+            instruction.operands[2] < InvalidCompactReg &&
+            function.registerTypes[instruction.operands[0]] ==
+                semantic::PrimitiveType::Array &&
+            function.registerTypes[instruction.operands[1]] ==
+                semantic::PrimitiveType::Int &&
+            function.registerTypes[instruction.operands[2]] ==
+                semantic::PrimitiveType::Int) {
+            return QuickOpcode::StoreElementIntFast;
+        }
+        return QuickOpcode::Generic;
+    case bytecode::Opcode::LoadField:
+        if (validRes &&
+            instruction.operands.size() == 1 &&
+            instruction.operands[0] < function.registerTypes.size() &&
+            instruction.operands[0] < InvalidCompactReg &&
+            function.registerTypes[instruction.operands[0]] ==
+                semantic::PrimitiveType::Object &&
+            instruction.typeIndex < module.types.size() &&
+            instruction.index < module.types[instruction.typeIndex].fields.size() &&
+            instruction.index < InvalidCompactReg) {
+            const auto& fld = module.types[instruction.typeIndex].fields[instruction.index];
+            if (fld.type != semantic::PrimitiveType::Handle &&
+                fld.type != semantic::PrimitiveType::Void &&
+                fld.type != semantic::PrimitiveType::Null &&
+                fld.type != semantic::PrimitiveType::Error &&
+                function.registerTypes[instruction.result] == fld.type) {
+                return QuickOpcode::LoadFieldFast;
+            }
+        }
+        return QuickOpcode::Generic;
+    case bytecode::Opcode::StoreField:
+        if (instruction.operands.size() == 2 &&
+            instruction.operands[0] < function.registerTypes.size() &&
+            instruction.operands[0] < InvalidCompactReg &&
+            instruction.operands[1] < function.registerTypes.size() &&
+            instruction.operands[1] < InvalidCompactReg &&
+            function.registerTypes[instruction.operands[0]] ==
+                semantic::PrimitiveType::Object &&
+            instruction.typeIndex < module.types.size() &&
+            instruction.index < module.types[instruction.typeIndex].fields.size() &&
+            instruction.index < InvalidCompactReg) {
+            const auto& fld = module.types[instruction.typeIndex].fields[instruction.index];
+            if (fld.type != semantic::PrimitiveType::Handle &&
+                fld.type != semantic::PrimitiveType::Void &&
+                fld.type != semantic::PrimitiveType::Null &&
+                fld.type != semantic::PrimitiveType::Error &&
+                function.registerTypes[instruction.operands[1]] == fld.type) {
+                return QuickOpcode::StoreFieldFast;
+            }
+        }
+        return QuickOpcode::Generic;
+    case bytecode::Opcode::LoadStructField:
+        if (validRes &&
+            instruction.operands.size() == 1 &&
+            instruction.operands[0] < function.registerTypes.size() &&
+            instruction.operands[0] < InvalidCompactReg &&
+            function.registerTypes[instruction.operands[0]] ==
+                semantic::PrimitiveType::Struct &&
+            instruction.typeIndex < module.types.size() &&
+            module.types[instruction.typeIndex].kind == semantic::TypeKind::Struct &&
+            instruction.index < module.types[instruction.typeIndex].fields.size() &&
+            instruction.index < InvalidCompactReg) {
+            const auto& fld = module.types[instruction.typeIndex].fields[instruction.index];
+            if (!semantic::isExactType(fld.type) &&
+                fld.type != semantic::PrimitiveType::Handle &&
+                function.registerTypes[instruction.result] == fld.type) {
+                return QuickOpcode::LoadStructFieldFast;
+            }
+            if (fld.type == semantic::PrimitiveType::Struct &&
+                function.registerTypes[instruction.result] ==
+                    semantic::PrimitiveType::Struct &&
+                instruction.result < function.registerTypeIds.size() &&
+                function.registerTypeIds[instruction.result] ==
+                    exactTypeId(fld.type, fld.typeName)) {
+                return QuickOpcode::LoadStructFieldFast;
+            }
+        }
+        return QuickOpcode::Generic;
+    case bytecode::Opcode::StoreStructField:
+        if (validRes &&
+            instruction.operands.size() == 2 &&
+            instruction.operands[0] < function.registerTypes.size() &&
+            instruction.operands[0] < InvalidCompactReg &&
+            instruction.operands[1] < function.registerTypes.size() &&
+            instruction.operands[1] < InvalidCompactReg &&
+            function.registerTypes[instruction.operands[0]] ==
+                semantic::PrimitiveType::Struct &&
+            instruction.typeIndex < module.types.size() &&
+            module.types[instruction.typeIndex].kind == semantic::TypeKind::Struct &&
+            instruction.index < module.types[instruction.typeIndex].fields.size() &&
+            instruction.index < InvalidCompactReg) {
+            const auto& fld = module.types[instruction.typeIndex].fields[instruction.index];
+            if (!semantic::isExactType(fld.type) &&
+                fld.type != semantic::PrimitiveType::Handle &&
+                function.registerTypes[instruction.operands[1]] == fld.type) {
+                return QuickOpcode::StoreStructFieldFast;
+            }
+            if (fld.type == semantic::PrimitiveType::Struct &&
+                function.registerTypes[instruction.operands[1]] ==
+                    semantic::PrimitiveType::Struct &&
+                instruction.operands[1] < function.registerTypeIds.size() &&
+                function.registerTypeIds[instruction.operands[1]] ==
+                    exactTypeId(fld.type, fld.typeName)) {
+                return QuickOpcode::StoreStructFieldFast;
+            }
+        }
+        return QuickOpcode::Generic;
+    default:
+        break;
+    }
+    if (validRes &&
+        instruction.operands.size() == 2 &&
+        instruction.operands[0] < function.registerTypes.size() &&
+        instruction.operands[0] < InvalidCompactReg &&
+        instruction.operands[1] < function.registerTypes.size() &&
+        instruction.operands[1] < InvalidCompactReg &&
+        function.registerTypes[instruction.operands[0]] ==
+            semantic::PrimitiveType::Double &&
+        function.registerTypes[instruction.operands[1]] ==
+            semantic::PrimitiveType::Double) {
+        switch (instruction.opcode) {
+        case bytecode::Opcode::AddDouble: return QuickOpcode::AddDouble;
+        case bytecode::Opcode::SubtractDouble: return QuickOpcode::SubtractDouble;
+        case bytecode::Opcode::MultiplyDouble: return QuickOpcode::MultiplyDouble;
+        case bytecode::Opcode::DivideDouble: return QuickOpcode::DivideDouble;
+        case bytecode::Opcode::LessDouble: return QuickOpcode::LessDouble;
+        case bytecode::Opcode::LessOrEqualDouble: return QuickOpcode::LessOrEqualDouble;
+        case bytecode::Opcode::GreaterDouble: return QuickOpcode::GreaterDouble;
+        case bytecode::Opcode::GreaterOrEqualDouble: return QuickOpcode::GreaterOrEqualDouble;
+        default: break;
+        }
+    }
+    if (validRes &&
+        instruction.operands.size() == 2 &&
+        instruction.operands[0] < function.registerTypes.size() &&
+        instruction.operands[0] < InvalidCompactReg &&
+        instruction.operands[1] < function.registerTypes.size() &&
+        instruction.operands[1] < InvalidCompactReg &&
+        function.registerTypes[instruction.operands[0]] ==
+            semantic::PrimitiveType::Float &&
+        function.registerTypes[instruction.operands[1]] ==
+            semantic::PrimitiveType::Float) {
+        const auto resType = function.registerTypes[instruction.result];
+        if (resType == semantic::PrimitiveType::Float) {
+            switch (instruction.opcode) {
+            case bytecode::Opcode::AddDouble: return QuickOpcode::AddFloat;
+            case bytecode::Opcode::SubtractDouble: return QuickOpcode::SubtractFloat;
+            case bytecode::Opcode::MultiplyDouble: return QuickOpcode::MultiplyFloat;
+            case bytecode::Opcode::DivideDouble: return QuickOpcode::DivideFloat;
+            default: break;
+            }
+        } else if (resType == semantic::PrimitiveType::Bool) {
+            switch (instruction.opcode) {
+            case bytecode::Opcode::LessDouble: return QuickOpcode::LessFloat;
+            case bytecode::Opcode::LessOrEqualDouble: return QuickOpcode::LessOrEqualFloat;
+            case bytecode::Opcode::GreaterDouble: return QuickOpcode::GreaterFloat;
+            case bytecode::Opcode::GreaterOrEqualDouble: return QuickOpcode::GreaterOrEqualFloat;
+            case bytecode::Opcode::Equal: return QuickOpcode::EqualFloat;
+            case bytecode::Opcode::NotEqual: return QuickOpcode::NotEqualFloat;
+            default: break;
+            }
+        }
+    }
+    if (!validRes ||
+        instruction.operands.size() < 2 ||
+        instruction.operands[0] >= function.registerTypes.size() ||
+        instruction.operands[0] >= InvalidCompactReg ||
+        instruction.operands[1] >= function.registerTypes.size() ||
+        instruction.operands[1] >= InvalidCompactReg ||
+        function.registerTypes[instruction.operands[0]] !=
+            semantic::PrimitiveType::Int ||
+        function.registerTypes[instruction.operands[1]] !=
+            semantic::PrimitiveType::Int) {
+        return QuickOpcode::Generic;
+    }
+    switch (instruction.opcode) {
+    case bytecode::Opcode::AddInt: return QuickOpcode::AddInt;
+    case bytecode::Opcode::SubtractInt: return QuickOpcode::SubtractInt;
+    case bytecode::Opcode::MultiplyInt: return QuickOpcode::MultiplyInt;
+    case bytecode::Opcode::DivideInt: return QuickOpcode::DivideInt;
+    case bytecode::Opcode::RemainderInt: return QuickOpcode::RemainderInt;
+    case bytecode::Opcode::LessInt: return QuickOpcode::LessInt;
+    case bytecode::Opcode::LessOrEqualInt:
+        return QuickOpcode::LessOrEqualInt;
+    case bytecode::Opcode::GreaterInt: return QuickOpcode::GreaterInt;
+    case bytecode::Opcode::GreaterOrEqualInt:
+        return QuickOpcode::GreaterOrEqualInt;
+    case bytecode::Opcode::Equal:
+        return QuickOpcode::EqualInt;
+    case bytecode::Opcode::NotEqual:
+        return QuickOpcode::NotEqualInt;
+    default: return QuickOpcode::Generic;
+    }
+}
+
+void populateExecutionBlockInstructions(
+    const bytecode::Module& module,
+    const bytecode::Function& function,
+    const bytecode::BasicBlock& bb,
+    std::vector<ExecutionInstruction>& instructions) {
+    instructions.clear();
+    instructions.reserve(bb.instructions.size());
+    for (const auto& instruction : bb.instructions) {
+        ExecutionInstruction execInst;
+        execInst.bytecode = &instruction;
+        execInst.opcode = computeQuickOpcode(module, function, instruction);
+        execInst.operationId = cachedInstructionOperationId(instruction.opcode);
+        execInst.opcodeName = bytecode::opcodeName(instruction.opcode);
+        execInst.result = toCompactReg(instruction.result);
+        execInst.checkedArithmetic1 = instruction.checkedArithmetic;
+        execInst.integerImmediate = instruction.activeIntegerImmediate();
+        if (instruction.opcode == bytecode::Opcode::LoadParameter ||
+            instruction.opcode == bytecode::Opcode::LoadLocal ||
+            instruction.opcode == bytecode::Opcode::StoreLocal ||
+            instruction.opcode == bytecode::Opcode::LoadField ||
+            instruction.opcode == bytecode::Opcode::StoreField ||
+            instruction.opcode == bytecode::Opcode::LoadStructField ||
+            instruction.opcode == bytecode::Opcode::StoreStructField) {
+            execInst.auxReg1 = toCompactReg(instruction.index);
+        }
+        if (!instruction.operands.empty()) {
+            execInst.op0 = toCompactReg(instruction.operands[0]);
+        }
+        if (instruction.operands.size() >= 2) {
+            execInst.op1 = toCompactReg(instruction.operands[1]);
+        }
+        if (instruction.operands.size() >= 3) {
+            execInst.op2 = toCompactReg(instruction.operands[2]);
+        }
+        instructions.push_back(execInst);
+    }
+
+    const auto isBinaryInt = [](QuickOpcode opcode) {
+        return opcode >= QuickOpcode::AddInt &&
+            opcode <= QuickOpcode::NotEqualInt;
+    };
+    for (std::size_t instructionIndex = 0;
+         instructionIndex < instructions.size();) {
+        auto& first = instructions[instructionIndex];
+        // Pattern 1: LoadParameter + StoreLocal (span 2)
+        const bool isCustomStructParamMove =
+            first.opcode == QuickOpcode::LoadParameter &&
+            first.auxReg1 < function.parameterTypes.size() &&
+            function.parameterTypes[first.auxReg1] == semantic::PrimitiveType::Struct &&
+            first.auxReg1 < function.parameterTypeIds.size() &&
+            findFlatStructSchemaByTypeId(function.parameterTypeIds[first.auxReg1]) != nullptr;
+        if (!isCustomStructParamMove &&
+            instructionIndex + 1 < instructions.size() &&
+            first.opcode == QuickOpcode::LoadParameter &&
+            instructions[instructionIndex + 1].opcode == QuickOpcode::StoreLocal &&
+            instructions[instructionIndex + 1].op0 == first.result) {
+            first.superOpcode = SuperOpcode::LoadParameterStoreLocal;
+            first.span = 2;
+            first.storeSlot = instructions[instructionIndex + 1].auxReg1;
+            instructionIndex += 2;
+            continue;
+        }
+        // Pattern 2: LoadLocal + (ConstantInt | LoadLocal) + BinaryInt (+ StoreLocal) (span 3 or 4)
+        if (instructionIndex + 2 < instructions.size() &&
+            first.opcode == QuickOpcode::LoadLocal &&
+            (instructions[instructionIndex + 1].opcode == QuickOpcode::ConstantInt ||
+             instructions[instructionIndex + 1].opcode == QuickOpcode::LoadLocal) &&
+            isBinaryInt(instructions[instructionIndex + 2].opcode)) {
+            const auto& second = instructions[instructionIndex + 1];
+            const auto& binary = instructions[instructionIndex + 2];
+            if (first.result != second.result &&
+                binary.op0 == first.result &&
+                binary.op1 == second.result) {
+                const auto constant = second.opcode == QuickOpcode::ConstantInt;
+                const auto storesResult =
+                    instructionIndex + 3 < instructions.size() &&
+                    instructions[instructionIndex + 3].opcode == QuickOpcode::StoreLocal &&
+                    instructions[instructionIndex + 3].op0 == binary.result;
+                first.superOpcode = storesResult
+                    ? (constant
+                        ? SuperOpcode::BinaryLocalIntConstantStoreLocal
+                        : SuperOpcode::BinaryLocalIntLocalStoreLocal)
+                    : (constant
+                        ? SuperOpcode::BinaryLocalIntConstant
+                        : SuperOpcode::BinaryLocalIntLocal);
+                first.span = storesResult ? 4 : 3;
+                first.binaryOpcode1 = binary.opcode;
+                first.checkedArithmetic1 = binary.checkedArithmetic1;
+                first.op1 = second.auxReg1;
+                first.integerImmediate = second.integerImmediate;
+                first.auxReg2 = second.result;
+                first.superResult = binary.result;
+                if (storesResult) {
+                    first.storeSlot = instructions[instructionIndex + 3].auxReg1;
+                }
+                instructionIndex += first.span;
+                continue;
+            }
+        }
+        // Pattern 3: LoadLocal + BinaryInt(r_loaded, r_reg) + BinaryInt(r_mid, r_reg2) + StoreLocal (span 4, e.g. ai_tick)
+        if (instructionIndex + 3 < instructions.size() &&
+            first.opcode == QuickOpcode::LoadLocal &&
+            isBinaryInt(instructions[instructionIndex + 1].opcode) &&
+            isBinaryInt(instructions[instructionIndex + 2].opcode) &&
+            instructions[instructionIndex + 3].opcode == QuickOpcode::StoreLocal) {
+            const auto& bin1 = instructions[instructionIndex + 1];
+            const auto& bin2 = instructions[instructionIndex + 2];
+            const auto& store = instructions[instructionIndex + 3];
+            if (bin1.op0 == first.result &&
+                bin1.op1 != first.result &&
+                bin2.op0 == bin1.result &&
+                bin2.op1 != bin1.result &&
+                bin2.op1 != first.result &&
+                store.op0 == bin2.result) {
+                first.superOpcode = SuperOpcode::BinaryLocalIntRegChainStoreLocal;
+                first.span = 4;
+                first.binaryOpcode1 = bin1.opcode;
+                first.checkedArithmetic1 = bin1.checkedArithmetic1;
+                first.binaryOpcode2 = bin2.opcode;
+                first.checkedArithmetic2 = bin2.checkedArithmetic1;
+                first.op1 = bin1.op1;
+                first.op2 = bin2.op1;
+                first.auxReg2 = bin1.result;
+                first.superResult = bin2.result;
+                first.storeSlot = store.auxReg1;
+                instructionIndex += 4;
+                continue;
+            }
+        }
+        // Pattern 4: LoadLocal + BinaryInt(r_loaded, r_reg) (+ StoreLocal) (span 2 or 3, O2 LICM loop headers & bodies!)
+        if (instructionIndex + 1 < instructions.size() &&
+            first.opcode == QuickOpcode::LoadLocal &&
+            isBinaryInt(instructions[instructionIndex + 1].opcode)) {
+            const auto& binary = instructions[instructionIndex + 1];
+            if (binary.op0 == first.result &&
+                binary.op1 != first.result) {
+                const auto storesResult =
+                    instructionIndex + 2 < instructions.size() &&
+                    instructions[instructionIndex + 2].opcode == QuickOpcode::StoreLocal &&
+                    instructions[instructionIndex + 2].op0 == binary.result;
+                first.superOpcode = storesResult
+                    ? SuperOpcode::BinaryLocalIntRegStoreLocal
+                    : SuperOpcode::BinaryLocalIntReg;
+                first.span = storesResult ? 3 : 2;
+                first.binaryOpcode1 = binary.opcode;
+                first.checkedArithmetic1 = binary.checkedArithmetic1;
+                first.op1 = binary.op1;
+                first.superResult = binary.result;
+                if (storesResult) {
+                    first.storeSlot = instructions[instructionIndex + 2].auxReg1;
+                }
+                instructionIndex += first.span;
+                continue;
+            }
+        }
+        ++instructionIndex;
+    }
+}
+
+template <typename ResolveDirectFn>
+void linkExecutionBlockCalls(
+    const bytecode::Module& module,
+    const bytecode::Function& function,
+    std::vector<ExecutionInstruction>& instructions,
+    ResolveDirectFn&& resolveDirect) {
+    for (auto& instruction : instructions) {
+        if (instruction.bytecode->opcode != bytecode::Opcode::Call ||
+            instruction.bytecode->index >= module.functionReferences.size()) {
+            continue;
+        }
+        const auto& reference = module.functionReferences[instruction.bytecode->index];
+        if (reference.virtualDispatch || reference.interfaceDispatch) {
+            bool operandsValid =
+                instruction.bytecode->operands.size() == reference.parameterTypes.size() &&
+                !instruction.bytecode->operands.empty();
+            if (instruction.bytecode->result != bytecode::InvalidRegister &&
+                (instruction.bytecode->result >= function.registerTypes.size() ||
+                 instruction.bytecode->result >= InvalidCompactReg)) {
+                operandsValid = false;
+            }
+            for (const auto op : instruction.bytecode->operands) {
+                if (op >= function.registerTypes.size() || op >= InvalidCompactReg) {
+                    operandsValid = false;
+                    break;
+                }
+            }
+            if (operandsValid &&
+                !(reference.virtualDispatch && reference.interfaceDispatch) &&
+                ((reference.virtualDispatch &&
+                  reference.virtualSlot != std::numeric_limits<std::uint32_t>::max() &&
+                  reference.parameterTypes.front() == semantic::PrimitiveType::Object) ||
+                 (reference.interfaceDispatch &&
+                  reference.interfaceTypeId != 0 &&
+                  reference.interfaceSlot != std::numeric_limits<std::uint32_t>::max() &&
+                  reference.parameterTypes.front() == semantic::PrimitiveType::Object &&
+                  (reference.parameterTypeIds.empty() ? 0 : reference.parameterTypeIds.front()) ==
+                      reference.interfaceTypeId))) {
+                instruction.opcode = QuickOpcode::CallPolled;
+            }
+            continue;
+        }
+        const auto resolved = resolveDirect(reference.symbolId);
+        const ProgramImage::FunctionLocation* targetLoc = resolved.first;
+        const ExecutionFunction* targetExec = resolved.second;
+        if (!targetLoc || !targetLoc->function) {
+            continue;
+        }
+        const auto& targetFunction = *targetLoc->function;
+        if (reference.returnType != targetFunction.returnType ||
+            reference.returnTypeId != targetFunction.returnTypeId ||
+            reference.parameterTypes != targetFunction.parameterTypes ||
+            reference.parameterTypeIds != targetFunction.parameterTypeIds ||
+            instruction.bytecode->operands.size() != targetFunction.parameterTypes.size()) {
+            continue;
+        }
+        bool callDirectRegsValid =
+            instruction.bytecode->result == bytecode::InvalidRegister ||
+            (instruction.bytecode->result < function.registerTypes.size() &&
+             instruction.bytecode->result < InvalidCompactReg);
+        for (const auto op : instruction.bytecode->operands) {
+            if (op >= function.registerTypes.size() || op >= InvalidCompactReg) {
+                callDirectRegsValid = false;
+                break;
+            }
+        }
+        if (!callDirectRegsValid) continue;
+        instruction.opcode = QuickOpcode::CallDirect;
+        instruction.directTarget = targetLoc;
+        instruction.directExecution = targetExec;
+    }
+}
+
+void packResolvedColdMeta(
+    const ExecutionFunction& dstFn,
+    const ResolvedFlatColdMeta& r,
+    std::vector<FlatColdCallMeta>& flatColdCalls,
+    FlatColdMeta& compact) {
+    compact.blockIndex = r.blockIndex;
+    compact.instructionIndexInBlock = r.instructionIndexInBlock;
+    compact.bytecodeIndexInBlock = InvalidStreamOffset;
+    compact.callMetaIdx = InvalidStreamOffset;
+
+    if (r.bytecode != nullptr) {
+        const ExecutionFunction* owner =
+            (r.inlinedCallee != nullptr && r.directExecution != nullptr)
+                ? r.directExecution
+                : &dstFn;
+        if (r.blockIndex < owner->blocks.size()) {
+            const auto* bb = owner->blocks[r.blockIndex].bytecode;
+            if (bb != nullptr &&
+                !bb->instructions.empty() &&
+                r.bytecode >= bb->instructions.data() &&
+                r.bytecode < bb->instructions.data() + bb->instructions.size()) {
+                compact.bytecodeIndexInBlock = static_cast<std::uint32_t>(
+                    r.bytecode - bb->instructions.data());
+            }
+        }
+    }
+
+    if (r.directTarget != nullptr ||
+        r.directExecution != nullptr ||
+        r.inlinedCallee != nullptr ||
+        r.callerBlockIndex != 0u ||
+        r.callerInstIndex != 0u ||
+        r.inlineFrameBias != 0u) {
+        if (!flatColdCalls.empty()) {
+            const auto& prev = flatColdCalls.back();
+            if (prev.directTarget == r.directTarget &&
+                prev.directExecution == r.directExecution &&
+                prev.inlinedCallee == r.inlinedCallee &&
+                prev.callerBlockIndex == r.callerBlockIndex &&
+                prev.callerInstIndex == r.callerInstIndex &&
+                prev.inlineFrameBias == r.inlineFrameBias) {
+                compact.callMetaIdx = static_cast<std::uint32_t>(
+                    flatColdCalls.size() - 1u);
+                return;
+            }
+        }
+        compact.callMetaIdx = static_cast<std::uint32_t>(flatColdCalls.size());
+        flatColdCalls.push_back(FlatColdCallMeta{
+            r.directTarget,
+            r.directExecution,
+            r.inlinedCallee,
+            r.callerBlockIndex,
+            r.callerInstIndex,
+            r.inlineFrameBias});
+    }
+}
+
 } // namespace
 
 std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
     const std::vector<bytecode::Module>& modules,
     const std::unordered_map<
-        semantic::SymbolId, ProgramImage::FunctionLocation>& functions) {
+        semantic::SymbolId, ProgramImage::FunctionLocation>& functions,
+    const std::unordered_map<
+        semantic::SymbolId, const semantic::TypeSymbol*>& types) {
     auto mirror = std::make_shared<ExecutionMirror>();
     mirror->instanceId = nextExecutionMirrorId();
     std::unordered_map<std::string, std::uint32_t> stringLiteralMap;
@@ -499,449 +1235,21 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
     mirror->functions.reserve(functionCount);
 
     for (const auto& module : modules) {
-        for (const auto& function : module.functions) {
-            const auto quickOpcode = [&](const bytecode::Instruction& instruction) {
-                const bool validRes =
-                    instruction.result < function.registerTypes.size() &&
-                    instruction.result < InvalidCompactReg;
-                switch (instruction.opcode) {
-                case bytecode::Opcode::LoadParameter:
-                    if (validRes &&
-                        instruction.index < function.parameterTypes.size() &&
-                        instruction.index < InvalidCompactReg) {
-                        return QuickOpcode::LoadParameter;
-                    }
-                    return QuickOpcode::Generic;
-                case bytecode::Opcode::ConstantInt:
-                    if (validRes &&
-                        function.registerTypes[instruction.result] ==
-                            semantic::PrimitiveType::Int) {
-                        return QuickOpcode::ConstantInt;
-                    }
-                    if (validRes &&
-                        function.registerTypes[instruction.result] ==
-                            semantic::PrimitiveType::Long) {
-                        return QuickOpcode::ConstantLong;
-                    }
-                    return QuickOpcode::Generic;
-                case bytecode::Opcode::ConstantBool:
-                    if (validRes &&
-                        function.registerTypes[instruction.result] ==
-                            semantic::PrimitiveType::Bool) {
-                        return QuickOpcode::ConstantBool;
-                    }
-                    return QuickOpcode::Generic;
-                case bytecode::Opcode::ConstantDouble:
-                    if (validRes &&
-                        function.registerTypes[instruction.result] ==
-                            semantic::PrimitiveType::Double) {
-                        return QuickOpcode::ConstantDouble;
-                    }
-                    return QuickOpcode::Generic;
-                case bytecode::Opcode::ArrayLength:
-                    if (validRes &&
-                        instruction.operands.size() == 1 &&
-                        instruction.operands[0] < function.registerTypes.size() &&
-                        instruction.operands[0] < InvalidCompactReg &&
-                        function.registerTypes[instruction.operands[0]] ==
-                            semantic::PrimitiveType::Array &&
-                        function.registerTypes[instruction.result] ==
-                            semantic::PrimitiveType::Int) {
-                        return QuickOpcode::ArrayLengthFast;
-                    }
-                    return QuickOpcode::Generic;
-                case bytecode::Opcode::ConvertIntToLong:
-                    if (validRes &&
-                        instruction.operands.size() == 1 &&
-                        instruction.operands[0] < function.registerTypes.size() &&
-                        instruction.operands[0] < InvalidCompactReg &&
-                        function.registerTypes[instruction.operands[0]] ==
-                            semantic::PrimitiveType::Int &&
-                        function.registerTypes[instruction.result] ==
-                            semantic::PrimitiveType::Long) {
-                        return QuickOpcode::ConvertIntToLongFast;
-                    }
-                    return QuickOpcode::Generic;
-                case bytecode::Opcode::ConvertIntToDouble:
-                    if (validRes &&
-                        instruction.operands.size() == 1 &&
-                        instruction.operands[0] < function.registerTypes.size() &&
-                        instruction.operands[0] < InvalidCompactReg &&
-                        function.registerTypes[instruction.operands[0]] ==
-                            semantic::PrimitiveType::Int &&
-                        function.registerTypes[instruction.result] ==
-                            semantic::PrimitiveType::Double) {
-                        return QuickOpcode::ConvertIntToDoubleFast;
-                    }
-                    return QuickOpcode::Generic;
-                case bytecode::Opcode::ConvertLongToDouble:
-                    if (validRes &&
-                        instruction.operands.size() == 1 &&
-                        instruction.operands[0] < function.registerTypes.size() &&
-                        instruction.operands[0] < InvalidCompactReg &&
-                        function.registerTypes[instruction.operands[0]] ==
-                            semantic::PrimitiveType::Long &&
-                        function.registerTypes[instruction.result] ==
-                            semantic::PrimitiveType::Double) {
-                        return QuickOpcode::ConvertLongToDoubleFast;
-                    }
-                    return QuickOpcode::Generic;
-                case bytecode::Opcode::ConvertNumeric:
-                    if (validRes &&
-                        instruction.operands.size() == 1 &&
-                        instruction.operands[0] < function.registerTypes.size() &&
-                        instruction.operands[0] < InvalidCompactReg) {
-                        const auto srcType = function.registerTypes[instruction.operands[0]];
-                        const auto dstType = function.registerTypes[instruction.result];
-                        if (srcType == semantic::PrimitiveType::Int &&
-                            dstType == semantic::PrimitiveType::Float) {
-                            return QuickOpcode::ConvertIntToFloatFast;
-                        }
-                        if (srcType == semantic::PrimitiveType::Double &&
-                            dstType == semantic::PrimitiveType::Float) {
-                            return QuickOpcode::ConvertDoubleToFloatFast;
-                        }
-                        if (srcType == semantic::PrimitiveType::Float &&
-                            dstType == semantic::PrimitiveType::Int) {
-                            return QuickOpcode::ConvertFloatToIntFast;
-                        }
-                        if (srcType == semantic::PrimitiveType::Float &&
-                            dstType == semantic::PrimitiveType::Double) {
-                            return QuickOpcode::ConvertFloatToDoubleFast;
-                        }
-                        if (srcType == semantic::PrimitiveType::Int &&
-                            dstType == semantic::PrimitiveType::Long) {
-                            return QuickOpcode::ConvertIntToLongFast;
-                        }
-                        if (srcType == semantic::PrimitiveType::Long &&
-                            dstType == semantic::PrimitiveType::Int) {
-                            return QuickOpcode::ConvertLongToIntFast;
-                        }
-                        if (srcType == semantic::PrimitiveType::Int &&
-                            dstType == semantic::PrimitiveType::Double) {
-                            return QuickOpcode::ConvertIntToDoubleFast;
-                        }
-                        if (srcType == semantic::PrimitiveType::Long &&
-                            dstType == semantic::PrimitiveType::Double) {
-                            return QuickOpcode::ConvertLongToDoubleFast;
-                        }
-                    }
-                    return QuickOpcode::Generic;
-                case bytecode::Opcode::NewStruct:
-                    if (validRes &&
-                        function.registerTypes[instruction.result] ==
-                            semantic::PrimitiveType::Struct &&
-                        instruction.result < function.registerTypeIds.size() &&
-                        instruction.typeIndex < module.types.size() &&
-                        module.types[instruction.typeIndex].kind == semantic::TypeKind::Struct) {
-                        const auto tid = module.types[instruction.typeIndex].id;
-                        if (function.registerTypeIds[instruction.result] == tid &&
-                            (tid == fixedTypeId() ||
-                             tid == fixed16TypeId() ||
-                             tid == fixed64TypeId() ||
-                             tid == vec2TypeId() ||
-                             tid == vec3TypeId() ||
-                             tid == quatTypeId() ||
-                             tid == vec2fTypeId() ||
-                             tid == vec3fTypeId() ||
-                             tid == quatfTypeId())) {
-                            return QuickOpcode::NewStructFast;
-                        }
-                    }
-                    return QuickOpcode::Generic;
-                case bytecode::Opcode::NegateInt:
-                    if (validRes &&
-                        !instruction.checkedArithmetic &&
-                        instruction.operands.size() == 1 &&
-                        instruction.operands[0] < function.registerTypes.size() &&
-                        instruction.operands[0] < InvalidCompactReg &&
-                        function.registerTypes[instruction.operands[0]] ==
-                            semantic::PrimitiveType::Int &&
-                        function.registerTypes[instruction.result] ==
-                            semantic::PrimitiveType::Int) {
-                        return QuickOpcode::NegateIntUnchecked;
-                    }
-                    return QuickOpcode::Generic;
-                case bytecode::Opcode::NegateDouble:
-                    if (validRes &&
-                        instruction.operands.size() == 1 &&
-                        instruction.operands[0] < function.registerTypes.size() &&
-                        instruction.operands[0] < InvalidCompactReg) {
-                        if (function.registerTypes[instruction.operands[0]] ==
-                                semantic::PrimitiveType::Double &&
-                            function.registerTypes[instruction.result] ==
-                                semantic::PrimitiveType::Double) {
-                            return QuickOpcode::NegateDouble;
-                        }
-                        if (function.registerTypes[instruction.operands[0]] ==
-                                semantic::PrimitiveType::Float &&
-                            function.registerTypes[instruction.result] ==
-                                semantic::PrimitiveType::Float) {
-                            return QuickOpcode::NegateFloat;
-                        }
-                    }
-                    return QuickOpcode::Generic;
-                case bytecode::Opcode::LogicalNot:
-                    if (validRes &&
-                        instruction.operands.size() == 1 &&
-                        instruction.operands[0] < function.registerTypes.size() &&
-                        instruction.operands[0] < InvalidCompactReg &&
-                        function.registerTypes[instruction.operands[0]] ==
-                            semantic::PrimitiveType::Bool &&
-                        function.registerTypes[instruction.result] ==
-                            semantic::PrimitiveType::Bool) {
-                        return QuickOpcode::LogicalNot;
-                    }
-                    return QuickOpcode::Generic;
-                case bytecode::Opcode::LoadLocal:
-                    if (validRes &&
-                        instruction.index < function.localTypes.size() &&
-                        instruction.index < InvalidCompactReg &&
-                        function.registerTypes[instruction.result] ==
-                            function.localTypes[instruction.index]) {
-                        return QuickOpcode::LoadLocal;
-                    }
-                    return QuickOpcode::Generic;
-                case bytecode::Opcode::StoreLocal:
-                    if (instruction.index < function.localTypes.size() &&
-                        instruction.index < InvalidCompactReg &&
-                        instruction.operands.size() == 1 &&
-                        instruction.operands[0] < function.registerTypes.size() &&
-                        instruction.operands[0] < InvalidCompactReg &&
-                        function.registerTypes[instruction.operands[0]] ==
-                            function.localTypes[instruction.index]) {
-                        return QuickOpcode::StoreLocal;
-                    }
-                    return QuickOpcode::Generic;
-                case bytecode::Opcode::CheckNotNull:
-                    if (validRes &&
-                        instruction.operands.size() == 1 &&
-                        instruction.operands[0] < function.registerTypes.size() &&
-                        instruction.operands[0] < InvalidCompactReg &&
-                        function.registerTypes[instruction.operands[0]] ==
-                            semantic::PrimitiveType::Object) {
-                        return QuickOpcode::CheckNotNullFast;
-                    }
-                    return QuickOpcode::Generic;
-                case bytecode::Opcode::LoadElement:
-                    if (validRes &&
-                        instruction.elementType == semantic::PrimitiveType::Int &&
-                        instruction.operands.size() == 2 &&
-                        instruction.operands[0] < function.registerTypes.size() &&
-                        instruction.operands[0] < InvalidCompactReg &&
-                        instruction.operands[1] < function.registerTypes.size() &&
-                        instruction.operands[1] < InvalidCompactReg &&
-                        function.registerTypes[instruction.operands[0]] ==
-                            semantic::PrimitiveType::Array &&
-                        function.registerTypes[instruction.operands[1]] ==
-                            semantic::PrimitiveType::Int) {
-                        return QuickOpcode::LoadElementIntFast;
-                    }
-                    return QuickOpcode::Generic;
-                case bytecode::Opcode::StoreElement:
-                    if (instruction.elementType == semantic::PrimitiveType::Int &&
-                        instruction.operands.size() == 3 &&
-                        instruction.operands[0] < function.registerTypes.size() &&
-                        instruction.operands[0] < InvalidCompactReg &&
-                        instruction.operands[1] < function.registerTypes.size() &&
-                        instruction.operands[1] < InvalidCompactReg &&
-                        instruction.operands[2] < function.registerTypes.size() &&
-                        instruction.operands[2] < InvalidCompactReg &&
-                        function.registerTypes[instruction.operands[0]] ==
-                            semantic::PrimitiveType::Array &&
-                        function.registerTypes[instruction.operands[1]] ==
-                            semantic::PrimitiveType::Int &&
-                        function.registerTypes[instruction.operands[2]] ==
-                            semantic::PrimitiveType::Int) {
-                        return QuickOpcode::StoreElementIntFast;
-                    }
-                    return QuickOpcode::Generic;
-                case bytecode::Opcode::LoadField:
-                    if (validRes &&
-                        instruction.operands.size() == 1 &&
-                        instruction.operands[0] < function.registerTypes.size() &&
-                        instruction.operands[0] < InvalidCompactReg &&
-                        function.registerTypes[instruction.operands[0]] ==
-                            semantic::PrimitiveType::Object &&
-                        instruction.typeIndex < module.types.size() &&
-                        instruction.index < module.types[instruction.typeIndex].fields.size() &&
-                        instruction.index < InvalidCompactReg) {
-                        const auto& fld = module.types[instruction.typeIndex].fields[instruction.index];
-                        if (fld.type != semantic::PrimitiveType::Handle &&
-                            fld.type != semantic::PrimitiveType::Void &&
-                            fld.type != semantic::PrimitiveType::Null &&
-                            fld.type != semantic::PrimitiveType::Error &&
-                            function.registerTypes[instruction.result] == fld.type) {
-                            return QuickOpcode::LoadFieldFast;
-                        }
-                    }
-                    return QuickOpcode::Generic;
-                case bytecode::Opcode::StoreField:
-                    if (instruction.operands.size() == 2 &&
-                        instruction.operands[0] < function.registerTypes.size() &&
-                        instruction.operands[0] < InvalidCompactReg &&
-                        instruction.operands[1] < function.registerTypes.size() &&
-                        instruction.operands[1] < InvalidCompactReg &&
-                        function.registerTypes[instruction.operands[0]] ==
-                            semantic::PrimitiveType::Object &&
-                        instruction.typeIndex < module.types.size() &&
-                        instruction.index < module.types[instruction.typeIndex].fields.size() &&
-                        instruction.index < InvalidCompactReg) {
-                        const auto& fld = module.types[instruction.typeIndex].fields[instruction.index];
-                        if (fld.type != semantic::PrimitiveType::Handle &&
-                            fld.type != semantic::PrimitiveType::Void &&
-                            fld.type != semantic::PrimitiveType::Null &&
-                            fld.type != semantic::PrimitiveType::Error &&
-                            function.registerTypes[instruction.operands[1]] == fld.type) {
-                            return QuickOpcode::StoreFieldFast;
-                        }
-                    }
-                    return QuickOpcode::Generic;
-                case bytecode::Opcode::LoadStructField:
-                    if (validRes &&
-                        instruction.operands.size() == 1 &&
-                        instruction.operands[0] < function.registerTypes.size() &&
-                        instruction.operands[0] < InvalidCompactReg &&
-                        function.registerTypes[instruction.operands[0]] ==
-                            semantic::PrimitiveType::Struct &&
-                        instruction.typeIndex < module.types.size() &&
-                        module.types[instruction.typeIndex].kind == semantic::TypeKind::Struct &&
-                        instruction.index < module.types[instruction.typeIndex].fields.size() &&
-                        instruction.index < InvalidCompactReg) {
-                        const auto& fld = module.types[instruction.typeIndex].fields[instruction.index];
-                        if (!semantic::isExactType(fld.type) &&
-                            fld.type != semantic::PrimitiveType::Handle &&
-                            function.registerTypes[instruction.result] == fld.type) {
-                            return QuickOpcode::LoadStructFieldFast;
-                        }
-                        if (fld.type == semantic::PrimitiveType::Struct &&
-                            function.registerTypes[instruction.result] ==
-                                semantic::PrimitiveType::Struct &&
-                            instruction.result < function.registerTypeIds.size() &&
-                            function.registerTypeIds[instruction.result] ==
-                                exactTypeId(fld.type, fld.typeName)) {
-                            return QuickOpcode::LoadStructFieldFast;
-                        }
-                    }
-                    return QuickOpcode::Generic;
-                case bytecode::Opcode::StoreStructField:
-                    if (validRes &&
-                        instruction.operands.size() == 2 &&
-                        instruction.operands[0] < function.registerTypes.size() &&
-                        instruction.operands[0] < InvalidCompactReg &&
-                        instruction.operands[1] < function.registerTypes.size() &&
-                        instruction.operands[1] < InvalidCompactReg &&
-                        function.registerTypes[instruction.operands[0]] ==
-                            semantic::PrimitiveType::Struct &&
-                        instruction.typeIndex < module.types.size() &&
-                        module.types[instruction.typeIndex].kind == semantic::TypeKind::Struct &&
-                        instruction.index < module.types[instruction.typeIndex].fields.size() &&
-                        instruction.index < InvalidCompactReg) {
-                        const auto& fld = module.types[instruction.typeIndex].fields[instruction.index];
-                        if (!semantic::isExactType(fld.type) &&
-                            fld.type != semantic::PrimitiveType::Handle &&
-                            function.registerTypes[instruction.operands[1]] == fld.type) {
-                            return QuickOpcode::StoreStructFieldFast;
-                        }
-                        if (fld.type == semantic::PrimitiveType::Struct &&
-                            function.registerTypes[instruction.operands[1]] ==
-                                semantic::PrimitiveType::Struct &&
-                            instruction.operands[1] < function.registerTypeIds.size() &&
-                            function.registerTypeIds[instruction.operands[1]] ==
-                                exactTypeId(fld.type, fld.typeName)) {
-                            return QuickOpcode::StoreStructFieldFast;
-                        }
-                    }
-                    return QuickOpcode::Generic;
-                default:
+        if (!mirror->hasAsyncOperations) {
+            for (const auto& fnRef : module.functionReferences) {
+                if (fnRef.name.find("Async.") != std::string::npos ||
+                    fnRef.name.find("Async::") != std::string::npos ||
+                    fnRef.name.find("Async__") != std::string::npos) {
+                    mirror->hasAsyncOperations = true;
                     break;
                 }
-                if (validRes &&
-                    instruction.operands.size() == 2 &&
-                    instruction.operands[0] < function.registerTypes.size() &&
-                    instruction.operands[0] < InvalidCompactReg &&
-                    instruction.operands[1] < function.registerTypes.size() &&
-                    instruction.operands[1] < InvalidCompactReg &&
-                    function.registerTypes[instruction.operands[0]] ==
-                        semantic::PrimitiveType::Double &&
-                    function.registerTypes[instruction.operands[1]] ==
-                        semantic::PrimitiveType::Double) {
-                    switch (instruction.opcode) {
-                    case bytecode::Opcode::AddDouble: return QuickOpcode::AddDouble;
-                    case bytecode::Opcode::SubtractDouble: return QuickOpcode::SubtractDouble;
-                    case bytecode::Opcode::MultiplyDouble: return QuickOpcode::MultiplyDouble;
-                    case bytecode::Opcode::DivideDouble: return QuickOpcode::DivideDouble;
-                    case bytecode::Opcode::LessDouble: return QuickOpcode::LessDouble;
-                    case bytecode::Opcode::LessOrEqualDouble: return QuickOpcode::LessOrEqualDouble;
-                    case bytecode::Opcode::GreaterDouble: return QuickOpcode::GreaterDouble;
-                    case bytecode::Opcode::GreaterOrEqualDouble: return QuickOpcode::GreaterOrEqualDouble;
-                    default: break;
-                    }
-                }
-                if (validRes &&
-                    instruction.operands.size() == 2 &&
-                    instruction.operands[0] < function.registerTypes.size() &&
-                    instruction.operands[0] < InvalidCompactReg &&
-                    instruction.operands[1] < function.registerTypes.size() &&
-                    instruction.operands[1] < InvalidCompactReg &&
-                    function.registerTypes[instruction.operands[0]] ==
-                        semantic::PrimitiveType::Float &&
-                    function.registerTypes[instruction.operands[1]] ==
-                        semantic::PrimitiveType::Float) {
-                    const auto resType = function.registerTypes[instruction.result];
-                    if (resType == semantic::PrimitiveType::Float) {
-                        switch (instruction.opcode) {
-                        case bytecode::Opcode::AddDouble: return QuickOpcode::AddFloat;
-                        case bytecode::Opcode::SubtractDouble: return QuickOpcode::SubtractFloat;
-                        case bytecode::Opcode::MultiplyDouble: return QuickOpcode::MultiplyFloat;
-                        case bytecode::Opcode::DivideDouble: return QuickOpcode::DivideFloat;
-                        default: break;
-                        }
-                    } else if (resType == semantic::PrimitiveType::Bool) {
-                        switch (instruction.opcode) {
-                        case bytecode::Opcode::LessDouble: return QuickOpcode::LessFloat;
-                        case bytecode::Opcode::LessOrEqualDouble: return QuickOpcode::LessOrEqualFloat;
-                        case bytecode::Opcode::GreaterDouble: return QuickOpcode::GreaterFloat;
-                        case bytecode::Opcode::GreaterOrEqualDouble: return QuickOpcode::GreaterOrEqualFloat;
-                        case bytecode::Opcode::Equal: return QuickOpcode::EqualFloat;
-                        case bytecode::Opcode::NotEqual: return QuickOpcode::NotEqualFloat;
-                        default: break;
-                        }
-                    }
-                }
-                if (!validRes ||
-                    instruction.operands.size() < 2 ||
-                    instruction.operands[0] >= function.registerTypes.size() ||
-                    instruction.operands[0] >= InvalidCompactReg ||
-                    instruction.operands[1] >= function.registerTypes.size() ||
-                    instruction.operands[1] >= InvalidCompactReg ||
-                    function.registerTypes[instruction.operands[0]] !=
-                        semantic::PrimitiveType::Int ||
-                    function.registerTypes[instruction.operands[1]] !=
-                        semantic::PrimitiveType::Int) {
-                    return QuickOpcode::Generic;
-                }
-                switch (instruction.opcode) {
-                case bytecode::Opcode::AddInt: return QuickOpcode::AddInt;
-                case bytecode::Opcode::SubtractInt: return QuickOpcode::SubtractInt;
-                case bytecode::Opcode::MultiplyInt: return QuickOpcode::MultiplyInt;
-                case bytecode::Opcode::DivideInt: return QuickOpcode::DivideInt;
-                case bytecode::Opcode::RemainderInt: return QuickOpcode::RemainderInt;
-                case bytecode::Opcode::LessInt: return QuickOpcode::LessInt;
-                case bytecode::Opcode::LessOrEqualInt:
-                    return QuickOpcode::LessOrEqualInt;
-                case bytecode::Opcode::GreaterInt: return QuickOpcode::GreaterInt;
-                case bytecode::Opcode::GreaterOrEqualInt:
-                    return QuickOpcode::GreaterOrEqualInt;
-                case bytecode::Opcode::Equal:
-                    return QuickOpcode::EqualInt;
-                case bytecode::Opcode::NotEqual:
-                    return QuickOpcode::NotEqualInt;
-                default: return QuickOpcode::Generic;
-                }
-            };
+            }
+        }
+        for (const auto& function : module.functions) {
             ExecutionFunction decoded;
+            decoded.ownerMirror = mirror.get();
             decoded.bytecode = &function;
+            decoded.module = &module;
             decoded.hasDebugSequencePoints = !function.debugInfo.sequencePoints.empty();
             decoded.blocks.resize(function.blocks.size());
             bytecode::BlockId maxBlockId = 0;
@@ -1005,165 +1313,18 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     }
                 }
 
-                auto& instructions = blockMirror.instructions;
-                instructions.reserve(bb.instructions.size());
-                for (const auto& instruction : bb.instructions) {
-                    ExecutionInstruction execInst;
-                    execInst.bytecode = &instruction;
-                    execInst.opcode = quickOpcode(instruction);
-                    execInst.operationId = cachedInstructionOperationId(instruction.opcode);
-                    execInst.opcodeName = bytecode::opcodeName(instruction.opcode);
-                    execInst.result = toCompactReg(instruction.result);
-                    execInst.checkedArithmetic1 = instruction.checkedArithmetic;
-                    execInst.integerImmediate = instruction.activeIntegerImmediate();
-                    if (instruction.opcode == bytecode::Opcode::LoadParameter ||
-                        instruction.opcode == bytecode::Opcode::LoadLocal ||
-                        instruction.opcode == bytecode::Opcode::StoreLocal ||
-                        instruction.opcode == bytecode::Opcode::LoadField ||
-                        instruction.opcode == bytecode::Opcode::StoreField ||
-                        instruction.opcode == bytecode::Opcode::LoadStructField ||
-                        instruction.opcode == bytecode::Opcode::StoreStructField) {
-                        execInst.auxReg1 = toCompactReg(instruction.index);
-                    }
-                    if (!instruction.operands.empty()) {
-                        execInst.op0 = toCompactReg(instruction.operands[0]);
-                    }
-                    if (instruction.operands.size() >= 2) {
-                        execInst.op1 = toCompactReg(instruction.operands[1]);
-                    }
-                    if (instruction.operands.size() >= 3) {
-                        execInst.op2 = toCompactReg(instruction.operands[2]);
-                    }
-                    instructions.push_back(execInst);
-                }
-
-                const auto isBinaryInt = [](QuickOpcode opcode) {
-                    return opcode >= QuickOpcode::AddInt &&
-                        opcode <= QuickOpcode::NotEqualInt;
-                };
-                for (std::size_t instructionIndex = 0;
-                     instructionIndex < instructions.size();) {
-                    auto& first = instructions[instructionIndex];
-                    // Pattern 1: LoadParameter + StoreLocal (span 2)
-                    const bool isCustomStructParamMove =
-                        first.opcode == QuickOpcode::LoadParameter &&
-                        first.auxReg1 < function.parameterTypes.size() &&
-                        function.parameterTypes[first.auxReg1] == semantic::PrimitiveType::Struct &&
-                        first.auxReg1 < function.parameterTypeIds.size() &&
-                        findFlatStructSchemaByTypeId(function.parameterTypeIds[first.auxReg1]) != nullptr;
-                    if (!isCustomStructParamMove &&
-                        instructionIndex + 1 < instructions.size() &&
-                        first.opcode == QuickOpcode::LoadParameter &&
-                        instructions[instructionIndex + 1].opcode ==
-                            QuickOpcode::StoreLocal &&
-                        instructions[instructionIndex + 1].op0 == first.result) {
-                        first.superOpcode = SuperOpcode::LoadParameterStoreLocal;
-                        first.span = 2;
-                        first.storeSlot = instructions[instructionIndex + 1].auxReg1;
-                        instructionIndex += 2;
-                        continue;
-                    }
-                    // Pattern 2: LoadLocal + (ConstantInt | LoadLocal) + BinaryInt (+ StoreLocal) (span 3 or 4)
-                    if (instructionIndex + 2 < instructions.size() &&
-                        first.opcode == QuickOpcode::LoadLocal &&
-                        (instructions[instructionIndex + 1].opcode ==
-                                QuickOpcode::ConstantInt ||
-                            instructions[instructionIndex + 1].opcode ==
-                                QuickOpcode::LoadLocal) &&
-                        isBinaryInt(instructions[instructionIndex + 2].opcode)) {
-                        const auto& second = instructions[instructionIndex + 1];
-                        const auto& binary = instructions[instructionIndex + 2];
-                        if (first.result != second.result &&
-                            binary.op0 == first.result &&
-                            binary.op1 == second.result) {
-                            const auto constant =
-                                second.opcode == QuickOpcode::ConstantInt;
-                            const auto storesResult =
-                                instructionIndex + 3 < instructions.size() &&
-                                instructions[instructionIndex + 3].opcode ==
-                                    QuickOpcode::StoreLocal &&
-                                instructions[instructionIndex + 3].op0 ==
-                                    binary.result;
-                            first.superOpcode = storesResult
-                                ? (constant
-                                    ? SuperOpcode::BinaryLocalIntConstantStoreLocal
-                                    : SuperOpcode::BinaryLocalIntLocalStoreLocal)
-                                : (constant
-                                    ? SuperOpcode::BinaryLocalIntConstant
-                                    : SuperOpcode::BinaryLocalIntLocal);
-                            first.span = storesResult ? 4 : 3;
-                            first.binaryOpcode1 = binary.opcode;
-                            first.checkedArithmetic1 = binary.checkedArithmetic1;
-                            first.op1 = second.auxReg1; // right local index (if LoadLocal)
-                            first.integerImmediate = second.integerImmediate; // right const (if ConstantInt)
-                            first.auxReg2 = second.result; // second temp reg
-                            first.superResult = binary.result; // binary dest reg
-                            if (storesResult) {
-                                first.storeSlot = instructions[instructionIndex + 3].auxReg1;
-                            }
-                            instructionIndex += first.span;
-                            continue;
+                populateExecutionBlockInstructions(
+                    module, function, bb, blockMirror.instructions);
+                if (!mirror->hasAsyncOperations) {
+                    for (const auto& bcInst : bb.instructions) {
+                        if (bcInst.opcode == bytecode::Opcode::AsyncEnter ||
+                            bcInst.opcode == bytecode::Opcode::AwaitSuspend ||
+                            bcInst.opcode == bytecode::Opcode::AwaitResume ||
+                            bcInst.opcode == bytecode::Opcode::AsyncResolve) {
+                            mirror->hasAsyncOperations = true;
+                            break;
                         }
                     }
-                    // Pattern 3: LoadLocal + BinaryInt(r_loaded, r_reg) + BinaryInt(r_mid, r_reg2) + StoreLocal (span 4, e.g. ai_tick)
-                    if (instructionIndex + 3 < instructions.size() &&
-                        first.opcode == QuickOpcode::LoadLocal &&
-                        isBinaryInt(instructions[instructionIndex + 1].opcode) &&
-                        isBinaryInt(instructions[instructionIndex + 2].opcode) &&
-                        instructions[instructionIndex + 3].opcode == QuickOpcode::StoreLocal) {
-                        const auto& bin1 = instructions[instructionIndex + 1];
-                        const auto& bin2 = instructions[instructionIndex + 2];
-                        const auto& store = instructions[instructionIndex + 3];
-                        if (bin1.op0 == first.result &&
-                            bin1.op1 != first.result &&
-                            bin2.op0 == bin1.result &&
-                            bin2.op1 != bin1.result &&
-                            bin2.op1 != first.result &&
-                            store.op0 == bin2.result) {
-                            first.superOpcode = SuperOpcode::BinaryLocalIntRegChainStoreLocal;
-                            first.span = 4;
-                            first.binaryOpcode1 = bin1.opcode;
-                            first.checkedArithmetic1 = bin1.checkedArithmetic1;
-                            first.binaryOpcode2 = bin2.opcode;
-                            first.checkedArithmetic2 = bin2.checkedArithmetic1;
-                            first.op1 = bin1.op1;      // first rhs register
-                            first.op2 = bin2.op1;      // second rhs register
-                            first.auxReg2 = bin1.result;  // r_mid
-                            first.superResult = bin2.result; // r_final
-                            first.storeSlot = store.auxReg1; // target local index
-                            instructionIndex += 4;
-                            continue;
-                        }
-                    }
-                    // Pattern 4: LoadLocal + BinaryInt(r_loaded, r_reg) (+ StoreLocal) (span 2 or 3, O2 LICM loop headers & bodies!)
-                    if (instructionIndex + 1 < instructions.size() &&
-                        first.opcode == QuickOpcode::LoadLocal &&
-                        isBinaryInt(instructions[instructionIndex + 1].opcode)) {
-                        const auto& binary = instructions[instructionIndex + 1];
-                        if (binary.op0 == first.result &&
-                            binary.op1 != first.result) {
-                            const auto storesResult =
-                                instructionIndex + 2 < instructions.size() &&
-                                instructions[instructionIndex + 2].opcode ==
-                                    QuickOpcode::StoreLocal &&
-                                instructions[instructionIndex + 2].op0 ==
-                                    binary.result;
-                            first.superOpcode = storesResult
-                                ? SuperOpcode::BinaryLocalIntRegStoreLocal
-                                : SuperOpcode::BinaryLocalIntReg;
-                            first.span = storesResult ? 3 : 2;
-                            first.binaryOpcode1 = binary.opcode;
-                            first.checkedArithmetic1 = binary.checkedArithmetic1;
-                            first.op1 = binary.op1;       // rhs register index
-                            first.superResult = binary.result; // binary result register
-                            if (storesResult) {
-                                first.storeSlot = instructions[instructionIndex + 2].auxReg1;
-                            }
-                            instructionIndex += first.span;
-                            continue;
-                        }
-                    }
-                    ++instructionIndex;
                 }
                 if (useDenseBlockIndices) {
                     decoded.denseBlockIndices[bb.id] = static_cast<std::uint32_t>(index);
@@ -1304,77 +1465,20 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                 }
             }
             for (auto& block : decoded->second.blocks) {
-                for (auto& instruction : block.instructions) {
-                    if (instruction.bytecode->opcode !=
-                            bytecode::Opcode::Call ||
-                        instruction.bytecode->index >=
-                            module.functionReferences.size()) {
-                        continue;
-                    }
-                    const auto& reference =
-                        module.functionReferences[instruction.bytecode->index];
-                    if (reference.virtualDispatch || reference.interfaceDispatch) {
-                        bool operandsValid =
-                            instruction.bytecode->operands.size() ==
-                                reference.parameterTypes.size() &&
-                            !instruction.bytecode->operands.empty();
-                        if (instruction.bytecode->result != bytecode::InvalidRegister &&
-                            (instruction.bytecode->result >= function.registerTypes.size() ||
-                             instruction.bytecode->result >= InvalidCompactReg)) {
-                            operandsValid = false;
+                linkExecutionBlockCalls(
+                    module,
+                    function,
+                    block.instructions,
+                    [&](semantic::SymbolId symId)
+                        -> std::pair<const ProgramImage::FunctionLocation*, const ExecutionFunction*> {
+                        const auto target = functions.find(symId);
+                        if (target == functions.end() || !target->second.function) {
+                            return {nullptr, nullptr};
                         }
-                        for (const auto op : instruction.bytecode->operands) {
-                            if (op >= function.registerTypes.size() || op >= InvalidCompactReg) {
-                                operandsValid = false;
-                                break;
-                            }
-                        }
-                        if (operandsValid &&
-                            !(reference.virtualDispatch && reference.interfaceDispatch) &&
-                            ((reference.virtualDispatch &&
-                              reference.virtualSlot != std::numeric_limits<std::uint32_t>::max() &&
-                              reference.parameterTypes.front() == semantic::PrimitiveType::Object) ||
-                             (reference.interfaceDispatch &&
-                              reference.interfaceTypeId != 0 &&
-                              reference.interfaceSlot != std::numeric_limits<std::uint32_t>::max() &&
-                              reference.parameterTypes.front() == semantic::PrimitiveType::Object &&
-                              (reference.parameterTypeIds.empty() ? 0 : reference.parameterTypeIds.front()) ==
-                                  reference.interfaceTypeId))) {
-                            instruction.opcode = QuickOpcode::CallPolled;
-                        }
-                        continue;
-                    }
-                    const auto target = functions.find(reference.symbolId);
-                    if (target == functions.end() || !target->second.function) {
-                        continue;
-                    }
-                    const auto& targetFunction = *target->second.function;
-                    if (reference.returnType != targetFunction.returnType ||
-                        reference.returnTypeId != targetFunction.returnTypeId ||
-                        reference.parameterTypes !=
-                            targetFunction.parameterTypes ||
-                        reference.parameterTypeIds !=
-                            targetFunction.parameterTypeIds ||
-                        instruction.bytecode->operands.size() !=
-                            targetFunction.parameterTypes.size()) {
-                        continue;
-                    }
-                    bool callDirectRegsValid =
-                        instruction.bytecode->result == bytecode::InvalidRegister ||
-                        (instruction.bytecode->result < function.registerTypes.size() &&
-                         instruction.bytecode->result < InvalidCompactReg);
-                    for (const auto op : instruction.bytecode->operands) {
-                        if (op >= function.registerTypes.size() || op >= InvalidCompactReg) {
-                            callDirectRegsValid = false;
-                            break;
-                        }
-                    }
-                    if (!callDirectRegsValid) continue;
-                    instruction.opcode = QuickOpcode::CallDirect;
-                    instruction.directTarget = &target->second;
-                    instruction.directExecution = findExecutionFunction(
-                        *mirror, targetFunction);
-                }
+                        return {
+                            &target->second,
+                            findExecutionFunction(*mirror, *target->second.function)};
+                    });
             }
         }
     }
@@ -1767,16 +1871,29 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
         }
     }
 
-    const auto internFieldMeta = [&](semantic::SymbolId ownerTid, semantic::SymbolId fieldTid) -> std::uint32_t {
-        for (std::size_t m = 0; m < mirror->fieldMetas.size(); ++m) {
-            if (mirror->fieldMetas[m].ownerTypeId == ownerTid &&
-                mirror->fieldMetas[m].fieldTypeId == fieldTid) {
-                return static_cast<std::uint32_t>(m);
-            }
+    struct FieldMetaPairHash {
+        std::size_t operator()(
+            const std::pair<semantic::SymbolId, semantic::SymbolId>& key) const noexcept {
+            const std::uint64_t a = key.first;
+            const std::uint64_t b = key.second;
+            const std::uint64_t h =
+                a ^ (b * 0x9e3779b97f4a7c15ULL + 0x517cc1b727220a95ULL + (a << 6) + (a >> 2));
+            return static_cast<std::size_t>(h);
         }
-        const auto mIdx = static_cast<std::uint32_t>(mirror->fieldMetas.size());
-        mirror->fieldMetas.push_back(FieldAccessMeta{ownerTid, fieldTid});
-        return mIdx;
+    };
+    std::unordered_map<
+        std::pair<semantic::SymbolId, semantic::SymbolId>,
+        std::uint32_t,
+        FieldMetaPairHash> fieldMetaMap;
+    fieldMetaMap.reserve(64u);
+    const auto internFieldMeta = [&](semantic::SymbolId ownerTid, semantic::SymbolId fieldTid) -> std::uint32_t {
+        const auto [it, inserted] = fieldMetaMap.emplace(
+            std::make_pair(ownerTid, fieldTid),
+            static_cast<std::uint32_t>(mirror->fieldMetas.size()));
+        if (inserted) {
+            mirror->fieldMetas.push_back(FieldAccessMeta{ownerTid, fieldTid});
+        }
+        return it->second;
     };
 
     const auto classifyFastField = [&](const semantic::FieldSymbol& fld,
@@ -1923,6 +2040,9 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
             execFunc.isAsyncFunction = !function.blocks.empty() &&
                 !function.blocks.front().instructions.empty() &&
                 function.blocks.front().instructions.front().opcode == bytecode::Opcode::AsyncEnter;
+            if (execFunc.isAsyncFunction) {
+                mirror->hasAsyncOperations = true;
+            }
 
             const std::size_t paramCount = function.parameterTypes.size();
             const std::size_t localCount = function.localTypes.size();
@@ -3076,7 +3196,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
 
             struct FlatBuildItem {
                 FlatInstruction hot{};
-                FlatColdMeta cold{};
+                ResolvedFlatColdMeta cold{};
             };
             execFunc.blockStreamOffsets.assign(execFunc.blocks.size(), InvalidStreamOffset);
             std::size_t estimatedStreamLen = 0;
@@ -3096,7 +3216,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                 for (std::size_t i = 0; i < nInst;) {
                     const auto& inst = blk.instructions[i];
                     FlatInstruction flat;
-                    FlatColdMeta cold;
+                    ResolvedFlatColdMeta cold;
                     cold.bytecode = inst.bytecode;
                     cold.directTarget = inst.directTarget;
                     cold.directExecution = inst.directExecution;
@@ -5042,9 +5162,15 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                 (bcInst.result == bytecode::InvalidRegister || bcInst.result < regCount) &&
                                 bcInst.typeIndex < module.types.size()) {
                                 const auto& delType = module.types[bcInst.typeIndex];
+                                const semantic::TypeSymbol* methodOwner = &delType;
+                                if (delType.delegateType && delType.id != 0 && methodOwner->methods.empty()) {
+                                    if (const auto tIt = types.find(delType.id); tIt != types.end() && tIt->second) {
+                                        methodOwner = tIt->second;
+                                    }
+                                }
                                 const semantic::FunctionSymbol* invokeSym = nullptr;
                                 if (delType.delegateType && delType.id != 0) {
-                                    for (const auto& m : delType.methods) {
+                                    for (const auto& m : methodOwner->methods) {
                                         if (m.name == "Invoke") {
                                             invokeSym = &m;
                                             break;
@@ -5127,6 +5253,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                 }
                             }
                             if (bcInst.opcode == bytecode::Opcode::AsyncEnter) {
+                                mirror->hasAsyncOperations = true;
                                 flat.flatOpcode = FlatOpcode::AsyncEnter;
                                 break;
                             }
@@ -5134,6 +5261,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                 bcInst.operands.size() == 1 &&
                                 bcInst.operands[0] < regCount &&
                                 bcInst.index < localCount) {
+                                mirror->hasAsyncOperations = true;
                                 flat.flatOpcode = FlatOpcode::AwaitSuspend;
                                 flat.src0Slot = regSlot(static_cast<std::uint16_t>(bcInst.operands[0]));
                                 flat.storeSlot = localSlot(static_cast<std::uint16_t>(bcInst.index));
@@ -5143,6 +5271,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                             if (bcInst.opcode == bytecode::Opcode::AwaitResume &&
                                 bcInst.index < localCount &&
                                 (bcInst.result == bytecode::InvalidRegister || bcInst.result < regCount)) {
+                                mirror->hasAsyncOperations = true;
                                 flat.flatOpcode = FlatOpcode::AwaitResume;
                                 flat.src0Slot = localSlot(static_cast<std::uint16_t>(bcInst.index));
                                 flat.dstSlot = (bcInst.result == bytecode::InvalidRegister)
@@ -5157,6 +5286,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                 bcInst.operands.size() <= 1 &&
                                 (bcInst.operands.empty() || bcInst.operands[0] < regCount) &&
                                 bcInst.typeIndex < module.types.size()) {
+                                mirror->hasAsyncOperations = true;
                                 flat.flatOpcode = FlatOpcode::AsyncResolve;
                                 flat.dstSlot = regSlot(static_cast<std::uint16_t>(bcInst.result));
                                 flat.src0Slot = bcInst.operands.empty()
@@ -5256,7 +5386,9 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                             }
                             if (((bcInst.opcode == bytecode::Opcode::ConstantInt &&
                                   bcInst.result < function.registerTypes.size() &&
-                                  function.registerTypes[bcInst.result] == semantic::PrimitiveType::Enum) ||
+                                  function.registerTypes[bcInst.result] == semantic::PrimitiveType::Enum &&
+                                  bcInst.integerImmediate >= -2147483647LL - 1LL &&
+                                  bcInst.integerImmediate <= 2147483647LL) ||
                                  bcInst.opcode == bytecode::Opcode::ConstantTypeId) &&
                                 bcInst.result < regCount) {
                                 flat.flatOpcode = FlatOpcode::ConstantEnumFast;
@@ -6108,7 +6240,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                 // Append block terminator as a FlatInstruction
                 {
                     FlatInstruction termInst;
-                    FlatColdMeta termCold;
+                    ResolvedFlatColdMeta termCold;
                     termCold.blockIndex = static_cast<std::uint32_t>(bIdx);
                     termCold.instructionIndexInBlock = static_cast<std::uint32_t>(nInst);
                     termInst.span = 1;
@@ -6962,9 +7094,14 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
 
             execFunc.flatStream.resize(buildStream.size());
             execFunc.flatCold.resize(buildStream.size());
+            execFunc.flatColdCalls.clear();
             for (std::size_t idx = 0; idx < buildStream.size(); ++idx) {
                 execFunc.flatStream[idx] = buildStream[idx].hot;
-                execFunc.flatCold[idx] = buildStream[idx].cold;
+                packResolvedColdMeta(
+                    execFunc,
+                    buildStream[idx].cold,
+                    execFunc.flatColdCalls,
+                    execFunc.flatCold[idx]);
             }
             execFunc.canUseFlatFastPath = !execFunc.flatStream.empty();
 
@@ -7800,7 +7937,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
             std::vector<std::uint8_t> unfoldAt(caller.flatStream.size(), 0u);
             for (std::size_t i = 0; i < caller.flatStream.size(); ++i) {
                 const auto& fi = caller.flatStream[i];
-                const auto& fc = caller.flatCold[i];
+                const auto fc = caller.resolveCold(i);
                 if ((fi.flatOpcode == FlatOpcode::CallDirect0 ||
                      fi.flatOpcode == FlatOpcode::CallDirect1 ||
                      fi.flatOpcode == FlatOpcode::CallDirect2 ||
@@ -7841,14 +7978,14 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                 const std::size_t oldLen = caller.flatStream.size();
                 std::vector<std::uint32_t> oldToNewOffset(oldLen + 1, 0);
                 std::vector<FlatInstruction> newStream;
-                std::vector<FlatColdMeta> newCold;
+                std::vector<ResolvedFlatColdMeta> newCold;
                 newStream.reserve(oldLen + extraInstCount);
                 newCold.reserve(oldLen + extraInstCount);
 
                 for (std::size_t i = 0; i < oldLen; ++i) {
                     oldToNewOffset[i] = static_cast<std::uint32_t>(newStream.size());
                     const auto fi = caller.flatStream[i];
-                    const auto fc = caller.flatCold[i];
+                    const auto fc = caller.resolveCold(i);
 
                     const bool canUnfoldHere = (unfoldAt[i] != 0u);
 
@@ -7897,7 +8034,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                 caller.registerOffset + fc.bytecode->operands[3]);
                         }
                     }
-                    FlatColdMeta enterCold;
+                    ResolvedFlatColdMeta enterCold;
                     enterCold.bytecode = fc.bytecode;
                     enterCold.directTarget = fc.directTarget;
                     enterCold.directExecution = fc.directExecution;
@@ -7944,7 +8081,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
 
                     for (std::size_t k = 0; k < cLen; ++k) {
                         FlatInstruction cInst = callee.flatStream[k];
-                        FlatColdMeta cCold = callee.flatCold[k];
+                        ResolvedFlatColdMeta cCold = callee.resolveCold(k);
                         cCold.directExecution = &callee;
                         cCold.inlinedCallee = fc.directTarget;
                         cCold.callerBlockIndex = fc.blockIndex;
@@ -8042,7 +8179,15 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                 }
 
                 caller.flatStream = std::move(newStream);
-                caller.flatCold = std::move(newCold);
+                caller.flatCold.resize(newCold.size());
+                caller.flatColdCalls.clear();
+                for (std::size_t idx = 0; idx < newCold.size(); ++idx) {
+                    packResolvedColdMeta(
+                        caller,
+                        newCold[idx],
+                        caller.flatColdCalls,
+                        caller.flatCold[idx]);
+                }
             }
 
             // Thread 1-hop unconditional Jump -> Jump chains (e.g. nested if/else-if merge blocks)
@@ -8058,7 +8203,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                         mid.span == 1 &&
                         mid.trueTargetOffset < caller.flatStream.size() &&
                         mid.trueTargetOffset != midIdx &&
-                        caller.flatCold[idx].inlinedCallee == caller.flatCold[midIdx].inlinedCallee) {
+                        caller.coldInlinedCallee(idx) == caller.coldInlinedCallee(midIdx)) {
                         inst.auxImm32 = midIdx;
                         inst.trueTargetOffset = mid.trueTargetOffset;
                         inst.span = 2;
@@ -8068,7 +8213,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                 mid.flatOpcode == FlatOpcode::SuperBinaryLocalIntRegStoreJump) &&
                                (mid.arithFlags & FlatInstruction::FlagPreJump1) == 0u &&
                                mid.span < 250u &&
-                               caller.flatCold[idx].inlinedCallee == caller.flatCold[midIdx].inlinedCallee) {
+                               caller.coldInlinedCallee(idx) == caller.coldInlinedCallee(midIdx)) {
                         FlatInstruction fusedJump = mid;
                         fusedJump.span = static_cast<std::uint8_t>(mid.span + 1u);
                         fusedJump.arithFlags = static_cast<std::uint8_t>(
@@ -8101,10 +8246,80 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                 loc.function ? findExecutionFunction(*mirror, *loc.function) : nullptr};
         }
     }
+    mirror->fieldMetas.shrink_to_fit();
+    mirror->objectTemplates.shrink_to_fit();
+    mirror->stringLiterals.shrink_to_fit();
+    mirror->constPoolValues.shrink_to_fit();
+    mirror->stackRefTemplates.shrink_to_fit();
+    mirror->polyCallSites.shrink_to_fit();
+    mirror->newDelegateSites.shrink_to_fit();
+    mirror->invokeDelegateSites.shrink_to_fit();
+    for (auto& [fnPtr, execFn] : mirror->functions) {
+        (void)fnPtr;
+        execFn.slotPayloadOffsets.shrink_to_fit();
+        execFn.slotStructSchemaIds.shrink_to_fit();
+        execFn.flatStream.shrink_to_fit();
+        execFn.flatCold.shrink_to_fit();
+        execFn.flatColdCalls.shrink_to_fit();
+        execFn.blockStreamOffsets.shrink_to_fit();
+        execFn.denseBlockIndices.shrink_to_fit();
+        execFn.blocks.shrink_to_fit();
+        if (execFn.canUseFlatFastPath &&
+            execFn.module != nullptr &&
+            execFn.bytecode != nullptr) {
+            execFn.slowInstructionsOnce = std::make_unique<std::once_flag>();
+            for (auto& blk : execFn.blocks) {
+                std::vector<ExecutionInstruction>().swap(blk.instructions);
+            }
+        } else {
+            for (auto& blk : execFn.blocks) {
+                blk.instructions.shrink_to_fit();
+            }
+        }
+    }
     return mirror;
 }
 
-const ExecutionMirror& executionMirror(const ProgramImage& program) noexcept {
+void ensureSlowInstructions(const ExecutionFunction& execFn) {
+    if (!execFn.slowInstructionsOnce ||
+        execFn.module == nullptr ||
+        execFn.bytecode == nullptr) {
+        return;
+    }
+    std::call_once(*execFn.slowInstructionsOnce, [&]() {
+        auto& mutableFn = const_cast<ExecutionFunction&>(execFn);
+        for (std::size_t index = 0; index < mutableFn.blocks.size(); ++index) {
+            auto& blk = mutableFn.blocks[index];
+            if (blk.bytecode == nullptr) continue;
+            populateExecutionBlockInstructions(
+                *execFn.module, *execFn.bytecode, *blk.bytecode, blk.instructions);
+            if (execFn.ownerMirror != nullptr) {
+                linkExecutionBlockCalls(
+                    *execFn.module,
+                    *execFn.bytecode,
+                    blk.instructions,
+                    [&](semantic::SymbolId symId)
+                        -> std::pair<const ProgramImage::FunctionLocation*, const ExecutionFunction*> {
+                        const auto* entry = execFn.ownerMirror->lookupFunctionFast(symId);
+                        if (!entry) return {nullptr, nullptr};
+                        return {entry->location, entry->execution};
+                    });
+            }
+            blk.instructions.shrink_to_fit();
+        }
+    });
+}
+
+const ExecutionMirror& executionMirrorSlow(const ProgramImage& program) {
+    if (!program.executionMirrorOnce_) {
+        program.executionMirrorOnce_ = std::make_shared<std::once_flag>();
+    }
+    std::call_once(*program.executionMirrorOnce_, [&]() {
+        program.executionMirror_ = buildExecutionMirror(
+            program.modules_, program.functions_, program.types_);
+        program.executionMirrorFast_.ptr.store(
+            program.executionMirror_.get(), std::memory_order_release);
+    });
     return *program.executionMirror_;
 }
 
@@ -8123,7 +8338,11 @@ ProgramImage::ProgramImage(std::vector<bytecode::Module> modules)
     names_.reserve(totalFunctions);
     for (const auto& module : modules_) {
         for (const auto& type : module.types) {
-            types_.emplace(type.id, &type);
+            const auto [it, inserted] = types_.emplace(type.id, &type);
+            if (!inserted && type.moduleName == module.name &&
+                it->second->moduleName != module.name) {
+                it->second = &type;
+            }
         }
         for (const auto& function : module.functions) {
             const auto qualified = module.name + "::" + function.name;
@@ -8133,7 +8352,7 @@ ProgramImage::ProgramImage(std::vector<bytecode::Module> modules)
             names_.emplace(qualified, function.symbolId);
         }
     }
-    executionMirror_ = detail::buildExecutionMirror(modules_, functions_);
+    // ExecutionMirror is built lazily on first detail::executionMirror(program) access.
 }
 
 ProgramImage::ProgramImage(const ProgramImage& other)
@@ -8212,11 +8431,35 @@ std::optional<ProgramImage> ProgramImage::link(
 const std::vector<bytecode::Module>& ProgramImage::modules() const noexcept { return modules_; }
 
 void ProgramImage::compactForRuntime() {
+    const bool hasMirror =
+        (executionMirrorFast_.ptr.load(std::memory_order_acquire) != nullptr ||
+         executionMirror_ != nullptr);
+    if (!hasMirror) {
+        for (auto& module : modules_) {
+            module.functions.shrink_to_fit();
+            module.types.shrink_to_fit();
+            module.functionReferences.shrink_to_fit();
+            module.sourceFiles.shrink_to_fit();
+        }
+        types_.clear();
+        functions_.clear();
+        for (const auto& module : modules_) {
+            for (const auto& type : module.types) {
+                const auto [it, inserted] = types_.emplace(type.id, &type);
+                if (!inserted && type.moduleName == module.name &&
+                    it->second->moduleName != module.name) {
+                    it->second = &type;
+                }
+            }
+            for (const auto& function : module.functions) {
+                const auto qualified = module.name + "::" + function.name;
+                functions_.emplace(
+                    function.symbolId,
+                    FunctionLocation{&module, &function, qualified});
+            }
+        }
+    }
     for (auto& module : modules_) {
-        module.functions.shrink_to_fit();
-        module.types.shrink_to_fit();
-        module.functionReferences.shrink_to_fit();
-        module.sourceFiles.shrink_to_fit();
         for (auto& type : module.types) {
             type.fields.shrink_to_fit();
             type.virtualDispatchTable.shrink_to_fit();
@@ -8243,10 +8486,12 @@ void ProgramImage::compactForRuntime() {
             fn.localTypeIds.shrink_to_fit();
             fn.registerTypes.shrink_to_fit();
             fn.registerTypeIds.shrink_to_fit();
-            fn.blocks.shrink_to_fit();
-            for (auto& bb : fn.blocks) {
-                bb.parameters.shrink_to_fit();
-                bb.instructions.shrink_to_fit();
+            if (!hasMirror) {
+                fn.blocks.shrink_to_fit();
+                for (auto& bb : fn.blocks) {
+                    bb.parameters.shrink_to_fit();
+                    bb.instructions.shrink_to_fit();
+                }
             }
         }
     }
@@ -8266,11 +8511,14 @@ void ProgramImage::compactForRuntime() {
             execFn.slotStructSchemaIds.shrink_to_fit();
             execFn.flatStream.shrink_to_fit();
             execFn.flatCold.shrink_to_fit();
+            execFn.flatColdCalls.shrink_to_fit();
             execFn.blockStreamOffsets.shrink_to_fit();
             execFn.denseBlockIndices.shrink_to_fit();
             execFn.blocks.shrink_to_fit();
-            for (auto& blk : execFn.blocks) {
-                blk.instructions.shrink_to_fit();
+            if (!execFn.slowInstructionsOnce) {
+                for (auto& blk : execFn.blocks) {
+                    blk.instructions.shrink_to_fit();
+                }
             }
         }
     }
@@ -8295,9 +8543,10 @@ const ProgramImage::FunctionLocation* ProgramImage::resolveFunction(
 
 void ProgramImage::setParallelBatchKernelFactory(
     ParallelBatchKernelFactory factory) const {
-    if (!executionMirror_ || !executionMirror_->parallelBatchFactorySlot) return;
-    std::lock_guard<std::mutex> lock(executionMirror_->parallelBatchFactorySlot->mutex);
-    executionMirror_->parallelBatchFactorySlot->factory = std::move(factory);
+    const auto& mirror = detail::executionMirror(*this);
+    if (!mirror.parallelBatchFactorySlot) return;
+    std::lock_guard<std::mutex> lock(mirror.parallelBatchFactorySlot->mutex);
+    mirror.parallelBatchFactorySlot->factory = std::move(factory);
 }
 
 ParallelNativeBatchKernel ProgramImage::buildParallelBatchKernel(
@@ -8306,11 +8555,12 @@ ParallelNativeBatchKernel ProgramImage::buildParallelBatchKernel(
     const std::vector<ParallelNativeColumnBinding>& paramColumns,
     const ParallelJobConfig& config,
     bool usesParallelPrng) const {
-    if (!executionMirror_ || !executionMirror_->parallelBatchFactorySlot) return {};
+    const auto& mirror = detail::executionMirror(*this);
+    if (!mirror.parallelBatchFactorySlot) return {};
     ParallelBatchKernelFactory factoryCopy;
     {
-        std::lock_guard<std::mutex> lock(executionMirror_->parallelBatchFactorySlot->mutex);
-        factoryCopy = executionMirror_->parallelBatchFactorySlot->factory;
+        std::lock_guard<std::mutex> lock(mirror.parallelBatchFactorySlot->mutex);
+        factoryCopy = mirror.parallelBatchFactorySlot->factory;
     }
     if (!factoryCopy) return {};
     return factoryCopy(symbolId, kernelKind, paramColumns, config, usesParallelPrng);
@@ -8325,10 +8575,11 @@ const semantic::TypeSymbol* ProgramImage::resolveType(
 std::optional<ProgramImage::FrameStructAllocationStats> ProgramImage::functionStructFrameStats(
     const std::string& qualifiedName) const {
     const auto symOpt = findFunction(qualifiedName);
-    if (!symOpt || !executionMirror_) return std::nullopt;
+    if (!symOpt) return std::nullopt;
+    const auto& mirror = detail::executionMirror(*this);
     const auto* loc = resolveFunction(*symOpt);
     if (!loc || !loc->function) return std::nullopt;
-    const auto* execFn = detail::findExecutionFunction(*executionMirror_, *loc->function);
+    const auto* execFn = detail::findExecutionFunction(mirror, *loc->function);
     if (!execFn) return std::nullopt;
     FrameStructAllocationStats stats{};
     stats.singleZoneSlots = execFn->singleZoneSlots;

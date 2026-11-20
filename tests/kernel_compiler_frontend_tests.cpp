@@ -1657,6 +1657,215 @@ public partial class BadVm {
     }
 }
 
+void testWaveRegressionAstPruningAndSessionNonMutation() {
+    const std::string libSrc = R"RS(
+module Lib.Prunable;
+
+public class AuditTagAttribute {
+    public AuditTagAttribute() {}
+}
+
+public class MathExt {
+    public static int PlusTen(this int x) {
+        return x + 10;
+    }
+}
+
+public class UnusedDeadType {
+    public int Compute() {
+        return 77;
+    }
+}
+)RS";
+
+    const std::string app1Src = R"RS(
+module App.First;
+import Lib.Prunable;
+
+[AuditTag]
+public class FirstHero {
+    public int value = 5;
+}
+
+public int Run(int x) {
+    FirstHero h = new FirstHero();
+    return x.PlusTen() + h.value;
+}
+)RS";
+
+    const std::string app2Src = R"RS(
+module App.Second;
+import Lib.Prunable;
+
+public int Run() {
+    UnusedDeadType d = new UnusedDeadType();
+    return d.Compute();
+}
+)RS";
+
+    auto session = std::make_shared<compiler::CompilerSession>();
+
+    compiler::CompilationOptions opts1;
+    opts1.session = session;
+    opts1.pruneUnreachableModules = {"Lib.Prunable"};
+    compiler::Compilation comp1(
+        {{"lib.rscript", libSrc}, {"app1.rscript", app1Src}}, opts1);
+    auto build1 = comp1.build();
+    require(!build1.diagnostics.hasErrors(),
+        "App.First compile with pruneUnreachableModules failed:\n" +
+            diagnosticsText(build1.diagnostics));
+
+    bool sawUnusedInLib1 = false;
+    bool sawExtInLib1 = false;
+    for (const auto& m : build1.modules) {
+        if (m.name == "Lib.Prunable") {
+            for (const auto& t : m.types) {
+                if (t.name == "UnusedDeadType") sawUnusedInLib1 = true;
+                if (t.name == "MathExt") sawExtInLib1 = true;
+            }
+        }
+    }
+    require(!sawUnusedInLib1,
+        "UnusedDeadType should have been pruned from Lib.Prunable in build1");
+    require(sawExtInLib1,
+        "Extension class MathExt used via x.PlusTen() should survive pruning");
+
+    {
+        auto prog1 = buildAndLink(
+            {{"lib.rscript", libSrc}, {"app1.rscript", app1Src}}, opts1);
+        runtime::Interpreter interp1(prog1);
+        const auto res1 = interp1.invoke("App.First::Run", {runtime::Value{std::int64_t{32}}});
+        require(res1.succeeded && std::get<std::int64_t>(res1.value) == 47,
+            "App.First::Run expected 47");
+    }
+
+    // Recompile another app against the SAME CompilerSession; cached AST for Lib.Prunable
+    // must remain unmutated so UnusedDeadType is still available for App.Second!
+    compiler::CompilationOptions opts2;
+    opts2.session = session;
+    opts2.pruneUnreachableModules = {"Lib.Prunable"};
+    auto prog2 = buildAndLink(
+        {{"lib.rscript", libSrc}, {"app2.rscript", app2Src}}, opts2);
+    runtime::Interpreter interp2(prog2);
+    const auto res2 = interp2.invoke("App.Second::Run", {});
+    require(res2.succeeded && std::get<std::int64_t>(res2.value) == 77,
+        "App.Second::Run expected 77 (session cached syntaxTree must not be mutated in-place)");
+}
+
+void testAuditRegressionFrontendAndOptimizer() {
+    // 1. Multi-char escape char literal ('\u0041') before type usage & inside interpolated string must not break pruning.
+    {
+        const std::string libSrc = R"RS(
+module Lib.EscapePrune;
+public class KeepViaCharEscape {
+    public int Val() { return 41; }
+}
+public class DropUnused {
+    public int Val() { return 99; }
+}
+)RS";
+        const std::string appSrc = R"RS(
+module App.EscapePrune;
+import Lib.EscapePrune;
+
+public int Run() {
+    char q = '\u0041';
+    char r = '\u0042';
+    string s = $"{'\u0042'}";
+    KeepViaCharEscape k = new KeepViaCharEscape();
+    return (q == 'A' && r == 'B' && s.Length > 0) ? k.Val() : 0;
+}
+)RS";
+        compiler::CompilationOptions opts;
+        opts.pruneUnreachableModules = {"Lib.EscapePrune"};
+        auto prog = buildAndLink({{"lib_esc.rscript", libSrc}, {"app_esc.rscript", appSrc}}, opts);
+        runtime::Interpreter interp(prog);
+        const auto res = interp.invoke("App.EscapePrune::Run", {});
+        require(res.succeeded && std::get<std::int64_t>(res.value) == 41,
+            "Escape char literal before identifier broke pruneUnreachableModules");
+    }
+
+    // 2. -O2 subtype LoadStructField forwarding, checked((int)2147483647.5) overflow & -O1/-O2 algebraic identity convergence.
+    {
+        const std::string optSrc = R"RS(
+module Opt.AuditReg;
+
+public class BaseBox {
+    public int a = 10;
+}
+
+public class DerivedBox : BaseBox {
+    public int d = 20;
+}
+
+public struct OuterHolder {
+    public BaseBox box;
+}
+
+public int SubtypeStructForward() {
+    OuterHolder h = new OuterHolder();
+    h.box = new DerivedBox();
+    DerivedBox sub = (DerivedBox)h.box;
+    return sub.a + sub.d;
+}
+
+public int CheckedDoubleToIntOverflow() {
+    return (int)2147483647.5;
+}
+
+public int CheckedDoubleToIntMinOverflow() {
+    return (int)-2147483649.0;
+}
+
+public int AlgebraicIdentity(int x) {
+    int a = x + 0;
+    int b = a - 0;
+    return b * 1;
+}
+)RS";
+        compiler::Compilation comp({{"opt_reg.rscript", optSrc}});
+        auto build = comp.build();
+        require(!build.diagnostics.hasErrors(),
+            "Opt.AuditReg compile failed:\n" + diagnosticsText(build.diagnostics));
+
+        for (const auto lvl : {optimization::Level::Basic, optimization::Level::Aggressive}) {
+            diagnostics::DiagnosticBag optDiag;
+            optimization::Options oOpts;
+            oOpts.level = lvl;
+            auto optRes = optimization::Optimizer{}.optimize(build.modules, optDiag, oOpts);
+            require(!optDiag.hasErrors(),
+                "Optimizer failed:\n" + diagnosticsText(optDiag));
+            require(optRes.statistics.constantsFolded <= 16u,
+                "Algebraic identity optimization spun excessively without converging");
+
+            bytecode::Lowerer lowerer;
+            std::vector<bytecode::Module> bcMods;
+            for (const auto& m : optRes.modules) bcMods.push_back(lowerer.lower(m));
+            runtime::RuntimeError linkErr;
+            auto linked = runtime::ProgramImage::link(std::move(bcMods), linkErr);
+            require(linked.has_value(), "Link failed after optimization: " + linkErr.message);
+            auto prog = std::make_shared<const runtime::ProgramImage>(std::move(*linked));
+            runtime::Interpreter interp(prog);
+
+            const auto subRes = interp.invoke("Opt.AuditReg::SubtypeStructForward", {});
+            require(subRes.succeeded && std::get<std::int64_t>(subRes.value) == 30,
+                "Subtype LoadStructField forwarding mismatch");
+
+            const auto ovMax = interp.invoke("Opt.AuditReg::CheckedDoubleToIntOverflow", {});
+            require(!ovMax.succeeded && ovMax.error.code == runtime::ErrorCode::IntegerOverflow,
+                "checked((int)2147483647.5) must trap with IntegerOverflow");
+
+            const auto ovMin = interp.invoke("Opt.AuditReg::CheckedDoubleToIntMinOverflow", {});
+            require(!ovMin.succeeded && ovMin.error.code == runtime::ErrorCode::IntegerOverflow,
+                "checked((int)-2147483649.0) must trap with IntegerOverflow");
+
+            const auto algRes = interp.invoke("Opt.AuditReg::AlgebraicIdentity", {runtime::Value{std::int64_t{42}}});
+            require(algRes.succeeded && std::get<std::int64_t>(algRes.value) == 42,
+                "AlgebraicIdentity(42) expected 42");
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1681,6 +1890,8 @@ int main() {
     run("[Blittable] layout, [FieldTag]/[FormerlySerializedAs] .rsbc, ProjectConfig & C11 macro cache", testBlittableSchemaEvolutionProjectConfigAndMacroCache);
     run("C# base syntax primitives (verbatim, =>, :this, iface:iface, arity generics, lambdas)", testCSharpBaseSyntaxPrimitives);
     run("Standard Reactive Macros ([Signal] & [RelayCommand] 3-way partial)", testStandardReactiveMacros);
+    run("Wave 1 regression: Attribute/extension pruning & CompilerSession non-mutation", testWaveRegressionAstPruningAndSessionNonMutation);
+    run("Audit regression: char escape pruning, -O2 subtype LoadStructField, checked double->int & x+0 convergence", testAuditRegressionFrontendAndOptimizer);
 
     return failures == 0 ? 0 : 1;
 }

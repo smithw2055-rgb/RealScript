@@ -1,10 +1,10 @@
 #include "JitInternal.h"
 
-#include <iomanip>
-#include <sstream>
-
 #if !defined(__EMSCRIPTEN__) && UINTPTR_MAX == 0xffffffffffffffffULL && \
     (defined(REALSCRIPT_STENCIL_ENABLE_ARM64) || defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64))
+
+#include <iomanip>
+#include <sstream>
 
 namespace realscript::jit::jit_detail {
 namespace {
@@ -403,8 +403,10 @@ public:
         if (imm == 0u) {
             storeMem8Reg(base, disp, A64Reg::XZR);
         } else {
-            movz32(A64Reg::X10, imm, 0);
-            storeMem8Reg(base, disp, A64Reg::X10);
+            auto [b, uimm12] = resolveScaledAddr(base, disp, 1);
+            const A64Reg valReg = (b == A64Reg::X10) ? A64Reg::X11 : A64Reg::X10;
+            movz32(valReg, imm, 0);
+            emitInst(0x39000000u | (uimm12 << 10) | (regCode(b) << 5) | regCode(valReg));
         }
     }
     void loadMem16ZeroExt(A64Reg dst, A64Reg base, std::int32_t disp) {
@@ -427,8 +429,10 @@ public:
         if (imm == 0u) {
             storeMem32(base, disp, A64Reg::XZR);
         } else {
-            movImm32(A64Reg::X10, imm);
-            storeMem32(base, disp, A64Reg::X10);
+            auto [b, uimm12] = resolveScaledAddr(base, disp, 4);
+            const A64Reg valReg = (b == A64Reg::X10) ? A64Reg::X11 : A64Reg::X10;
+            movImm32(valReg, imm);
+            emitInst(0xB9000000u | (uimm12 << 10) | (regCode(b) << 5) | regCode(valReg));
         }
     }
     void loadMem64(A64Reg dst, A64Reg base, std::int32_t disp) {
@@ -443,8 +447,10 @@ public:
         if (imm == 0u) {
             storeMem64(base, disp, A64Reg::XZR);
         } else {
-            movImm64(A64Reg::X10, imm);
-            storeMem64(base, disp, A64Reg::X10);
+            auto [b, uimm12] = resolveScaledAddr(base, disp, 8);
+            const A64Reg valReg = (b == A64Reg::X10) ? A64Reg::X11 : A64Reg::X10;
+            movImm64(valReg, imm);
+            emitInst(0xF9000000u | (uimm12 << 10) | (regCode(b) << 5) | regCode(valReg));
         }
     }
 
@@ -1055,12 +1061,15 @@ private:
         case FO::ConstantEnumFast:
         case FO::ConstantStringFast:
         case FO::EqualValueFast:
+        case FO::ConvertNumericFast:
+        case FO::BinaryUIntFast:
         case FO::CallIntrinsicFast:
         case FO::CallDirect0:
         case FO::CallDirect1:
         case FO::CallDirect2:
         case FO::CallDirectN:
         case FO::CallPolledFast:
+        case FO::SuperCheckNotNullCallPolledFast:
         case FO::GenericBytecode:
             emitHelperCallInline(&jitFlatStructAndStackRefHelper, i32Idx);
             break;
@@ -1191,14 +1200,22 @@ private:
             break;
         }
 
-        case FO::NegateIntUnchecked:
-            emitBudgetDeduct(i32Idx, fi.span, false);
+        case FO::NegateIntChecked:
+        case FO::NegateIntUnchecked: {
+            const bool isChecked = (fi.flatOpcode == FO::NegateIntChecked && fi.checked1());
+            emitBudgetDeduct(i32Idx, fi.span, isChecked && fi.span > 1u);
             emitCheckTagOrTrap(fi.src0Slot, kTagInt64, i32Idx, unexecAfter);
             as.loadMem32(A64Reg::X0, A64Reg::X20, slotOff(fi.src0Slot));
+            if (isChecked) {
+                as.cmpImm32(A64Reg::X0, std::numeric_limits<std::int32_t>::min());
+                const auto ovfStub = addColdStub(ColdTrapStub::Kind::IntegerOverflow, i32Idx, unexecAfter);
+                as.bcc(A64Cond::EQ, ovfStub);
+            }
             as.subReg32(A64Reg::X0, A64Reg::XZR, A64Reg::X0);
             as.sxtw(A64Reg::X0, A64Reg::X0);
             emitWriteTaggedResult(fi.dstSlot, kTagInt64);
             break;
+        }
 
         case FO::LogicalNot:
             emitBudgetDeduct(i32Idx, fi.span, false);
@@ -1387,6 +1404,9 @@ private:
                 instLabels[fi.trueTargetOffset],
                 instLabels[fi.falseTargetOffset]);
 
+            as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, hasExecutionPolicy)));
+            as.cmpImm32(A64Reg::X6, 0);
+            as.bcc(A64Cond::NE, slowStub);
             as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src0Slot) + 15);
             as.cmpImm32(A64Reg::X6, kTagInt64);
             as.bcc(A64Cond::NE, slowStub);
@@ -1420,6 +1440,9 @@ private:
             const auto slowStub = addColdStub(
                 ColdTrapStub::Kind::ArrayLengthSlow, i32Idx, 0, doneLbl);
 
+            as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, hasExecutionPolicy)));
+            as.cmpImm32(A64Reg::X6, 0);
+            as.bcc(A64Cond::NE, slowStub);
             as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src0Slot) + 15);
             as.cmpImm32(A64Reg::X6, kTagObjectRef);
             as.bcc(A64Cond::NE, slowStub);
@@ -1478,6 +1501,9 @@ private:
                         const auto slowStub = addColdStub(
                             ColdTrapStub::Kind::ArrayLoadSlow, i32Idx, 0, doneLbl);
 
+                        as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X19, static_cast<std::int32_t>(offsetof(JitAbiContext, hasExecutionPolicy)));
+                        as.cmpImm32(A64Reg::X6, 0);
+                        as.bcc(A64Cond::NE, slowStub);
                         as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src0Slot) + 15);
                         as.cmpImm32(A64Reg::X6, kTagObjectRef);
                         as.bcc(A64Cond::NE, slowStub);
@@ -1545,6 +1571,12 @@ private:
             const auto slowStub = addColdStub(
                 ColdTrapStub::Kind::ArrayLoadSlow, i32Idx, 0, doneLbl);
 
+            as.loadMem8ZeroExt(
+                A64Reg::X6,
+                A64Reg::X19,
+                static_cast<std::int32_t>(offsetof(JitAbiContext, hasExecutionPolicy)));
+            as.cmpImm32(A64Reg::X6, 0);
+            as.bcc(A64Cond::NE, slowStub);
             as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src0Slot) + 15);
             as.cmpImm32(A64Reg::X6, kTagObjectRef);
             as.bcc(A64Cond::NE, slowStub);
@@ -1606,6 +1638,12 @@ private:
                 const auto slowStub = addColdStub(
                     ColdTrapStub::Kind::ArrayStoreSlow, i32Idx, 0, doneLbl);
 
+                as.loadMem8ZeroExt(
+                    A64Reg::X6,
+                    A64Reg::X19,
+                    static_cast<std::int32_t>(offsetof(JitAbiContext, hasExecutionPolicy)));
+                as.cmpImm32(A64Reg::X6, 0);
+                as.bcc(A64Cond::NE, slowStub);
                 as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src0Slot) + 15);
                 as.cmpImm32(A64Reg::X6, kTagObjectRef);
                 as.bcc(A64Cond::NE, slowStub);
@@ -1682,6 +1720,12 @@ private:
             const auto slowStub = addColdStub(
                 ColdTrapStub::Kind::ArrayStoreSlow, i32Idx, 0, doneLbl);
 
+            as.loadMem8ZeroExt(
+                A64Reg::X6,
+                A64Reg::X19,
+                static_cast<std::int32_t>(offsetof(JitAbiContext, hasExecutionPolicy)));
+            as.cmpImm32(A64Reg::X6, 0);
+            as.bcc(A64Cond::NE, slowStub);
             as.loadMem8ZeroExt(A64Reg::X6, A64Reg::X20, slotOff(fi.src0Slot) + 15);
             as.cmpImm32(A64Reg::X6, kTagObjectRef);
             as.bcc(A64Cond::NE, slowStub);
@@ -2061,13 +2105,21 @@ private:
         case FO::InlineCallEnter: {
             emitHelperCallInline(&jitInlineCallEnterHelper, i32Idx);
             const std::size_t fastTarget = idx + 1u + fi.inlineArgCount;
-            if (fi.inlineArgCount > 0u && fastTarget < nInst) {
+            const bool hasFastTarget = (fi.inlineArgCount > 0u && fastTarget < nInst);
+            const bool hasSkipTarget = (fi.auxImm32 < nInst);
+            if (hasFastTarget || hasSkipTarget) {
                 as.loadMem32(
                     A64Reg::X0,
                     A64Reg::X19,
                     static_cast<std::int32_t>(offsetof(JitAbiContext, nextFlatOffsetOut)));
-                as.cmpImm32(A64Reg::X0, 0);
-                as.bcc(A64Cond::NE, instLabels[fastTarget]);
+                if (hasSkipTarget) {
+                    as.cmpImm32(A64Reg::X0, 2);
+                    as.bcc(A64Cond::EQ, instLabels[fi.auxImm32]);
+                }
+                if (hasFastTarget) {
+                    as.cmpImm32(A64Reg::X0, 0);
+                    as.bcc(A64Cond::NE, instLabels[fastTarget]);
+                }
             }
             break;
         }
@@ -2131,7 +2183,7 @@ private:
             break;
 
         case FO::TermBranchGeneric: {
-            const auto& cold = execFunc.flatCold[idx];
+            const auto cold = execFunc.resolveCold(idx);
             if (cold.blockIndex >= execFunc.blocks.size()) return {};
             const auto& blk = execFunc.blocks[cold.blockIndex];
             const auto& term = blk.bytecode->terminator;
@@ -2218,7 +2270,7 @@ private:
 
         case FO::TermReturnGeneric: {
             emitBudgetDeduct(i32Idx, fi.span, false);
-            const auto& cold = execFunc.flatCold[idx];
+            const auto cold = execFunc.resolveCold(idx);
             const auto retReg = execFunc.blocks[cold.blockIndex].bytecode->terminator.value;
             const auto retSlot = static_cast<std::uint16_t>(execFunc.registerOffset + retReg);
             as.ldrQ(0, A64Reg::X20, slotOff(retSlot));

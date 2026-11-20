@@ -111,6 +111,7 @@ struct ModuleWork {
     bool deterministic = false;
     bool frontendCached = false;
     bool neededByDirtyModule = false;
+    std::vector<std::shared_ptr<syntax::CompilationUnitSyntax>> keptSyntaxTrees;
 };
 
 struct CachedModuleFrontend {

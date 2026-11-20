@@ -450,10 +450,13 @@ SyntaxToken Lexer::lexInterpolatedString() {
             }
             if (current() == '\'') {
                 advance();
-                if (current() == '\\' && peek(1) != '\0') {
-                    advance(2);
-                } else if (current() != '\0') {
-                    advance();
+                while (current() != '\0' && current() != '\'' &&
+                       current() != '\r' && current() != '\n') {
+                    if (current() == '\\' && peek(1) != '\0') {
+                        advance(2);
+                    } else {
+                        advance();
+                    }
                 }
                 if (current() == '\'') {
                     advance();
