@@ -33,6 +33,7 @@ struct NativeGenericTemplate {
     std::vector<syntax::TypeSyntax> parameterTypeSyntaxes;
     std::optional<syntax::TypeSyntax> returnTypeSyntax;
     bool isExtension = false;
+    bool isStaticMember = false;
     std::map<std::string, std::vector<std::string>> constraints;
     std::vector<syntax::GenericConstraintClauseSyntax> rawConstraints;
     const ParsedUnit* unit = nullptr;
@@ -1277,7 +1278,15 @@ public:
                 break;
             }
         }
-        if (!anyGenericSyntax) return;
+        bool anyPrecompiledInst = false;
+        for (const auto& [mn, mod] : modules_) {
+            (void)mn;
+            if (mod.precompiledExternal && !mod.precompiledGenericInstantiations.empty()) {
+                anyPrecompiledInst = true;
+                break;
+            }
+        }
+        if (!anyGenericSyntax && !anyPrecompiledInst) return;
 
         std::unordered_map<std::string, std::uint64_t> preSpecTransFp;
         if (sessionImpl_ != nullptr) {
@@ -1289,6 +1298,12 @@ public:
                 const int st = state[modName];
                 if (st == 1) return 0;
                 if (st == 2) return preSpecTransFp[modName];
+                if (it->second.precompiledExternal) {
+                    state[modName] = 2;
+                    preSpecTransFp[modName] = combineFingerprint(
+                        configFp_, it->second.transitiveSourceFingerprint);
+                    return preSpecTransFp[modName];
+                }
                 state[modName] = 1;
                 std::uint64_t fp = combineFingerprint(configFp_, stableFingerprint("mod:" + modName));
                 for (const auto* u : it->second.units) {
@@ -1320,7 +1335,7 @@ public:
             if (concrete != nullptr) {
                 for (auto& [modName, mod] : modules_) {
                     const std::uint64_t tfp = preSpecTransFp[modName];
-                    if (tfp == 0 || mod.invalid) continue;
+                    if (tfp == 0 || mod.invalid || mod.precompiledExternal) continue;
                     const std::string cacheKey = modName + "#" + std::to_string(tfp);
                     const auto hit = concrete->entries.find(cacheKey);
                     if (hit == concrete->entries.end() || hit->second.transitivePreSpecFp != tfp) {
@@ -1379,11 +1394,44 @@ public:
                         entry.instantiations.begin(),
                         entry.instantiations.end());
                     preCachedModules_.insert(modName);
+                    sessionCachedModules_.insert(modName);
                 }
             }
         }
 
         collectTemplates();
+        for (auto& [modName, mod] : modules_) {
+            if (!mod.precompiledExternal) continue;
+            preCachedModules_.insert(modName);
+            for (auto* u : mod.units) {
+                if (u) processed_.insert(u);
+            }
+            for (const auto& inst : mod.precompiledGenericInstantiations) {
+                if (inst.generatedName.empty()) continue;
+                const auto dotPos = inst.genericName.find('.');
+                if (dotPos != std::string::npos) {
+                    const std::string ownerName = inst.genericName.substr(0, dotPos);
+                    const std::string mKey =
+                        modName + "::member:" + ownerName + "::" + inst.generatedName;
+                    specializations_.insert(mKey);
+                    precompiledMembers_.insert(mKey);
+                } else {
+                    const auto fModIt = registry_.functions.find(modName);
+                    const bool isFreeFn = fModIt != registry_.functions.end() &&
+                        fModIt->second.find(inst.genericName) != fModIt->second.end();
+                    if (isFreeFn) {
+                        specializations_.insert(
+                            modName + "::function:" + inst.generatedName);
+                    } else {
+                        specializations_.insert(
+                            modName + "::type:" + inst.generatedName);
+                        instantiatedTypes_[inst.generatedName] = {
+                            inst.genericName, inst.arguments};
+                    }
+                }
+                result_.nativeGenericInstantiations.push_back(inst);
+            }
+        }
         validateTemplateDeclarationConstraints();
         std::vector<ParsedUnit*> queue;
         for (auto& unit : units_) {
@@ -1571,8 +1619,9 @@ private:
 
     void collectTemplates() {
         for (auto& [moduleName, module] : modules_) {
-            if (preCachedModules_.count(moduleName) != 0) continue;
+            if (sessionCachedModules_.count(moduleName) != 0) continue;
             for (const auto* unit : module.units) {
+                if (!unit || !unit->syntaxTree) continue;
                 for (const auto& declaration : unit->syntaxTree->classes) {
                     if (declaration.typeParameters.empty()) continue;
                     NativeGenericTemplate tmpl;
@@ -1758,6 +1807,8 @@ private:
         declaration.returnTypeSyntax = function.returnType;
         declaration.isExtension = !function.parameters.empty() &&
             function.parameters.front().hasThisModifier();
+        declaration.isStaticMember = function.staticKeyword.has_value() ||
+            semantic::hasModifier(function.modifiers, syntax::SyntaxKind::StaticKeyword);
         for (const auto& parameter : function.parameters) {
             declaration.parameterTypes.push_back(
                 nativeGenericTypeText(parameter.type));
@@ -1766,6 +1817,87 @@ private:
         declaration.constraints = nativeGenericConstraints(function.constraints);
         registry_.members[moduleName][function.identifierToken.text]
             .push_back(std::move(declaration));
+    }
+
+    static std::string symbolTypeText(
+        semantic::PrimitiveType t,
+        const std::string& typeName) {
+        if (t == semantic::PrimitiveType::Array) {
+            semantic::PrimitiveType elemT = semantic::PrimitiveType::Error;
+            std::string elemName;
+            if (!typeName.empty() && semantic::decodeArrayTypeName(typeName, elemT, elemName)) {
+                return symbolTypeText(elemT, elemName) + "[]";
+            }
+            if (!typeName.empty()) return typeName;
+        }
+        if (!typeName.empty()) return typeName;
+        const char* prim = semantic::primitiveTypeName(t);
+        return prim != nullptr ? std::string(prim) : std::string{};
+    }
+
+    const semantic::TypeSymbol* findPrecompiledTypeSymbol(
+        const std::string& ownerModule,
+        const std::string& typeName) const noexcept {
+        const auto simpleName = stripCanonicalModulePrefix(typeName);
+        if (simpleName.empty()) return nullptr;
+        auto scanMod = [&](const ModuleWork& mod) -> const semantic::TypeSymbol* {
+            for (const auto& ts : mod.types) {
+                if (ts.name == simpleName) return &ts;
+            }
+            if (mod.types.empty() && mod.precompiledTypeLayer) {
+                if (auto ref = mod.precompiledTypeLayer->findByName(simpleName, false); ref.hasValue()) {
+                    pinnedPrecompiledTypes_.push_back(ref);
+                    return &(*ref);
+                }
+            }
+            return nullptr;
+        };
+        if (!ownerModule.empty()) {
+            const auto modIt = modules_.find(ownerModule);
+            if (modIt != modules_.end()) {
+                if (const auto* ts = scanMod(modIt->second)) return ts;
+            }
+        }
+        const auto sep = typeName.find("::");
+        if (sep != std::string::npos) {
+            const auto modIt = modules_.find(typeName.substr(0, sep));
+            if (modIt != modules_.end()) {
+                if (const auto* ts = scanMod(modIt->second)) return ts;
+            }
+        }
+        for (const auto& [modName, mod] : modules_) {
+            (void)modName;
+            if (!mod.precompiledExternal && mod.types.empty()) continue;
+            if (const auto* ts = scanMod(mod)) return ts;
+        }
+        return nullptr;
+    }
+
+    std::vector<std::string> collectDirectBaseSimpleNames(
+        const std::string& simpleTypeName) const {
+        std::vector<std::string> out;
+        if (simpleTypeName.empty()) return out;
+        for (const auto& unit : units_) {
+            if (!unit || !unit->syntaxTree) continue;
+            for (const auto& cls : unit->syntaxTree->classes) {
+                if (!cls.typeParameters.empty() || cls.identifierToken.text != simpleTypeName) continue;
+                for (const auto& base : cls.interfaces) {
+                    const auto simpleBase = stripCanonicalModulePrefix(nativeGenericTypeText(base));
+                    if (!simpleBase.empty()) out.push_back(simpleBase);
+                }
+            }
+        }
+        if (const auto* ts = findPrecompiledTypeSymbol({}, simpleTypeName)) {
+            if (!ts->baseTypeName.empty()) {
+                const auto sb = stripCanonicalModulePrefix(ts->baseTypeName);
+                if (!sb.empty()) out.push_back(sb);
+            }
+            for (const auto& bi : ts->baseInterfaceNames) {
+                const auto sb = stripCanonicalModulePrefix(bi);
+                if (!sb.empty()) out.push_back(sb);
+            }
+        }
+        return out;
     }
 
     void registerDynamicMemberTemplatesFromType(
@@ -1798,27 +1930,53 @@ private:
         const std::string& sourceName) {
         const auto simpleReceiver = stripCanonicalModulePrefix(receiverType);
         std::vector<const NativeGenericTemplate*> candidates;
-        const auto append = [&](const std::string& candidateModule) {
+        auto appendForOwner = [&](const std::string& candidateModule,
+                                  const std::string& targetOwner) {
             const auto module = registry_.members.find(candidateModule);
             if (module == registry_.members.end()) return;
             const auto found = module->second.find(name);
             if (found == module->second.end()) return;
             for (const auto& value : found->second) {
-                if (simpleReceiver.empty() || simpleReceiver == value.ownerName) {
+                if (targetOwner.empty() || targetOwner == value.ownerName) {
                     candidates.push_back(&value);
                 }
             }
         };
-        append(moduleName);
-        if (candidates.empty() || simpleReceiver.empty()) {
-            const auto module = modules_.find(moduleName);
-            if (module != modules_.end()) {
-                for (const auto& imported : module->second.imports) append(imported);
+        auto scanScopeForOwner = [&](const std::string& targetOwner) {
+            appendForOwner(moduleName, targetOwner);
+            if (candidates.empty() || targetOwner.empty()) {
+                const auto module = modules_.find(moduleName);
+                if (module != modules_.end()) {
+                    for (const auto& imported : module->second.imports) {
+                        appendForOwner(imported, targetOwner);
+                    }
+                }
+                if (currentRewritingUnit_) {
+                    for (const auto& hyg : currentRewritingUnit_->unitHygienicModules) {
+                        appendForOwner(hyg, targetOwner);
+                    }
+                }
+                for (const auto& hyg : currentMethodHygienicModules_) {
+                    appendForOwner(hyg, targetOwner);
+                }
             }
-            if (currentRewritingUnit_) {
-                for (const auto& hyg : currentRewritingUnit_->unitHygienicModules) append(hyg);
+        };
+        scanScopeForOwner(simpleReceiver);
+        if (candidates.empty() && !simpleReceiver.empty()) {
+            std::unordered_set<std::string> visitedBases{simpleReceiver};
+            std::vector<std::string> baseQueue = collectDirectBaseSimpleNames(simpleReceiver);
+            for (std::size_t bi = 0; bi < baseQueue.size() && candidates.empty(); ++bi) {
+                const auto& baseName = baseQueue[bi];
+                if (!visitedBases.insert(baseName).second) continue;
+                scanScopeForOwner(baseName);
+                if (candidates.empty()) {
+                    for (const auto& nextBase : collectDirectBaseSimpleNames(baseName)) {
+                        if (visitedBases.find(nextBase) == visitedBases.end()) {
+                            baseQueue.push_back(nextBase);
+                        }
+                    }
+                }
             }
-            for (const auto& hyg : currentMethodHygienicModules_) append(hyg);
         }
         if (candidates.size() == 1) return candidates.front();
         if (candidates.size() > 1) {
@@ -1990,6 +2148,23 @@ private:
                 }
             }
         }
+        std::unordered_set<std::string> visited;
+        std::string curOwner = simpleOwner;
+        for (std::size_t depth = 0; !curOwner.empty() && depth < 32; ++depth) {
+            if (!visited.insert(curOwner).second) break;
+            const auto* ts = findPrecompiledTypeSymbol({}, curOwner);
+            if (!ts) break;
+            for (const auto& f : ts->fields) {
+                if (f.name == memberName) return symbolTypeText(f.type, f.typeName);
+            }
+            for (const auto& p : ts->properties) {
+                if (p.name == memberName) return symbolTypeText(p.type, p.typeName);
+            }
+            for (const auto& em : ts->enumMembers) {
+                if (em.name == memberName) return rawOwnerType;
+            }
+            curOwner = stripCanonicalModulePrefix(ts->baseTypeName);
+        }
         return {};
     }
 
@@ -2057,6 +2232,87 @@ private:
                             return typeText(m.returnType);
                         }
                     }
+                }
+            }
+        }
+        if (isMemberCall && !simpleOwner.empty()) {
+            std::unordered_set<std::string> visited;
+            std::string curOwner = simpleOwner;
+            for (std::size_t depth = 0; !curOwner.empty() && depth < 32; ++depth) {
+                if (!visited.insert(curOwner).second) break;
+                const auto* ts = findPrecompiledTypeSymbol({}, curOwner);
+                if (!ts) break;
+                for (const auto& m : ts->methods) {
+                    if (m.name == simpleCall && m.parameters.size() == argCount) {
+                        return symbolTypeText(m.returnType, m.returnTypeName);
+                    }
+                }
+                curOwner = stripCanonicalModulePrefix(ts->baseTypeName);
+            }
+            for (const auto& [modName, mod] : modules_) {
+                (void)modName;
+                if (!mod.precompiledExternal && mod.interfaces.empty()) continue;
+                const auto iIt = mod.interfaces.find(simpleOwner);
+                if (iIt != mod.interfaces.end()) {
+                    for (const auto& m : iIt->second.methods) {
+                        if (m.name == simpleCall && m.parameters.size() == argCount) {
+                            return symbolTypeText(m.returnType.type, m.returnType.typeName);
+                        }
+                    }
+                }
+            }
+        }
+        for (const auto& [modName, mod] : modules_) {
+            (void)modName;
+            if (!mod.precompiledExternal && mod.declarations.empty()) continue;
+            for (const auto& fn : mod.declarations) {
+                if (fn.name != simpleCall) continue;
+                const std::size_t expected = (isMemberCall && fn.extensionMethod)
+                    ? (argCount + 1)
+                    : argCount;
+                if (fn.parameters.size() == expected) {
+                    return symbolTypeText(fn.returnType, fn.returnTypeName);
+                }
+            }
+            if (isMemberCall) {
+                for (const auto& ts : mod.types) {
+                    for (const auto& m : ts.methods) {
+                        if (m.name != simpleCall) continue;
+                        if (m.extensionMethod && m.parameters.size() == argCount + 1) {
+                            return symbolTypeText(m.returnType, m.returnTypeName);
+                        }
+                        if (simpleOwner == ts.name && m.parameters.size() == argCount) {
+                            return symbolTypeText(m.returnType, m.returnTypeName);
+                        }
+                    }
+                }
+                if (mod.types.empty() && mod.precompiledTypeLayer) {
+                    if (!simpleOwner.empty()) {
+                        if (auto ownerRef = mod.precompiledTypeLayer->findByName(simpleOwner, false);
+                            ownerRef.hasValue()) {
+                            for (const auto& m : ownerRef->methods) {
+                                if (m.name != simpleCall) continue;
+                                if (m.extensionMethod && m.parameters.size() == argCount + 1) {
+                                    return symbolTypeText(m.returnType, m.returnTypeName);
+                                }
+                                if (m.parameters.size() == argCount) {
+                                    return symbolTypeText(m.returnType, m.returnTypeName);
+                                }
+                            }
+                        }
+                    }
+                    std::string foundExtRet;
+                    mod.precompiledTypeLayer->forEachExtensionOwner([&](const semantic::TypeSymbol& ts) {
+                        if (!foundExtRet.empty()) return;
+                        for (const auto& m : ts.methods) {
+                            if (m.name == simpleCall && m.extensionMethod &&
+                                m.parameters.size() == argCount + 1) {
+                                foundExtRet = symbolTypeText(m.returnType, m.returnTypeName);
+                                break;
+                            }
+                        }
+                    });
+                    if (!foundExtRet.empty()) return foundExtRet;
                 }
             }
         }
@@ -2452,6 +2708,22 @@ private:
                 if (d.typeParameters.empty() && d.identifierToken.text == typeName) return true;
             }
         }
+        if (modIt->second.precompiledExternal || !modIt->second.types.empty() ||
+            !modIt->second.interfaces.empty() || !modIt->second.delegates.empty()) {
+            for (const auto& ts : modIt->second.types) {
+                if (ts.name == typeName) return true;
+            }
+            if (modIt->second.types.empty() && modIt->second.precompiledTypeLayer &&
+                modIt->second.precompiledTypeLayer->containsName(typeName, false)) {
+                return true;
+            }
+            if (modIt->second.interfaces.find(typeName) != modIt->second.interfaces.end()) {
+                return true;
+            }
+            if (modIt->second.delegates.find(typeName) != modIt->second.delegates.end()) {
+                return true;
+            }
+        }
         return false;
     }
 
@@ -2608,6 +2880,19 @@ private:
             for (const auto& d : u->syntaxTree->delegates) {
                 if (d.typeParameters.empty() && d.identifierToken.text == rArg.simpleBaseName) {
                     return semantic::accessibilityFromModifiers(d.modifiers) == semantic::Accessibility::Public;
+                }
+            }
+        }
+        if (modIt->second.precompiledExternal || !modIt->second.types.empty()) {
+            for (const auto& ts : modIt->second.types) {
+                if (ts.name == rArg.simpleBaseName) {
+                    return ts.accessibility == semantic::Accessibility::Public;
+                }
+            }
+            if (modIt->second.types.empty() && modIt->second.precompiledTypeLayer) {
+                if (auto ref = modIt->second.precompiledTypeLayer->findByName(rArg.simpleBaseName, false);
+                    ref.hasValue()) {
+                    return ref->accessibility == semantic::Accessibility::Public;
                 }
             }
         }
@@ -2770,8 +3055,12 @@ private:
 
         const bool isBuiltin = (declaration == nullptr);
         std::string targetModule;
+        bool declModIsPrecompiled = false;
         if (declaration) {
             const std::string& declMod = declaration->moduleName;
+            const auto declModCheckIt = modules_.find(declMod);
+            declModIsPrecompiled = declModCheckIt != modules_.end() &&
+                declModCheckIt->second.precompiledExternal;
             std::set<std::string> downstreamOwners;
             if (!function && !declMod.empty() && declMod != "$global") {
                 for (const auto& rArg : resolvedArgs) {
@@ -2792,13 +3081,16 @@ private:
                 nativeGenericGeneratedName(declaration->name, declMangleArgs);
             const std::string declKey =
                 declMod + "::" + (function ? "function:" : "type:") + declGeneratedName;
-            if (!function && !declMod.empty() && declMod != "$global" &&
-                declMod.rfind("RealScript.", 0) != 0 &&
+            const bool canShareSpecModule = !declMod.empty() && declMod != "$global" &&
+                ((!function && declMod.rfind("RealScript.", 0) != 0) || declModIsPrecompiled);
+            if (canShareSpecModule &&
                 preCachedModules_.count(declMod) != 0 &&
                 (!downstreamOwners.empty() ||
                  specializations_.find(declKey) == specializations_.end())) {
                 std::string suffix;
-                if (downstreamOwners.empty()) {
+                if (function) {
+                    suffix = "__fn";
+                } else if (downstreamOwners.empty()) {
                     suffix = "__shared";
                 } else {
                     for (const auto& dm : downstreamOwners) {
@@ -2811,6 +3103,20 @@ private:
                     return sp != std::string::npos ? declMod.substr(0, sp) : declMod;
                 }();
                 targetModule = baseDeclMod + ".__spec." + suffix;
+                const std::string candKey =
+                    targetModule + "::" + (function ? "function:" : "type:") + declGeneratedName;
+                while (true) {
+                    const auto tmIt = modules_.find(targetModule);
+                    if (tmIt != modules_.end() && tmIt->second.precompiledExternal &&
+                        specializations_.find(
+                            targetModule + "::" + (function ? "function:" : "type:") + declGeneratedName) ==
+                            specializations_.end()) {
+                        targetModule += ".__u";
+                    } else {
+                        break;
+                    }
+                }
+                (void)candKey;
                 auto& specMod = modules_[targetModule];
                 specMod.name = targetModule;
                 const auto declModIt = modules_.find(declMod);
@@ -2857,7 +3163,7 @@ private:
             : generatedName;
 
         if (targetModule != consumerModule &&
-            (!function || (declaration && declaration->isExtension))) {
+            (!function || (declaration && (declaration->isExtension || declModIsPrecompiled)))) {
             modules_[consumerModule].hygienicModules.insert(targetModule);
         }
         if (!function) {
@@ -3172,21 +3478,27 @@ private:
     }
 
     template <typename Fn>
-    void forEachVisibleUnit(const std::string& moduleName, Fn&& fn) const {
-        const auto visitModule = [&](const std::string& modName) {
+    void forEachVisibleModule(const std::string& moduleName, Fn&& fn) const {
+        const auto visitMod = [&](const std::string& modName) {
             const auto modIt = modules_.find(modName);
-            if (modIt == modules_.end()) return;
-            for (const auto* unitPtr : modIt->second.units) {
-                if (unitPtr && unitPtr->syntaxTree) fn(modName, *unitPtr);
-            }
+            if (modIt != modules_.end()) fn(modName, modIt->second);
         };
-        visitModule(moduleName);
+        visitMod(moduleName);
         const auto selfIt = modules_.find(moduleName);
         if (selfIt != modules_.end()) {
             for (const auto& imported : selfIt->second.imports) {
-                visitModule(imported);
+                visitMod(imported);
             }
         }
+    }
+
+    template <typename Fn>
+    void forEachVisibleUnit(const std::string& moduleName, Fn&& fn) const {
+        forEachVisibleModule(moduleName, [&](const std::string& modName, const ModuleWork& mod) {
+            for (const auto* unitPtr : mod.units) {
+                if (unitPtr && unitPtr->syntaxTree) fn(modName, *unitPtr);
+            }
+        });
     }
 
     const NativeGenericTemplate* findTypeTemplateInScope(
@@ -3242,6 +3554,27 @@ private:
                     if (d.typeParameters.empty() && d.identifierToken.text == name) { found = true; return; }
                 }
             });
+            if (!found) {
+                forEachVisibleModule(moduleName, [&](const std::string&, const ModuleWork& mod) {
+                    if (found) return;
+                    if (!mod.precompiledExternal && mod.types.empty() &&
+                        mod.interfaces.empty() && mod.delegates.empty()) {
+                        return;
+                    }
+                    for (const auto& ts : mod.types) {
+                        if (ts.name == name) { found = true; return; }
+                    }
+                    if (mod.types.empty() && mod.precompiledTypeLayer &&
+                        mod.precompiledTypeLayer->containsName(name, false)) {
+                        found = true;
+                        return;
+                    }
+                    if (mod.interfaces.find(name) != mod.interfaces.end() ||
+                        mod.delegates.find(name) != mod.delegates.end()) {
+                        found = true;
+                    }
+                });
+            }
             return found;
         }
 
@@ -3346,6 +3679,43 @@ private:
                 }
             }
         });
+        if (resultKind == ConstraintTypeKind::Invalid) {
+            forEachVisibleModule(moduleName, [&](const std::string&, const ModuleWork& mod) {
+                if (resultKind != ConstraintTypeKind::Invalid) return;
+                if (!mod.precompiledExternal && mod.types.empty() &&
+                    mod.interfaces.empty() && mod.delegates.empty()) {
+                    return;
+                }
+                if (mod.interfaces.find(name) != mod.interfaces.end()) {
+                    resultKind = ConstraintTypeKind::Interface;
+                    return;
+                }
+                if (mod.delegates.find(name) != mod.delegates.end()) {
+                    resultKind = ConstraintTypeKind::NonInheritable;
+                    return;
+                }
+                auto handlePrecompiledType = [&](const semantic::TypeSymbol& ts) {
+                    if (ts.interfaceType) {
+                        resultKind = ConstraintTypeKind::Interface;
+                    } else if (ts.delegateType || ts.kind != semantic::TypeKind::Class || ts.sealedType) {
+                        resultKind = ConstraintTypeKind::NonInheritable;
+                    } else {
+                        resultKind = ConstraintTypeKind::Class;
+                    }
+                };
+                for (const auto& ts : mod.types) {
+                    if (ts.name != name) continue;
+                    handlePrecompiledType(ts);
+                    return;
+                }
+                if (mod.types.empty() && mod.precompiledTypeLayer) {
+                    if (auto ref = mod.precompiledTypeLayer->findByName(name, false); ref.hasValue()) {
+                        handlePrecompiledType(*ref);
+                        return;
+                    }
+                }
+            });
+        }
         return resultKind;
     }
 
@@ -3826,14 +4196,60 @@ private:
                 recordBases(unit, value.interfaces);
             }
         };
+        auto recordPrecompiledParent = [&](const std::string& fromModule,
+                                           const std::string& parentRaw) {
+            if (parentRaw.empty()) return;
+            const auto resolvedParent = resolveHygienicArgument(fromModule, parentRaw);
+            outSupertypes.insert(parentRaw);
+            outSupertypes.insert(resolvedParent.simpleBaseName);
+            if (!resolvedParent.ownerModule.empty()) {
+                outSupertypes.insert(resolvedParent.canonicalBaseName);
+            }
+            collectSupertypes(
+                resolvedParent.ownerModule,
+                resolvedParent.simpleBaseName,
+                outSupertypes,
+                visited);
+        };
+        auto scanPrecompiledMod = [&](const std::string& modName,
+                                      const ModuleWork& mod) {
+            if (!mod.precompiledExternal && mod.types.empty() && mod.interfaces.empty()) {
+                return;
+            }
+            for (const auto& ts : mod.types) {
+                if (ts.name != simpleTypeName) continue;
+                recordPrecompiledParent(modName, ts.baseTypeName);
+                for (const auto& bi : ts.baseInterfaceNames) {
+                    recordPrecompiledParent(modName, bi);
+                }
+            }
+            if (mod.types.empty() && mod.precompiledTypeLayer) {
+                if (auto ref = mod.precompiledTypeLayer->findByName(simpleTypeName, false); ref.hasValue()) {
+                    recordPrecompiledParent(modName, ref->baseTypeName);
+                    for (const auto& bi : ref->baseInterfaceNames) {
+                        recordPrecompiledParent(modName, bi);
+                    }
+                }
+            }
+            if (const auto iIt = mod.interfaces.find(simpleTypeName);
+                iIt != mod.interfaces.end()) {
+                for (const auto& bi : iIt->second.baseInterfaces) {
+                    recordPrecompiledParent(modName, bi);
+                }
+            }
+        };
         if (!ownerModule.empty()) {
             const auto modIt = modules_.find(ownerModule);
             if (modIt != modules_.end()) {
                 for (const auto* u : modIt->second.units) scanUnit(u);
+                scanPrecompiledMod(ownerModule, modIt->second);
                 return;
             }
         }
         for (const auto& unit : units_) scanUnit(unit.get());
+        for (const auto& [modName, mod] : modules_) {
+            scanPrecompiledMod(modName, mod);
+        }
     }
 
     ConcreteTypeFacts concreteTypeFacts(const HygienicSubstitutedType& arg) const {
@@ -3909,16 +4325,65 @@ private:
             return std::nullopt;
         };
 
+        auto inspectPrecompiledMod = [&](const ModuleWork& mod) -> std::optional<ConcreteTypeFacts> {
+            if (!mod.precompiledExternal && mod.types.empty() &&
+                mod.interfaces.empty() && mod.delegates.empty()) {
+                return std::nullopt;
+            }
+            auto evalType = [&](const semantic::TypeSymbol& ts) -> ConcreteTypeFacts {
+                if (ts.interfaceType || ts.delegateType) {
+                    return ConcreteTypeFacts{true, false, true, false, supertypes};
+                }
+                if (ts.kind == semantic::TypeKind::Struct || ts.kind == semantic::TypeKind::Enum) {
+                    return ConcreteTypeFacts{true, true, false, true, supertypes};
+                }
+                const bool isAbstractOrStatic = ts.abstractType || ts.staticType;
+                bool hasInstanceConstructor = false;
+                bool defaultConstructor = false;
+                if (!isAbstractOrStatic) {
+                    for (const auto& ctor : ts.constructors) {
+                        if (ctor.staticMethod) continue;
+                        hasInstanceConstructor = true;
+                        if (ctor.parameters.empty() &&
+                            ctor.accessibility == semantic::Accessibility::Public) {
+                            defaultConstructor = true;
+                        }
+                    }
+                    if (!hasInstanceConstructor) defaultConstructor = true;
+                }
+                return ConcreteTypeFacts{true, false, true, defaultConstructor, supertypes};
+            };
+            for (const auto& ts : mod.types) {
+                if (ts.name != name) continue;
+                return evalType(ts);
+            }
+            if (mod.types.empty() && mod.precompiledTypeLayer) {
+                if (auto ref = mod.precompiledTypeLayer->findByName(name, false); ref.hasValue()) {
+                    return evalType(*ref);
+                }
+            }
+            if (mod.interfaces.find(name) != mod.interfaces.end() ||
+                mod.delegates.find(name) != mod.delegates.end()) {
+                return ConcreteTypeFacts{true, false, true, false, supertypes};
+            }
+            return std::nullopt;
+        };
+
         if (!arg.ownerModule.empty()) {
             const auto modIt = modules_.find(arg.ownerModule);
             if (modIt != modules_.end()) {
                 for (const auto* u : modIt->second.units) {
                     if (auto found = inspectUnit(u)) return *found;
                 }
+                if (auto found = inspectPrecompiledMod(modIt->second)) return *found;
             }
         }
         for (const auto& unit : units_) {
             if (auto found = inspectUnit(unit.get())) return *found;
+        }
+        for (const auto& [modName, mod] : modules_) {
+            (void)modName;
+            if (auto found = inspectPrecompiledMod(mod)) return *found;
         }
         return {};
     }
@@ -4134,15 +4599,64 @@ private:
         mangleArgs.reserve(resolvedArgs.size());
         for (const auto& rArg : resolvedArgs) {
             mangleArgs.push_back(formatMangleArgument(rArg, declaration.moduleName, false));
-            if (!rArg.ownerModule.empty() && rArg.ownerModule != declaration.moduleName) {
-                modules_[declaration.moduleName].hygienicModules.insert(rArg.ownerModule);
+        }
+        const auto generated = nativeGenericGeneratedName(
+            declaration.name, mangleArgs);
+        const auto key = declaration.moduleName + "::member:" +
+            declaration.ownerName + "::" + generated;
+        if (precompiledMembers_.count(key) != 0) {
+            if (!declaration.moduleName.empty() && declaration.moduleName != consumerModule) {
+                modules_[consumerModule].hygienicModules.insert(declaration.moduleName);
+            }
+            return generated;
+        }
+        const bool externalOwner = !declaration.moduleName.empty() &&
+            modules_.find(declaration.moduleName) != modules_.end() &&
+            modules_.at(declaration.moduleName).precompiledExternal;
+        std::string overlayModName;
+        if (externalOwner) {
+            const std::string baseDeclMod = [&]() {
+                const auto sp = declaration.moduleName.find(".__spec.");
+                return sp != std::string::npos ? declaration.moduleName.substr(0, sp) : declaration.moduleName;
+            }();
+            overlayModName = baseDeclMod + ".__spec.__member";
+            while (modules_.find(overlayModName) != modules_.end() &&
+                   modules_.at(overlayModName).precompiledExternal) {
+                overlayModName += ".__u";
+            }
+            auto& overlayMod = modules_[overlayModName];
+            overlayMod.name = overlayModName;
+            const auto declModIt = modules_.find(declaration.moduleName);
+            if (declModIt != modules_.end()) {
+                overlayMod.deterministic = declModIt->second.deterministic;
+                for (const auto& imp : declModIt->second.imports) {
+                    if (imp != overlayModName) overlayMod.imports.insert(imp);
+                }
+                for (const auto& hm : declModIt->second.hygienicModules) {
+                    if (hm != overlayModName) overlayMod.hygienicModules.insert(hm);
+                }
+            }
+            overlayMod.imports.insert(declaration.moduleName);
+            overlayMod.hygienicModules.insert(declaration.moduleName);
+            for (const auto& rArg : resolvedArgs) {
+                if (!rArg.ownerModule.empty() && rArg.ownerModule != overlayModName) {
+                    overlayMod.hygienicModules.insert(rArg.ownerModule);
+                }
+            }
+            modules_[consumerModule].hygienicModules.insert(overlayModName);
+        } else {
+            for (const auto& rArg : resolvedArgs) {
+                if (!rArg.ownerModule.empty() && rArg.ownerModule != declaration.moduleName) {
+                    modules_[declaration.moduleName].hygienicModules.insert(rArg.ownerModule);
+                }
             }
         }
         if (!declaration.moduleName.empty() && declaration.moduleName != consumerModule) {
             modules_[consumerModule].hygienicModules.insert(declaration.moduleName);
         }
-        const auto generated = nativeGenericGeneratedName(
-            declaration.name, mangleArgs);
+        const std::string emittedName = externalOwner
+            ? ("__member_spec__" + declaration.ownerName + "__" + generated)
+            : generated;
         if (declaration.returnTypeSyntax) {
             ast_monomorphizer::SubstitutionMap retSubs;
             for (std::size_t idx = 0;
@@ -4168,27 +4682,29 @@ private:
                 }
                 localTypes_ = savedLocal;
             }
-            specializedReturnTypes_[generated] = typeText(retCopy);
+            const auto retStr = typeText(retCopy);
+            specializedReturnTypes_[generated] = retStr;
+            if (externalOwner) {
+                specializedReturnTypes_[emittedName] = retStr;
+            }
         }
-        const auto key = declaration.moduleName + "::member:" +
-            declaration.ownerName + "::" + generated;
         if (specializations_.insert(key).second) {
             if (currentGenericDepth_ >= 32u) {
                 result_.diagnostics.report(
                     "RS8512",
                     "generic specialization depth limit (32) exceeded while instantiating member '" +
-                        generated + "'",
+                        emittedName + "'",
                     span,
                     diagnostics::DiagnosticSeverity::Error,
                     sourceName);
                 modules_[consumerModule].invalid = true;
-                return generated;
+                return emittedName;
             }
             pendingMembers_.push_back(PendingNativeGenericMember{
                 &declaration,
                 consumerModule,
                 std::move(resolvedArgs),
-                generated,
+                emittedName,
                 span,
                 sourceName,
                 currentGenericDepth_ + 1u});
@@ -4196,9 +4712,602 @@ private:
                 LanguageGenericInstantiation{
                     declaration.ownerName + "." + declaration.name,
                     mangleArgs,
-                    generated});
+                    emittedName});
         }
-        return generated;
+        return emittedName;
+    }
+
+    struct LiftedMemberSymbols {
+        std::set<std::string> instanceFieldsOrProps;
+        std::set<std::string> staticFieldsOrProps;
+        std::set<std::string> instanceMethods;
+        std::set<std::string> staticMethods;
+    };
+
+    LiftedMemberSymbols collectLiftedMemberSymbols(
+        const std::string& declMod,
+        const std::string& ownerName) const {
+        LiftedMemberSymbols out;
+        std::unordered_set<std::string> visited;
+        std::string cur = ownerName;
+        for (std::size_t depth = 0; !cur.empty() && depth < 32; ++depth) {
+            if (!visited.insert(cur).second) break;
+            const auto* ts = findPrecompiledTypeSymbol(depth == 0 ? declMod : std::string{}, cur);
+            if (!ts) break;
+            for (const auto& f : ts->fields) {
+                if (f.staticField || f.constField) {
+                    out.staticFieldsOrProps.insert(f.name);
+                } else {
+                    out.instanceFieldsOrProps.insert(f.name);
+                }
+            }
+            for (const auto& p : ts->properties) {
+                if (p.staticProperty) {
+                    out.staticFieldsOrProps.insert(p.name);
+                } else {
+                    out.instanceFieldsOrProps.insert(p.name);
+                }
+            }
+            for (const auto& e : ts->events) {
+                out.instanceFieldsOrProps.insert(e.name);
+            }
+            for (const auto& m : ts->methods) {
+                if (m.staticMethod) {
+                    out.staticMethods.insert(m.name);
+                } else {
+                    out.instanceMethods.insert(m.name);
+                }
+            }
+            cur = stripCanonicalModulePrefix(ts->baseTypeName);
+        }
+        return out;
+    }
+
+    static std::unique_ptr<syntax::ExpressionSyntax> makeLiftedReceiverExpr(
+        const std::string& nameText,
+        text::TextSpan span) {
+        auto ne = std::make_unique<syntax::NameExpressionSyntax>();
+        ne->identifierToken = syntax::SyntaxToken{
+            syntax::SyntaxKind::IdentifierToken, span, nameText, {}, false};
+        return ne;
+    }
+
+    static void rewriteLiftedPattern(
+        syntax::PatternSyntax& pattern,
+        const LiftedMemberSymbols& syms,
+        const std::string& canonicalOwner,
+        bool isStaticMember,
+        std::set<std::string>& shadowed) {
+        switch (pattern.kind()) {
+        case syntax::SyntaxKind::ConstantPattern: {
+            auto& cp = static_cast<syntax::ConstantPatternSyntax&>(pattern);
+            if (cp.expression) {
+                rewriteLiftedExpression(
+                    cp.expression, syms, canonicalOwner, isStaticMember, shadowed);
+            }
+            return;
+        }
+        case syntax::SyntaxKind::RelationalPattern: {
+            auto& rp = static_cast<syntax::RelationalPatternSyntax&>(pattern);
+            if (rp.operand) {
+                rewriteLiftedExpression(
+                    rp.operand, syms, canonicalOwner, isStaticMember, shadowed);
+            }
+            return;
+        }
+        case syntax::SyntaxKind::PropertyPattern: {
+            auto& pp = static_cast<syntax::PropertyPatternSyntax&>(pattern);
+            for (auto& prop : pp.properties) {
+                if (prop.pattern) {
+                    rewriteLiftedPattern(
+                        *prop.pattern, syms, canonicalOwner, isStaticMember, shadowed);
+                }
+            }
+            return;
+        }
+        case syntax::SyntaxKind::UnaryPattern: {
+            auto& un = static_cast<syntax::UnaryPatternSyntax&>(pattern);
+            if (un.pattern) {
+                rewriteLiftedPattern(
+                    *un.pattern, syms, canonicalOwner, isStaticMember, shadowed);
+            }
+            return;
+        }
+        case syntax::SyntaxKind::BinaryPattern: {
+            auto& bin = static_cast<syntax::BinaryPatternSyntax&>(pattern);
+            if (bin.left) {
+                rewriteLiftedPattern(
+                    *bin.left, syms, canonicalOwner, isStaticMember, shadowed);
+            }
+            if (bin.right) {
+                rewriteLiftedPattern(
+                    *bin.right, syms, canonicalOwner, isStaticMember, shadowed);
+            }
+            return;
+        }
+        case syntax::SyntaxKind::ParenthesizedPattern: {
+            auto& paren = static_cast<syntax::ParenthesizedPatternSyntax&>(pattern);
+            if (paren.pattern) {
+                rewriteLiftedPattern(
+                    *paren.pattern, syms, canonicalOwner, isStaticMember, shadowed);
+            }
+            return;
+        }
+        default:
+            return;
+        }
+    }
+
+    static void rewriteLiftedExpression(
+        std::unique_ptr<syntax::ExpressionSyntax>& exprPtr,
+        const LiftedMemberSymbols& syms,
+        const std::string& canonicalOwner,
+        bool isStaticMember,
+        std::set<std::string>& shadowed) {
+        if (!exprPtr) return;
+        switch (exprPtr->kind()) {
+        case syntax::SyntaxKind::ThisExpression: {
+            if (!isStaticMember) {
+                const auto sp = exprPtr->span();
+                exprPtr = makeLiftedReceiverExpr("__self", sp);
+            }
+            return;
+        }
+        case syntax::SyntaxKind::NameExpression: {
+            auto& ne = static_cast<syntax::NameExpressionSyntax&>(*exprPtr);
+            if (ne.lessToken) {
+                return;
+            }
+            const auto& id = ne.identifierToken.text;
+            if (shadowed.find(id) != shadowed.end()) return;
+            std::string recvName;
+            if (!isStaticMember && syms.instanceFieldsOrProps.count(id) != 0) {
+                recvName = "__self";
+            } else if (syms.staticFieldsOrProps.count(id) != 0) {
+                recvName = canonicalOwner;
+            }
+            if (!recvName.empty()) {
+                auto ma = std::make_unique<syntax::MemberAccessExpressionSyntax>();
+                const auto sp = ne.identifierToken.span;
+                ma->receiver = makeLiftedReceiverExpr(recvName, sp);
+                ma->dotToken = syntax::SyntaxToken{
+                    syntax::SyntaxKind::DotToken, sp, ".", {}, false};
+                ma->nameToken = std::move(ne.identifierToken);
+                exprPtr = std::move(ma);
+            }
+            return;
+        }
+        case syntax::SyntaxKind::AssignmentExpression: {
+            auto& ae = static_cast<syntax::AssignmentExpressionSyntax&>(*exprPtr);
+            rewriteLiftedExpression(
+                ae.expression, syms, canonicalOwner, isStaticMember, shadowed);
+            const auto& id = ae.identifierToken.text;
+            if (shadowed.find(id) != shadowed.end()) return;
+            std::string recvName;
+            if (!isStaticMember && syms.instanceFieldsOrProps.count(id) != 0) {
+                recvName = "__self";
+            } else if (syms.staticFieldsOrProps.count(id) != 0) {
+                recvName = canonicalOwner;
+            }
+            if (!recvName.empty()) {
+                auto ma = std::make_unique<syntax::MemberAssignmentExpressionSyntax>();
+                const auto sp = ae.identifierToken.span;
+                ma->receiver = makeLiftedReceiverExpr(recvName, sp);
+                ma->dotToken = syntax::SyntaxToken{
+                    syntax::SyntaxKind::DotToken, sp, ".", {}, false};
+                ma->nameToken = std::move(ae.identifierToken);
+                ma->equalsToken = std::move(ae.equalsToken);
+                ma->expression = std::move(ae.expression);
+                exprPtr = std::move(ma);
+            }
+            return;
+        }
+        case syntax::SyntaxKind::CallExpression: {
+            auto& ce = static_cast<syntax::CallExpressionSyntax&>(*exprPtr);
+            for (auto& arg : ce.arguments) {
+                rewriteLiftedExpression(
+                    arg, syms, canonicalOwner, isStaticMember, shadowed);
+            }
+            const auto& id = ce.identifierToken.text;
+            if (shadowed.find(id) != shadowed.end() ||
+                id.rfind("__member_spec__", 0) == 0) {
+                return;
+            }
+            std::string recvName;
+            if (!isStaticMember && syms.instanceMethods.count(id) != 0) {
+                recvName = "__self";
+            } else if (syms.staticMethods.count(id) != 0) {
+                recvName = canonicalOwner;
+            }
+            if (!recvName.empty()) {
+                auto mc = std::make_unique<syntax::MemberCallExpressionSyntax>();
+                const auto sp = ce.identifierToken.span;
+                mc->receiver = makeLiftedReceiverExpr(recvName, sp);
+                mc->dotToken = syntax::SyntaxToken{
+                    syntax::SyntaxKind::DotToken, sp, ".", {}, false};
+                mc->nameToken = std::move(ce.identifierToken);
+                mc->lessToken = std::move(ce.lessToken);
+                mc->typeArguments = std::move(ce.typeArguments);
+                mc->typeArgumentCommaTokens = std::move(ce.typeArgumentCommaTokens);
+                mc->greaterToken = std::move(ce.greaterToken);
+                mc->openParenToken = std::move(ce.openParenToken);
+                mc->argumentModifiers = std::move(ce.argumentModifiers);
+                mc->argumentNames = std::move(ce.argumentNames);
+                mc->argumentNameColonTokens = std::move(ce.argumentNameColonTokens);
+                mc->arguments = std::move(ce.arguments);
+                mc->commaTokens = std::move(ce.commaTokens);
+                mc->closeParenToken = std::move(ce.closeParenToken);
+                exprPtr = std::move(mc);
+            }
+            return;
+        }
+        case syntax::SyntaxKind::MemberCallExpression: {
+            auto& mc = static_cast<syntax::MemberCallExpressionSyntax&>(*exprPtr);
+            rewriteLiftedExpression(
+                mc.receiver, syms, canonicalOwner, isStaticMember, shadowed);
+            for (auto& arg : mc.arguments) {
+                rewriteLiftedExpression(
+                    arg, syms, canonicalOwner, isStaticMember, shadowed);
+            }
+            return;
+        }
+        case syntax::SyntaxKind::MemberAccessExpression: {
+            auto& ma = static_cast<syntax::MemberAccessExpressionSyntax&>(*exprPtr);
+            rewriteLiftedExpression(
+                ma.receiver, syms, canonicalOwner, isStaticMember, shadowed);
+            return;
+        }
+        case syntax::SyntaxKind::ElementAccessExpression: {
+            auto& ea = static_cast<syntax::ElementAccessExpressionSyntax&>(*exprPtr);
+            rewriteLiftedExpression(
+                ea.receiver, syms, canonicalOwner, isStaticMember, shadowed);
+            rewriteLiftedExpression(
+                ea.index, syms, canonicalOwner, isStaticMember, shadowed);
+            return;
+        }
+        case syntax::SyntaxKind::ElementAssignmentExpression: {
+            auto& ea = static_cast<syntax::ElementAssignmentExpressionSyntax&>(*exprPtr);
+            rewriteLiftedExpression(
+                ea.receiver, syms, canonicalOwner, isStaticMember, shadowed);
+            rewriteLiftedExpression(
+                ea.index, syms, canonicalOwner, isStaticMember, shadowed);
+            rewriteLiftedExpression(
+                ea.expression, syms, canonicalOwner, isStaticMember, shadowed);
+            return;
+        }
+        case syntax::SyntaxKind::MemberAssignmentExpression: {
+            auto& ma = static_cast<syntax::MemberAssignmentExpressionSyntax&>(*exprPtr);
+            rewriteLiftedExpression(
+                ma.receiver, syms, canonicalOwner, isStaticMember, shadowed);
+            rewriteLiftedExpression(
+                ma.expression, syms, canonicalOwner, isStaticMember, shadowed);
+            return;
+        }
+        case syntax::SyntaxKind::UnaryExpression: {
+            auto& un = static_cast<syntax::UnaryExpressionSyntax&>(*exprPtr);
+            rewriteLiftedExpression(
+                un.operand, syms, canonicalOwner, isStaticMember, shadowed);
+            return;
+        }
+        case syntax::SyntaxKind::BinaryExpression: {
+            auto& bin = static_cast<syntax::BinaryExpressionSyntax&>(*exprPtr);
+            rewriteLiftedExpression(
+                bin.left, syms, canonicalOwner, isStaticMember, shadowed);
+            if (bin.right) {
+                if (bin.operatorToken.kind == syntax::SyntaxKind::AmpersandAmpersandToken &&
+                    bin.left) {
+                    auto rightShadowed = shadowed;
+                    ast_monomorphizer::collectIntroducedPatternVariables(*bin.left, rightShadowed);
+                    rewriteLiftedExpression(
+                        bin.right, syms, canonicalOwner, isStaticMember, rightShadowed);
+                } else {
+                    rewriteLiftedExpression(
+                        bin.right, syms, canonicalOwner, isStaticMember, shadowed);
+                }
+            }
+            return;
+        }
+        case syntax::SyntaxKind::TypeBinaryExpression: {
+            auto& tb = static_cast<syntax::TypeBinaryExpressionSyntax&>(*exprPtr);
+            rewriteLiftedExpression(
+                tb.expression, syms, canonicalOwner, isStaticMember, shadowed);
+            if (tb.pattern) {
+                rewriteLiftedPattern(
+                    *tb.pattern, syms, canonicalOwner, isStaticMember, shadowed);
+            }
+            return;
+        }
+        case syntax::SyntaxKind::SwitchExpression: {
+            auto& sw = static_cast<syntax::SwitchExpressionSyntax&>(*exprPtr);
+            rewriteLiftedExpression(
+                sw.expression, syms, canonicalOwner, isStaticMember, shadowed);
+            for (auto& arm : sw.arms) {
+                auto armShadowed = shadowed;
+                if (arm.pattern) {
+                    rewriteLiftedPattern(
+                        *arm.pattern, syms, canonicalOwner, isStaticMember, armShadowed);
+                    ast_monomorphizer::collectPatternVariablesFromPattern(
+                        *arm.pattern, armShadowed, false);
+                } else {
+                    if (arm.patternDesignation) armShadowed.insert(arm.patternDesignation->text);
+                    rewriteLiftedExpression(
+                        arm.label, syms, canonicalOwner, isStaticMember, armShadowed);
+                }
+                rewriteLiftedExpression(
+                    arm.guard, syms, canonicalOwner, isStaticMember, armShadowed);
+                rewriteLiftedExpression(
+                    arm.value, syms, canonicalOwner, isStaticMember, armShadowed);
+            }
+            return;
+        }
+        case syntax::SyntaxKind::ConditionalExpression: {
+            auto& ce = static_cast<syntax::ConditionalExpressionSyntax&>(*exprPtr);
+            rewriteLiftedExpression(
+                ce.condition, syms, canonicalOwner, isStaticMember, shadowed);
+            rewriteLiftedExpression(
+                ce.whenTrue, syms, canonicalOwner, isStaticMember, shadowed);
+            rewriteLiftedExpression(
+                ce.whenFalse, syms, canonicalOwner, isStaticMember, shadowed);
+            return;
+        }
+        case syntax::SyntaxKind::ParenthesizedExpression: {
+            auto& pe = static_cast<syntax::ParenthesizedExpressionSyntax&>(*exprPtr);
+            rewriteLiftedExpression(
+                pe.expression, syms, canonicalOwner, isStaticMember, shadowed);
+            return;
+        }
+        case syntax::SyntaxKind::CastExpression: {
+            auto& ce = static_cast<syntax::CastExpressionSyntax&>(*exprPtr);
+            rewriteLiftedExpression(
+                ce.expression, syms, canonicalOwner, isStaticMember, shadowed);
+            return;
+        }
+        case syntax::SyntaxKind::LambdaExpression: {
+            auto& le = static_cast<syntax::LambdaExpressionSyntax&>(*exprPtr);
+            auto innerShadowed = shadowed;
+            for (const auto& p : le.parameterTokens) {
+                if (p.text != "_") innerShadowed.insert(p.text);
+            }
+            if (le.blockBody) {
+                rewriteLiftedStatement(
+                    *le.blockBody, syms, canonicalOwner, isStaticMember, innerShadowed);
+            } else {
+                rewriteLiftedExpression(
+                    le.body, syms, canonicalOwner, isStaticMember, innerShadowed);
+            }
+            return;
+        }
+        case syntax::SyntaxKind::NewObjectExpression: {
+            auto& ne = static_cast<syntax::NewObjectExpressionSyntax&>(*exprPtr);
+            for (auto& arg : ne.arguments) {
+                rewriteLiftedExpression(
+                    arg, syms, canonicalOwner, isStaticMember, shadowed);
+            }
+            for (auto& init : ne.initializers) {
+                for (auto& e : init.expressions) {
+                    rewriteLiftedExpression(
+                        e, syms, canonicalOwner, isStaticMember, shadowed);
+                }
+            }
+            return;
+        }
+        case syntax::SyntaxKind::NewArrayExpression: {
+            auto& ne = static_cast<syntax::NewArrayExpressionSyntax&>(*exprPtr);
+            rewriteLiftedExpression(
+                ne.length, syms, canonicalOwner, isStaticMember, shadowed);
+            for (auto& item : ne.initialValues) {
+                rewriteLiftedExpression(
+                    item, syms, canonicalOwner, isStaticMember, shadowed);
+            }
+            return;
+        }
+        default:
+            return;
+        }
+    }
+
+    static void rewriteLiftedStatement(
+        syntax::StatementSyntax& statement,
+        const LiftedMemberSymbols& syms,
+        const std::string& canonicalOwner,
+        bool isStaticMember,
+        std::set<std::string>& shadowed) {
+        switch (statement.kind()) {
+        case syntax::SyntaxKind::BlockStatement: {
+            auto blockShadowed = shadowed;
+            for (auto& child : static_cast<syntax::BlockStatementSyntax&>(statement).statements) {
+                if (child) {
+                    rewriteLiftedStatement(
+                        *child, syms, canonicalOwner, isStaticMember, blockShadowed);
+                }
+            }
+            return;
+        }
+        case syntax::SyntaxKind::ReturnStatement: {
+            auto& stmt = static_cast<syntax::ReturnStatementSyntax&>(statement);
+            rewriteLiftedExpression(
+                stmt.expression, syms, canonicalOwner, isStaticMember, shadowed);
+            return;
+        }
+        case syntax::SyntaxKind::IfStatement: {
+            auto& stmt = static_cast<syntax::IfStatementSyntax&>(statement);
+            rewriteLiftedExpression(
+                stmt.condition, syms, canonicalOwner, isStaticMember, shadowed);
+            if (stmt.thenStatement) {
+                auto thenShadowed = shadowed;
+                if (stmt.condition) {
+                    ast_monomorphizer::collectIntroducedPatternVariables(
+                        *stmt.condition, thenShadowed);
+                }
+                rewriteLiftedStatement(
+                    *stmt.thenStatement, syms, canonicalOwner, isStaticMember, thenShadowed);
+            }
+            if (stmt.elseStatement) {
+                auto elseShadowed = shadowed;
+                rewriteLiftedStatement(
+                    *stmt.elseStatement, syms, canonicalOwner, isStaticMember, elseShadowed);
+            }
+            return;
+        }
+        case syntax::SyntaxKind::WhileStatement: {
+            auto& stmt = static_cast<syntax::WhileStatementSyntax&>(statement);
+            rewriteLiftedExpression(
+                stmt.condition, syms, canonicalOwner, isStaticMember, shadowed);
+            if (stmt.body) {
+                auto bodyShadowed = shadowed;
+                if (stmt.condition) {
+                    ast_monomorphizer::collectIntroducedPatternVariables(
+                        *stmt.condition, bodyShadowed);
+                }
+                rewriteLiftedStatement(
+                    *stmt.body, syms, canonicalOwner, isStaticMember, bodyShadowed);
+            }
+            return;
+        }
+        case syntax::SyntaxKind::ForStatement: {
+            auto& stmt = static_cast<syntax::ForStatementSyntax&>(statement);
+            auto forShadowed = shadowed;
+            if (stmt.initializer) {
+                rewriteLiftedStatement(
+                    *stmt.initializer, syms, canonicalOwner, isStaticMember, forShadowed);
+            }
+            rewriteLiftedExpression(
+                stmt.condition, syms, canonicalOwner, isStaticMember, forShadowed);
+            rewriteLiftedExpression(
+                stmt.increment, syms, canonicalOwner, isStaticMember, forShadowed);
+            if (stmt.body) {
+                rewriteLiftedStatement(
+                    *stmt.body, syms, canonicalOwner, isStaticMember, forShadowed);
+            }
+            return;
+        }
+        case syntax::SyntaxKind::ForeachStatement: {
+            auto& stmt = static_cast<syntax::ForeachStatementSyntax&>(statement);
+            rewriteLiftedExpression(
+                stmt.collection, syms, canonicalOwner, isStaticMember, shadowed);
+            auto bodyShadowed = shadowed;
+            bodyShadowed.insert(stmt.identifierToken.text);
+            for (const auto& extra : stmt.additionalBindings) {
+                bodyShadowed.insert(extra.identifierToken.text);
+            }
+            if (stmt.body) {
+                rewriteLiftedStatement(
+                    *stmt.body, syms, canonicalOwner, isStaticMember, bodyShadowed);
+            }
+            return;
+        }
+        case syntax::SyntaxKind::DoWhileStatement: {
+            auto& stmt = static_cast<syntax::DoWhileStatementSyntax&>(statement);
+            if (stmt.body) {
+                auto bodyShadowed = shadowed;
+                rewriteLiftedStatement(
+                    *stmt.body, syms, canonicalOwner, isStaticMember, bodyShadowed);
+            }
+            rewriteLiftedExpression(
+                stmt.condition, syms, canonicalOwner, isStaticMember, shadowed);
+            return;
+        }
+        case syntax::SyntaxKind::SwitchStatement: {
+            auto& stmt = static_cast<syntax::SwitchStatementSyntax&>(statement);
+            rewriteLiftedExpression(
+                stmt.expression, syms, canonicalOwner, isStaticMember, shadowed);
+            for (auto& sec : stmt.sections) {
+                auto secShadowed = shadowed;
+                if (sec.pattern) {
+                    rewriteLiftedPattern(
+                        *sec.pattern, syms, canonicalOwner, isStaticMember, secShadowed);
+                    ast_monomorphizer::collectPatternVariablesFromPattern(
+                        *sec.pattern, secShadowed, false);
+                } else {
+                    if (sec.patternDesignation) secShadowed.insert(sec.patternDesignation->text);
+                    rewriteLiftedExpression(
+                        sec.label, syms, canonicalOwner, isStaticMember, secShadowed);
+                }
+                rewriteLiftedExpression(
+                    sec.guard, syms, canonicalOwner, isStaticMember, secShadowed);
+                for (auto& child : sec.statements) {
+                    if (child) {
+                        rewriteLiftedStatement(
+                            *child, syms, canonicalOwner, isStaticMember, secShadowed);
+                    }
+                }
+            }
+            return;
+        }
+        case syntax::SyntaxKind::ThrowStatement: {
+            auto& stmt = static_cast<syntax::ThrowStatementSyntax&>(statement);
+            rewriteLiftedExpression(
+                stmt.expression, syms, canonicalOwner, isStaticMember, shadowed);
+            return;
+        }
+        case syntax::SyntaxKind::TryStatement: {
+            auto& stmt = static_cast<syntax::TryStatementSyntax&>(statement);
+            {
+                auto tryShadowed = shadowed;
+                rewriteLiftedStatement(
+                    stmt.body, syms, canonicalOwner, isStaticMember, tryShadowed);
+            }
+            for (auto& c : stmt.catches) {
+                auto catchShadowed = shadowed;
+                if (c.identifierToken) catchShadowed.insert(c.identifierToken->text);
+                rewriteLiftedStatement(
+                    c.body, syms, canonicalOwner, isStaticMember, catchShadowed);
+            }
+            if (stmt.finallyBody) {
+                auto finShadowed = shadowed;
+                rewriteLiftedStatement(
+                    *stmt.finallyBody, syms, canonicalOwner, isStaticMember, finShadowed);
+            }
+            return;
+        }
+        case syntax::SyntaxKind::YieldWaitStatement: {
+            auto& stmt = static_cast<syntax::YieldWaitStatementSyntax&>(statement);
+            rewriteLiftedExpression(
+                stmt.delay, syms, canonicalOwner, isStaticMember, shadowed);
+            rewriteLiftedExpression(
+                stmt.secondArgument, syms, canonicalOwner, isStaticMember, shadowed);
+            return;
+        }
+        case syntax::SyntaxKind::EventSubscriptionStatement: {
+            auto& stmt = static_cast<syntax::EventSubscriptionStatementSyntax&>(statement);
+            if (stmt.receiver) {
+                rewriteLiftedExpression(
+                    stmt.receiver, syms, canonicalOwner, isStaticMember, shadowed);
+            } else {
+                const auto& evName = stmt.eventNameToken.text;
+                std::string recvName;
+                if (!isStaticMember && syms.instanceFieldsOrProps.count(evName) != 0) {
+                    recvName = "__self";
+                } else if (syms.staticFieldsOrProps.count(evName) != 0) {
+                    recvName = canonicalOwner;
+                }
+                if (!recvName.empty()) {
+                    const auto sp = stmt.eventNameToken.span;
+                    stmt.receiver = makeLiftedReceiverExpr(recvName, sp);
+                    stmt.dotToken = syntax::SyntaxToken{
+                        syntax::SyntaxKind::DotToken, sp, ".", {}, false};
+                }
+            }
+            rewriteLiftedExpression(
+                stmt.handler, syms, canonicalOwner, isStaticMember, shadowed);
+            return;
+        }
+        case syntax::SyntaxKind::VariableDeclarationStatement: {
+            auto& stmt = static_cast<syntax::VariableDeclarationStatementSyntax&>(statement);
+            rewriteLiftedExpression(
+                stmt.initializer, syms, canonicalOwner, isStaticMember, shadowed);
+            shadowed.insert(stmt.identifierToken.text);
+            return;
+        }
+        case syntax::SyntaxKind::ExpressionStatement: {
+            auto& stmt = static_cast<syntax::ExpressionStatementSyntax&>(statement);
+            rewriteLiftedExpression(
+                stmt.expression, syms, canonicalOwner, isStaticMember, shadowed);
+            return;
+        }
+        default:
+            return;
+        }
     }
 
     void materializeMember(
@@ -4233,6 +5342,107 @@ private:
             if (!rArg.ownerModule.empty()) {
                 method.hygienicModules.push_back(rArg.ownerModule);
             }
+        }
+
+        const auto declModIt = modules_.find(pending.declaration->moduleName);
+        const bool externalOwner = declModIt != modules_.end() &&
+            declModIt->second.precompiledExternal;
+        if (externalOwner) {
+            const std::string& declMod = pending.declaration->moduleName;
+            const std::string& ownerName = pending.declaration->ownerName;
+            const std::string canonicalOwner = declMod + "::" + ownerName;
+            const LiftedMemberSymbols syms = collectLiftedMemberSymbols(declMod, ownerName);
+
+            std::set<std::string> memberNames;
+            memberNames.insert(syms.instanceFieldsOrProps.begin(), syms.instanceFieldsOrProps.end());
+            memberNames.insert(syms.staticFieldsOrProps.begin(), syms.staticFieldsOrProps.end());
+
+            bool hasGenerics = false;
+            ast_monomorphizer::arrayRankOverflowFlag() = false;
+            ast_monomorphizer::substituteFunctionDeclaration(
+                method, subs, memberNames, hasGenerics);
+            if (ast_monomorphizer::arrayRankOverflowFlag()) {
+                ast_monomorphizer::arrayRankOverflowFlag() = false;
+                result_.diagnostics.report(
+                    "RS8511",
+                    "generic member specialization '" + pending.generatedName +
+                        "' produces nested array type (rank > 1), which is not supported",
+                    pending.requestSpan,
+                    diagnostics::DiagnosticSeverity::Error,
+                    pending.sourceName);
+                modules_[pending.consumerModule].invalid = true;
+                return;
+            }
+
+            method.modifiers.clear();
+            method.modifiers.push_back(syntax::SyntaxToken{
+                syntax::SyntaxKind::PublicKeyword, pending.requestSpan, "public", {}, false});
+            method.staticKeyword.reset();
+
+            std::set<std::string> shadowed;
+            for (const auto& p : method.parameters) {
+                shadowed.insert(p.identifierToken.text);
+            }
+            if (!pending.declaration->isStaticMember) {
+                shadowed.insert("__self");
+            }
+            if (method.hasBody()) {
+                rewriteLiftedStatement(
+                    method.body,
+                    syms,
+                    canonicalOwner,
+                    pending.declaration->isStaticMember,
+                    shadowed);
+            }
+
+            if (!pending.declaration->isStaticMember) {
+                syntax::ParameterSyntax selfParam;
+                selfParam.thisKeyword = syntax::SyntaxToken{
+                    syntax::SyntaxKind::ThisKeyword, pending.requestSpan, "this", {}, false};
+                selfParam.type.name = syntax::SyntaxToken{
+                    syntax::SyntaxKind::IdentifierToken, pending.requestSpan, canonicalOwner, {}, false};
+                selfParam.identifierToken = syntax::SyntaxToken{
+                    syntax::SyntaxKind::IdentifierToken, pending.requestSpan, "__self", {}, false};
+                method.parameters.insert(method.parameters.begin(), std::move(selfParam));
+            }
+
+            const std::string baseDeclMod = [&]() {
+                const auto sp = declMod.find(".__spec.");
+                return sp != std::string::npos ? declMod.substr(0, sp) : declMod;
+            }();
+            std::string overlayModName = baseDeclMod + ".__spec.__member";
+            while (modules_.find(overlayModName) != modules_.end() &&
+                   modules_.at(overlayModName).precompiledExternal) {
+                overlayModName += ".__u";
+            }
+
+            auto unit = std::make_unique<ParsedUnit>();
+            const auto path = "$generated/member_generics/" +
+                nativeGenericSanitize(overlayModName) + "/" +
+                pending.generatedName + ".rscript";
+            unit->source = std::make_shared<text::SourceText>("", path);
+            unit->syntaxTree = std::make_shared<syntax::CompilationUnitSyntax>();
+            unit->syntaxTree->functions.push_back(std::move(method));
+            unit->hasGenericSyntax = true;
+            unit->moduleName = overlayModName;
+            unit->deterministic = declModIt->second.deterministic;
+            unit->isGenericSpecialization = true;
+            unit->genericDepth = pending.genericDepth;
+            unit->unitHygienicModules.insert(declMod);
+            for (const auto& hm : unit->syntaxTree->functions.back().hygienicModules) {
+                unit->unitHygienicModules.insert(hm);
+            }
+            unit->sourceFingerprint = combineFingerprint(
+                declModIt->second.sourceFingerprint,
+                stableFingerprint("lifted-member:" + pending.generatedName));
+
+            auto* pointer = unit.get();
+            auto& overlayMod = modules_[overlayModName];
+            overlayMod.name = overlayModName;
+            overlayMod.units.push_back(pointer);
+            units_.push_back(std::move(unit));
+            queue.push_back(pointer);
+            return;
         }
 
         auto* ownerUnit = const_cast<ParsedUnit*>(pending.declaration->unit);
@@ -4630,6 +5840,25 @@ private:
                 for (const auto& argument : call.typeArguments) {
                     arguments.push_back(typeText(argument));
                 }
+                auto prependSelfIfLiftedMember = [&](const std::string& resolvedName) {
+                    if (resolvedName.rfind("__member_spec__", 0) == 0 &&
+                        !memberDecl->isStaticMember) {
+                        auto thisExpr = std::make_unique<syntax::ThisExpressionSyntax>();
+                        thisExpr->thisKeyword = syntax::SyntaxToken{
+                            syntax::SyntaxKind::ThisKeyword, call.span(), "this", {}, false};
+                        call.arguments.insert(call.arguments.begin(), std::move(thisExpr));
+                        if (!call.argumentModifiers.empty()) {
+                            call.argumentModifiers.insert(call.argumentModifiers.begin(), std::nullopt);
+                        }
+                        if (!call.argumentNames.empty()) {
+                            call.argumentNames.insert(call.argumentNames.begin(), std::nullopt);
+                        }
+                        if (!call.argumentNameColonTokens.empty()) {
+                            call.argumentNameColonTokens.insert(
+                                call.argumentNameColonTokens.begin(), std::nullopt);
+                        }
+                    }
+                };
                 if (memberDecl) {
                     call.identifierToken.text = requestMember(
                         moduleName,
@@ -4637,6 +5866,7 @@ private:
                         arguments,
                         call.span(),
                         sourceName);
+                    prependSelfIfLiftedMember(call.identifierToken.text);
                 } else {
                     call.identifierToken.text = request(
                         moduleName,
@@ -4660,6 +5890,23 @@ private:
                         *inferred,
                         call.span(),
                         sourceName);
+                    if (call.identifierToken.text.rfind("__member_spec__", 0) == 0 &&
+                        !memberDecl->isStaticMember) {
+                        auto thisExpr = std::make_unique<syntax::ThisExpressionSyntax>();
+                        thisExpr->thisKeyword = syntax::SyntaxToken{
+                            syntax::SyntaxKind::ThisKeyword, call.span(), "this", {}, false};
+                        call.arguments.insert(call.arguments.begin(), std::move(thisExpr));
+                        if (!call.argumentModifiers.empty()) {
+                            call.argumentModifiers.insert(call.argumentModifiers.begin(), std::nullopt);
+                        }
+                        if (!call.argumentNames.empty()) {
+                            call.argumentNames.insert(call.argumentNames.begin(), std::nullopt);
+                        }
+                        if (!call.argumentNameColonTokens.empty()) {
+                            call.argumentNameColonTokens.insert(
+                                call.argumentNameColonTokens.begin(), std::nullopt);
+                        }
+                    }
                 } else {
                     result_.diagnostics.report(
                         "RS8520",
@@ -5287,7 +6534,10 @@ private:
     std::uint64_t configFp_ = 0;
     bool populateSessionCaches_ = true;
     std::unordered_set<std::string> preCachedModules_;
+    std::unordered_set<std::string> sessionCachedModules_;
+    std::unordered_set<std::string> precompiledMembers_;
     std::unordered_set<std::string> mutatedModulesByMemberSpec_;
+    mutable std::vector<semantic::SharedTypeRef> pinnedPrecompiledTypes_;
 };
 
 

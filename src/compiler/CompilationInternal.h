@@ -84,6 +84,7 @@ struct ParsedUnit {
     bool deterministic = false;
     bool hasGenericSyntax = false;
     bool isGenericSpecialization = false;
+    bool isPrecompiledTemplate = false;
     std::uint32_t genericDepth = 0;
     std::set<std::string> unitHygienicModules;
 };
@@ -95,6 +96,8 @@ struct ModuleWork {
     std::set<std::string> hygienicModules;
     std::vector<semantic::TypeSymbol> types;
     semantic::TypeSymbolMap visibleTypes;
+    semantic::SharedTypeLayer precompiledTypeLayer;
+    semantic::SharedTypeLayer frozenTypeLayer;
     std::vector<InterfaceDeclarationInput> interfaceInputs;
     InterfaceMap interfaces;
     InterfaceMap visibleInterfaces;
@@ -111,7 +114,9 @@ struct ModuleWork {
     bool invalid = false;
     bool deterministic = false;
     bool frontendCached = false;
+    bool precompiledExternal = false;
     bool neededByDirtyModule = false;
+    std::vector<LanguageGenericInstantiation> precompiledGenericInstantiations;
     std::vector<std::shared_ptr<syntax::CompilationUnitSyntax>> keptSyntaxTrees;
 };
 
@@ -121,6 +126,7 @@ struct CachedModuleFrontend {
     std::uint64_t publicFingerprint = 0;
     std::uint64_t dependencyFingerprint = 0;
     std::vector<semantic::TypeSymbol> types;
+    semantic::SharedTypeLayer typeLayer;
     InterfaceMap interfaces;
     DelegateMap delegates;
     std::vector<semantic::FunctionSymbol> declarations;

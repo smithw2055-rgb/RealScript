@@ -8,10 +8,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -372,7 +374,176 @@ struct SymbolOccurrence {
     bool definition = false;
 };
 
-using TypeSymbolMap = std::unordered_map<std::string, TypeSymbol>;
+class TypeSymbolLayer {
+public:
+    virtual ~TypeSymbolLayer() = default;
+
+    [[nodiscard]] virtual SharedTypeRef findByName(
+        std::string_view key,
+        bool canonicalOnly = false) const = 0;
+    [[nodiscard]] virtual SharedTypeRef findById(SymbolId id) const = 0;
+    [[nodiscard]] virtual bool containsName(
+        std::string_view key,
+        bool canonicalOnly = false) const = 0;
+    [[nodiscard]] virtual std::size_t entryCount() const noexcept = 0;
+    virtual void forEachExtensionOwner(
+        const std::function<void(const TypeSymbol&)>& fn) const = 0;
+    virtual void forEachType(
+        const std::function<void(const SharedTypeRef&)>& fn) const = 0;
+
+    [[nodiscard]] static std::shared_ptr<const TypeSymbolLayer> makeStatic(
+        const std::vector<TypeSymbol>& types);
+};
+
+using SharedTypeLayer = std::shared_ptr<const TypeSymbolLayer>;
+
+class TypeSymbolMap {
+public:
+    struct LayerRef {
+        SharedTypeLayer layer;
+        bool canonicalOnly = false;
+    };
+
+    class const_iterator {
+    public:
+        using value_type = std::pair<const std::string&, const TypeSymbol&>;
+        using reference = value_type;
+        struct pointer {
+            value_type val;
+            const value_type* operator->() const noexcept { return &val; }
+        };
+
+        const_iterator() = default;
+        const_iterator(std::string key, SharedTypeRef ref) noexcept
+            : singleKey_(std::move(key)),
+              singleRef_(std::move(ref)),
+              single_(true),
+              isEnd_(!singleRef_.hasValue()) {}
+        const_iterator(
+            std::shared_ptr<const std::vector<std::pair<std::string, SharedTypeRef>>> snapshot,
+            std::size_t index) noexcept
+            : snapshot_(std::move(snapshot)),
+              index_(index),
+              single_(false),
+              isEnd_(!snapshot_ || index_ >= snapshot_->size()) {}
+
+        [[nodiscard]] bool operator==(const const_iterator& other) const noexcept {
+            if (isEnd_ && other.isEnd_) return true;
+            if (isEnd_ != other.isEnd_) return false;
+            if (single_ && other.single_) {
+                return singleRef_.ptr == other.singleRef_.ptr && singleKey_ == other.singleKey_;
+            }
+            if (!single_ && !other.single_) {
+                return snapshot_ == other.snapshot_ && index_ == other.index_;
+            }
+            return false;
+        }
+        [[nodiscard]] bool operator!=(const const_iterator& other) const noexcept {
+            return !(*this == other);
+        }
+
+        [[nodiscard]] value_type operator*() const noexcept {
+            if (single_) {
+                return value_type{singleKey_, *singleRef_};
+            }
+            const auto& entry = (*snapshot_)[index_];
+            return value_type{entry.first, *entry.second};
+        }
+        [[nodiscard]] pointer operator->() const noexcept {
+            return pointer{**this};
+        }
+
+        const_iterator& operator++() noexcept {
+            if (isEnd_) return *this;
+            if (single_) {
+                isEnd_ = true;
+                singleRef_.reset();
+                return *this;
+            }
+            ++index_;
+            if (!snapshot_ || index_ >= snapshot_->size()) {
+                isEnd_ = true;
+            }
+            return *this;
+        }
+        const_iterator operator++(int) noexcept {
+            const_iterator copy(*this);
+            ++(*this);
+            return copy;
+        }
+
+    private:
+        std::string singleKey_;
+        SharedTypeRef singleRef_;
+        std::shared_ptr<const std::vector<std::pair<std::string, SharedTypeRef>>> snapshot_;
+        std::size_t index_ = 0;
+        bool single_ = false;
+        bool isEnd_ = true;
+    };
+    using iterator = const_iterator;
+
+    class AssignProxy {
+    public:
+        AssignProxy(TypeSymbolMap& owner, std::string key) noexcept
+            : owner_(owner), key_(std::move(key)) {}
+
+        AssignProxy& operator=(const TypeSymbol& value);
+        AssignProxy& operator=(TypeSymbol&& value);
+        AssignProxy& operator=(SharedTypeRef ref);
+        operator const TypeSymbol&() const;
+
+    private:
+        TypeSymbolMap& owner_;
+        std::string key_;
+    };
+
+    [[nodiscard]] const_iterator begin() const;
+    [[nodiscard]] const_iterator cbegin() const { return begin(); }
+    [[nodiscard]] const_iterator end() const noexcept { return const_iterator{}; }
+    [[nodiscard]] const_iterator cend() const noexcept { return const_iterator{}; }
+
+    [[nodiscard]] const_iterator find(std::string_view key) const;
+    [[nodiscard]] const TypeSymbol* findById(SymbolId id) const;
+    [[nodiscard]] bool containsName(std::string_view key) const;
+
+    [[nodiscard]] AssignProxy operator[](const std::string& key) {
+        return AssignProxy{*this, key};
+    }
+    [[nodiscard]] AssignProxy operator[](std::string&& key) {
+        return AssignProxy{*this, std::move(key)};
+    }
+
+    std::pair<const_iterator, bool> try_emplace(const std::string& key, const TypeSymbol& value);
+    std::pair<const_iterator, bool> try_emplace(const std::string& key, SharedTypeRef ref);
+    void insertShared(const SharedTypeRef& ref, bool includeSimpleName = true);
+    void attachLayer(SharedTypeLayer layer, bool canonicalOnly = false);
+    std::size_t erase(const std::string& key);
+    void clear() noexcept;
+
+    [[nodiscard]] std::size_t size() const noexcept;
+    [[nodiscard]] bool empty() const noexcept { return size() == 0; }
+
+    void forEachExtensionOwner(const std::function<void(const TypeSymbol&)>& fn) const;
+
+    void setTrackTouched(bool enable) noexcept { trackTouched_ = enable; }
+    [[nodiscard]] const std::unordered_map<SymbolId, SharedTypeRef>& touchedExternal() const noexcept {
+        return touchedExternal_;
+    }
+
+private:
+    friend class AssignProxy;
+    void assignKey(const std::string& key, SharedTypeRef ref);
+    [[nodiscard]] bool hasKeyNoTouch(std::string_view key) const;
+    [[nodiscard]] const_iterator findNoTouch(std::string_view key) const;
+
+    std::unordered_map<std::string, SharedTypeRef> local_;
+    std::unordered_map<SymbolId, SharedTypeRef> localById_;
+    std::vector<LayerRef> layers_;
+    std::unordered_set<std::string> erasedKeys_;
+    mutable std::unordered_map<SymbolId, SharedTypeRef> touchedExternal_;
+    bool trackTouched_ = false;
+};
+
 using FunctionOverloadMap =
     std::unordered_map<std::string, std::vector<FunctionSymbol>>;
 

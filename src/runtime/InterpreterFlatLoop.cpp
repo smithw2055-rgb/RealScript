@@ -47,7 +47,10 @@ bool executeFunction(
     const auto* execution = cachedExecution
         ? cachedExecution
         : detail::findExecutionFunction(activeMirror, function);
-    if (!execution || execution->entry == detail::InvalidBlockIndex) {
+    if (!execution ||
+        (!execution->compiled.load(std::memory_order_acquire) &&
+         !detail::ensureFunctionCompiled(activeMirror, *execution)) ||
+        execution->entry == detail::InvalidBlockIndex) {
         return fail(state, ErrorCode::InvalidProgram,
             "function execution mirror is missing");
     }
@@ -1723,6 +1726,12 @@ bool executeFunction(
                         const semantic::SymbolId actualTid = oce.view.typeId;
                         const std::uint32_t siteId = ip->auxImm32;
                         const PolymorphicPicWay* hit = nullptr;
+                        if (RS_FLAT_UNLIKELY(state.polyCallCache != nullptr &&
+                                             state.mirror != nullptr &&
+                                             siteId >= state.polyCallCache->size() &&
+                                             siteId < state.mirror->polyCallSites.size())) {
+                            state.polyCallCache->resize(state.mirror->polyCallSites.size());
+                        }
                         if (RS_FLAT_LIKELY(state.polyCallCache != nullptr &&
                                            siteId < state.polyCallCache->size())) {
                             auto& pic = (*state.polyCallCache)[siteId];
@@ -1742,7 +1751,10 @@ bool executeFunction(
                         }
                         if (RS_FLAT_LIKELY(hit != nullptr)) {
                             const auto* calleeExec = hit->execution;
-                            const auto tKind = calleeExec->trivialKind;
+                            const auto tKind = (calleeExec != nullptr &&
+                                                calleeExec->compiled.load(std::memory_order_acquire))
+                                ? calleeExec->trivialKind
+                                : detail::TrivialMethodKind::None;
                             if (tKind != detail::TrivialMethodKind::None &&
                                 (!(policyInterceptsCalls ||
                                    (tKind == detail::TrivialMethodKind::StoreThisFieldExact && policyChecksSameHeapWrites)) ||
@@ -5815,6 +5827,12 @@ bool executeFunction(
                     if (baseCost > 1u) goto L_FlatSuperFallback;
                     goto L_FlatBudgetExceeded;
                 }
+                if (RS_FLAT_UNLIKELY(state.mirror != nullptr &&
+                                     state.delegateCallCache != nullptr &&
+                                     ip->auxImm32 >= state.delegateCallCache->size() &&
+                                     ip->auxImm32 < state.mirror->invokeDelegateSites.size())) {
+                    state.delegateCallCache->resize(state.mirror->invokeDelegateSites.size());
+                }
                 if (RS_FLAT_UNLIKELY(state.heap == nullptr || state.mirror == nullptr ||
                                      state.delegateCallCache == nullptr ||
                                      ip->auxImm32 >= state.mirror->invokeDelegateSites.size() ||
@@ -5923,7 +5941,9 @@ bool executeFunction(
                 auto& siteCache = (*state.delegateCallCache)[ip->auxImm32];
 
                 const auto calleeExec_isStore = [](const detail::ExecutionFunction* ef) noexcept -> bool {
-                    return ef != nullptr && ef->trivialKind == detail::TrivialMethodKind::StoreThisFieldExact;
+                    return ef != nullptr &&
+                           ef->compiled.load(std::memory_order_acquire) &&
+                           ef->trivialKind == detail::TrivialMethodKind::StoreThisFieldExact;
                 };
                 const auto tryEvalTrivialLeaf = [&](const ResolvedDelegateLeaf& leaf,
                                                     std::uint64_t preCallCost,
@@ -5931,6 +5951,9 @@ bool executeFunction(
                     if (policyInterceptsCalls ||
                         (calleeExec_isStore(leaf.execution) && policyChecksSameHeapWrites)) return false;
                     const auto* calleeExec = leaf.execution;
+                    if (calleeExec == nullptr || !calleeExec->compiled.load(std::memory_order_acquire)) {
+                        return false;
+                    }
                     const auto tKind = calleeExec->trivialKind;
                     if (tKind == detail::TrivialMethodKind::None ||
                         RS_FLAT_UNLIKELY(state.stack.size() >= state.limits.recursionLimit)) {
@@ -7053,6 +7076,11 @@ bool executeFunction(
                     gcActive = (state.heap->phase() != GcPhase::Idle || state.heap->collectionRequested());
                 }
                 if (RS_FLAT_UNLIKELY(!refOpt.has_value())) goto L_FlatGenericFallback;
+                if (RS_FLAT_UNLIKELY(state.stringLiteralCache != nullptr &&
+                                     ip->auxImm32 >= state.stringLiteralCache->size() &&
+                                     ip->auxImm32 < activeMirror.stringLiterals.size())) {
+                    state.stringLiteralCache->resize(activeMirror.stringLiterals.size());
+                }
                 if (state.stringLiteralCache != nullptr &&
                     ip->auxImm32 < state.stringLiteralCache->size()) {
                     const std::uint64_t curEpoch = curStringEpoch();

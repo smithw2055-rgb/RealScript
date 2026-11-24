@@ -18,8 +18,7 @@ void addVisibleType(
     semantic::TypeSymbolMap& map,
     const semantic::TypeSymbol& type,
     bool includeSimpleName) {
-    map[semantic::canonicalTypeName(type)] = type;
-    if (includeSimpleName) map[type.name] = type;
+    map.insertShared(semantic::SharedTypeRef::makeCopy(type), includeSimpleName);
 }
 
 void refreshVisibleTypes(
@@ -29,9 +28,19 @@ void refreshVisibleTypes(
     for (const auto& importedName : module.imports) {
         const auto imported = modules.find(importedName);
         if (imported == modules.end()) continue;
+        if (imported->second.precompiledTypeLayer) {
+            module.visibleTypes.attachLayer(imported->second.precompiledTypeLayer, false);
+            continue;
+        }
+        if (imported->second.frozenTypeLayer) {
+            module.visibleTypes.attachLayer(imported->second.frozenTypeLayer, false);
+            continue;
+        }
         for (const auto& type : imported->second.types) {
-            module.visibleTypes[semantic::canonicalTypeName(type)] = type;
-            module.visibleTypes.try_emplace(type.name, type);
+            auto ref = semantic::SharedTypeRef::makeCopy(type);
+            const std::string canon = semantic::canonicalTypeName(type);
+            module.visibleTypes[canon] = ref;
+            module.visibleTypes.try_emplace(type.name, ref);
         }
     }
     for (const auto& type : module.types) {
@@ -40,6 +49,14 @@ void refreshVisibleTypes(
     for (const auto& hygienicName : module.hygienicModules) {
         const auto hyg = modules.find(hygienicName);
         if (hyg == modules.end()) continue;
+        if (hyg->second.precompiledTypeLayer) {
+            module.visibleTypes.attachLayer(hyg->second.precompiledTypeLayer, true);
+            continue;
+        }
+        if (hyg->second.frozenTypeLayer) {
+            module.visibleTypes.attachLayer(hyg->second.frozenTypeLayer, true);
+            continue;
+        }
         for (const auto& type : hyg->second.types) {
             addVisibleType(module.visibleTypes, type, false);
         }
@@ -86,11 +103,33 @@ semantic::TypeSymbol* findOwnClassOrType(
 const semantic::TypeSymbol* findGlobalType(
     const std::map<std::string, ModuleWork>& modules,
     const std::string& canonicalName) {
+    if (const auto sep = canonicalName.find("::"); sep != std::string::npos) {
+        const auto modIt = modules.find(canonicalName.substr(0, sep));
+        if (modIt != modules.end()) {
+            for (const auto& type : modIt->second.types) {
+                if (semantic::canonicalTypeName(type) == canonicalName) {
+                    return &type;
+                }
+            }
+            if (modIt->second.types.empty() && modIt->second.precompiledTypeLayer) {
+                if (const auto ref = modIt->second.precompiledTypeLayer->findByName(canonicalName, false);
+                    ref.hasValue()) {
+                    return &(*ref);
+                }
+            }
+        }
+    }
     for (const auto& [moduleName, module] : modules) {
         (void)moduleName;
         for (const auto& type : module.types) {
             if (semantic::canonicalTypeName(type) == canonicalName) {
                 return &type;
+            }
+        }
+        if (module.types.empty() && module.precompiledTypeLayer) {
+            if (const auto ref = module.precompiledTypeLayer->findByName(canonicalName, false);
+                ref.hasValue()) {
+                return &(*ref);
             }
         }
     }
@@ -214,10 +253,16 @@ void applyInheritedFieldLayouts(
                         break;
                     }
                 }
+                const semantic::TypeSymbol* resolvedBase = nullptr;
                 if (base && baseModule) {
                     apply(*baseModule, *base);
+                    resolvedBase = base;
+                } else {
+                    resolvedBase = findGlobalType(modules, type.baseTypeName);
+                }
+                if (resolvedBase) {
                     auto ownFields = type.fields;
-                    type.fields = base->fields;
+                    type.fields = resolvedBase->fields;
                     std::unordered_set<std::string> names;
                     for (const auto& field : type.fields) {
                         names.insert(field.name);

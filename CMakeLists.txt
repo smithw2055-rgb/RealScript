@@ -121,6 +121,7 @@ realscript_add_layer_library(realscript_layer_bytecode_format
     src/bytecode/BytecodeVerifier.cpp
     src/bytecode/BytecodeDisassembler.cpp
     src/bytecode/BytecodeCodec.cpp
+    src/bytecode/Lz4Codec.cpp
     src/debug/DebugInfo.cpp
 )
 realscript_add_slice_library(realscript_slice_bytecode_core Bytecode
@@ -156,6 +157,7 @@ realscript_add_layer_library(realscript_layer_compiler_core
     src/compiler/SequenceAndEventSynthesis.cpp
     src/compiler/MetadataAndValidation.cpp
     src/compiler/Compilation.cpp
+    src/compiler/PrecompiledModule.cpp
     src/compiler/ModuleBuildCache.cpp
     src/compiler/ProjectConfig.cpp
     src/compiler/StandardMacros.cpp
@@ -594,6 +596,12 @@ if(REALSCRIPT_BUILD_TESTS)
         realscript.kernel.runtime-vm-and-gc
         RealScript::Kernel
         tests/kernel_runtime_vm_and_gc_tests.cpp)
+
+    realscript_add_cpp_test(
+        realscript_kernel_precompiled_lazy_runtime_tests
+        realscript.kernel.precompiled-lazy-runtime
+        RealScript::Kernel
+        tests/precompiled_lazy_runtime_tests.cpp)
 
     realscript_add_cpp_test(
         realscript_kernel_async_and_fiber_tests

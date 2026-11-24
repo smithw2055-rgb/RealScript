@@ -20,6 +20,7 @@ namespace realscript::text { class SourceText; }
 namespace realscript::syntax { struct CompilationUnitSyntax; }
 
 namespace realscript::compiler {
+struct PrecompiledFrontendPack;
 
 struct ModuleBuildInfo {
     std::string name;
@@ -51,6 +52,7 @@ struct BuildResult {
     std::vector<LanguageGenericInstantiation> nativeGenericInstantiations;
     std::vector<LanguageSequenceRecord> nativeSequences;
     BuildSnapshot snapshot;
+    std::shared_ptr<PrecompiledFrontendPack> precompiledFrontend;
     std::size_t prunedFrontendTypes = 0;
     std::size_t prunedFrontendFunctions = 0;
 };
@@ -134,6 +136,8 @@ struct CompilationOptions {
     bool populateSnapshot = true;
     bool collectSymbolOccurrences = true;
     bool emitDebugInfo = true;
+    std::shared_ptr<const PrecompiledFrontendPack> precompiledModules;
+    bool capturePrecompiledFrontend = false;
     std::unordered_set<std::string> pruneUnreachableModules;
     std::unordered_set<std::string> reachabilityRootSymbols;
 };

@@ -454,4 +454,55 @@ public:
     diagnostics::DiagnosticBag& diagnostics);
 [[nodiscard]] std::string bytesToHex(const std::vector<std::uint8_t>& bytes);
 
+struct LazyFunctionBodyLoc {
+    std::uint32_t moduleIndex = 0;
+    std::uint32_t functionIndex = 0;
+    std::uint32_t chunkIndex = 0;
+    std::uint32_t offsetInChunk = 0;
+    std::uint32_t uncompressedSize = 0;
+};
+
+struct LazyBytecodeChunk {
+    std::uint32_t uncompressedSize = 0;
+    std::uint32_t compressedOffset = 0;
+    std::uint32_t compressedSize = 0;
+    std::uint64_t checksum = 0;
+};
+
+struct LazyBytecodeBundle {
+    std::vector<Module> headerModules;
+    std::vector<std::string> sharedStrings;
+    std::vector<LazyFunctionBodyLoc> functionLocs;
+    std::vector<LazyBytecodeChunk> chunks;
+    const std::uint8_t* rawBlobData = nullptr;
+    std::size_t rawBlobSize = 0;
+    std::vector<std::uint8_t> ownedBlob;
+};
+
+[[nodiscard]] std::vector<std::uint8_t> encodeLazyBytecodeBundle(
+    const std::vector<Module>& modules,
+    std::size_t targetChunkBytes = 24576);
+
+[[nodiscard]] bool decodeLazyBytecodeBundleHeader(
+    const std::uint8_t* data,
+    std::size_t size,
+    LazyBytecodeBundle& outBundle,
+    bool copyBlob,
+    diagnostics::DiagnosticBag& diagnostics,
+    bool skipChecksum = false);
+
+[[nodiscard]] bool decompressLazyChunk(
+    const LazyBytecodeBundle& bundle,
+    std::uint32_t chunkIndex,
+    std::vector<std::uint8_t>& outChunk,
+    diagnostics::DiagnosticBag& diagnostics);
+
+[[nodiscard]] bool decodeLazyFunctionBody(
+    const LazyBytecodeBundle& bundle,
+    std::uint32_t locIndex,
+    Function& outFunction,
+    diagnostics::DiagnosticBag& diagnostics,
+    const std::vector<std::uint8_t>* preDecompressedChunk = nullptr,
+    const Module* moduleOverride = nullptr);
+
 } // namespace realscript::bytecode

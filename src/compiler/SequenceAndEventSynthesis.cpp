@@ -774,6 +774,21 @@ std::optional<semantic::FieldSymbol> makeSequenceLocalField(
                             }
                         }
                     }
+                    if (modIt->second.types.empty() && modIt->second.precompiledTypeLayer) {
+                        auto liveRef = modIt->second.precompiledTypeLayer->findById(targetType.id);
+                        if (!liveRef.hasValue()) {
+                            liveRef = modIt->second.precompiledTypeLayer->findByName(targetType.name);
+                        }
+                        if (liveRef.hasValue()) {
+                            for (const auto& m : liveRef->methods) {
+                                if (m.staticMethod == wantStatic && m.name == mname) {
+                                    outType = m.returnType;
+                                    outName = m.returnTypeName;
+                                    return outType != semantic::PrimitiveType::Error;
+                                }
+                            }
+                        }
+                    }
                     auto checkSyntaxMethods = [&](const auto& decls) -> bool {
                         for (const auto& decl : decls) {
                             if (decl.identifierToken.text != targetType.name) continue;
@@ -3360,14 +3375,8 @@ void synthesizeDeclarationsSequencesAndMembers(
         const auto findInterfaceType =
             [&](semantic::SymbolId interfaceTypeId)
                 -> const semantic::TypeSymbol* {
-                for (const auto& [name, type] : module.visibleTypes) {
-                    (void)name;
-                    if (type.id == interfaceTypeId &&
-                        type.interfaceType) {
-                        return &type;
-                    }
-                }
-                return nullptr;
+                const auto* found = module.visibleTypes.findById(interfaceTypeId);
+                return (found && found->interfaceType) ? found : nullptr;
             };
         const auto findInterfaceContract =
             [&](semantic::SymbolId interfaceTypeId)

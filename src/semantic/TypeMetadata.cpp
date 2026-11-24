@@ -440,16 +440,17 @@ std::optional<BlittableStructLayout> computeBlittableStructLayout(
     const TypeSymbolMap& visibleTypes,
     std::string* outReason) {
     if (outReason) outReason->clear();
-    std::unordered_map<SymbolId, const TypeSymbol*> byId;
-    byId.reserve(visibleTypes.size());
-    for (const auto& [name, sym] : visibleTypes) {
-        (void)name;
-        const SymbolId sid = sym.id != 0 ? sym.id : stableTypeId(sym);
-        if (sid != 0) byId[sid] = &sym;
-    }
     const auto lookup = [&](SymbolId tid, const std::string& name) -> const TypeSymbol* {
-        if (const auto it = byId.find(tid); it != byId.end()) return it->second;
-        if (const auto it = visibleTypes.find(name); it != visibleTypes.end()) return &it->second;
+        if (tid != 0) {
+            if (const auto* byId = visibleTypes.findById(tid)) {
+                return byId;
+            }
+        }
+        if (!name.empty()) {
+            if (const auto it = visibleTypes.find(name); it != visibleTypes.end()) {
+                return &it->second;
+            }
+        }
         return nullptr;
     };
     std::unordered_set<SymbolId> visiting;
@@ -481,6 +482,388 @@ std::optional<BlittableStructLayout> computeBlittableStructLayout(
         if (sid != 0) byId[sid] = &sym;
     }
     return computeBlittableStructLayout(type, byId, outReason);
+}
+
+namespace {
+
+class StaticTypeSymbolLayer final : public TypeSymbolLayer {
+public:
+    explicit StaticTypeSymbolLayer(const std::vector<TypeSymbol>& types) {
+        types_.reserve(types.size());
+        byCanonical_.reserve(types.size());
+        bySimple_.reserve(types.size());
+        byId_.reserve(types.size());
+        for (const auto& t : types) {
+            auto ref = SharedTypeRef::makeCopy(t);
+            const std::string canonical = canonicalTypeName(t);
+            byCanonical_.emplace(canonical, ref);
+            if (!t.name.empty()) {
+                bySimple_.try_emplace(t.name, ref);
+            }
+            if (t.id != 0) {
+                byId_.emplace(t.id, ref);
+            }
+            for (const auto& m : t.methods) {
+                if (m.staticMethod && m.extensionMethod && !m.parameters.empty()) {
+                    extensionOwners_.push_back(ref);
+                    break;
+                }
+            }
+            types_.push_back(std::move(ref));
+        }
+    }
+
+    SharedTypeRef findByName(
+        std::string_view key,
+        bool canonicalOnly) const override {
+        const std::string keyStr(key);
+        if (const auto it = byCanonical_.find(keyStr); it != byCanonical_.end()) {
+            return it->second;
+        }
+        if (!canonicalOnly) {
+            if (const auto it = bySimple_.find(keyStr); it != bySimple_.end()) {
+                return it->second;
+            }
+        }
+        return {};
+    }
+
+    SharedTypeRef findById(SymbolId id) const override {
+        if (id == 0) return {};
+        const auto it = byId_.find(id);
+        return it != byId_.end() ? it->second : SharedTypeRef{};
+    }
+
+    bool containsName(
+        std::string_view key,
+        bool canonicalOnly) const override {
+        const std::string keyStr(key);
+        if (byCanonical_.find(keyStr) != byCanonical_.end()) {
+            return true;
+        }
+        if (!canonicalOnly && bySimple_.find(keyStr) != bySimple_.end()) {
+            return true;
+        }
+        return false;
+    }
+
+    std::size_t entryCount() const noexcept override {
+        return types_.size() * 2u;
+    }
+
+    void forEachExtensionOwner(
+        const std::function<void(const TypeSymbol&)>& fn) const override {
+        for (const auto& ref : extensionOwners_) {
+            if (ref.hasValue()) {
+                fn(*ref);
+            }
+        }
+    }
+
+    void forEachType(
+        const std::function<void(const SharedTypeRef&)>& fn) const override {
+        for (const auto& ref : types_) {
+            if (ref.hasValue()) {
+                fn(ref);
+            }
+        }
+    }
+
+private:
+    std::vector<SharedTypeRef> types_;
+    std::unordered_map<std::string, SharedTypeRef> byCanonical_;
+    std::unordered_map<std::string, SharedTypeRef> bySimple_;
+    std::unordered_map<SymbolId, SharedTypeRef> byId_;
+    std::vector<SharedTypeRef> extensionOwners_;
+};
+
+} // namespace
+
+std::shared_ptr<const TypeSymbolLayer> TypeSymbolLayer::makeStatic(
+    const std::vector<TypeSymbol>& types) {
+    return std::make_shared<StaticTypeSymbolLayer>(types);
+}
+
+TypeSymbolMap::AssignProxy& TypeSymbolMap::AssignProxy::operator=(const TypeSymbol& value) {
+    owner_.assignKey(key_, SharedTypeRef::makeCopy(value));
+    return *this;
+}
+
+TypeSymbolMap::AssignProxy& TypeSymbolMap::AssignProxy::operator=(TypeSymbol&& value) {
+    owner_.assignKey(key_, SharedTypeRef(std::make_shared<TypeSymbol>(std::move(value))));
+    return *this;
+}
+
+TypeSymbolMap::AssignProxy& TypeSymbolMap::AssignProxy::operator=(SharedTypeRef ref) {
+    owner_.assignKey(key_, std::move(ref));
+    return *this;
+}
+
+TypeSymbolMap::AssignProxy::operator const TypeSymbol&() const {
+    const auto it = owner_.findNoTouch(key_);
+    if (it != owner_.end()) {
+        return it->second;
+    }
+    static const TypeSymbol kEmpty{};
+    return kEmpty;
+}
+
+void TypeSymbolMap::assignKey(const std::string& key, SharedTypeRef ref) {
+    if (!ref.hasValue()) {
+        erase(key);
+        return;
+    }
+    erasedKeys_.erase(key);
+    local_[key] = ref;
+    if (ref->id != 0) {
+        localById_[ref->id] = ref;
+    }
+}
+
+void TypeSymbolMap::insertShared(const SharedTypeRef& ref, bool includeSimpleName) {
+    if (!ref.hasValue()) return;
+    const std::string canonical = canonicalTypeName(*ref);
+    erasedKeys_.erase(canonical);
+    local_[canonical] = ref;
+    if (includeSimpleName && !ref->name.empty()) {
+        erasedKeys_.erase(ref->name);
+        local_[ref->name] = ref;
+    }
+    if (ref->id != 0) {
+        localById_[ref->id] = ref;
+    }
+}
+
+void TypeSymbolMap::attachLayer(SharedTypeLayer layer, bool canonicalOnly) {
+    if (!layer) return;
+    layers_.push_back(LayerRef{std::move(layer), canonicalOnly});
+}
+
+std::size_t TypeSymbolMap::erase(const std::string& key) {
+    std::size_t removed = 0;
+    const auto it = local_.find(key);
+    if (it != local_.end()) {
+        const SymbolId oldId = it->second ? it->second->id : 0;
+        local_.erase(it);
+        removed = 1;
+        if (oldId != 0) {
+            bool stillReferenced = false;
+            for (const auto& [k, r] : local_) {
+                (void)k;
+                if (r && r->id == oldId) {
+                    stillReferenced = true;
+                    break;
+                }
+            }
+            if (!stillReferenced) {
+                localById_.erase(oldId);
+            }
+        }
+    }
+    for (const auto& entry : layers_) {
+        if (entry.layer && entry.layer->containsName(key, entry.canonicalOnly)) {
+            erasedKeys_.insert(key);
+            removed = 1;
+            break;
+        }
+    }
+    return removed;
+}
+
+void TypeSymbolMap::clear() noexcept {
+    local_.clear();
+    localById_.clear();
+    layers_.clear();
+    erasedKeys_.clear();
+    touchedExternal_.clear();
+}
+
+std::size_t TypeSymbolMap::size() const noexcept {
+    std::size_t total = local_.size();
+    for (const auto& entry : layers_) {
+        if (entry.layer) {
+            total += entry.layer->entryCount();
+        }
+    }
+    return total;
+}
+
+bool TypeSymbolMap::hasKeyNoTouch(std::string_view key) const {
+    const std::string keyStr(key);
+    if (local_.find(keyStr) != local_.end()) {
+        return true;
+    }
+    if (!erasedKeys_.empty() && erasedKeys_.find(keyStr) != erasedKeys_.end()) {
+        return false;
+    }
+    for (const auto& entry : layers_) {
+        if (entry.layer && entry.layer->containsName(key, entry.canonicalOnly)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TypeSymbolMap::containsName(std::string_view key) const {
+    return hasKeyNoTouch(key);
+}
+
+TypeSymbolMap::const_iterator TypeSymbolMap::findNoTouch(std::string_view key) const {
+    const std::string keyStr(key);
+    if (const auto it = local_.find(keyStr); it != local_.end()) {
+        return const_iterator(it->first, it->second);
+    }
+    if (!erasedKeys_.empty() && erasedKeys_.find(keyStr) != erasedKeys_.end()) {
+        return end();
+    }
+    for (const auto& entry : layers_) {
+        if (!entry.layer) continue;
+        SharedTypeRef ref = entry.layer->findByName(key, entry.canonicalOnly);
+        if (ref.hasValue()) {
+            if (!erasedKeys_.empty()) {
+                const std::string canon = canonicalTypeName(*ref);
+                if (erasedKeys_.find(canon) != erasedKeys_.end()) {
+                    continue;
+                }
+            }
+            return const_iterator(keyStr, std::move(ref));
+        }
+    }
+    return end();
+}
+
+TypeSymbolMap::const_iterator TypeSymbolMap::find(std::string_view key) const {
+    const std::string keyStr(key);
+    if (const auto it = local_.find(keyStr); it != local_.end()) {
+        return const_iterator(it->first, it->second);
+    }
+    if (!erasedKeys_.empty() && erasedKeys_.find(keyStr) != erasedKeys_.end()) {
+        return end();
+    }
+    for (const auto& entry : layers_) {
+        if (!entry.layer) continue;
+        SharedTypeRef ref = entry.layer->findByName(key, entry.canonicalOnly);
+        if (ref.hasValue()) {
+            if (!erasedKeys_.empty()) {
+                const std::string canon = canonicalTypeName(*ref);
+                if (erasedKeys_.find(canon) != erasedKeys_.end()) {
+                    continue;
+                }
+            }
+            if (trackTouched_ && ref->id != 0) {
+                touchedExternal_.try_emplace(ref->id, ref);
+            }
+            return const_iterator(keyStr, std::move(ref));
+        }
+    }
+    return end();
+}
+
+const TypeSymbol* TypeSymbolMap::findById(SymbolId id) const {
+    if (id == 0) return nullptr;
+    if (const auto it = localById_.find(id); it != localById_.end()) {
+        return it->second.hasValue() ? &(*it->second) : nullptr;
+    }
+    for (const auto& entry : layers_) {
+        if (!entry.layer) continue;
+        SharedTypeRef ref = entry.layer->findById(id);
+        if (ref.hasValue()) {
+            if (!erasedKeys_.empty()) {
+                const std::string canon = canonicalTypeName(*ref);
+                if (erasedKeys_.find(canon) != erasedKeys_.end() &&
+                    (ref->name.empty() || erasedKeys_.find(ref->name) != erasedKeys_.end())) {
+                    continue;
+                }
+            }
+            if (trackTouched_) {
+                touchedExternal_.try_emplace(id, ref);
+            }
+            return &(*ref);
+        }
+    }
+    return nullptr;
+}
+
+std::pair<TypeSymbolMap::const_iterator, bool> TypeSymbolMap::try_emplace(
+    const std::string& key,
+    const TypeSymbol& value) {
+    if (const auto existing = findNoTouch(key); existing != end()) {
+        return {existing, false};
+    }
+    auto ref = SharedTypeRef::makeCopy(value);
+    assignKey(key, ref);
+    return {const_iterator(key, std::move(ref)), true};
+}
+
+std::pair<TypeSymbolMap::const_iterator, bool> TypeSymbolMap::try_emplace(
+    const std::string& key,
+    SharedTypeRef ref) {
+    if (const auto existing = findNoTouch(key); existing != end()) {
+        return {existing, false};
+    }
+    assignKey(key, ref);
+    return {const_iterator(key, std::move(ref)), true};
+}
+
+TypeSymbolMap::const_iterator TypeSymbolMap::begin() const {
+    auto snapshot = std::make_shared<std::vector<std::pair<std::string, SharedTypeRef>>>();
+    snapshot->reserve(local_.size());
+    std::unordered_set<std::string> seenKeys;
+    seenKeys.reserve(local_.size() + 32u);
+    for (const auto& [k, ref] : local_) {
+        if (!ref.hasValue()) continue;
+        if (seenKeys.insert(k).second) {
+            snapshot->emplace_back(k, ref);
+        }
+    }
+    for (const auto& entry : layers_) {
+        if (!entry.layer) continue;
+        entry.layer->forEachType([&](const SharedTypeRef& ref) {
+            if (!ref.hasValue()) return;
+            const std::string canonical = canonicalTypeName(*ref);
+            if (erasedKeys_.find(canonical) == erasedKeys_.end() &&
+                seenKeys.insert(canonical).second) {
+                snapshot->emplace_back(canonical, ref);
+            }
+            if (!entry.canonicalOnly && !ref->name.empty() &&
+                erasedKeys_.find(ref->name) == erasedKeys_.end() &&
+                seenKeys.insert(ref->name).second) {
+                snapshot->emplace_back(ref->name, ref);
+            }
+        });
+    }
+    if (snapshot->empty()) {
+        return end();
+    }
+    return const_iterator(std::move(snapshot), 0);
+}
+
+void TypeSymbolMap::forEachExtensionOwner(
+    const std::function<void(const TypeSymbol&)>& fn) const {
+    std::unordered_set<SymbolId> visitedIds;
+    for (const auto& [k, ref] : local_) {
+        (void)k;
+        if (!ref.hasValue() || ref->id == 0) continue;
+        bool hasExt = false;
+        for (const auto& m : ref->methods) {
+            if (m.staticMethod && m.extensionMethod && !m.parameters.empty()) {
+                hasExt = true;
+                break;
+            }
+        }
+        if (hasExt && visitedIds.insert(ref->id).second) {
+            fn(*ref);
+        }
+    }
+    for (const auto& entry : layers_) {
+        if (!entry.layer) continue;
+        entry.layer->forEachExtensionOwner([&](const TypeSymbol& ts) {
+            if (ts.id != 0 && !visitedIds.insert(ts.id).second) {
+                return;
+            }
+            fn(ts);
+        });
+    }
 }
 
 } // namespace realscript::semantic

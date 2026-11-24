@@ -3857,7 +3857,24 @@ public:
         RuntimeError& error,
         bool verifyModules = true);
 
+    static std::optional<ProgramImage> linkLayered(
+        std::shared_ptr<const bytecode::LazyBytecodeBundle> baseBundle,
+        std::vector<bytecode::Module> userModules,
+        RuntimeError& error,
+        bool verifyUserModules = true);
+
+    static std::optional<ProgramImage> linkLayeredConsumeHeader(
+        std::shared_ptr<bytecode::LazyBytecodeBundle> mutableBaseBundle,
+        std::vector<bytecode::Module> userModules,
+        RuntimeError& error,
+        bool verifyUserModules = true);
+
     void compactForRuntime();
+
+    [[nodiscard]] std::size_t totalLazyFunctionCount() const noexcept;
+    [[nodiscard]] std::size_t compiledLazyFunctionCount() const noexcept;
+    [[nodiscard]] std::size_t decodedLazyChunkCacheSize() const noexcept;
+    [[nodiscard]] std::size_t evictedLazyChunkCount() const noexcept;
 
     [[nodiscard]] const std::vector<bytecode::Module>& modules() const noexcept;
     [[nodiscard]] std::size_t functionCount() const noexcept;
@@ -3922,6 +3939,9 @@ private:
     std::unordered_map<semantic::SymbolId, FunctionLocation> functions_;
     std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> types_;
     std::unordered_map<std::string, semantic::SymbolId> names_;
+    std::shared_ptr<const bytecode::LazyBytecodeBundle> lazyBaseBundle_;
+    std::size_t baseModuleCount_ = 0;
+    std::unordered_map<const bytecode::Function*, std::uint32_t> lazyFuncLocIndex_;
     mutable std::shared_ptr<std::once_flag> executionMirrorOnce_ = std::make_shared<std::once_flag>();
     mutable std::shared_ptr<const detail::ExecutionMirror> executionMirror_;
     AtomicMirrorCache executionMirrorFast_{};

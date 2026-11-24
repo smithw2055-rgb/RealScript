@@ -13,11 +13,7 @@ namespace realscript::semantic {
 using namespace detail;
 
 const TypeSymbol* Binder::findVisibleType(SymbolId id) const noexcept {
-    for (const auto& [name, type] : visibleTypes_) {
-        (void)name;
-        if (type.id == id) return &type;
-    }
-    return nullptr;
+    return visibleTypes_.findById(id);
 }
 
 bool Binder::isTypeAccessible(const TypeSymbol& type) const noexcept {

@@ -680,6 +680,149 @@ SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
     return bindModule(input);
 }
 
+void appendReferencedExternalTypes(
+    const TypeSymbolMap& visibleTypes,
+    SemanticModel& result) {
+    std::unordered_set<SymbolId> emittedIds;
+    emittedIds.reserve(result.types.size() + visibleTypes.touchedExternal().size() + 16u);
+    for (const auto& t : result.types) {
+        if (t.id != 0) emittedIds.insert(t.id);
+    }
+
+    std::vector<const TypeSymbol*> queue;
+    std::vector<const TypeSymbol*> externalTypes;
+    queue.reserve(result.types.size() + visibleTypes.touchedExternal().size() + 16u);
+    for (const auto& t : result.types) {
+        queue.push_back(&t);
+    }
+
+    auto markPtr = [&](const TypeSymbol* ts) {
+        if (!ts || ts->id == 0) return;
+        if (ts->moduleName == result.moduleName) return;
+        if (emittedIds.insert(ts->id).second) {
+            externalTypes.push_back(ts);
+            queue.push_back(ts);
+        }
+    };
+    auto markId = [&](SymbolId tid) {
+        if (tid == 0 || emittedIds.count(tid) != 0) return;
+        if (const auto* ts = visibleTypes.findById(tid)) {
+            markPtr(ts);
+        }
+    };
+    auto markName = [&](const std::string& rawName, std::string_view fallbackMod) {
+        if (rawName.empty()) return;
+        std::string name = rawName;
+        if (name.size() >= 2 && name.substr(name.size() - 2) == "[]") {
+            PrimitiveType elemPrim = PrimitiveType::Error;
+            std::string elemName;
+            std::string cur = name;
+            while (decodeArrayTypeName(cur, elemPrim, elemName)) {
+                if (elemPrim != PrimitiveType::Array) {
+                    name = std::move(elemName);
+                    break;
+                }
+                cur = std::move(elemName);
+            }
+        }
+        if (name.empty()) return;
+        if (name.find("::") == std::string::npos && !fallbackMod.empty()) {
+            const std::string qual = std::string(fallbackMod) + "::" + name;
+            if (const auto qit = visibleTypes.find(qual); qit != visibleTypes.end()) {
+                markPtr(&qit->second);
+                return;
+            }
+        }
+        if (const auto it = visibleTypes.find(name); it != visibleTypes.end()) {
+            markPtr(&it->second);
+            return;
+        }
+        if (name.back() == '?') {
+            if (const auto it = visibleTypes.find(name.substr(0, name.size() - 1));
+                it != visibleTypes.end()) {
+                markPtr(&it->second);
+            }
+        }
+    };
+    auto markTypeRef = [&](PrimitiveType pt, const std::string& tn, std::string_view fallbackMod) {
+        if (tn.empty()) return;
+        if (pt == PrimitiveType::Array) {
+            markName(tn, fallbackMod);
+            return;
+        }
+        if (isExactType(pt) || pt == PrimitiveType::Handle || pt == PrimitiveType::Error) {
+            markName(tn, fallbackMod);
+        }
+    };
+    auto scanFunctionRef = [&](const FunctionSymbol& fn, std::string_view fallbackMod) {
+        if (fn.ownerTypeId != 0) markId(fn.ownerTypeId);
+        if (!fn.ownerTypeName.empty()) markName(fn.ownerTypeName, fallbackMod);
+        if (fn.declaringTypeId != 0) markId(fn.declaringTypeId);
+        markTypeRef(fn.returnType, fn.returnTypeName, fallbackMod);
+        markTypeRef(fn.storageReturnType, fn.storageReturnTypeName, fallbackMod);
+        for (const auto& p : fn.parameters) {
+            markTypeRef(p.type, p.typeName, fallbackMod);
+            markTypeRef(p.storageType, p.storageTypeName, fallbackMod);
+        }
+    };
+
+    for (const auto& [tid, ref] : visibleTypes.touchedExternal()) {
+        (void)tid;
+        if (ref.hasValue()) {
+            markPtr(&(*ref));
+        }
+    }
+    for (const auto& bf : result.functions) {
+        scanFunctionRef(bf.symbol, result.moduleName);
+    }
+
+    for (std::size_t qIdx = 0; qIdx < queue.size(); ++qIdx) {
+        const TypeSymbol& cur = *queue[qIdx];
+        if (cur.baseTypeId != 0) markId(cur.baseTypeId);
+        if (!cur.baseTypeName.empty()) markName(cur.baseTypeName, cur.moduleName);
+        for (const auto& iface : cur.baseInterfaceNames) {
+            markName(iface, cur.moduleName);
+        }
+        for (const auto& imap : cur.interfaceDispatchMaps) {
+            markId(imap.interfaceTypeId);
+        }
+        for (const auto& fld : cur.fields) {
+            markTypeRef(fld.type, fld.typeName, cur.moduleName);
+        }
+        for (const auto& m : cur.methods) {
+            scanFunctionRef(m, cur.moduleName);
+        }
+        for (const auto& c : cur.constructors) {
+            scanFunctionRef(c, cur.moduleName);
+        }
+        if (cur.staticConstructor.has_value()) {
+            scanFunctionRef(*cur.staticConstructor, cur.moduleName);
+        }
+        for (const auto& p : cur.properties) {
+            markTypeRef(p.type, p.typeName, cur.moduleName);
+            if (p.getter.has_value()) scanFunctionRef(*p.getter, cur.moduleName);
+            if (p.setter.has_value()) scanFunctionRef(*p.setter, cur.moduleName);
+        }
+        for (const auto& ev : cur.events) {
+            if (!ev.delegateName.empty()) markName(ev.delegateName, cur.moduleName);
+            markTypeRef(ev.storageField.type, ev.storageField.typeName, cur.moduleName);
+            for (const auto& p : ev.parameters) {
+                markTypeRef(p.type, p.typeName, cur.moduleName);
+            }
+        }
+    }
+
+    if (externalTypes.empty()) return;
+    std::sort(externalTypes.begin(), externalTypes.end(),
+        [](const TypeSymbol* a, const TypeSymbol* b) {
+            return canonicalTypeName(*a) < canonicalTypeName(*b);
+        });
+    result.types.reserve(result.types.size() + externalTypes.size());
+    for (const TypeSymbol* ts : externalTypes) {
+        result.types.push_back(*ts);
+    }
+}
+
 SemanticModel Binder::bindModule(const ModuleBindingInput& input) {
     ModuleBindingInput copy = input;
     return bindModule(std::move(copy));
@@ -691,6 +834,7 @@ SemanticModel Binder::bindModule(ModuleBindingInput&& input) {
     sharedTypesById_.clear();
     collectOccurrences_ = input.collectOccurrences;
     visibleTypes_ = std::move(input.visibleTypes);
+    visibleTypes_.setTrackTouched(true);
     hygienicAccessibleModules_ = std::move(input.hygienicAccessibleModules);
     obsoleteSymbols_ = std::move(input.obsoleteSymbols);
     pendingFunctionBindings_.clear();
@@ -755,6 +899,7 @@ SemanticModel Binder::bindModule(ModuleBindingInput&& input) {
             result.types.end(),
             std::make_move_iterator(pendingTypes_.begin()),
             std::make_move_iterator(pendingTypes_.end()));
+        appendReferencedExternalTypes(visibleTypes_, result);
         result.occurrences = std::move(occurrences_);
         return result;
     }
@@ -776,6 +921,7 @@ SemanticModel Binder::bindModule(ModuleBindingInput&& input) {
             result.functions.push_back(bindFunction(binding));
         }
     }
+    appendReferencedExternalTypes(visibleTypes_, result);
     result.occurrences = std::move(occurrences_);
     return result;
 }

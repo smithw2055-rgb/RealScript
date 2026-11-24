@@ -33,10 +33,31 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
                     interfaceNamesById.emplace(t.id, semantic::canonicalTypeName(t));
                 }
             }
+            for (const auto& [iName, contract] : mod.interfaces) {
+                (void)iName;
+                const std::string cName = contract.moduleName.empty()
+                    ? contract.name
+                    : (contract.moduleName + "::" + contract.name);
+                interfaceNamesById.try_emplace(semantic::stableTypeId(cName), cName);
+            }
         }
+        std::vector<semantic::SharedTypeRef> pinnedPrecompiledTypes;
         const auto findGlobalCached = [&](const std::string& canonicalName) -> const semantic::TypeSymbol* {
             const auto it = globalTypesByName.find(canonicalName);
-            return it == globalTypesByName.end() ? nullptr : it->second;
+            if (it != globalTypesByName.end()) return it->second;
+            const auto sep = canonicalName.find("::");
+            if (sep != std::string::npos) {
+                const auto modIt = modules.find(canonicalName.substr(0, sep));
+                if (modIt != modules.end() && modIt->second.precompiledTypeLayer) {
+                    auto ref = modIt->second.precompiledTypeLayer->findByName(canonicalName, false);
+                    if (ref.hasValue()) {
+                        const auto* raw = &(*ref);
+                        pinnedPrecompiledTypes.push_back(std::move(ref));
+                        return raw;
+                    }
+                }
+            }
+            return nullptr;
         };
 
         struct InterfaceOwnerWork {
@@ -413,6 +434,7 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
         };
         for (auto& [modName, mod] : modules) {
             (void)modName;
+            if (mod.precompiledExternal) continue;
             for (const auto* unit : mod.units) {
                 if (!unit || !unit->syntaxTree) continue;
                 scanAttrTypeDecls(mod, *unit, unit->syntaxTree->classes);
@@ -644,6 +666,7 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
 
         for (auto& [modName, mod] : modules) {
             (void)modName;
+            if (mod.precompiledExternal) continue;
             std::unordered_map<std::string, const text::SourceText*> unitSourcesByName;
             for (const auto* u : mod.units) {
                 if (u && u->source) unitSourcesByName[u->source->name()] = u->source.get();
@@ -964,7 +987,8 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
         }
         const auto findFieldTagGlobal = [&](const std::string& canonicalName) -> const semantic::TypeSymbol* {
             const auto it = fieldTagTypesByName.find(canonicalName);
-            return it == fieldTagTypesByName.end() ? nullptr : it->second;
+            if (it != fieldTagTypesByName.end()) return it->second;
+            return findGlobalType(modules, canonicalName);
         };
         for (auto& [modName, mod] : modules) {
             (void)modName;
@@ -1303,8 +1327,45 @@ void closeGlobalInterfacesValidateAttributesAndLayouts(
             }
         }
 
+        std::vector<semantic::SharedTypeRef> pinnedBlittableRefs;
+        std::function<void(const semantic::TypeSymbol&)> ensureFieldDepsInAllTypes =
+            [&](const semantic::TypeSymbol& curType) {
+                for (const auto& f : curType.fields) {
+                    if (f.staticField || f.constField) continue;
+                    std::string fName = f.typeName;
+                    if (f.type == semantic::PrimitiveType::Array) {
+                        semantic::PrimitiveType ep = semantic::PrimitiveType::Error;
+                        std::string en;
+                        std::string arr = f.typeName;
+                        while (semantic::decodeArrayTypeName(arr, ep, en)) {
+                            if (ep != semantic::PrimitiveType::Array) {
+                                fName = en;
+                                break;
+                            }
+                            arr = en;
+                        }
+                    }
+                    if (fName.empty()) continue;
+                    const semantic::SymbolId tid = semantic::stableTypeId(fName);
+                    if (tid == 0 || allTypesById.find(tid) != allTypesById.end()) continue;
+                    const auto sep = fName.find("::");
+                    if (sep != std::string::npos) {
+                        const auto modIt = modules.find(fName.substr(0, sep));
+                        if (modIt != modules.end() && modIt->second.precompiledTypeLayer) {
+                            auto ref = modIt->second.precompiledTypeLayer->findByName(fName, false);
+                            if (ref.hasValue()) {
+                                const auto* ptr = &(*ref);
+                                pinnedBlittableRefs.push_back(std::move(ref));
+                                allTypesById.emplace(ptr->id, ptr);
+                                ensureFieldDepsInAllTypes(*ptr);
+                            }
+                        }
+                    }
+                }
+            };
         const auto validateBlittableStruct = [&](PendingBlittable& item) {
             auto& type = *item.type;
+            ensureFieldDepsInAllTypes(type);
             auto& mod = *item.module;
             std::string srcName;
             text::TextSpan span;

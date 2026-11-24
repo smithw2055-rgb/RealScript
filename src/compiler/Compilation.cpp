@@ -1,5 +1,7 @@
 #include "CompilationInternal.h"
 
+#include "realscript/compiler/PrecompiledModule.h"
+
 #include <algorithm>
 #include <atomic>
 #include <exception>
@@ -1526,6 +1528,204 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         }
     }
 
+    const auto declStartOffset = [](const auto& decl, const std::optional<syntax::SyntaxToken>* extraTok = nullptr) -> std::size_t {
+        std::size_t start = decl.span().start;
+        for (const auto& attrList : decl.attributes) {
+            const auto sp = attrList.span();
+            if (!sp.empty()) start = (std::min)(start, sp.start);
+        }
+        for (const auto& modTok : decl.modifiers) {
+            if (!modTok.missing && !modTok.span.empty()) {
+                start = (std::min)(start, modTok.span.start);
+            }
+        }
+        if (extraTok && extraTok->has_value() && !(*extraTok)->missing && !(*extraTok)->span.empty()) {
+            start = (std::min)(start, (*extraTok)->span.start);
+        }
+        return start;
+    };
+
+    const auto sliceDeclText = [&](std::size_t startOff, std::size_t endOff, const std::string& content) -> std::string {
+        if (startOff >= content.size() || endOff <= startOff) return {};
+        const std::size_t safeEnd = (std::min)(endOff, content.size());
+        return content.substr(startOff, safeEnd - startOff);
+    };
+
+    auto buildUnitTemplateSnippet = [&](const ParsedUnit& unit) -> std::string {
+        if (!unit.source || !unit.syntaxTree || unit.invalid) return {};
+        const auto& content = unit.source->content();
+        const auto& st = *unit.syntaxTree;
+        std::vector<std::string> fragments;
+
+        for (const auto& c : st.classes) {
+            if (!c.typeParameters.empty()) {
+                auto frag = sliceDeclText(declStartOffset(c), c.span().end(), content);
+                if (!frag.empty()) fragments.push_back(std::move(frag));
+            } else {
+                std::vector<std::string> genericMethods;
+                for (const auto& m : c.methods) {
+                    if (!m.typeParameters.empty()) {
+                        auto mf = sliceDeclText(declStartOffset(m, &m.staticKeyword), m.span().end(), content);
+                        if (!mf.empty()) genericMethods.push_back(std::move(mf));
+                    }
+                }
+                if (!genericMethods.empty()) {
+                    std::ostringstream partialCls;
+                    bool hasPartial = false;
+                    for (const auto& modTok : c.modifiers) {
+                        if (modTok.text == "partial") hasPartial = true;
+                        partialCls << modTok.text << ' ';
+                    }
+                    if (!hasPartial) partialCls << "partial ";
+                    partialCls << "class " << c.identifierToken.text << " {\n";
+                    for (const auto& gm : genericMethods) {
+                        partialCls << gm << "\n";
+                    }
+                    partialCls << "}";
+                    fragments.push_back(partialCls.str());
+                }
+            }
+        }
+        for (const auto& s : st.structs) {
+            if (!s.typeParameters.empty()) {
+                auto frag = sliceDeclText(declStartOffset(s), s.span().end(), content);
+                if (!frag.empty()) fragments.push_back(std::move(frag));
+            } else {
+                std::vector<std::string> genericMethods;
+                for (const auto& m : s.methods) {
+                    if (!m.typeParameters.empty()) {
+                        auto mf = sliceDeclText(declStartOffset(m, &m.staticKeyword), m.span().end(), content);
+                        if (!mf.empty()) genericMethods.push_back(std::move(mf));
+                    }
+                }
+                if (!genericMethods.empty()) {
+                    std::ostringstream partialSt;
+                    bool hasPartial = false;
+                    for (const auto& modTok : s.modifiers) {
+                        if (modTok.text == "partial") hasPartial = true;
+                        partialSt << modTok.text << ' ';
+                    }
+                    if (!hasPartial) partialSt << "partial ";
+                    partialSt << "struct " << s.identifierToken.text << " {\n";
+                    for (const auto& gm : genericMethods) {
+                        partialSt << gm << "\n";
+                    }
+                    partialSt << "}";
+                    fragments.push_back(partialSt.str());
+                }
+            }
+        }
+        for (const auto& iface : st.interfaces) {
+            if (!iface.typeParameters.empty()) {
+                auto frag = sliceDeclText(declStartOffset(iface), iface.span().end(), content);
+                if (!frag.empty()) fragments.push_back(std::move(frag));
+            }
+        }
+        for (const auto& del : st.delegates) {
+            if (!del.typeParameters.empty()) {
+                auto frag = sliceDeclText(declStartOffset(del), del.span().end(), content);
+                if (!frag.empty()) fragments.push_back(std::move(frag));
+            }
+        }
+        for (const auto& fn : st.functions) {
+            if (!fn.typeParameters.empty()) {
+                auto frag = sliceDeclText(declStartOffset(fn, &fn.staticKeyword), fn.span().end(), content);
+                if (!frag.empty()) fragments.push_back(std::move(frag));
+            }
+        }
+
+        if (fragments.empty()) return {};
+
+        std::ostringstream snippet;
+        if (unit.moduleName != "$global") {
+            snippet << "module " << unit.moduleName << ";\n";
+        }
+        for (const auto& imp : unit.imports) {
+            snippet << "import " << imp << ";\n";
+        }
+        for (const auto& frag : fragments) {
+            snippet << "\n" << frag << "\n";
+        }
+        return snippet.str();
+    };
+
+    // Register precompiled external frontend modules (if supplied) BEFORE builtin pack mounting
+    // so e.g. a precompiled RealScript.Math prevents re-parsing $builtin/RealScript.Math.rscript.
+    std::vector<std::pair<std::size_t, std::string>> mountedPrecompiledMods;
+    if (options_.precompiledModules) {
+        configFp = combineFingerprint(configFp, options_.precompiledModules->contentHash);
+        for (std::size_t pmIdx = 0; pmIdx < options_.precompiledModules->modules.size(); ++pmIdx) {
+            const auto& pm = options_.precompiledModules->modules[pmIdx];
+            if (pm.name.empty() || modules.find(pm.name) != modules.end()) {
+                continue;
+            }
+            auto& mod = modules[pm.name];
+            mod.name = pm.name;
+            mod.precompiledExternal = true;
+            mod.frontendCached = true;
+            mod.neededByDirtyModule = true;
+            mod.deterministic = pm.deterministic;
+            mod.sourceFingerprint = pm.sourceFingerprint;
+            mod.transitiveSourceFingerprint = pm.transitiveSourceFingerprint;
+            mod.publicFingerprint = pm.publicFingerprint;
+            mod.dependencyFingerprint = pm.dependencyFingerprint;
+            mod.imports.insert(pm.imports.begin(), pm.imports.end());
+            mod.hygienicModules.insert(pm.hygienicModules.begin(), pm.hygienicModules.end());
+            if (pm.typeLayer) {
+                mod.precompiledTypeLayer = pm.typeLayer;
+            } else if (!pm.types.empty()) {
+                mod.precompiledTypeLayer = semantic::TypeSymbolLayer::makeStatic(pm.types);
+            }
+            mod.declarations = pm.declarations;
+            mod.precompiledGenericInstantiations = pm.nativeGenericInstantiations;
+
+            for (const auto& pIface : pm.interfaces) {
+                detail::InterfaceContract c;
+                c.moduleName = pIface.moduleName;
+                c.name = pIface.name;
+                c.sourceName = pIface.sourceName;
+                c.declarationSpan = pIface.declarationSpan;
+                c.baseInterfaces = pIface.baseInterfaces;
+                c.baseInterfaceSpans = pIface.baseInterfaceSpans;
+                c.methods.reserve(pIface.methods.size());
+                for (const auto& pmMethod : pIface.methods) {
+                    detail::InterfaceMethodContract im;
+                    im.name = pmMethod.name;
+                    im.returnType = detail::InterfaceTypeRef{
+                        pmMethod.returnType.type, pmMethod.returnType.typeName};
+                    im.parameters.reserve(pmMethod.parameters.size());
+                    for (const auto& pp : pmMethod.parameters) {
+                        im.parameters.push_back(detail::InterfaceTypeRef{pp.type, pp.typeName});
+                    }
+                    im.parameterModifiers = pmMethod.parameterModifiers;
+                    im.declarationSpan = pmMethod.declarationSpan;
+                    im.hasDefaultImplementation = pmMethod.hasDefaultImplementation;
+                    im.methodSyntax = nullptr;
+                    im.sourceName = pmMethod.sourceName;
+                    im.hygienicModules = pmMethod.hygienicModules;
+                    c.methods.push_back(std::move(im));
+                }
+                mod.interfaces.emplace(c.name, std::move(c));
+            }
+            for (const auto& pDel : pm.delegates) {
+                detail::DelegateContract dc;
+                dc.moduleName = pDel.moduleName;
+                dc.name = pDel.name;
+                dc.sourceName = pDel.sourceName;
+                dc.returnType = detail::InterfaceTypeRef{
+                    pDel.returnType.type, pDel.returnType.typeName};
+                dc.parameters.reserve(pDel.parameters.size());
+                for (const auto& pp : pDel.parameters) {
+                    dc.parameters.push_back(detail::InterfaceTypeRef{pp.type, pp.typeName});
+                }
+                dc.parameterModifiers = pDel.parameterModifiers;
+                dc.declarationSpan = pDel.declarationSpan;
+                mod.delegates.emplace(dc.name, std::move(dc));
+            }
+            mountedPrecompiledMods.emplace_back(pmIdx, pm.name);
+        }
+    }
+
     // Mount needed ModulePacks via unified ModulePack descriptors (zero hardcoded module branches)
     std::unordered_set<std::string> packNamesSet;
     for (const auto& p : effectivePacks) packNamesSet.insert(p.moduleName);
@@ -1539,7 +1739,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 needed = true;
                 continue;
             }
-            if (pack.implicitUsagePredicate && packNamesSet.find(name) == packNamesSet.end()) {
+            if (pack.implicitUsagePredicate &&
+                !module.precompiledExternal &&
+                packNamesSet.find(name) == packNamesSet.end()) {
                 for (const auto* u : module.units) {
                     if (u && u->source && pack.implicitUsagePredicate(u->source->content())) {
                         needed = true;
@@ -1563,6 +1765,24 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         }
     }
 
+    std::unordered_map<std::string, std::vector<PrecompiledGenericTemplateSource>> capturedTemplatesByMod;
+    if (options_.capturePrecompiledFrontend) {
+        for (const auto& [modName, mod] : modules) {
+            if (modName == "$global" || mod.precompiledExternal) continue;
+            auto& vec = capturedTemplatesByMod[modName];
+            std::size_t idx = 0;
+            for (const auto* u : mod.units) {
+                if (!u || u->isPrecompiledTemplate) continue;
+                auto snippet = buildUnitTemplateSnippet(*u);
+                if (!snippet.empty()) {
+                    vec.push_back(PrecompiledGenericTemplateSource{
+                        "$precompiled/" + modName + "/tmpl_" + std::to_string(idx++) + ".rs",
+                        std::move(snippet)});
+                }
+            }
+        }
+    }
+
     if (!options_.pruneUnreachableModules.empty()) {
         pruneUnreachableAstDeclarations(
             options_.pruneUnreachableModules,
@@ -1572,9 +1792,57 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             result);
     }
 
+    if (options_.precompiledModules && !mountedPrecompiledMods.empty()) {
+        bool anyGenericSyntaxAfterPacks = false;
+        for (const auto& [mn, mw] : modules) {
+            (void)mn;
+            if (mw.precompiledExternal) continue;
+            for (const auto* u : mw.units) {
+                if (u && u->hasGenericSyntax) {
+                    anyGenericSyntaxAfterPacks = true;
+                    break;
+                }
+            }
+            if (anyGenericSyntaxAfterPacks) break;
+        }
+        if (anyGenericSyntaxAfterPacks) {
+            for (const auto& [pmIdx, modName] : mountedPrecompiledMods) {
+                const auto& pm = options_.precompiledModules->modules[pmIdx];
+                auto modIt = modules.find(modName);
+                if (modIt == modules.end()) continue;
+                auto& mod = modIt->second;
+                std::vector<PrecompiledGenericTemplateSource> loadedTemplates;
+                const auto* tmplList = &pm.genericTemplateSources;
+                if (tmplList->empty()) {
+                    if (!options_.precompiledModules->loadGenericTemplates(pmIdx, loadedTemplates)) {
+                        loadedTemplates.clear();
+                    }
+                    tmplList = &loadedTemplates;
+                }
+                for (std::size_t tIdx = 0; tIdx < tmplList->size(); ++tIdx) {
+                    const auto& tmplSrc = (*tmplList)[tIdx];
+                    if (tmplSrc.sourceText.empty()) continue;
+                    const std::string vPath = tmplSrc.virtualPath.empty()
+                        ? ("$precompiled/" + pm.name + "/tmpl_" + std::to_string(tIdx) + ".rs")
+                        : tmplSrc.virtualPath;
+                    auto tUnit = parseOneSource(SourceFile{vPath, tmplSrc.sourceText});
+                    tUnit->isPrecompiledTemplate = true;
+                    for (const auto& diagnostic : tUnit->parseDiagnostics) {
+                        result.diagnostics.report(
+                            diagnostic.code, diagnostic.message, diagnostic.span,
+                            diagnostic.severity, vPath);
+                    }
+                    mod.invalid = mod.invalid || tUnit->invalid;
+                    mod.units.push_back(tUnit.get());
+                    units.push_back(std::move(tUnit));
+                }
+            }
+        }
+    }
+
     // Merge partial class / partial struct declarations & reconcile partial methods
     for (auto& [modName, mod] : modules) {
-        (void)modName;
+        if (mod.precompiledExternal) continue;
         mergePartialTypesInModule(mod, result, sessionImpl);
         if (!options_.populateSnapshot && sessionImpl != nullptr &&
             modName != "Aero.UI" && modName != "Aero.Native" &&
@@ -1630,6 +1898,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
     // Stable source order, source fingerprints, and incremental module frontend cache check.
     for (auto& [moduleName, module] : modules) {
         (void)moduleName;
+        if (module.precompiledExternal) continue;
         std::stable_sort(module.units.begin(), module.units.end(),
             [](const ParsedUnit* left, const ParsedUnit* right) {
                 if (left->source->name() != right->source->name()) {
@@ -1650,6 +1919,10 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             [&](const std::string& modName) -> std::uint64_t {
             const auto it = modules.find(modName);
             if (it == modules.end() || it->second.invalid) return 0;
+            if (it->second.precompiledExternal) {
+                fpState[modName] = 2;
+                return it->second.transitiveSourceFingerprint;
+            }
             const int st = fpState[modName];
             if (st == 1) return 0;
             if (st == 2) return it->second.transitiveSourceFingerprint;
@@ -1676,6 +1949,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         }
         for (auto& [moduleName, module] : modules) {
             (void)moduleName;
+            if (module.precompiledExternal) continue;
             if (module.transitiveSourceFingerprint == 0) continue;
             std::uint64_t tfp = module.transitiveSourceFingerprint;
             for (const auto& hm : module.hygienicModules) {
@@ -1693,7 +1967,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         if (previous && sessionImpl != nullptr) {
             std::lock_guard<std::mutex> lock(sessionImpl->moduleFrontendCacheMutex);
             for (auto& [moduleName, module] : modules) {
-                if (moduleName == "$global" || module.invalid || module.transitiveSourceFingerprint == 0) continue;
+                if (moduleName == "$global" || module.precompiledExternal || module.invalid || module.transitiveSourceFingerprint == 0) continue;
                 const auto prevIt = previous->modules.find(moduleName);
                 if (prevIt == previous->modules.end() ||
                     prevIt->second.sourceFingerprint != module.sourceFingerprint) {
@@ -1757,12 +2031,13 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 for (const auto& hm : it->second.hygienicModules) dirtyQueue.push_back(hm);
             }
             for (auto& [moduleName, module] : modules) {
-                if (module.frontendCached && module.neededByDirtyModule) {
+                if (!module.precompiledExternal && module.frontendCached && module.neededByDirtyModule) {
                     const std::string cacheKey =
                         moduleName + "#" + std::to_string(module.transitiveSourceFingerprint) +
                         "#" + std::to_string(configFp);
                     const auto& fc = sessionImpl->moduleFrontendCache.at(cacheKey);
                     module.types = fc.types;
+                    module.frozenTypeLayer = fc.typeLayer;
                     module.interfaces = fc.interfaces;
                     module.delegates = fc.delegates;
                     module.declarations = fc.declarations;
@@ -1792,6 +2067,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             fc.publicFingerprint = module.publicFingerprint;
             fc.dependencyFingerprint = module.dependencyFingerprint;
             fc.types = module.types;
+            fc.typeLayer = semantic::TypeSymbolLayer::makeStatic(module.types);
             fc.interfaces = module.interfaces;
             fc.delegates = module.delegates;
             fc.declarations = module.declarations;
@@ -1849,11 +2125,10 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         }
     }
 
-    std::unordered_map<std::string, const semantic::TypeSymbol*> globalTypesByName;
-    for (const auto& [modName, mod] : modules) {
+    for (auto& [modName, mod] : modules) {
         (void)modName;
-        for (const auto& t : mod.types) {
-            globalTypesByName.emplace(semantic::canonicalTypeName(t), &t);
+        if (!mod.precompiledExternal && !mod.frozenTypeLayer && !mod.types.empty()) {
+            mod.frozenTypeLayer = semantic::TypeSymbolLayer::makeStatic(mod.types);
         }
     }
 
@@ -1885,6 +2160,12 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             module.dependencyFingerprint,
             false,
         };
+        if (module.precompiledExternal) {
+            task.reused = true;
+            task.buildInfo.reused = true;
+            moduleTasks.push_back(std::move(task));
+            continue;
+        }
         if (previous) {
             const auto cached = previous->modules.find(moduleName);
             bool inlinedUpstreamUnchanged = true;
@@ -1977,57 +2258,31 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         bindingInput.declarations = module.declarations;
         bindingInput.functionBindings = module.functionBindings;
         bindingInput.collectOccurrences = options_.collectSymbolOccurrences;
-        {
-            std::unordered_set<semantic::SymbolId> seenTypeIds;
-            std::vector<const semantic::TypeSymbol*> descriptorQueue;
-            seenTypeIds.reserve(module.visibleTypes.size());
-            descriptorQueue.reserve(module.visibleTypes.size());
-            for (const auto& [visibleName, type] : module.visibleTypes) {
-                (void)visibleName;
-                if (seenTypeIds.insert(type.id).second) {
-                    descriptorQueue.push_back(&type);
-                }
-            }
-            const auto enqueueGlobalTypeByName = [&](const std::string& canonical) {
-                if (canonical.empty()) return;
-                if (const auto gtIt = globalTypesByName.find(canonical);
-                    gtIt != globalTypesByName.end()) {
-                    if (seenTypeIds.insert(gtIt->second->id).second) {
-                        descriptorQueue.push_back(gtIt->second);
-                    }
-                }
-            };
-            for (std::size_t qIdx = 0; qIdx < descriptorQueue.size(); ++qIdx) {
-                const semantic::TypeSymbol& curType = *descriptorQueue[qIdx];
-                if (!curType.baseTypeName.empty()) {
-                    enqueueGlobalTypeByName(curType.baseTypeName);
-                }
-                for (const auto& fld : curType.fields) {
-                    if (fld.type == semantic::PrimitiveType::Object ||
-                        fld.type == semantic::PrimitiveType::Struct ||
-                        fld.type == semantic::PrimitiveType::Enum) {
-                        enqueueGlobalTypeByName(fld.typeName);
-                    } else if (fld.type == semantic::PrimitiveType::Array) {
-                        semantic::PrimitiveType elemPrim = semantic::PrimitiveType::Error;
-                        std::string elemTypeName;
-                        if (semantic::decodeArrayTypeName(fld.typeName, elemPrim, elemTypeName) &&
-                            !elemTypeName.empty()) {
-                            enqueueGlobalTypeByName(elemTypeName);
-                        }
-                    }
-                }
-            }
-            std::sort(descriptorQueue.begin(), descriptorQueue.end(),
-                [](const semantic::TypeSymbol* left, const semantic::TypeSymbol* right) {
-                    return semantic::canonicalTypeName(*left) < semantic::canonicalTypeName(*right);
-                });
-            bindingInput.types.reserve(descriptorQueue.size());
-            for (const semantic::TypeSymbol* typePtr : descriptorQueue) {
-                bindingInput.types.push_back(*typePtr);
+        bindingInput.types = module.types;
+        bindingInput.visibleFunctions = std::move(visibleFunctions);
+        for (const auto& impName : module.imports) {
+            const auto impIt = modules.find(impName);
+            if (impIt == modules.end()) continue;
+            if (impIt->second.precompiledTypeLayer) {
+                bindingInput.visibleTypes.attachLayer(impIt->second.precompiledTypeLayer, false);
+            } else if (impIt->second.frozenTypeLayer) {
+                bindingInput.visibleTypes.attachLayer(impIt->second.frozenTypeLayer, false);
             }
         }
-        bindingInput.visibleFunctions = std::move(visibleFunctions);
-        bindingInput.visibleTypes = module.visibleTypes;
+        for (const auto& type : module.types) {
+            bindingInput.visibleTypes.insertShared(
+                semantic::SharedTypeRef::makeCopy(type), true);
+        }
+        for (const auto& hygName : module.hygienicModules) {
+            const auto hygIt = modules.find(hygName);
+            if (hygIt == modules.end()) continue;
+            if (hygIt->second.precompiledTypeLayer) {
+                bindingInput.visibleTypes.attachLayer(hygIt->second.precompiledTypeLayer, true);
+            } else if (hygIt->second.frozenTypeLayer) {
+                bindingInput.visibleTypes.attachLayer(hygIt->second.frozenTypeLayer, true);
+            }
+        }
+        bindingInput.visibleTypes.setTrackTouched(true);
         bindingInput.obsoleteSymbols = globalObsoleteSymbols;
         for (const auto* unit : module.units) bindingInput.units.push_back(unit->syntaxTree.get());
 
@@ -2039,43 +2294,30 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 out.symbols = std::move(semanticModel.occurrences);
             }
             if (hadSyntaxError || out.diagnostics.hasErrors()) {
-                for (const auto& [visName, visType] : module.visibleTypes) {
-                    (void)visName;
-                    if (visType.moduleName == moduleName) {
-                        mir::Module partialMod;
-                        partialMod.name = moduleName;
-                        for (const auto& [visNameInner, visTypeInner] : module.visibleTypes) {
-                            (void)visNameInner;
-                            if (visTypeInner.moduleName == moduleName) {
-                                const bool dup = std::any_of(
-                                    partialMod.types.begin(),
-                                    partialMod.types.end(),
-                                    [&](const semantic::TypeSymbol& ex) { return ex.id == visTypeInner.id; });
-                                if (!dup) partialMod.types.push_back(visTypeInner);
+                if (!module.types.empty()) {
+                    mir::Module partialMod;
+                    partialMod.name = moduleName;
+                    partialMod.types = module.types;
+                    std::sort(
+                        partialMod.types.begin(),
+                        partialMod.types.end(),
+                        [](const semantic::TypeSymbol& left, const semantic::TypeSymbol& right) {
+                            return semantic::canonicalTypeName(left) <
+                                semantic::canonicalTypeName(right);
+                        });
+                    clearInitializerSyntaxPointers(partialMod.types);
+                    if (options_.emitDebugInfo) {
+                        std::unordered_set<std::string> seenPaths;
+                        for (const auto* u : module.units) {
+                            if (u && u->source && seenPaths.insert(u->source->name()).second) {
+                                partialMod.sourceFiles.push_back(makeSourceFileInfo(
+                                    *u->source,
+                                    static_cast<debug::SourceFileId>(partialMod.sourceFiles.size())));
                             }
                         }
-                        std::sort(
-                            partialMod.types.begin(),
-                            partialMod.types.end(),
-                            [](const semantic::TypeSymbol& left, const semantic::TypeSymbol& right) {
-                                return semantic::canonicalTypeName(left) <
-                                    semantic::canonicalTypeName(right);
-                            });
-                        clearInitializerSyntaxPointers(partialMod.types);
-                        if (options_.emitDebugInfo) {
-                            std::unordered_set<std::string> seenPaths;
-                            for (const auto* u : module.units) {
-                                if (u && u->source && seenPaths.insert(u->source->name()).second) {
-                                    partialMod.sourceFiles.push_back(makeSourceFileInfo(
-                                        *u->source,
-                                        static_cast<debug::SourceFileId>(partialMod.sourceFiles.size())));
-                                }
-                            }
-                        }
-                        out.hasMirModule = true;
-                        out.mirModule = std::move(partialMod);
-                        break;
                     }
+                    out.hasMirModule = true;
+                    out.mirModule = std::move(partialMod);
                 }
                 return;
             }
@@ -2192,6 +2434,90 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         [](const auto& left, const auto& right) {
             return left.typeName < right.typeName;
         });
+
+    if (options_.capturePrecompiledFrontend && !result.diagnostics.hasErrors()) {
+        auto pack = std::make_shared<PrecompiledFrontendPack>();
+        std::unordered_map<std::string, const mir::Module*> mirByName;
+        for (const auto& mm : result.modules) {
+            mirByName.emplace(mm.name, &mm);
+        }
+        for (const auto& [moduleName, mod] : modules) {
+            if (moduleName == "$global" || mod.precompiledExternal || mod.invalid) continue;
+            PrecompiledModuleFrontend pm;
+            pm.name = moduleName;
+            pm.sourceFingerprint = mod.sourceFingerprint;
+            pm.transitiveSourceFingerprint = mod.transitiveSourceFingerprint;
+            pm.publicFingerprint = mod.publicFingerprint;
+            pm.dependencyFingerprint = mod.dependencyFingerprint;
+            pm.deterministic = mod.deterministic;
+            pm.imports.assign(mod.imports.begin(), mod.imports.end());
+            pm.hygienicModules.assign(mod.hygienicModules.begin(), mod.hygienicModules.end());
+            pm.types = mod.types;
+            for (auto& t : pm.types) {
+                for (auto& f : t.fields) f.initializerSyntax = nullptr;
+            }
+            pm.declarations = mod.declarations;
+
+            pm.interfaces.reserve(mod.interfaces.size());
+            for (const auto& [iName, contract] : mod.interfaces) {
+                (void)iName;
+                PrecompiledInterfaceContract pic;
+                pic.moduleName = contract.moduleName;
+                pic.name = contract.name;
+                pic.sourceName = contract.sourceName;
+                pic.declarationSpan = contract.declarationSpan;
+                pic.baseInterfaces = contract.baseInterfaces;
+                pic.baseInterfaceSpans = contract.baseInterfaceSpans;
+                pic.methods.reserve(contract.methods.size());
+                for (const auto& m : contract.methods) {
+                    PrecompiledInterfaceMethodContract pim;
+                    pim.name = m.name;
+                    pim.returnType = PrecompiledTypeRef{m.returnType.type, m.returnType.typeName};
+                    pim.parameters.reserve(m.parameters.size());
+                    for (const auto& p : m.parameters) {
+                        pim.parameters.push_back(PrecompiledTypeRef{p.type, p.typeName});
+                    }
+                    pim.parameterModifiers = m.parameterModifiers;
+                    pim.declarationSpan = m.declarationSpan;
+                    pim.hasDefaultImplementation = m.hasDefaultImplementation;
+                    pim.sourceName = m.sourceName;
+                    pim.hygienicModules = m.hygienicModules;
+                    pic.methods.push_back(std::move(pim));
+                }
+                pm.interfaces.push_back(std::move(pic));
+            }
+            pm.delegates.reserve(mod.delegates.size());
+            for (const auto& [dName, contract] : mod.delegates) {
+                (void)dName;
+                PrecompiledDelegateContract pdc;
+                pdc.moduleName = contract.moduleName;
+                pdc.name = contract.name;
+                pdc.sourceName = contract.sourceName;
+                pdc.returnType = PrecompiledTypeRef{contract.returnType.type, contract.returnType.typeName};
+                pdc.parameters.reserve(contract.parameters.size());
+                for (const auto& p : contract.parameters) {
+                    pdc.parameters.push_back(PrecompiledTypeRef{p.type, p.typeName});
+                }
+                pdc.parameterModifiers = contract.parameterModifiers;
+                pdc.declarationSpan = contract.declarationSpan;
+                pm.delegates.push_back(std::move(pdc));
+            }
+
+            if (const auto mIt = mirByName.find(moduleName); mIt != mirByName.end()) {
+                pm.nativeAttributes = mIt->second->languageMetadata.attributes;
+                pm.nativeSequences = mIt->second->languageMetadata.sequences;
+                pm.nativeInterfaces = mIt->second->languageMetadata.interfaces;
+                pm.nativeGenericInstantiations = mIt->second->languageMetadata.genericInstantiations;
+            }
+            if (const auto tIt = capturedTemplatesByMod.find(moduleName);
+                tIt != capturedTemplatesByMod.end()) {
+                pm.genericTemplateSources = tIt->second;
+            }
+            pack->modules.push_back(std::move(pm));
+        }
+        result.precompiledFrontend = std::move(pack);
+    }
+
     return result;
 }
 

@@ -1837,8 +1837,7 @@ std::unique_ptr<BoundExpression> Binder::tryBindExtensionMethodCall(
             }
         }
     }
-    for (const auto& [visName, visType] : visibleTypes_) {
-        (void)visName;
+    visibleTypes_.forEachExtensionOwner([&](const TypeSymbol& visType) {
         for (const auto& m : visType.methods) {
             if (m.staticMethod && m.extensionMethod &&
                 m.name == syntaxTree.nameToken.text && !m.parameters.empty() &&
@@ -1847,7 +1846,7 @@ std::unique_ptr<BoundExpression> Binder::tryBindExtensionMethodCall(
                 extCandidates.push_back(&m);
             }
         }
-    }
+    });
     if (extCandidates.empty()) return nullptr;
 
     std::vector<std::unique_ptr<BoundExpression>> extArgs;
@@ -2323,6 +2322,57 @@ std::unique_ptr<BoundExpression> Binder::bindMemberCallExpression(
     if (!best && !staticCall && receiver) {
         if (auto extCall = tryBindExtensionMethodCall(syntaxTree, receiver, arguments)) {
             return extCall;
+        }
+    }
+    if (!best && staticCall && syntaxTree.nameToken.text.rfind("__member_spec__", 0) == 0) {
+        if (const auto globals = visibleFunctions_.find(syntaxTree.nameToken.text);
+            globals != visibleFunctions_.end()) {
+            std::vector<const FunctionSymbol*> staticHelpers;
+            for (const auto& fn : globals->second) {
+                if (!fn.method && isMemberAccessible(fn.accessibility, fn.declaringTypeId, fn.moduleName)) {
+                    staticHelpers.push_back(&fn);
+                }
+            }
+            bool helperAmbiguous = false;
+            const auto helperPlan = selectFlexibleCall(
+                staticHelpers,
+                arguments,
+                &syntaxTree.argumentNames,
+                &syntaxTree.argumentModifiers,
+                visibleTypes_,
+                helperAmbiguous);
+            if (helperPlan.function && !helperAmbiguous) {
+                if (collectOccurrences_) {
+                    recordSymbolReference(
+                        occurrences_,
+                        currentSourceName_,
+                        helperPlan.function->id,
+                        SymbolKind::Function,
+                        helperPlan.function->name,
+                        syntaxTree.nameToken.span);
+                }
+                auto prepared = prepareCallArguments(
+                    *helperPlan.function,
+                    helperPlan.sources,
+                    std::move(arguments),
+                    syntaxTree.arguments,
+                    syntaxTree.argumentModifiers,
+                    syntaxTree.span(),
+                    "method argument");
+                return applyNullConditional(
+                    bindSelectedCall(
+                        *helperPlan.function,
+                        std::move(prepared.arguments),
+                        prepared.syntaxArguments,
+                        prepared.modifiers,
+                        std::move(prepared.evaluationOrder),
+                        nullptr,
+                        syntaxTree.span(),
+                        "method argument",
+                        false),
+                    syntaxTree.dotToken,
+                    syntaxTree.span());
+            }
         }
     }
     if (!best) {

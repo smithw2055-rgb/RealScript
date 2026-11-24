@@ -122,6 +122,58 @@ bool sameTypeContract(
     return true;
 }
 
+bool sameBaseTypeContractSlim(
+    const semantic::TypeSymbol& baseType,
+    const semantic::TypeSymbol& userType) noexcept {
+    if (baseType.id != userType.id || baseType.kind != userType.kind ||
+        baseType.accessibility != userType.accessibility ||
+        baseType.delegateType != userType.delegateType ||
+        baseType.interfaceType != userType.interfaceType ||
+        baseType.abstractType != userType.abstractType ||
+        baseType.sealedType != userType.sealedType ||
+        baseType.baseTypeId != userType.baseTypeId ||
+        baseType.baseTypeName != userType.baseTypeName ||
+        baseType.moduleName != userType.moduleName ||
+        baseType.name != userType.name ||
+        baseType.virtualDispatchTable != userType.virtualDispatchTable ||
+        baseType.interfaceDispatchMaps != userType.interfaceDispatchMaps ||
+        baseType.fields.size() != userType.fields.size()) {
+        return false;
+    }
+    for (std::size_t index = 0; index < baseType.fields.size(); ++index) {
+        const auto& first = baseType.fields[index];
+        const auto& second = userType.fields[index];
+        if (first.id != second.id || first.name != second.name ||
+            first.accessibility != second.accessibility ||
+            first.declaringTypeId != second.declaringTypeId ||
+            first.type != second.type ||
+            first.typeName != second.typeName ||
+            first.index != second.index) {
+            return false;
+        }
+    }
+    if (baseType.methods.size() == userType.methods.size()) {
+        for (std::size_t index = 0; index < baseType.methods.size(); ++index) {
+            if (!sameMethodContract(baseType.methods[index], userType.methods[index])) {
+                return false;
+            }
+        }
+        return true;
+    }
+    for (const auto& bm : baseType.methods) {
+        bool matched = false;
+        for (const auto& um : userType.methods) {
+            if (um.id == bm.id) {
+                if (!sameMethodContract(bm, um)) return false;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) return false;
+    }
+    return true;
+}
+
 bool bytecodeMatchesMethod(
     const bytecode::Function& function,
     const semantic::FunctionSymbol& method) noexcept {
@@ -216,17 +268,32 @@ const semantic::FunctionSymbol* interfaceMethodAt(
 
 bool validateObjectModel(
     const std::vector<bytecode::Module>& modules,
-    RuntimeError& error) {
+    RuntimeError& error,
+    std::size_t baseModuleCount = 0u) {
     TypeIndex types;
     FunctionIndex functions;
-    for (const auto& module : modules) {
+    std::unordered_map<semantic::SymbolId, std::size_t> typeSourceModIdx;
+    for (std::size_t modIdx = 0; modIdx < modules.size(); ++modIdx) {
+        const auto& module = modules[modIdx];
         for (const auto& type : module.types) {
             const auto [found, inserted] = types.emplace(type.id, &type);
-            if (!inserted && !sameTypeContract(*found->second, type)) {
-                return linkFailure(
-                    error,
-                    "conflicting type descriptors share TypeId " +
-                        std::to_string(type.id));
+            if (inserted) {
+                typeSourceModIdx.emplace(type.id, modIdx);
+            } else {
+                const auto srcIt = typeSourceModIdx.find(type.id);
+                const bool fromBase =
+                    baseModuleCount > 0u &&
+                    srcIt != typeSourceModIdx.end() &&
+                    srcIt->second < baseModuleCount;
+                const bool ok = fromBase
+                    ? sameBaseTypeContractSlim(*found->second, type)
+                    : sameTypeContract(*found->second, type);
+                if (!ok) {
+                    return linkFailure(
+                        error,
+                        "conflicting type descriptors share TypeId " +
+                            std::to_string(type.id));
+                }
             }
         }
         for (const auto& function : module.functions) {
@@ -323,7 +390,12 @@ bool validateObjectModel(
     }
 
     for (const auto& [typeId, type] : types) {
-        (void)typeId;
+        if (baseModuleCount > 0u) {
+            const auto srcIt = typeSourceModIdx.find(typeId);
+            if (srcIt != typeSourceModIdx.end() && srcIt->second < baseModuleCount) {
+                continue;
+            }
+        }
         for (std::size_t slot = 0;
              slot < type->virtualDispatchTable.size(); ++slot) {
             const auto* method = virtualMethodAt(*type, slot);
@@ -1208,26 +1280,487 @@ void packResolvedColdMeta(
 
 } // namespace
 
+namespace {
+
+[[nodiscard]] bool isBuiltinMathModule(const bytecode::Module& mod) noexcept {
+    return mod.name == "RealScript.Math" &&
+        !mod.sourceFiles.empty() &&
+        mod.sourceFiles[0].path == "$builtin/RealScript.Math.rscript";
+}
+
+[[nodiscard]] std::uint32_t bLen(const ExecutionFunction* fn, std::size_t idx) noexcept {
+    if (!fn || idx >= fn->blocks.size() || !fn->blocks[idx].bytecode) return 0u;
+    return static_cast<std::uint32_t>(fn->blocks[idx].bytecode->instructions.size() + 1u);
+}
+
+void initSingleExecutionFunctionPass1(
+    ExecutionMirror& mirror,
+    const bytecode::Module& module,
+    const bytecode::Function& function,
+    ExecutionFunction& decoded) {
+    decoded.ownerMirror = &mirror;
+    decoded.bytecode = &function;
+    decoded.module = &module;
+    decoded.hasDebugSequencePoints = !function.debugInfo.sequencePoints.empty();
+    decoded.blocks.clear();
+    decoded.blocks.resize(function.blocks.size());
+    decoded.entry = InvalidBlockIndex;
+    decoded.edgeScratchCount = 0;
+    decoded.denseBlockIndices.clear();
+    decoded.sparseBlockIndices.reset();
+
+    bytecode::BlockId maxBlockId = 0;
+    for (const auto& bb : function.blocks) {
+        if (bb.id > maxBlockId) maxBlockId = bb.id;
+    }
+    const bool useDenseBlockIndices =
+        !function.blocks.empty() &&
+        static_cast<std::uint64_t>(maxBlockId) <=
+            static_cast<std::uint64_t>(function.blocks.size()) * 4ull + 32ull;
+    if (useDenseBlockIndices) {
+        decoded.denseBlockIndices.assign(
+            static_cast<std::size_t>(maxBlockId) + 1u,
+            InvalidStreamOffset);
+    } else if (!function.blocks.empty()) {
+        decoded.sparseBlockIndices =
+            std::make_unique<std::unordered_map<bytecode::BlockId, std::size_t>>();
+        decoded.sparseBlockIndices->reserve(function.blocks.size());
+    }
+    for (std::size_t index = 0; index < function.blocks.size(); ++index) {
+        const auto& bb = function.blocks[index];
+        auto& blockMirror = decoded.blocks[index];
+        blockMirror.bytecode = &bb;
+        blockMirror.terminatorKind = bb.terminator.kind;
+        blockMirror.terminatorOpId = cachedTerminatorOperationId(bb.terminator.kind);
+        blockMirror.terminatorOpName = bytecode::terminatorName(bb.terminator.kind);
+        if (bb.terminator.kind == bytecode::TerminatorKind::Branch) {
+            blockMirror.terminatorReg = bb.terminator.condition;
+            blockMirror.conditionPrevalidatedBool =
+                bb.terminator.condition < function.registerTypes.size() &&
+                function.registerTypes[bb.terminator.condition] ==
+                    semantic::PrimitiveType::Bool;
+        } else if (bb.terminator.kind == bytecode::TerminatorKind::ReturnValue ||
+                   bb.terminator.kind == bytecode::TerminatorKind::Throw) {
+            blockMirror.terminatorReg = bb.terminator.value;
+            if (bb.terminator.kind == bytecode::TerminatorKind::ReturnValue &&
+                bb.terminator.value < function.registerTypes.size() &&
+                function.registerTypes[bb.terminator.value] == function.returnType &&
+                ((!semantic::isExactType(function.returnType) &&
+                  function.returnType != semantic::PrimitiveType::Object &&
+                  function.returnType != semantic::PrimitiveType::Array &&
+                  function.returnType != semantic::PrimitiveType::String &&
+                  function.returnType != semantic::PrimitiveType::Handle) ||
+                 (function.returnType == semantic::PrimitiveType::Struct &&
+                  bb.terminator.value < function.registerTypeIds.size() &&
+                  function.registerTypeIds[bb.terminator.value] == function.returnTypeId &&
+                  (function.returnTypeId == fixedTypeId() ||
+                   function.returnTypeId == fixed16TypeId() ||
+                   function.returnTypeId == fixed64TypeId() ||
+                   function.returnTypeId == vec2TypeId() ||
+                   function.returnTypeId == vec3TypeId() ||
+                   function.returnTypeId == quatTypeId() ||
+                   function.returnTypeId == vec2fTypeId() ||
+                   function.returnTypeId == vec3fTypeId() ||
+                   function.returnTypeId == quatfTypeId())) ||
+                 (function.returnType == semantic::PrimitiveType::Enum &&
+                  function.returnTypeId != 0 &&
+                  bb.terminator.value < function.registerTypeIds.size() &&
+                  function.registerTypeIds[bb.terminator.value] == function.returnTypeId) ||
+                 (function.returnType == semantic::PrimitiveType::Handle &&
+                  (function.returnTypeId == 0 ||
+                   (bb.terminator.value < function.registerTypeIds.size() &&
+                    function.registerTypeIds[bb.terminator.value] == function.returnTypeId))))) {
+                blockMirror.returnPrevalidatedScalar = true;
+            }
+        }
+
+        populateExecutionBlockInstructions(
+            module, function, bb, blockMirror.instructions);
+        if (!mirror.hasAsyncOperations) {
+            for (const auto& bcInst : bb.instructions) {
+                if (bcInst.opcode == bytecode::Opcode::AsyncEnter ||
+                    bcInst.opcode == bytecode::Opcode::AwaitSuspend ||
+                    bcInst.opcode == bytecode::Opcode::AwaitResume ||
+                    bcInst.opcode == bytecode::Opcode::AsyncResolve) {
+                    mirror.hasAsyncOperations = true;
+                    break;
+                }
+            }
+        }
+        if (useDenseBlockIndices) {
+            decoded.denseBlockIndices[bb.id] = static_cast<std::uint32_t>(index);
+        } else if (decoded.sparseBlockIndices) {
+            decoded.sparseBlockIndices->emplace(bb.id, index);
+        }
+    }
+
+    const std::size_t entryIdx = decoded.findBlockIndex(0);
+    if (entryIdx != InvalidBlockIndex) decoded.entry = entryIdx;
+    const auto bindEdge = [&](ExecutionEdge& edge,
+                              bytecode::BlockId target,
+                              const bytecode::SmallRegisterVector& sources) {
+        const std::size_t foundIdx = decoded.findBlockIndex(target);
+        if (foundIdx == InvalidBlockIndex) return;
+        edge.target = foundIdx;
+        edge.targetBlockId = target;
+        edge.sources = &sources;
+        edge.destinations = &function.blocks[foundIdx].parameters;
+        edge.hasArguments = !sources.empty();
+        decoded.edgeScratchCount =
+            std::max(decoded.edgeScratchCount, sources.size());
+    };
+    for (std::size_t index = 0; index < function.blocks.size(); ++index) {
+        const auto& block = function.blocks[index];
+        auto& blockMirror = decoded.blocks[index];
+        if (block.terminator.kind == bytecode::TerminatorKind::Jump ||
+            block.terminator.kind == bytecode::TerminatorKind::Branch) {
+            bindEdge(
+                blockMirror.branch,
+                block.terminator.target,
+                block.terminator.arguments);
+        }
+        if (block.terminator.kind == bytecode::TerminatorKind::Branch) {
+            bindEdge(
+                blockMirror.falseBranch,
+                block.terminator.falseTarget,
+                block.terminator.falseArguments);
+        }
+    }
+}
+
+void linkSingleExecutionFunctionPass2(
+    ExecutionMirror& mirror,
+    const std::unordered_map<semantic::SymbolId, ProgramImage::FunctionLocation>& functions,
+    const bytecode::Module& module,
+    const bytecode::Function& function,
+    ExecutionFunction& execFn) {
+    if (function.blocks.size() == 1 && function.exceptionHandlers.empty()) {
+        const auto& bb = function.blocks[0];
+        std::vector<int> localSourceParam(function.localTypes.size(), -1);
+        std::vector<int> regSourceParam(function.registerTypes.size(), -1);
+        const bytecode::FunctionReference* candidateRef = nullptr;
+        bytecode::Register callResultReg = bytecode::InvalidRegister;
+        bool validForwarder = !bb.instructions.empty();
+        for (std::size_t instIdx = 0;
+             instIdx < bb.instructions.size() && validForwarder;
+             ++instIdx) {
+            const auto& inst = bb.instructions[instIdx];
+            switch (inst.opcode) {
+            case bytecode::Opcode::LoadParameter:
+                if (inst.result < regSourceParam.size() &&
+                    inst.index < function.parameterTypes.size()) {
+                    regSourceParam[inst.result] = static_cast<int>(inst.index);
+                } else {
+                    validForwarder = false;
+                }
+                break;
+            case bytecode::Opcode::StoreLocal:
+                if (inst.index < localSourceParam.size() &&
+                    inst.operands.size() == 1 &&
+                    inst.operands[0] < regSourceParam.size() &&
+                    regSourceParam[inst.operands[0]] >= 0) {
+                    localSourceParam[inst.index] =
+                        regSourceParam[inst.operands[0]];
+                } else {
+                    validForwarder = false;
+                }
+                break;
+            case bytecode::Opcode::LoadLocal:
+                if (inst.result < regSourceParam.size() &&
+                    inst.index < localSourceParam.size() &&
+                    localSourceParam[inst.index] >= 0) {
+                    regSourceParam[inst.result] =
+                        localSourceParam[inst.index];
+                } else {
+                    validForwarder = false;
+                }
+                break;
+            case bytecode::Opcode::Call:
+                if (instIdx + 1 == bb.instructions.size() &&
+                    inst.index < module.functionReferences.size()) {
+                    const auto& ref = module.functionReferences[inst.index];
+                    if (!ref.virtualDispatch && !ref.interfaceDispatch &&
+                        ref.name.rfind("__rs_native_", 0) == 0 &&
+                        functions.find(ref.symbolId) == functions.end() &&
+                        inst.operands.size() == function.parameterTypes.size() &&
+                        ref.parameterTypes == function.parameterTypes &&
+                        ref.parameterTypeIds == function.parameterTypeIds) {
+                        bool allParamsMatch = true;
+                        for (std::size_t k = 0; k < inst.operands.size(); ++k) {
+                            if (inst.operands[k] >= regSourceParam.size() ||
+                                regSourceParam[inst.operands[k]] !=
+                                    static_cast<int>(k)) {
+                                allParamsMatch = false;
+                                break;
+                            }
+                        }
+                        if (allParamsMatch) {
+                            candidateRef = &ref;
+                            callResultReg = inst.result;
+                            break;
+                        }
+                    }
+                }
+                validForwarder = false;
+                break;
+            default:
+                validForwarder = false;
+                break;
+            }
+        }
+        if (validForwarder && candidateRef &&
+            candidateRef->name.rfind("$intrinsic::", 0) != 0) {
+            const bool returnMatches =
+                (function.returnType == semantic::PrimitiveType::Void &&
+                 bb.terminator.kind == bytecode::TerminatorKind::ReturnVoid) ||
+                (function.returnType != semantic::PrimitiveType::Void &&
+                 bb.terminator.kind == bytecode::TerminatorKind::ReturnValue &&
+                 bb.terminator.value == callResultReg &&
+                 candidateRef->returnType == function.returnType &&
+                 candidateRef->returnTypeId == function.returnTypeId);
+            if (returnMatches) {
+                execFn.directNativeReference = candidateRef;
+                execFn.nativeForwarderInstructionCost =
+                    static_cast<std::uint16_t>(bb.instructions.size() + 1u);
+            }
+        }
+    }
+    for (auto& block : execFn.blocks) {
+        linkExecutionBlockCalls(
+            module,
+            function,
+            block.instructions,
+            [&](semantic::SymbolId symId)
+                -> std::pair<const ProgramImage::FunctionLocation*, const ExecutionFunction*> {
+                const auto target = functions.find(symId);
+                if (target == functions.end() || !target->second.function) {
+                    return {nullptr, nullptr};
+                }
+                return {
+                    &target->second,
+                    findExecutionFunction(mirror, *target->second.function)};
+            });
+    }
+}
+
+bool computeStraightLineCallMetricsImpl(
+    const ExecutionFunction* fn,
+    std::uint32_t& outInstCost,
+    std::uint16_t& outCallCount,
+    std::uint16_t& outMaxDepth,
+    int depth) noexcept {
+    if (!fn || !fn->bytecode || fn->blocks.size() != 1 ||
+        !fn->bytecode->exceptionHandlers.empty() || depth > 6) {
+        return false;
+    }
+    const auto& blk = fn->blocks[0];
+    if (blk.terminatorKind != bytecode::TerminatorKind::ReturnValue &&
+        blk.terminatorKind != bytecode::TerminatorKind::ReturnVoid) {
+        return false;
+    }
+    std::uint32_t instCost =
+        static_cast<std::uint32_t>(blk.bytecode->instructions.size() + 1u);
+    std::uint32_t callCount = 1u;
+    std::uint16_t maxSubDepth = 0u;
+    for (const auto& inst : blk.instructions) {
+        if (!inst.bytecode) return false;
+        const auto op = inst.bytecode->opcode;
+        if (op == bytecode::Opcode::NewObject ||
+            op == bytecode::Opcode::NewDelegate ||
+            op == bytecode::Opcode::NewArray ||
+            op == bytecode::Opcode::ConstantString) {
+            return false;
+        }
+        if (op == bytecode::Opcode::Call) {
+            if (inst.opcode != QuickOpcode::CallDirect || !inst.directExecution) {
+                return false;
+            }
+            std::uint32_t subInst = 0;
+            std::uint16_t subCalls = 0;
+            std::uint16_t subDepth = 0;
+            if (!computeStraightLineCallMetricsImpl(
+                    inst.directExecution, subInst, subCalls, subDepth, depth + 1)) {
+                return false;
+            }
+            instCost += subInst;
+            callCount += subCalls;
+            if (subDepth > maxSubDepth) maxSubDepth = subDepth;
+        }
+    }
+    if (instCost >= InvalidCompactReg || callCount > 250u || (1u + maxSubDepth) > 250u) {
+        return false;
+    }
+    outInstCost = instCost;
+    outCallCount = static_cast<std::uint16_t>(callCount);
+    outMaxDepth = static_cast<std::uint16_t>(1u + maxSubDepth);
+    return true;
+}
+
+void compileSingleExecutionFunctionPass3(
+    ExecutionMirror* mirror,
+    LazyCompileState& ctx,
+    const std::unordered_map<semantic::SymbolId, ProgramImage::FunctionLocation>& functions,
+    const std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*>& types,
+    const bytecode::Module& module,
+    const bytecode::Function& function,
+    ExecutionFunction& execFunc);
+
+void optimizeSingleExecutionFunctionPass4(ExecutionFunction& caller);
+
+void finalizeCompiledExecutionFunction(ExecutionFunction& execFn) {
+    execFn.slotPayloadOffsets.shrink_to_fit();
+    execFn.slotStructSchemaIds.shrink_to_fit();
+    execFn.flatStream.shrink_to_fit();
+    execFn.flatCold.shrink_to_fit();
+    execFn.flatColdCalls.shrink_to_fit();
+    execFn.blockStreamOffsets.shrink_to_fit();
+    execFn.denseBlockIndices.shrink_to_fit();
+    execFn.blocks.shrink_to_fit();
+    if (execFn.canUseFlatFastPath &&
+        execFn.module != nullptr &&
+        execFn.bytecode != nullptr) {
+        execFn.slowInstructionsOnce = std::make_unique<std::once_flag>();
+        for (auto& blk : execFn.blocks) {
+            std::vector<ExecutionInstruction>().swap(blk.instructions);
+        }
+    } else {
+        for (auto& blk : execFn.blocks) {
+            blk.instructions.shrink_to_fit();
+        }
+    }
+    execFn.compiled.store(true, std::memory_order_release);
+}
+
+void populateTypeDispatchAndFastTable(
+    ExecutionMirror& mirror,
+    const std::vector<bytecode::Module>& modules,
+    const std::unordered_map<semantic::SymbolId, ProgramImage::FunctionLocation>& functions) {
+    std::size_t totalTypeCount = 0;
+    for (const auto& module : modules) totalTypeCount += module.types.size();
+    std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> allTypesById;
+    allTypesById.reserve(totalTypeCount);
+    for (const auto& module : modules) {
+        for (const auto& type : module.types) {
+            if (type.id != 0) allTypesById.emplace(type.id, &type);
+        }
+    }
+    const auto resolvePrelinkedTarget = [&](semantic::SymbolId symId) noexcept -> PrelinkedDispatchTarget {
+        PrelinkedDispatchTarget out{};
+        out.symbolId = symId;
+        if (symId == 0) return out;
+        const auto fIt = functions.find(symId);
+        if (fIt != functions.end() && fIt->second.function) {
+            out.target = &fIt->second;
+            out.execution = findExecutionFunction(mirror, *fIt->second.function);
+        }
+        return out;
+    };
+
+    mirror.typeDispatch.reserve(allTypesById.size());
+    for (const auto& [tid, typePtr] : allTypesById) {
+        const auto& type = *typePtr;
+        TypeDispatchMetadata meta;
+        meta.typeId = tid;
+
+        auto cur = tid;
+        for (std::size_t depth = 0; cur != 0 && depth < 256; ++depth) {
+            if (std::find(meta.assignableTargetIds.begin(), meta.assignableTargetIds.end(), cur) ==
+                meta.assignableTargetIds.end()) {
+                meta.assignableTargetIds.push_back(cur);
+            }
+            const auto cIt = allTypesById.find(cur);
+            if (cIt == allTypesById.end()) break;
+            for (const auto& imap : cIt->second->interfaceDispatchMaps) {
+                if (imap.interfaceTypeId != 0 &&
+                    std::find(meta.assignableTargetIds.begin(),
+                              meta.assignableTargetIds.end(),
+                              imap.interfaceTypeId) == meta.assignableTargetIds.end()) {
+                    meta.assignableTargetIds.push_back(imap.interfaceTypeId);
+                }
+            }
+            cur = cIt->second->baseTypeId;
+        }
+
+        if (type.kind == semantic::TypeKind::Class) {
+            meta.virtualTargets.reserve(type.virtualDispatchTable.size());
+            for (const auto vSym : type.virtualDispatchTable) {
+                meta.virtualTargets.push_back(resolvePrelinkedTarget(vSym));
+            }
+
+            cur = tid;
+            for (std::size_t depth = 0; cur != 0 && depth < 256; ++depth) {
+                const auto cIt = allTypesById.find(cur);
+                if (cIt == allTypesById.end()) break;
+                for (const auto& imap : cIt->second->interfaceDispatchMaps) {
+                    if (imap.interfaceTypeId == 0) continue;
+                    const bool exists = std::any_of(
+                        meta.interfaceMaps.begin(),
+                        meta.interfaceMaps.end(),
+                        [&](const PrelinkedInterfaceMap& m) {
+                            return m.interfaceTypeId == imap.interfaceTypeId;
+                        });
+                    if (!exists) {
+                        PrelinkedInterfaceMap pmap;
+                        pmap.interfaceTypeId = imap.interfaceTypeId;
+                        pmap.slots.reserve(imap.slots.size());
+                        for (const auto sSym : imap.slots) {
+                            pmap.slots.push_back(resolvePrelinkedTarget(sSym));
+                        }
+                        meta.interfaceMaps.push_back(std::move(pmap));
+                    }
+                }
+                cur = cIt->second->baseTypeId;
+            }
+            std::sort(
+                meta.interfaceMaps.begin(),
+                meta.interfaceMaps.end(),
+                [](const PrelinkedInterfaceMap& a, const PrelinkedInterfaceMap& b) {
+                    return a.interfaceTypeId < b.interfaceTypeId;
+                });
+        }
+        mirror.typeDispatch.emplace(tid, std::move(meta));
+    }
+
+    if (!functions.empty()) {
+        std::size_t tableCap = 16u;
+        const std::size_t minCap = functions.size() * 2u;
+        while (tableCap < minCap) {
+            tableCap <<= 1u;
+        }
+        mirror.fastFunctionTable.resize(tableCap);
+        const std::size_t mask = tableCap - 1u;
+        for (const auto& [symId, loc] : functions) {
+            if (symId == 0u) continue;
+            std::size_t slot = static_cast<std::size_t>(
+                (symId ^ (symId >> 32u)) * 11400714819323198485ULL) & mask;
+            while (mirror.fastFunctionTable[slot].symbolId != 0u) {
+                slot = (slot + 1u) & mask;
+            }
+            mirror.fastFunctionTable[slot] = FastFunctionDispatchEntry{
+                symId,
+                &loc,
+                loc.function ? findExecutionFunction(mirror, *loc.function) : nullptr};
+        }
+    }
+}
+
+} // namespace
+
 std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
     const std::vector<bytecode::Module>& modules,
     const std::unordered_map<
         semantic::SymbolId, ProgramImage::FunctionLocation>& functions,
     const std::unordered_map<
-        semantic::SymbolId, const semantic::TypeSymbol*>& types) {
+        semantic::SymbolId, const semantic::TypeSymbol*>& types,
+    const std::shared_ptr<const bytecode::LazyBytecodeBundle>& lazyBaseBundle,
+    const std::unordered_map<const bytecode::Function*, std::uint32_t>* lazyFuncLocIndex) {
     auto mirror = std::make_shared<ExecutionMirror>();
     mirror->instanceId = nextExecutionMirrorId();
-    std::unordered_map<std::string, std::uint32_t> stringLiteralMap;
-    stringLiteralMap.reserve(256u);
-    const auto internMirrorLiteral = [&](const std::string& text) -> std::uint32_t {
-        const auto found = stringLiteralMap.find(text);
-        if (found != stringLiteralMap.end()) {
-            return found->second;
-        }
-        const auto idx = static_cast<std::uint32_t>(mirror->stringLiterals.size());
-        mirror->stringLiterals.push_back(text);
-        stringLiteralMap.emplace(text, idx);
-        return idx;
-    };
+    auto ctxPtr = std::make_unique<LazyCompileState>();
+    LazyCompileState& ctx = *ctxPtr;
+    ctx.stringLiteralMap.reserve(256u);
+    ctx.fieldMetaMap.reserve(64u);
+
     std::size_t functionCount = 0;
     for (const auto& module : modules) functionCount += module.functions.size();
     mirror->functions.reserve(functionCount);
@@ -1248,124 +1781,15 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
             decoded.ownerMirror = mirror.get();
             decoded.bytecode = &function;
             decoded.module = &module;
-            decoded.hasDebugSequencePoints = !function.debugInfo.sequencePoints.empty();
-            decoded.blocks.resize(function.blocks.size());
-            bytecode::BlockId maxBlockId = 0;
-            for (const auto& bb : function.blocks) {
-                if (bb.id > maxBlockId) maxBlockId = bb.id;
-            }
-            const bool useDenseBlockIndices =
-                !function.blocks.empty() &&
-                static_cast<std::uint64_t>(maxBlockId) <=
-                    static_cast<std::uint64_t>(function.blocks.size()) * 4ull + 32ull;
-            if (useDenseBlockIndices) {
-                decoded.denseBlockIndices.assign(
-                    static_cast<std::size_t>(maxBlockId) + 1u,
-                    InvalidStreamOffset);
-            } else if (!function.blocks.empty()) {
-                decoded.sparseBlockIndices =
-                    std::make_unique<std::unordered_map<bytecode::BlockId, std::size_t>>();
-                decoded.sparseBlockIndices->reserve(function.blocks.size());
-            }
-            for (std::size_t index = 0; index < function.blocks.size(); ++index) {
-                const auto& bb = function.blocks[index];
-                auto& blockMirror = decoded.blocks[index];
-                blockMirror.bytecode = &bb;
-                blockMirror.terminatorKind = bb.terminator.kind;
-                blockMirror.terminatorOpId = cachedTerminatorOperationId(bb.terminator.kind);
-                blockMirror.terminatorOpName = bytecode::terminatorName(bb.terminator.kind);
-                if (bb.terminator.kind == bytecode::TerminatorKind::Branch) {
-                    blockMirror.terminatorReg = bb.terminator.condition;
-                    blockMirror.conditionPrevalidatedBool =
-                        bb.terminator.condition < function.registerTypes.size() &&
-                        function.registerTypes[bb.terminator.condition] ==
-                            semantic::PrimitiveType::Bool;
-                } else if (bb.terminator.kind == bytecode::TerminatorKind::ReturnValue ||
-                           bb.terminator.kind == bytecode::TerminatorKind::Throw) {
-                    blockMirror.terminatorReg = bb.terminator.value;
-                    if (bb.terminator.kind == bytecode::TerminatorKind::ReturnValue &&
-                        bb.terminator.value < function.registerTypes.size() &&
-                        function.registerTypes[bb.terminator.value] == function.returnType &&
-                        ((!semantic::isExactType(function.returnType) &&
-                          function.returnType != semantic::PrimitiveType::Object &&
-                          function.returnType != semantic::PrimitiveType::Array &&
-                          function.returnType != semantic::PrimitiveType::String &&
-                          function.returnType != semantic::PrimitiveType::Handle) ||
-                         (function.returnType == semantic::PrimitiveType::Struct &&
-                          bb.terminator.value < function.registerTypeIds.size() &&
-                          function.registerTypeIds[bb.terminator.value] == function.returnTypeId &&
-                          (function.returnTypeId == fixedTypeId() ||
-                           function.returnTypeId == fixed16TypeId() ||
-                           function.returnTypeId == fixed64TypeId() ||
-                           function.returnTypeId == vec2TypeId() ||
-                           function.returnTypeId == vec3TypeId() ||
-                           function.returnTypeId == quatTypeId() ||
-                           function.returnTypeId == vec2fTypeId() ||
-                           function.returnTypeId == vec3fTypeId() ||
-                           function.returnTypeId == quatfTypeId())) ||
-                         (function.returnType == semantic::PrimitiveType::Enum &&
-                          function.returnTypeId != 0 &&
-                          bb.terminator.value < function.registerTypeIds.size() &&
-                          function.registerTypeIds[bb.terminator.value] == function.returnTypeId) ||
-                         (function.returnType == semantic::PrimitiveType::Handle &&
-                          (function.returnTypeId == 0 ||
-                           (bb.terminator.value < function.registerTypeIds.size() &&
-                            function.registerTypeIds[bb.terminator.value] == function.returnTypeId))))) {
-                        blockMirror.returnPrevalidatedScalar = true;
-                    }
-                }
-
-                populateExecutionBlockInstructions(
-                    module, function, bb, blockMirror.instructions);
-                if (!mirror->hasAsyncOperations) {
-                    for (const auto& bcInst : bb.instructions) {
-                        if (bcInst.opcode == bytecode::Opcode::AsyncEnter ||
-                            bcInst.opcode == bytecode::Opcode::AwaitSuspend ||
-                            bcInst.opcode == bytecode::Opcode::AwaitResume ||
-                            bcInst.opcode == bytecode::Opcode::AsyncResolve) {
-                            mirror->hasAsyncOperations = true;
-                            break;
-                        }
-                    }
-                }
-                if (useDenseBlockIndices) {
-                    decoded.denseBlockIndices[bb.id] = static_cast<std::uint32_t>(index);
-                } else if (decoded.sparseBlockIndices) {
-                    decoded.sparseBlockIndices->emplace(bb.id, index);
+            if (lazyFuncLocIndex != nullptr) {
+                if (const auto it = lazyFuncLocIndex->find(&function);
+                    it != lazyFuncLocIndex->end()) {
+                    decoded.lazyLocIndex = it->second;
+                    ++ctx.totalLazyCount;
                 }
             }
-
-            const std::size_t entryIdx = decoded.findBlockIndex(0);
-            if (entryIdx != InvalidBlockIndex) decoded.entry = entryIdx;
-            const auto bindEdge = [&](ExecutionEdge& edge,
-                                      bytecode::BlockId target,
-                                      const bytecode::SmallRegisterVector& sources) {
-                const std::size_t foundIdx = decoded.findBlockIndex(target);
-                if (foundIdx == InvalidBlockIndex) return;
-                edge.target = foundIdx;
-                edge.targetBlockId = target;
-                edge.sources = &sources;
-                edge.destinations = &function.blocks[foundIdx].parameters;
-                edge.hasArguments = !sources.empty();
-                decoded.edgeScratchCount =
-                    std::max(decoded.edgeScratchCount, sources.size());
-            };
-            for (std::size_t index = 0; index < function.blocks.size(); ++index) {
-                const auto& block = function.blocks[index];
-                auto& blockMirror = decoded.blocks[index];
-                if (block.terminator.kind == bytecode::TerminatorKind::Jump ||
-                    block.terminator.kind == bytecode::TerminatorKind::Branch) {
-                    bindEdge(
-                        blockMirror.branch,
-                        block.terminator.target,
-                        block.terminator.arguments);
-                }
-                if (block.terminator.kind == bytecode::TerminatorKind::Branch) {
-                    bindEdge(
-                        blockMirror.falseBranch,
-                        block.terminator.falseTarget,
-                        block.terminator.falseArguments);
-                }
+            if (decoded.lazyLocIndex == InvalidStreamOffset) {
+                initSingleExecutionFunctionPass1(*mirror, module, function, decoded);
             }
             mirror->functions.emplace(&function, std::move(decoded));
         }
@@ -1374,179 +1798,26 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
     for (const auto& module : modules) {
         for (const auto& function : module.functions) {
             const auto decoded = mirror->functions.find(&function);
-            if (decoded == mirror->functions.end()) continue;
-            if (function.blocks.size() == 1 && function.exceptionHandlers.empty()) {
-                const auto& bb = function.blocks[0];
-                std::vector<int> localSourceParam(function.localTypes.size(), -1);
-                std::vector<int> regSourceParam(function.registerTypes.size(), -1);
-                const bytecode::FunctionReference* candidateRef = nullptr;
-                bytecode::Register callResultReg = bytecode::InvalidRegister;
-                bool validForwarder = !bb.instructions.empty();
-                for (std::size_t instIdx = 0;
-                     instIdx < bb.instructions.size() && validForwarder;
-                     ++instIdx) {
-                    const auto& inst = bb.instructions[instIdx];
-                    switch (inst.opcode) {
-                    case bytecode::Opcode::LoadParameter:
-                        if (inst.result < regSourceParam.size() &&
-                            inst.index < function.parameterTypes.size()) {
-                            regSourceParam[inst.result] = static_cast<int>(inst.index);
-                        } else {
-                            validForwarder = false;
-                        }
-                        break;
-                    case bytecode::Opcode::StoreLocal:
-                        if (inst.index < localSourceParam.size() &&
-                            inst.operands.size() == 1 &&
-                            inst.operands[0] < regSourceParam.size() &&
-                            regSourceParam[inst.operands[0]] >= 0) {
-                            localSourceParam[inst.index] =
-                                regSourceParam[inst.operands[0]];
-                        } else {
-                            validForwarder = false;
-                        }
-                        break;
-                    case bytecode::Opcode::LoadLocal:
-                        if (inst.result < regSourceParam.size() &&
-                            inst.index < localSourceParam.size() &&
-                            localSourceParam[inst.index] >= 0) {
-                            regSourceParam[inst.result] =
-                                localSourceParam[inst.index];
-                        } else {
-                            validForwarder = false;
-                        }
-                        break;
-                    case bytecode::Opcode::Call:
-                        if (instIdx + 1 == bb.instructions.size() &&
-                            inst.index < module.functionReferences.size()) {
-                            const auto& ref = module.functionReferences[inst.index];
-                            if (!ref.virtualDispatch && !ref.interfaceDispatch &&
-                                ref.name.rfind("__rs_native_", 0) == 0 &&
-                                functions.find(ref.symbolId) == functions.end() &&
-                                inst.operands.size() == function.parameterTypes.size() &&
-                                ref.parameterTypes == function.parameterTypes &&
-                                ref.parameterTypeIds == function.parameterTypeIds) {
-                                bool allParamsMatch = true;
-                                for (std::size_t k = 0; k < inst.operands.size(); ++k) {
-                                    if (inst.operands[k] >= regSourceParam.size() ||
-                                        regSourceParam[inst.operands[k]] !=
-                                            static_cast<int>(k)) {
-                                        allParamsMatch = false;
-                                        break;
-                                    }
-                                }
-                                if (allParamsMatch) {
-                                    candidateRef = &ref;
-                                    callResultReg = inst.result;
-                                    break;
-                                }
-                            }
-                        }
-                        validForwarder = false;
-                        break;
-                    default:
-                        validForwarder = false;
-                        break;
-                    }
-                }
-                if (validForwarder && candidateRef &&
-                    candidateRef->name.rfind("$intrinsic::", 0) != 0) {
-                    const bool returnMatches =
-                        (function.returnType == semantic::PrimitiveType::Void &&
-                         bb.terminator.kind == bytecode::TerminatorKind::ReturnVoid) ||
-                        (function.returnType != semantic::PrimitiveType::Void &&
-                         bb.terminator.kind == bytecode::TerminatorKind::ReturnValue &&
-                         bb.terminator.value == callResultReg &&
-                         candidateRef->returnType == function.returnType &&
-                         candidateRef->returnTypeId == function.returnTypeId);
-                    if (returnMatches) {
-                        decoded->second.directNativeReference = candidateRef;
-                        decoded->second.nativeForwarderInstructionCost =
-                            static_cast<std::uint16_t>(bb.instructions.size() + 1u);
-                    }
-                }
+            if (decoded == mirror->functions.end() ||
+                decoded->second.lazyLocIndex != InvalidStreamOffset) {
+                continue;
             }
-            for (auto& block : decoded->second.blocks) {
-                linkExecutionBlockCalls(
-                    module,
-                    function,
-                    block.instructions,
-                    [&](semantic::SymbolId symId)
-                        -> std::pair<const ProgramImage::FunctionLocation*, const ExecutionFunction*> {
-                        const auto target = functions.find(symId);
-                        if (target == functions.end() || !target->second.function) {
-                            return {nullptr, nullptr};
-                        }
-                        return {
-                            &target->second,
-                            findExecutionFunction(*mirror, *target->second.function)};
-                    });
-            }
+            linkSingleExecutionFunctionPass2(*mirror, functions, module, function, decoded->second);
         }
     }
 
-    const auto isBuiltinMathModule = [](const bytecode::Module& mod) noexcept {
-        return mod.name == "RealScript.Math" &&
-            !mod.sourceFiles.empty() &&
-            mod.sourceFiles[0].path == "$builtin/RealScript.Math.rscript";
-    };
-
     const auto computeStraightLineCallMetrics = [](
-        const auto& self,
         const ExecutionFunction* fn,
         std::uint32_t& outInstCost,
         std::uint16_t& outCallCount,
         std::uint16_t& outMaxDepth,
         int depth) noexcept -> bool {
-        if (!fn || !fn->bytecode || fn->blocks.size() != 1 ||
-            !fn->bytecode->exceptionHandlers.empty() || depth > 6) {
-            return false;
-        }
-        const auto& blk = fn->blocks[0];
-        if (blk.terminatorKind != bytecode::TerminatorKind::ReturnValue &&
-            blk.terminatorKind != bytecode::TerminatorKind::ReturnVoid) {
-            return false;
-        }
-        std::uint32_t instCost =
-            static_cast<std::uint32_t>(blk.bytecode->instructions.size() + 1u);
-        std::uint32_t callCount = 1u;
-        std::uint16_t maxSubDepth = 0u;
-        for (const auto& inst : blk.instructions) {
-            if (!inst.bytecode) return false;
-            const auto op = inst.bytecode->opcode;
-            if (op == bytecode::Opcode::NewObject ||
-                op == bytecode::Opcode::NewDelegate ||
-                op == bytecode::Opcode::NewArray ||
-                op == bytecode::Opcode::ConstantString) {
-                return false;
-            }
-            if (op == bytecode::Opcode::Call) {
-                if (inst.opcode != QuickOpcode::CallDirect || !inst.directExecution) {
-                    return false;
-                }
-                std::uint32_t subInst = 0;
-                std::uint16_t subCalls = 0;
-                std::uint16_t subDepth = 0;
-                if (!self(self, inst.directExecution, subInst, subCalls, subDepth, depth + 1)) {
-                    return false;
-                }
-                instCost += subInst;
-                callCount += subCalls;
-                if (subDepth > maxSubDepth) maxSubDepth = subDepth;
-            }
-        }
-        if (instCost >= InvalidCompactReg || callCount > 250u || (1u + maxSubDepth) > 250u) {
-            return false;
-        }
-        outInstCost = instCost;
-        outCallCount = static_cast<std::uint16_t>(callCount);
-        outMaxDepth = static_cast<std::uint16_t>(1u + maxSubDepth);
-        return true;
+        return computeStraightLineCallMetricsImpl(
+            fn, outInstCost, outCallCount, outMaxDepth, depth);
     };
 
-    // Precompute block-derived instruction/call metrics for multi-block builtin RealScript.Math functions
-    // (Fixed.Sin, Fixed.Cos, Math.Sqrt64, Fixed.Sqrt, Quat.Length, Quat.Normalized, Quat.FromEuler, Quat.Lerp)
     const auto findMathExecFn = [&](std::string_view name, std::size_t paramCount) noexcept -> const ExecutionFunction* {
+        if (lazyBaseBundle != nullptr) return nullptr;
         for (const auto& mod : modules) {
             if (!isBuiltinMathModule(mod)) continue;
             for (const auto& fn : mod.functions) {
@@ -1558,31 +1829,6 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
         }
         return nullptr;
     };
-    const auto bLen = [](const ExecutionFunction* fn, std::size_t idx) noexcept -> std::uint32_t {
-        if (!fn || idx >= fn->blocks.size() || !fn->blocks[idx].bytecode) return 0u;
-        return static_cast<std::uint32_t>(fn->blocks[idx].bytecode->instructions.size() + 1u);
-    };
-
-    std::uint32_t sinCalleeBaseCost = 0;
-    std::uint16_t sinCalleeCalls = 0;
-    std::uint32_t sinWrapExtraCost = 0;
-    std::uint32_t cosCalleeBaseCost = 0;
-    std::uint16_t cosCalleeCalls = 0;
-    std::uint32_t sqrt64NegCalleeCost = 0;
-    std::uint32_t sqrt64PosBaseCalleeCost = 0;
-    std::uint32_t sqrt64LoopIterCost = 0;
-    std::uint32_t fixedSqrtNegCalleeCost = 0;
-    std::uint32_t fixedSqrtPosBaseCalleeCost = 0;
-    std::uint32_t quatLenPosBaseCalleeCost = 0;
-    std::uint16_t quatLenPosCalls = 0;
-    std::uint32_t quatNormPosBaseCalleeCost = 0;
-    std::uint16_t quatNormPosCalls = 0;
-    std::uint32_t quatFromEulerBaseCalleeCost = 0;
-    std::uint16_t quatFromEulerBaseCalls = 0;
-    std::uint32_t quatLerpPosBaseCalleeCost = 0;
-    std::uint16_t quatLerpPosBaseCalls = 0;
-    std::uint32_t quatLerpDotNegExtraCost = 0;
-    std::uint16_t quatLerpDotNegExtraCalls = 0;
 
     const auto accumBlockMetrics = [&](const ExecutionFunction* fn,
                                        std::size_t bIdx,
@@ -1597,27 +1843,26 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                 return false;
             }
             const auto& cName = inst.directTarget->function->name;
-            if (cName == "Fixed.Sin" && sinCalleeBaseCost > 0) {
-                ioInst += sinCalleeBaseCost;
-                ioCalls = static_cast<std::uint16_t>(ioCalls + sinCalleeCalls);
-            } else if (cName == "Fixed.Cos" && cosCalleeBaseCost > 0) {
-                ioInst += cosCalleeBaseCost;
-                ioCalls = static_cast<std::uint16_t>(ioCalls + cosCalleeCalls);
-            } else if (cName == "Math.Sqrt64" && sqrt64PosBaseCalleeCost > 0) {
-                ioInst += sqrt64PosBaseCalleeCost;
+            if (cName == "Fixed.Sin" && ctx.sinCalleeBaseCost > 0) {
+                ioInst += ctx.sinCalleeBaseCost;
+                ioCalls = static_cast<std::uint16_t>(ioCalls + ctx.sinCalleeCalls);
+            } else if (cName == "Fixed.Cos" && ctx.cosCalleeBaseCost > 0) {
+                ioInst += ctx.cosCalleeBaseCost;
+                ioCalls = static_cast<std::uint16_t>(ioCalls + ctx.cosCalleeCalls);
+            } else if (cName == "Math.Sqrt64" && ctx.sqrt64PosBaseCalleeCost > 0) {
+                ioInst += ctx.sqrt64PosBaseCalleeCost;
                 ioCalls = static_cast<std::uint16_t>(ioCalls + 1u);
-            } else if (cName == "Quat.Length" && quatLenPosBaseCalleeCost > 0) {
-                ioInst += quatLenPosBaseCalleeCost;
-                ioCalls = static_cast<std::uint16_t>(ioCalls + quatLenPosCalls);
-            } else if (cName == "Quat.Normalized" && quatNormPosBaseCalleeCost > 0) {
-                ioInst += quatNormPosBaseCalleeCost;
-                ioCalls = static_cast<std::uint16_t>(ioCalls + quatNormPosCalls);
+            } else if (cName == "Quat.Length" && ctx.quatLenPosBaseCalleeCost > 0) {
+                ioInst += ctx.quatLenPosBaseCalleeCost;
+                ioCalls = static_cast<std::uint16_t>(ioCalls + ctx.quatLenPosCalls);
+            } else if (cName == "Quat.Normalized" && ctx.quatNormPosBaseCalleeCost > 0) {
+                ioInst += ctx.quatNormPosBaseCalleeCost;
+                ioCalls = static_cast<std::uint16_t>(ioCalls + ctx.quatNormPosCalls);
             } else {
                 std::uint32_t subInst = 0;
                 std::uint16_t subCalls = 0;
                 std::uint16_t subDepth = 0;
                 if (!computeStraightLineCallMetrics(
-                        computeStraightLineCallMetrics,
                         inst.directExecution,
                         subInst,
                         subCalls,
@@ -1646,33 +1891,33 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
             accumBlockMetrics(sinFn, 7, cost, calls) &&
             accumBlockMetrics(sinFn, 9, cost, calls) &&
             accumBlockMetrics(sinFn, 10, cost, calls)) {
-            sinCalleeBaseCost = cost;
-            sinCalleeCalls = calls;
-            sinWrapExtraCost = bLen(sinFn, 1);
+            ctx.sinCalleeBaseCost = cost;
+            ctx.sinCalleeCalls = calls;
+            ctx.sinWrapExtraCost = bLen(sinFn, 1);
         }
     }
     if (const auto* cosFn = findMathExecFn("Fixed.Cos", 1);
-        cosFn && cosFn->blocks.size() == 1 && sinCalleeBaseCost > 0) {
+        cosFn && cosFn->blocks.size() == 1 && ctx.sinCalleeBaseCost > 0) {
         std::uint32_t cost = 0;
         std::uint16_t calls = 1;
         if (accumBlockMetrics(cosFn, 0, cost, calls)) {
-            cosCalleeBaseCost = cost;
-            cosCalleeCalls = calls;
+            ctx.cosCalleeBaseCost = cost;
+            ctx.cosCalleeCalls = calls;
         }
     }
     if (const auto* sq64Fn = findMathExecFn("Math.Sqrt64", 1);
         sq64Fn && sq64Fn->blocks.size() == 12 &&
         bLen(sq64Fn, 3) == bLen(sq64Fn, 4) &&
         bLen(sq64Fn, 9) == bLen(sq64Fn, 10) + 2u) {
-        sqrt64NegCalleeCost = bLen(sq64Fn, 0) + bLen(sq64Fn, 1);
-        sqrt64PosBaseCalleeCost =
+        ctx.sqrt64NegCalleeCost = bLen(sq64Fn, 0) + bLen(sq64Fn, 1);
+        ctx.sqrt64PosBaseCalleeCost =
             bLen(sq64Fn, 0) + bLen(sq64Fn, 2) + bLen(sq64Fn, 3) +
             bLen(sq64Fn, 5) + bLen(sq64Fn, 6) + bLen(sq64Fn, 8);
-        sqrt64LoopIterCost =
+        ctx.sqrt64LoopIterCost =
             bLen(sq64Fn, 6) + bLen(sq64Fn, 7) + bLen(sq64Fn, 10) + bLen(sq64Fn, 11);
     }
     if (const auto* fSqFn = findMathExecFn("Fixed.Sqrt", 1);
-        fSqFn && fSqFn->blocks.size() == 3 && sqrt64PosBaseCalleeCost > 0) {
+        fSqFn && fSqFn->blocks.size() == 3 && ctx.sqrt64PosBaseCalleeCost > 0) {
         std::uint32_t negCost = 0;
         std::uint16_t negCalls = 1;
         std::uint32_t posCost = 0;
@@ -1681,40 +1926,40 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
             accumBlockMetrics(fSqFn, 1, negCost, negCalls) &&
             accumBlockMetrics(fSqFn, 0, posCost, posCalls) &&
             accumBlockMetrics(fSqFn, 2, posCost, posCalls)) {
-            fixedSqrtNegCalleeCost = negCost;
-            fixedSqrtPosBaseCalleeCost = posCost;
+            ctx.fixedSqrtNegCalleeCost = negCost;
+            ctx.fixedSqrtPosBaseCalleeCost = posCost;
         }
     }
     if (const auto* qLenFn = findMathExecFn("Quat.Length", 1);
-        qLenFn && qLenFn->blocks.size() == 1 && sqrt64PosBaseCalleeCost > 0) {
+        qLenFn && qLenFn->blocks.size() == 1 && ctx.sqrt64PosBaseCalleeCost > 0) {
         std::uint32_t cost = 0;
         std::uint16_t calls = 1;
         if (accumBlockMetrics(qLenFn, 0, cost, calls)) {
-            quatLenPosBaseCalleeCost = cost;
-            quatLenPosCalls = calls;
+            ctx.quatLenPosBaseCalleeCost = cost;
+            ctx.quatLenPosCalls = calls;
         }
     }
     if (const auto* qNormFn = findMathExecFn("Quat.Normalized", 1);
-        qNormFn && qNormFn->blocks.size() == 3 && quatLenPosBaseCalleeCost > 0) {
+        qNormFn && qNormFn->blocks.size() == 3 && ctx.quatLenPosBaseCalleeCost > 0) {
         std::uint32_t cost = 0;
         std::uint16_t calls = 1;
         if (accumBlockMetrics(qNormFn, 0, cost, calls) &&
             accumBlockMetrics(qNormFn, 2, cost, calls)) {
-            quatNormPosBaseCalleeCost = cost;
-            quatNormPosCalls = calls;
+            ctx.quatNormPosBaseCalleeCost = cost;
+            ctx.quatNormPosCalls = calls;
         }
     }
     if (const auto* qEulerFn = findMathExecFn("Quat.FromEuler", 3);
-        qEulerFn && qEulerFn->blocks.size() == 1 && sinCalleeBaseCost > 0 && cosCalleeBaseCost > 0) {
+        qEulerFn && qEulerFn->blocks.size() == 1 && ctx.sinCalleeBaseCost > 0 && ctx.cosCalleeBaseCost > 0) {
         std::uint32_t cost = 0;
         std::uint16_t calls = 1;
         if (accumBlockMetrics(qEulerFn, 0, cost, calls)) {
-            quatFromEulerBaseCalleeCost = cost;
-            quatFromEulerBaseCalls = calls;
+            ctx.quatFromEulerBaseCalleeCost = cost;
+            ctx.quatFromEulerBaseCalls = calls;
         }
     }
     if (const auto* qLerpFn = findMathExecFn("Quat.Lerp", 3);
-        qLerpFn && qLerpFn->blocks.size() == 3 && quatNormPosBaseCalleeCost > 0) {
+        qLerpFn && qLerpFn->blocks.size() == 3 && ctx.quatNormPosBaseCalleeCost > 0) {
         std::uint32_t cost = 0;
         std::uint16_t calls = 1;
         std::uint32_t negExtra = 0;
@@ -1722,15 +1967,15 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
         if (accumBlockMetrics(qLerpFn, 0, cost, calls) &&
             accumBlockMetrics(qLerpFn, 2, cost, calls) &&
             accumBlockMetrics(qLerpFn, 1, negExtra, negCalls)) {
-            quatLerpPosBaseCalleeCost = cost;
-            quatLerpPosBaseCalls = calls;
-            quatLerpDotNegExtraCost = negExtra;
-            quatLerpDotNegExtraCalls = negCalls;
+            ctx.quatLerpPosBaseCalleeCost = cost;
+            ctx.quatLerpPosBaseCalls = calls;
+            ctx.quatLerpDotNegExtraCost = negExtra;
+            ctx.quatLerpDotNegExtraCalls = negCalls;
         }
     }
 
     // Pre-build zero-malloc ObjectAllocationTemplates for concrete classes whose default fields are non-traceable
-    std::unordered_map<semantic::SymbolId, std::uint16_t> objectTemplateByTypeId;
+    auto& objectTemplateByTypeId = ctx.objectTemplateByTypeId;
     for (const auto& module : modules) {
         for (const auto& type : module.types) {
             if (type.id == 0 || type.kind != semantic::TypeKind::Class ||
@@ -1873,21 +2118,77 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
         }
     }
 
-    struct FieldMetaPairHash {
-        std::size_t operator()(
-            const std::pair<semantic::SymbolId, semantic::SymbolId>& key) const noexcept {
-            const std::uint64_t a = key.first;
-            const std::uint64_t b = key.second;
-            const std::uint64_t h =
-                a ^ (b * 0x9e3779b97f4a7c15ULL + 0x517cc1b727220a95ULL + (a << 6) + (a >> 2));
-            return static_cast<std::size_t>(h);
+    // Pass 3: Compile non-lazy functions (user modules, or all modules in eager mode)
+    for (const auto& module : modules) {
+        for (const auto& function : module.functions) {
+            const auto found = mirror->functions.find(&function);
+            if (found == mirror->functions.end() ||
+                found->second.lazyLocIndex != InvalidStreamOffset) {
+                continue;
+            }
+            compileSingleExecutionFunctionPass3(
+                mirror.get(), ctx, functions, types, module, function, found->second);
         }
+    }
+
+    // Pass 3b: Pre-link per-type virtual & interface dispatch tables + flattened O(1) assignable IDs
+    populateTypeDispatchAndFastTable(*mirror, modules, functions);
+
+    // Pass 4: Unfold small-frame leaf script functions & thread Jump chains for non-lazy functions
+    for (const auto& module : modules) {
+        for (const auto& function : module.functions) {
+            const auto found = mirror->functions.find(&function);
+            if (found == mirror->functions.end() ||
+                found->second.lazyLocIndex != InvalidStreamOffset) {
+                continue;
+            }
+            optimizeSingleExecutionFunctionPass4(found->second);
+        }
+    }
+
+    for (auto& [fnPtr, execFn] : mirror->functions) {
+        (void)fnPtr;
+        if (execFn.lazyLocIndex != InvalidStreamOffset) {
+            continue;
+        }
+        finalizeCompiledExecutionFunction(execFn);
+    }
+
+    if (lazyBaseBundle != nullptr) {
+        ctx.baseBundle = lazyBaseBundle;
+        ctx.modules = &modules;
+        ctx.functions = &functions;
+        ctx.types = &types;
+        ctx.decodedChunkLru.reserve(LazyCompileState::kMaxDecodedChunks);
+        mirror->lazyState = std::move(ctxPtr);
+    }
+    return mirror;
+}
+
+namespace {
+
+void compileSingleExecutionFunctionPass3(
+    ExecutionMirror* mirror,
+    LazyCompileState& ctx,
+    const std::unordered_map<semantic::SymbolId, ProgramImage::FunctionLocation>& functions,
+    const std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*>& types,
+    const bytecode::Module& module,
+    const bytecode::Function& function,
+    ExecutionFunction& execFunc) {
+    (void)functions;
+    auto& stringLiteralMap = ctx.stringLiteralMap;
+    const auto internMirrorLiteral = [&](const std::string& text) -> std::uint32_t {
+        const auto found = stringLiteralMap.find(text);
+        if (found != stringLiteralMap.end()) {
+            return found->second;
+        }
+        const auto idx = static_cast<std::uint32_t>(mirror->stringLiterals.size());
+        mirror->stringLiterals.push_back(text);
+        stringLiteralMap.emplace(text, idx);
+        return idx;
     };
-    std::unordered_map<
-        std::pair<semantic::SymbolId, semantic::SymbolId>,
-        std::uint32_t,
-        FieldMetaPairHash> fieldMetaMap;
-    fieldMetaMap.reserve(64u);
+    const auto& objectTemplateByTypeId = ctx.objectTemplateByTypeId;
+    auto& fieldMetaMap = ctx.fieldMetaMap;
     const auto internFieldMeta = [&](semantic::SymbolId ownerTid, semantic::SymbolId fieldTid) -> std::uint32_t {
         const auto [it, inserted] = fieldMetaMap.emplace(
             std::make_pair(ownerTid, fieldTid),
@@ -2043,30 +2344,47 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
         }
     };
 
-    // Pass 3: Build unified flat frame slot layout & direct-threaded FlatInstruction stream
-    for (const auto& module : modules) {
-        for (const auto& function : module.functions) {
-            auto found = mirror->functions.find(&function);
-            if (found == mirror->functions.end()) continue;
-            auto& execFunc = found->second;
-            execFunc.hasExceptionHandlers = !function.exceptionHandlers.empty();
-            execFunc.isAsyncFunction = !function.blocks.empty() &&
-                !function.blocks.front().instructions.empty() &&
-                function.blocks.front().instructions.front().opcode == bytecode::Opcode::AsyncEnter;
-            if (execFunc.isAsyncFunction) {
-                mirror->hasAsyncOperations = true;
-            }
+    const std::uint32_t sinCalleeBaseCost = ctx.sinCalleeBaseCost;
+    const std::uint16_t sinCalleeCalls = ctx.sinCalleeCalls;
+    const std::uint32_t sinWrapExtraCost = ctx.sinWrapExtraCost;
+    const std::uint32_t cosCalleeBaseCost = ctx.cosCalleeBaseCost;
+    const std::uint16_t cosCalleeCalls = ctx.cosCalleeCalls;
+    const std::uint32_t sqrt64NegCalleeCost = ctx.sqrt64NegCalleeCost;
+    const std::uint32_t sqrt64PosBaseCalleeCost = ctx.sqrt64PosBaseCalleeCost;
+    const std::uint32_t sqrt64LoopIterCost = ctx.sqrt64LoopIterCost;
+    const std::uint32_t fixedSqrtNegCalleeCost = ctx.fixedSqrtNegCalleeCost;
+    const std::uint32_t fixedSqrtPosBaseCalleeCost = ctx.fixedSqrtPosBaseCalleeCost;
+    const std::uint32_t quatLenPosBaseCalleeCost = ctx.quatLenPosBaseCalleeCost;
+    const std::uint16_t quatLenPosCalls = ctx.quatLenPosCalls;
+    const std::uint32_t quatNormPosBaseCalleeCost = ctx.quatNormPosBaseCalleeCost;
+    const std::uint16_t quatNormPosCalls = ctx.quatNormPosCalls;
+    const std::uint32_t quatFromEulerBaseCalleeCost = ctx.quatFromEulerBaseCalleeCost;
+    const std::uint16_t quatFromEulerBaseCalls = ctx.quatFromEulerBaseCalls;
+    const std::uint32_t quatLerpPosBaseCalleeCost = ctx.quatLerpPosBaseCalleeCost;
+    const std::uint16_t quatLerpPosBaseCalls = ctx.quatLerpPosBaseCalls;
+    const std::uint32_t quatLerpDotNegExtraCost = ctx.quatLerpDotNegExtraCost;
+    const std::uint16_t quatLerpDotNegExtraCalls = ctx.quatLerpDotNegExtraCalls;
+    (void)quatLenPosBaseCalleeCost;
+    (void)quatLenPosCalls;
 
-            const std::size_t paramCount = function.parameterTypes.size();
-            const std::size_t localCount = function.localTypes.size();
-            const std::size_t regCount = function.registerTypes.size();
-            const std::size_t singleSlots =
-                paramCount + localCount + regCount + execFunc.edgeScratchCount;
-            if (singleSlots >= InvalidCompactReg ||
-                execFunc.entry == InvalidBlockIndex) {
-                execFunc.canUseFlatFastPath = false;
-                continue;
-            }
+    execFunc.hasExceptionHandlers = !function.exceptionHandlers.empty();
+    execFunc.isAsyncFunction = !function.blocks.empty() &&
+        !function.blocks.front().instructions.empty() &&
+        function.blocks.front().instructions.front().opcode == bytecode::Opcode::AsyncEnter;
+    if (execFunc.isAsyncFunction) {
+        mirror->hasAsyncOperations = true;
+    }
+
+    const std::size_t paramCount = function.parameterTypes.size();
+    const std::size_t localCount = function.localTypes.size();
+    const std::size_t regCount = function.registerTypes.size();
+    const std::size_t singleSlots =
+        paramCount + localCount + regCount + execFunc.edgeScratchCount;
+    if (singleSlots >= InvalidCompactReg ||
+        execFunc.entry == InvalidBlockIndex) {
+        execFunc.canUseFlatFastPath = false;
+        return;
+    }
             execFunc.paramOffset = 0;
             execFunc.localOffset = static_cast<std::uint16_t>(paramCount);
             execFunc.registerOffset = static_cast<std::uint16_t>(paramCount + localCount);
@@ -3201,7 +3519,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
 
                 if (payloadOverflow || payloadCursor >= InvalidCompactReg) {
                     execFunc.canUseFlatFastPath = false;
-                    continue;
+                    return;
                 }
                 totalSlots = payloadCursor;
             }
@@ -4055,8 +4373,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                             std::uint32_t calleeInstCost = 0;
                             std::uint16_t calleeCallCount = 0;
                             std::uint16_t calleeMaxDepth = 0;
-                            if (computeStraightLineCallMetrics(
-                                    computeStraightLineCallMetrics,
+                            if (computeStraightLineCallMetricsImpl(
                                     inst.directExecution,
                                     calleeInstCost,
                                     calleeCallCount,
@@ -4414,7 +4731,10 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                 const auto retTypeId = targetFn.returnTypeId;
                                 const auto fTid = fixedTypeId();
                                 const auto qTid = quatTypeId();
-                                const bool isWrapper1Block = (inst.directExecution->blocks.size() == 1);
+                                const bool calleeCompiled =
+                                    inst.directExecution->compiled.load(std::memory_order_acquire);
+                                const bool isWrapper1Block =
+                                    calleeCompiled && (inst.directExecution->blocks.size() == 1);
                                 const std::uint32_t wrapperCost = isWrapper1Block
                                     ? bLen(inst.directExecution, 0)
                                     : 0u;
@@ -7783,182 +8103,87 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                     execFunc.hasFastParamToLocalPrologue = fastPrologue;
                 }
             }
-        }
-    }
+}
 
-    // Pass 3b: Pre-link per-type virtual & interface dispatch tables + flattened O(1) assignable IDs
-    {
-        std::size_t totalTypeCount = 0;
-        for (const auto& module : modules) totalTypeCount += module.types.size();
-        std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> allTypesById;
-        allTypesById.reserve(totalTypeCount);
-        for (const auto& module : modules) {
-            for (const auto& type : module.types) {
-                if (type.id != 0) allTypesById.emplace(type.id, &type);
-            }
-        }
-        const auto resolvePrelinkedTarget = [&](semantic::SymbolId symId) noexcept -> PrelinkedDispatchTarget {
-            PrelinkedDispatchTarget out{};
-            out.symbolId = symId;
-            if (symId == 0) return out;
-            const auto fIt = functions.find(symId);
-            if (fIt != functions.end() && fIt->second.function) {
-                out.target = &fIt->second;
-                out.execution = findExecutionFunction(*mirror, *fIt->second.function);
-            }
-            return out;
-        };
+void optimizeSingleExecutionFunctionPass4(ExecutionFunction& caller) {
+    if (!caller.canUseFlatFastPath || caller.flatStream.empty()) return;
 
-        mirror->typeDispatch.reserve(allTypesById.size());
-        for (const auto& [tid, typePtr] : allTypesById) {
-            const auto& type = *typePtr;
-            TypeDispatchMetadata meta;
-            meta.typeId = tid;
+    const auto isBranchLikeOp = [](FlatOpcode op) noexcept -> bool {
+        return op == FlatOpcode::TermJumpNoArgs ||
+            op == FlatOpcode::TermBranchBoolNoArgs ||
+            op == FlatOpcode::TermBranchGeneric ||
+            op == FlatOpcode::SuperLessLocalRegBranch ||
+            op == FlatOpcode::SuperLessLocalConstBranch ||
+            op == FlatOpcode::SuperLessLocalArrayLengthBranch ||
+            op == FlatOpcode::SuperBinaryLocalIntConstStoreJump ||
+            op == FlatOpcode::SuperBinaryLocalIntLocalStoreJump ||
+            op == FlatOpcode::SuperBinaryLocalIntRegStoreJump ||
+            op == FlatOpcode::InlineReturnVoidJump ||
+            op == FlatOpcode::InlineReturnScalarJump;
+    };
+    const auto hasAuxNonSlotMeta = [](FlatOpcode op) noexcept -> bool {
+        return op == FlatOpcode::NewStructFast ||
+            op == FlatOpcode::InitStructSlice ||
+            op == FlatOpcode::CopyStructSlice ||
+            op == FlatOpcode::LoadStructSliceField ||
+            op == FlatOpcode::StoreStructSliceField ||
+            op == FlatOpcode::StoreLocalStructFieldInPlace ||
+            op == FlatOpcode::StoreElementStructFieldInPlace ||
+            op == FlatOpcode::InitStackRefCell ||
+            op == FlatOpcode::BindLocalStackRef ||
+            op == FlatOpcode::WritebackLocalStackRef ||
+            op == FlatOpcode::LoadStackRefCell ||
+            op == FlatOpcode::StoreStackRefCell ||
+            op == FlatOpcode::StoreStackRefStructFieldInPlace ||
+            op == FlatOpcode::NewArrayFast ||
+            op == FlatOpcode::NewObjectFast ||
+            op == FlatOpcode::CheckNotNullFast ||
+            op == FlatOpcode::IsTypeObjFast ||
+            op == FlatOpcode::AsTypeObjFast ||
+            op == FlatOpcode::NewDelegateFast ||
+            op == FlatOpcode::CombineDelegateFast ||
+            op == FlatOpcode::RemoveDelegateFast ||
+            op == FlatOpcode::InvokeDelegateFast ||
+            op == FlatOpcode::LoadFieldFast ||
+            op == FlatOpcode::LoadFieldExactFast ||
+            op == FlatOpcode::StoreFieldFast ||
+            op == FlatOpcode::StoreFieldExactFast ||
+            op == FlatOpcode::StoreElementStructFast ||
+            op == FlatOpcode::LoadVec3FieldFast ||
+            op == FlatOpcode::StoreVec3FieldFast ||
+            op == FlatOpcode::LoadQuatFieldFast ||
+            op == FlatOpcode::StoreQuatFieldFast ||
+            op == FlatOpcode::SuperLoadVec3RawFast ||
+            op == FlatOpcode::SuperLoadQuatRawFast ||
+            op == FlatOpcode::ConstantStringFast ||
+            op == FlatOpcode::ConstantEnumFast ||
+            op == FlatOpcode::ConstantNullTagFast ||
+            op == FlatOpcode::EqualValueFast ||
+            op == FlatOpcode::ConvertNumericFast ||
+            op == FlatOpcode::NegateIntChecked ||
+            op == FlatOpcode::BinaryUIntFast ||
+            op == FlatOpcode::CallIntrinsicFast ||
+            (op >= FlatOpcode::MathFixedConst && op <= FlatOpcode::SuperQuatMulRotateVec3);
+    };
 
-            // Flatten self + all base classes + all interfaces (deduplicated) for O(1) L1 scan
-            auto cur = tid;
-            for (std::size_t depth = 0; cur != 0 && depth < 256; ++depth) {
-                if (std::find(meta.assignableTargetIds.begin(), meta.assignableTargetIds.end(), cur) ==
-                    meta.assignableTargetIds.end()) {
-                    meta.assignableTargetIds.push_back(cur);
-                }
-                const auto cIt = allTypesById.find(cur);
-                if (cIt == allTypesById.end()) break;
-                for (const auto& imap : cIt->second->interfaceDispatchMaps) {
-                    if (imap.interfaceTypeId != 0 &&
-                        std::find(meta.assignableTargetIds.begin(),
-                                  meta.assignableTargetIds.end(),
-                                  imap.interfaceTypeId) == meta.assignableTargetIds.end()) {
-                        meta.assignableTargetIds.push_back(imap.interfaceTypeId);
-                    }
-                }
-                cur = cIt->second->baseTypeId;
-            }
-
-            if (type.kind == semantic::TypeKind::Class) {
-                meta.virtualTargets.reserve(type.virtualDispatchTable.size());
-                for (const auto vSym : type.virtualDispatchTable) {
-                    meta.virtualTargets.push_back(resolvePrelinkedTarget(vSym));
-                }
-
-                // Collect own + inherited interface maps (first match in inheritance order wins)
-                cur = tid;
-                for (std::size_t depth = 0; cur != 0 && depth < 256; ++depth) {
-                    const auto cIt = allTypesById.find(cur);
-                    if (cIt == allTypesById.end()) break;
-                    for (const auto& imap : cIt->second->interfaceDispatchMaps) {
-                        if (imap.interfaceTypeId == 0) continue;
-                        const bool exists = std::any_of(
-                            meta.interfaceMaps.begin(),
-                            meta.interfaceMaps.end(),
-                            [&](const PrelinkedInterfaceMap& m) {
-                                return m.interfaceTypeId == imap.interfaceTypeId;
-                            });
-                        if (!exists) {
-                            PrelinkedInterfaceMap pmap;
-                            pmap.interfaceTypeId = imap.interfaceTypeId;
-                            pmap.slots.reserve(imap.slots.size());
-                            for (const auto sSym : imap.slots) {
-                                pmap.slots.push_back(resolvePrelinkedTarget(sSym));
-                            }
-                            meta.interfaceMaps.push_back(std::move(pmap));
-                        }
-                    }
-                    cur = cIt->second->baseTypeId;
-                }
-                std::sort(
-                    meta.interfaceMaps.begin(),
-                    meta.interfaceMaps.end(),
-                    [](const PrelinkedInterfaceMap& a, const PrelinkedInterfaceMap& b) {
-                        return a.interfaceTypeId < b.interfaceTypeId;
-                    });
-            }
-            mirror->typeDispatch.emplace(tid, std::move(meta));
-        }
-    }
-
-    // Pass 4: Unfold small-frame leaf script functions at CallDirect sites & thread empty Jump->Jump chains
-    for (const auto& module : modules) {
-        for (const auto& function : module.functions) {
-            auto found = mirror->functions.find(&function);
-            if (found == mirror->functions.end()) continue;
-            auto& caller = found->second;
-            if (!caller.canUseFlatFastPath || caller.flatStream.empty()) continue;
-
-            const auto isBranchLikeOp = [](FlatOpcode op) noexcept -> bool {
-                return op == FlatOpcode::TermJumpNoArgs ||
-                    op == FlatOpcode::TermBranchBoolNoArgs ||
-                    op == FlatOpcode::TermBranchGeneric ||
-                    op == FlatOpcode::SuperLessLocalRegBranch ||
-                    op == FlatOpcode::SuperLessLocalConstBranch ||
-                    op == FlatOpcode::SuperLessLocalArrayLengthBranch ||
-                    op == FlatOpcode::SuperBinaryLocalIntConstStoreJump ||
-                    op == FlatOpcode::SuperBinaryLocalIntLocalStoreJump ||
-                    op == FlatOpcode::SuperBinaryLocalIntRegStoreJump ||
-                    op == FlatOpcode::InlineReturnVoidJump ||
-                    op == FlatOpcode::InlineReturnScalarJump;
-            };
-            const auto hasAuxNonSlotMeta = [](FlatOpcode op) noexcept -> bool {
-                return op == FlatOpcode::NewStructFast ||
-                    op == FlatOpcode::InitStructSlice ||
-                    op == FlatOpcode::CopyStructSlice ||
-                    op == FlatOpcode::LoadStructSliceField ||
-                    op == FlatOpcode::StoreStructSliceField ||
-                    op == FlatOpcode::StoreLocalStructFieldInPlace ||
-                    op == FlatOpcode::StoreElementStructFieldInPlace ||
-                    op == FlatOpcode::InitStackRefCell ||
-                    op == FlatOpcode::BindLocalStackRef ||
-                    op == FlatOpcode::WritebackLocalStackRef ||
-                    op == FlatOpcode::LoadStackRefCell ||
-                    op == FlatOpcode::StoreStackRefCell ||
-                    op == FlatOpcode::StoreStackRefStructFieldInPlace ||
-                    op == FlatOpcode::NewArrayFast ||
-                    op == FlatOpcode::NewObjectFast ||
-                    op == FlatOpcode::CheckNotNullFast ||
-                    op == FlatOpcode::IsTypeObjFast ||
-                    op == FlatOpcode::AsTypeObjFast ||
-                    op == FlatOpcode::NewDelegateFast ||
-                    op == FlatOpcode::CombineDelegateFast ||
-                    op == FlatOpcode::RemoveDelegateFast ||
-                    op == FlatOpcode::InvokeDelegateFast ||
-                    op == FlatOpcode::LoadFieldFast ||
-                    op == FlatOpcode::LoadFieldExactFast ||
-                    op == FlatOpcode::StoreFieldFast ||
-                    op == FlatOpcode::StoreFieldExactFast ||
-                    op == FlatOpcode::StoreElementStructFast ||
-                    op == FlatOpcode::LoadVec3FieldFast ||
-                    op == FlatOpcode::StoreVec3FieldFast ||
-                    op == FlatOpcode::LoadQuatFieldFast ||
-                    op == FlatOpcode::StoreQuatFieldFast ||
-                    op == FlatOpcode::SuperLoadVec3RawFast ||
-                    op == FlatOpcode::SuperLoadQuatRawFast ||
-                    op == FlatOpcode::ConstantStringFast ||
-                    op == FlatOpcode::ConstantEnumFast ||
-                    op == FlatOpcode::ConstantNullTagFast ||
-                    op == FlatOpcode::EqualValueFast ||
-                    op == FlatOpcode::ConvertNumericFast ||
-                    op == FlatOpcode::NegateIntChecked ||
-                    op == FlatOpcode::BinaryUIntFast ||
-                    op == FlatOpcode::CallIntrinsicFast ||
-                    (op >= FlatOpcode::MathFixedConst && op <= FlatOpcode::SuperQuatMulRotateVec3);
-            };
-
-            // Scan CallDirect sites eligible for unfolding
-            std::uint32_t maxCalleeSlots = 0;
-            std::size_t extraInstCount = 0;
-            bool anyInlinableCall = false;
-            std::vector<std::uint8_t> unfoldAt(caller.flatStream.size(), 0u);
-            for (std::size_t i = 0; i < caller.flatStream.size(); ++i) {
-                const auto& fi = caller.flatStream[i];
-                const auto fc = caller.resolveCold(i);
-                if ((fi.flatOpcode == FlatOpcode::CallDirect0 ||
-                     fi.flatOpcode == FlatOpcode::CallDirect1 ||
-                     fi.flatOpcode == FlatOpcode::CallDirect2 ||
-                     fi.flatOpcode == FlatOpcode::CallDirectN) &&
-                    fc.directExecution != nullptr &&
-                    fc.directTarget != nullptr &&
-                    fc.directExecution != &caller &&
-                    fc.directExecution->isSmallLeafInlineCandidate) {
+    // Scan CallDirect sites eligible for unfolding
+    std::uint32_t maxCalleeSlots = 0;
+    std::size_t extraInstCount = 0;
+    bool anyInlinableCall = false;
+    std::vector<std::uint8_t> unfoldAt(caller.flatStream.size(), 0u);
+    for (std::size_t i = 0; i < caller.flatStream.size(); ++i) {
+        const auto& fi = caller.flatStream[i];
+        const auto fc = caller.resolveCold(i);
+        if ((fi.flatOpcode == FlatOpcode::CallDirect0 ||
+             fi.flatOpcode == FlatOpcode::CallDirect1 ||
+             fi.flatOpcode == FlatOpcode::CallDirect2 ||
+             fi.flatOpcode == FlatOpcode::CallDirectN) &&
+            fc.directExecution != nullptr &&
+            fc.directTarget != nullptr &&
+            fc.directExecution != &caller &&
+            (fc.directExecution->lazyLocIndex == InvalidStreamOffset ||
+             fc.directExecution->compiled.load(std::memory_order_acquire)) &&
+            fc.directExecution->isSmallLeafInlineCandidate) {
                     if (fi.flatOpcode == FlatOpcode::CallDirectN) {
                         if (!fc.bytecode || fc.bytecode->operands.size() > 4) continue;
                     }
@@ -8237,63 +8462,86 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                 }
             }
         }
+
+} // namespace
+
+bool ensureFunctionCompiledSlow(
+    const ExecutionMirror& mirror,
+    const ExecutionFunction& execFn) {
+    if (execFn.compiled.load(std::memory_order_acquire)) {
+        return true;
     }
-    if (!functions.empty()) {
-        std::size_t tableCap = 16u;
-        const std::size_t minCap = functions.size() * 2u;
-        while (tableCap < minCap) {
-            tableCap <<= 1u;
-        }
-        mirror->fastFunctionTable.resize(tableCap);
-        const std::size_t mask = tableCap - 1u;
-        for (const auto& [symId, loc] : functions) {
-            if (symId == 0u) continue;
-            std::size_t slot = static_cast<std::size_t>(
-                (symId ^ (symId >> 32u)) * 11400714819323198485ULL) & mask;
-            while (mirror->fastFunctionTable[slot].symbolId != 0u) {
-                slot = (slot + 1u) & mask;
-            }
-            mirror->fastFunctionTable[slot] = FastFunctionDispatchEntry{
-                symId,
-                &loc,
-                loc.function ? findExecutionFunction(*mirror, *loc.function) : nullptr};
-        }
+    auto* state = mirror.lazyState.get();
+    if (!state || !state->baseBundle || !state->modules || !state->functions || !state->types) {
+        return false;
     }
-    mirror->fieldMetas.shrink_to_fit();
-    mirror->objectTemplates.shrink_to_fit();
-    mirror->stringLiterals.shrink_to_fit();
-    mirror->constPoolValues.shrink_to_fit();
-    mirror->stackRefTemplates.shrink_to_fit();
-    mirror->polyCallSites.shrink_to_fit();
-    mirror->newDelegateSites.shrink_to_fit();
-    mirror->invokeDelegateSites.shrink_to_fit();
-    for (auto& [fnPtr, execFn] : mirror->functions) {
-        (void)fnPtr;
-        execFn.slotPayloadOffsets.shrink_to_fit();
-        execFn.slotStructSchemaIds.shrink_to_fit();
-        execFn.flatStream.shrink_to_fit();
-        execFn.flatCold.shrink_to_fit();
-        execFn.flatColdCalls.shrink_to_fit();
-        execFn.blockStreamOffsets.shrink_to_fit();
-        execFn.denseBlockIndices.shrink_to_fit();
-        execFn.blocks.shrink_to_fit();
-        if (execFn.canUseFlatFastPath &&
-            execFn.module != nullptr &&
-            execFn.bytecode != nullptr) {
-            execFn.slowInstructionsOnce = std::make_unique<std::once_flag>();
-            for (auto& blk : execFn.blocks) {
-                std::vector<ExecutionInstruction>().swap(blk.instructions);
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (execFn.compiled.load(std::memory_order_acquire)) {
+        return true;
+    }
+    if (execFn.lazyLocIndex == InvalidStreamOffset || !execFn.module || !execFn.bytecode) {
+        return false;
+    }
+    const auto& bundle = *state->baseBundle;
+    if (execFn.lazyLocIndex >= bundle.functionLocs.size()) {
+        return false;
+    }
+    const auto& loc = bundle.functionLocs[execFn.lazyLocIndex];
+    if (loc.chunkIndex >= bundle.chunks.size()) {
+        return false;
+    }
+
+    diagnostics::DiagnosticBag diag;
+    std::vector<std::uint8_t>* chunkBufPtr = nullptr;
+    for (std::size_t i = 0; i < state->decodedChunkLru.size(); ++i) {
+        if (state->decodedChunkLru[i].chunkIndex == loc.chunkIndex) {
+            if (i != 0u) {
+                auto hit = std::move(state->decodedChunkLru[i]);
+                state->decodedChunkLru.erase(state->decodedChunkLru.begin() + static_cast<std::ptrdiff_t>(i));
+                state->decodedChunkLru.insert(state->decodedChunkLru.begin(), std::move(hit));
             }
-        } else {
-            for (auto& blk : execFn.blocks) {
-                blk.instructions.shrink_to_fit();
-            }
+            chunkBufPtr = &state->decodedChunkLru.front().bytes;
+            break;
         }
     }
-    return mirror;
+    if (!chunkBufPtr) {
+        LazyCompileState::DecodedChunkEntry fresh;
+        fresh.chunkIndex = loc.chunkIndex;
+        if (!bytecode::decompressLazyChunk(bundle, loc.chunkIndex, fresh.bytes, diag)) {
+            return false;
+        }
+        if (state->decodedChunkLru.size() >= LazyCompileState::kMaxDecodedChunks) {
+            state->decodedChunkLru.pop_back();
+            state->evictedChunkCount.fetch_add(1u, std::memory_order_release);
+        }
+        state->decodedChunkLru.insert(state->decodedChunkLru.begin(), std::move(fresh));
+        chunkBufPtr = &state->decodedChunkLru.front().bytes;
+    }
+    auto* mutableBytecodeFn = const_cast<bytecode::Function*>(execFn.bytecode);
+    if (!bytecode::decodeLazyFunctionBody(
+            bundle, execFn.lazyLocIndex, *mutableBytecodeFn, diag, chunkBufPtr, execFn.module)) {
+        return false;
+    }
+
+    auto* mutableMirror = const_cast<ExecutionMirror*>(&mirror);
+    auto& mutableExec = const_cast<ExecutionFunction&>(execFn);
+    initSingleExecutionFunctionPass1(
+        *mutableMirror, *execFn.module, *mutableBytecodeFn, mutableExec);
+    linkSingleExecutionFunctionPass2(
+        *mutableMirror, *state->functions, *execFn.module, *mutableBytecodeFn, mutableExec);
+    compileSingleExecutionFunctionPass3(
+        mutableMirror, *state, *state->functions, *state->types, *execFn.module, *mutableBytecodeFn, mutableExec);
+    optimizeSingleExecutionFunctionPass4(mutableExec);
+    finalizeCompiledExecutionFunction(mutableExec);
+    state->compiledLazyCount.fetch_add(1u, std::memory_order_release);
+    return true;
 }
 
 void ensureSlowInstructions(const ExecutionFunction& execFn) {
+    if (execFn.ownerMirror != nullptr &&
+        !execFn.compiled.load(std::memory_order_acquire)) {
+        (void)ensureFunctionCompiled(*execFn.ownerMirror, execFn);
+    }
     if (!execFn.slowInstructionsOnce ||
         execFn.module == nullptr ||
         execFn.bytecode == nullptr) {
@@ -8329,7 +8577,11 @@ const ExecutionMirror& executionMirrorSlow(const ProgramImage& program) {
     }
     std::call_once(*program.executionMirrorOnce_, [&]() {
         program.executionMirror_ = buildExecutionMirror(
-            program.modules_, program.functions_, program.types_);
+            program.modules_,
+            program.functions_,
+            program.types_,
+            program.lazyBaseBundle_,
+            program.lazyBaseBundle_ ? &program.lazyFuncLocIndex_ : nullptr);
         program.executionMirrorFast_.ptr.store(
             program.executionMirror_.get(), std::memory_order_release);
     });
@@ -8337,6 +8589,56 @@ const ExecutionMirror& executionMirrorSlow(const ProgramImage& program) {
 }
 
 } // namespace detail
+
+namespace {
+
+bool validateLinkSymbolsAndObjectModel(
+    const std::vector<bytecode::Module>& modules,
+    RuntimeError& error,
+    std::size_t baseModuleCount = 0u) {
+    std::size_t totalFunctions = 0;
+    for (const auto& module : modules) {
+        totalFunctions += module.functions.size();
+    }
+    struct LinkSymbolEntry {
+        semantic::SymbolId symbolId = 0;
+        std::size_t ordinal = 0;
+        const std::string* moduleName = nullptr;
+        const std::string* functionName = nullptr;
+    };
+    std::vector<LinkSymbolEntry> linkSymbols;
+    linkSymbols.reserve(totalFunctions);
+    std::size_t ordinal = 0;
+    for (const auto& module : modules) {
+        for (const auto& function : module.functions) {
+            linkSymbols.push_back(LinkSymbolEntry{
+                function.symbolId, ordinal++, &module.name, &function.name});
+        }
+    }
+    if (linkSymbols.size() > 1u) {
+        std::sort(
+            linkSymbols.begin(),
+            linkSymbols.end(),
+            [](const LinkSymbolEntry& lhs, const LinkSymbolEntry& rhs) noexcept {
+                if (lhs.symbolId != rhs.symbolId) {
+                    return lhs.symbolId < rhs.symbolId;
+                }
+                return lhs.ordinal < rhs.ordinal;
+            });
+        for (std::size_t i = 1; i < linkSymbols.size(); ++i) {
+            if (linkSymbols[i].symbolId == linkSymbols[i - 1u].symbolId) {
+                const auto qualified =
+                    *linkSymbols[i].moduleName + "::" + *linkSymbols[i].functionName;
+                error.code = ErrorCode::DuplicateSymbol;
+                error.message = "duplicate function SymbolId while linking '" + qualified + "'";
+                return false;
+            }
+        }
+    }
+    return validateObjectModel(modules, error, baseModuleCount);
+}
+
+} // namespace
 
 ProgramImage::ProgramImage(std::vector<bytecode::Module> modules)
     : modules_(std::move(modules)) {
@@ -8369,7 +8671,24 @@ ProgramImage::ProgramImage(std::vector<bytecode::Module> modules)
 }
 
 ProgramImage::ProgramImage(const ProgramImage& other)
-    : ProgramImage(other.modules_) {}
+    : ProgramImage(other.modules_) {
+    if (other.lazyBaseBundle_) {
+        lazyBaseBundle_ = other.lazyBaseBundle_;
+        baseModuleCount_ = other.baseModuleCount_;
+        lazyFuncLocIndex_.reserve(lazyBaseBundle_->functionLocs.size());
+        for (std::uint32_t locIdx = 0;
+             locIdx < static_cast<std::uint32_t>(lazyBaseBundle_->functionLocs.size());
+             ++locIdx) {
+            const auto& loc = lazyBaseBundle_->functionLocs[locIdx];
+            if (loc.moduleIndex < modules_.size() &&
+                loc.functionIndex < modules_[loc.moduleIndex].functions.size()) {
+                lazyFuncLocIndex_.emplace(
+                    &modules_[loc.moduleIndex].functions[loc.functionIndex],
+                    locIdx);
+            }
+        }
+    }
+}
 
 ProgramImage& ProgramImage::operator=(const ProgramImage& other) {
     if (this == &other) return *this;
@@ -8382,21 +8701,8 @@ std::optional<ProgramImage> ProgramImage::link(
     std::vector<bytecode::Module> modules,
     RuntimeError& error,
     bool verifyModules) {
-    std::size_t totalFunctions = 0;
-    for (const auto& module : modules) {
-        totalFunctions += module.functions.size();
-    }
-    struct LinkSymbolEntry {
-        semantic::SymbolId symbolId = 0;
-        std::size_t ordinal = 0;
-        const std::string* moduleName = nullptr;
-        const std::string* functionName = nullptr;
-    };
-    std::vector<LinkSymbolEntry> linkSymbols;
-    linkSymbols.reserve(totalFunctions);
-    std::size_t ordinal = 0;
-    for (const auto& module : modules) {
-        if (verifyModules) {
+    if (verifyModules) {
+        for (const auto& module : modules) {
             diagnostics::DiagnosticBag diagnostics;
             if (!bytecode::verifyModule(module, diagnostics)) {
                 error.code = ErrorCode::InvalidProgram;
@@ -8410,35 +8716,122 @@ std::optional<ProgramImage> ProgramImage::link(
                 return std::nullopt;
             }
         }
-        for (const auto& function : module.functions) {
-            linkSymbols.push_back(LinkSymbolEntry{
-                function.symbolId, ordinal++, &module.name, &function.name});
-        }
     }
-    if (linkSymbols.size() > 1u) {
-        std::sort(
-            linkSymbols.begin(),
-            linkSymbols.end(),
-            [](const LinkSymbolEntry& lhs, const LinkSymbolEntry& rhs) noexcept {
-                if (lhs.symbolId != rhs.symbolId) {
-                    return lhs.symbolId < rhs.symbolId;
+    if (!validateLinkSymbolsAndObjectModel(modules, error)) {
+        return std::nullopt;
+    }
+    return ProgramImage(std::move(modules));
+}
+
+std::optional<ProgramImage> ProgramImage::linkLayered(
+    std::shared_ptr<const bytecode::LazyBytecodeBundle> baseBundle,
+    std::vector<bytecode::Module> userModules,
+    RuntimeError& error,
+    bool verifyUserModules) {
+    if (!baseBundle) {
+        return ProgramImage::link(std::move(userModules), error, verifyUserModules);
+    }
+    if (verifyUserModules) {
+        for (const auto& module : userModules) {
+            diagnostics::DiagnosticBag diagnostics;
+            if (!bytecode::verifyModule(module, diagnostics)) {
+                error.code = ErrorCode::InvalidProgram;
+                error.message =
+                    "bytecode verification failed while linking module '" +
+                    module.name + "'";
+                for (const auto& diagnostic : diagnostics.items()) {
+                    error.message += "; " + diagnostic.code + ": " +
+                        diagnostic.message;
                 }
-                return lhs.ordinal < rhs.ordinal;
-            });
-        for (std::size_t i = 1; i < linkSymbols.size(); ++i) {
-            if (linkSymbols[i].symbolId == linkSymbols[i - 1u].symbolId) {
-                const auto qualified =
-                    *linkSymbols[i].moduleName + "::" + *linkSymbols[i].functionName;
-                error.code = ErrorCode::DuplicateSymbol;
-                error.message = "duplicate function SymbolId while linking '" + qualified + "'";
                 return std::nullopt;
             }
         }
     }
-    if (!validateObjectModel(modules, error)) {
+    const std::size_t baseCount = baseBundle->headerModules.size();
+    std::vector<bytecode::Module> combined;
+    combined.reserve(baseCount + userModules.size());
+    for (const auto& mod : baseBundle->headerModules) {
+        combined.push_back(mod);
+    }
+    for (auto& mod : userModules) {
+        combined.push_back(std::move(mod));
+    }
+    if (!validateLinkSymbolsAndObjectModel(combined, error, baseCount)) {
         return std::nullopt;
     }
-    return ProgramImage(std::move(modules));
+
+    ProgramImage image(std::move(combined));
+    image.lazyBaseBundle_ = std::move(baseBundle);
+    image.baseModuleCount_ = baseCount;
+    image.lazyFuncLocIndex_.reserve(image.lazyBaseBundle_->functionLocs.size());
+    for (std::uint32_t locIdx = 0;
+         locIdx < static_cast<std::uint32_t>(image.lazyBaseBundle_->functionLocs.size());
+         ++locIdx) {
+        const auto& loc = image.lazyBaseBundle_->functionLocs[locIdx];
+        if (loc.moduleIndex < image.modules_.size() &&
+            loc.functionIndex < image.modules_[loc.moduleIndex].functions.size()) {
+            image.lazyFuncLocIndex_.emplace(
+                &image.modules_[loc.moduleIndex].functions[loc.functionIndex],
+                locIdx);
+        }
+    }
+    return image;
+}
+
+std::optional<ProgramImage> ProgramImage::linkLayeredConsumeHeader(
+    std::shared_ptr<bytecode::LazyBytecodeBundle> mutableBaseBundle,
+    std::vector<bytecode::Module> userModules,
+    RuntimeError& error,
+    bool verifyUserModules) {
+    if (!mutableBaseBundle) {
+        return ProgramImage::link(std::move(userModules), error, verifyUserModules);
+    }
+    if (verifyUserModules) {
+        for (const auto& module : userModules) {
+            diagnostics::DiagnosticBag diagnostics;
+            if (!bytecode::verifyModule(module, diagnostics)) {
+                error.code = ErrorCode::InvalidProgram;
+                error.message =
+                    "bytecode verification failed while linking module '" +
+                    module.name + "'";
+                for (const auto& diagnostic : diagnostics.items()) {
+                    error.message += "; " + diagnostic.code + ": " +
+                        diagnostic.message;
+                }
+                return std::nullopt;
+            }
+        }
+    }
+    const std::size_t baseCount = mutableBaseBundle->headerModules.size();
+    std::vector<bytecode::Module> combined;
+    combined.reserve(baseCount + userModules.size());
+    for (auto& mod : mutableBaseBundle->headerModules) {
+        combined.push_back(std::move(mod));
+    }
+    std::vector<bytecode::Module>().swap(mutableBaseBundle->headerModules);
+    for (auto& mod : userModules) {
+        combined.push_back(std::move(mod));
+    }
+    if (!validateLinkSymbolsAndObjectModel(combined, error, baseCount)) {
+        return std::nullopt;
+    }
+
+    ProgramImage image(std::move(combined));
+    image.lazyBaseBundle_ = std::move(mutableBaseBundle);
+    image.baseModuleCount_ = baseCount;
+    image.lazyFuncLocIndex_.reserve(image.lazyBaseBundle_->functionLocs.size());
+    for (std::uint32_t locIdx = 0;
+         locIdx < static_cast<std::uint32_t>(image.lazyBaseBundle_->functionLocs.size());
+         ++locIdx) {
+        const auto& loc = image.lazyBaseBundle_->functionLocs[locIdx];
+        if (loc.moduleIndex < image.modules_.size() &&
+            loc.functionIndex < image.modules_[loc.moduleIndex].functions.size()) {
+            image.lazyFuncLocIndex_.emplace(
+                &image.modules_[loc.moduleIndex].functions[loc.functionIndex],
+                locIdx);
+        }
+    }
+    return image;
 }
 
 const std::vector<bytecode::Module>& ProgramImage::modules() const noexcept { return modules_; }
@@ -8456,6 +8849,7 @@ void ProgramImage::compactForRuntime() {
         }
         types_.clear();
         functions_.clear();
+        lazyFuncLocIndex_.clear();
         for (const auto& module : modules_) {
             for (const auto& type : module.types) {
                 const auto [it, inserted] = types_.emplace(type.id, &type);
@@ -8471,8 +8865,54 @@ void ProgramImage::compactForRuntime() {
                     FunctionLocation{&module, &function, qualified});
             }
         }
+        if (lazyBaseBundle_) {
+            lazyFuncLocIndex_.reserve(lazyBaseBundle_->functionLocs.size());
+            for (std::uint32_t locIdx = 0;
+                 locIdx < static_cast<std::uint32_t>(lazyBaseBundle_->functionLocs.size());
+                 ++locIdx) {
+                const auto& loc = lazyBaseBundle_->functionLocs[locIdx];
+                if (loc.moduleIndex < modules_.size() &&
+                    loc.functionIndex < modules_[loc.moduleIndex].functions.size()) {
+                    lazyFuncLocIndex_.emplace(
+                        &modules_[loc.moduleIndex].functions[loc.functionIndex],
+                        locIdx);
+                }
+            }
+        }
     }
-    for (auto& module : modules_) {
+    auto slimRuntimeFunctionMeta = [](semantic::FunctionSymbol& fn,
+                                      bool keepParamsStruct,
+                                      bool stripHotReloadNames) {
+        std::string().swap(fn.sourceName);
+        std::string().swap(fn.moduleName);
+        std::string().swap(fn.ownerTypeName);
+        fn.declarationSpan = {};
+        fn.bodySpan = {};
+        if (stripHotReloadNames) {
+            std::string().swap(fn.returnTypeName);
+            std::string().swap(fn.storageReturnTypeName);
+        }
+        if (!keepParamsStruct) {
+            std::string().swap(fn.name);
+            std::vector<semantic::VariableSymbol>().swap(fn.parameters);
+            return;
+        }
+        for (auto& p : fn.parameters) {
+            std::string().swap(p.name);
+            if (stripHotReloadNames) {
+                std::string().swap(p.typeName);
+                std::string().swap(p.storageTypeName);
+            }
+            p.declarationSpan = {};
+            p.scopeSpan = {};
+            p.defaultValue = std::monostate{};
+            p.constantValue = std::monostate{};
+        }
+        fn.parameters.shrink_to_fit();
+    };
+    for (std::size_t modIdx = 0; modIdx < modules_.size(); ++modIdx) {
+        auto& module = modules_[modIdx];
+        const bool isBaseMod = (baseModuleCount_ > 0u && modIdx < baseModuleCount_);
         for (auto& type : module.types) {
             type.fields.shrink_to_fit();
             type.virtualDispatchTable.shrink_to_fit();
@@ -8484,15 +8924,61 @@ void ProgramImage::compactForRuntime() {
                 std::vector<semantic::FunctionSymbol>().swap(type.constructors);
                 std::vector<semantic::PropertySymbol>().swap(type.properties);
                 std::vector<semantic::EventSymbol>().swap(type.events);
+                std::vector<semantic::EnumMemberSymbol>().swap(type.enumMembers);
                 std::vector<std::string>().swap(type.baseInterfaceNames);
                 std::string().swap(type.sourceName);
+                type.declarationSpan = {};
             } else {
+                std::vector<semantic::EventSymbol>().swap(type.events);
+                std::string().swap(type.sourceName);
+                type.declarationSpan = {};
+                if (isBaseMod) {
+                    std::vector<std::string>().swap(type.baseInterfaceNames);
+                }
+                if (isBaseMod && !type.interfaceType && type.baseTypeId != 0) {
+                    type.methods.erase(
+                        std::remove_if(
+                            type.methods.begin(),
+                            type.methods.end(),
+                            [&](const semantic::FunctionSymbol& m) {
+                                return m.declaringTypeId != 0 && m.declaringTypeId != type.id;
+                            }),
+                        type.methods.end());
+                    type.properties.erase(
+                        std::remove_if(
+                            type.properties.begin(),
+                            type.properties.end(),
+                            [&](const semantic::PropertySymbol& p) {
+                                return p.declaringTypeId != 0 && p.declaringTypeId != type.id;
+                            }),
+                        type.properties.end());
+                }
+                for (auto& m : type.methods) {
+                    slimRuntimeFunctionMeta(m, true, isBaseMod);
+                }
+                for (auto& c : type.constructors) {
+                    slimRuntimeFunctionMeta(c, true, isBaseMod);
+                }
+                for (auto& p : type.properties) {
+                    std::string().swap(p.typeName);
+                    std::string().swap(p.sourceName);
+                    p.declarationSpan = {};
+                    if (p.getter.has_value()) {
+                        slimRuntimeFunctionMeta(*p.getter, false, true);
+                    }
+                    if (p.setter.has_value()) {
+                        slimRuntimeFunctionMeta(*p.setter, true, isBaseMod);
+                    }
+                }
                 type.methods.shrink_to_fit();
                 type.constructors.shrink_to_fit();
                 type.properties.shrink_to_fit();
             }
         }
         for (auto& fn : module.functions) {
+            if (lazyFuncLocIndex_.find(&fn) != lazyFuncLocIndex_.end() && fn.blocks.empty()) {
+                continue;
+            }
             fn.parameterTypes.shrink_to_fit();
             fn.parameterTypeIds.shrink_to_fit();
             fn.localTypes.shrink_to_fit();
@@ -8520,6 +9006,7 @@ void ProgramImage::compactForRuntime() {
         mirror->invokeDelegateSites.shrink_to_fit();
         for (auto& [fnPtr, execFn] : mirror->functions) {
             (void)fnPtr;
+            if (!execFn.compiled.load(std::memory_order_acquire)) continue;
             execFn.slotPayloadOffsets.shrink_to_fit();
             execFn.slotStructSchemaIds.shrink_to_fit();
             execFn.flatStream.shrink_to_fit();
@@ -8535,6 +9022,35 @@ void ProgramImage::compactForRuntime() {
             }
         }
     }
+}
+
+std::size_t ProgramImage::totalLazyFunctionCount() const noexcept {
+    return lazyFuncLocIndex_.size();
+}
+
+std::size_t ProgramImage::compiledLazyFunctionCount() const noexcept {
+    const auto* cached = executionMirrorFast_.ptr.load(std::memory_order_acquire);
+    if (!cached || !cached->lazyState) {
+        return 0u;
+    }
+    return cached->lazyState->compiledLazyCount.load(std::memory_order_acquire);
+}
+
+std::size_t ProgramImage::decodedLazyChunkCacheSize() const noexcept {
+    const auto* cached = executionMirrorFast_.ptr.load(std::memory_order_acquire);
+    if (!cached || !cached->lazyState) {
+        return 0u;
+    }
+    std::lock_guard<std::mutex> lock(cached->lazyState->mutex);
+    return cached->lazyState->decodedChunkLru.size();
+}
+
+std::size_t ProgramImage::evictedLazyChunkCount() const noexcept {
+    const auto* cached = executionMirrorFast_.ptr.load(std::memory_order_acquire);
+    if (!cached || !cached->lazyState) {
+        return 0u;
+    }
+    return cached->lazyState->evictedChunkCount.load(std::memory_order_acquire);
 }
 
 std::size_t ProgramImage::functionCount() const noexcept { return functions_.size(); }
@@ -8593,7 +9109,7 @@ std::optional<ProgramImage::FrameStructAllocationStats> ProgramImage::functionSt
     const auto* loc = resolveFunction(*symOpt);
     if (!loc || !loc->function) return std::nullopt;
     const auto* execFn = detail::findExecutionFunction(mirror, *loc->function);
-    if (!execFn) return std::nullopt;
+    if (!execFn || !detail::ensureFunctionCompiled(mirror, *execFn)) return std::nullopt;
     FrameStructAllocationStats stats{};
     stats.singleZoneSlots = execFn->singleZoneSlots;
     stats.payloadZoneSlots = execFn->totalFrameSlots >= execFn->singleZoneSlots

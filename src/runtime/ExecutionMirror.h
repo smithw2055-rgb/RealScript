@@ -7,12 +7,15 @@
 #include "realscript/runtime/Runtime.h"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace realscript::runtime::detail {
@@ -21,6 +24,107 @@ inline constexpr std::size_t InvalidBlockIndex =
     std::numeric_limits<std::size_t>::max();
 inline constexpr std::uint16_t InvalidCompactReg = 0xffffu;
 inline constexpr std::uint32_t InvalidStreamOffset = 0xffffffffu;
+
+struct AtomicBoolFlag {
+    mutable std::atomic<bool> flag{false};
+    AtomicBoolFlag() noexcept = default;
+    explicit AtomicBoolFlag(bool initial) noexcept : flag(initial) {}
+    AtomicBoolFlag(const AtomicBoolFlag& other) noexcept
+        : flag(other.flag.load(std::memory_order_acquire)) {}
+    AtomicBoolFlag& operator=(const AtomicBoolFlag& other) noexcept {
+        flag.store(other.flag.load(std::memory_order_acquire), std::memory_order_release);
+        return *this;
+    }
+    AtomicBoolFlag(AtomicBoolFlag&& other) noexcept
+        : flag(other.flag.load(std::memory_order_acquire)) {}
+    AtomicBoolFlag& operator=(AtomicBoolFlag&& other) noexcept {
+        flag.store(other.flag.load(std::memory_order_acquire), std::memory_order_release);
+        return *this;
+    }
+    [[nodiscard]] bool load(std::memory_order order = std::memory_order_acquire) const noexcept {
+        return flag.load(order);
+    }
+    void store(bool v, std::memory_order order = std::memory_order_release) const noexcept {
+        flag.store(v, order);
+    }
+    operator bool() const noexcept { return flag.load(std::memory_order_acquire); }
+    AtomicBoolFlag& operator=(bool v) noexcept {
+        flag.store(v, std::memory_order_release);
+        return *this;
+    }
+};
+
+template <typename T, std::size_t PageSize = 256, std::size_t MaxPages = 1024>
+class StablePagedVector {
+public:
+    StablePagedVector() noexcept = default;
+    ~StablePagedVector() {
+        const std::size_t n = count_.load(std::memory_order_relaxed);
+        const std::size_t pageCount = (n + PageSize - 1u) / PageSize;
+        for (std::size_t p = 0; p < pageCount && p < MaxPages; ++p) {
+            delete pages_[p].load(std::memory_order_relaxed);
+        }
+    }
+    StablePagedVector(const StablePagedVector&) = delete;
+    StablePagedVector& operator=(const StablePagedVector&) = delete;
+    StablePagedVector(StablePagedVector&&) = delete;
+    StablePagedVector& operator=(StablePagedVector&&) = delete;
+
+    void push_back(const T& value) {
+        const std::size_t idx = count_.load(std::memory_order_relaxed);
+        const std::size_t pIdx = idx / PageSize;
+        if (pIdx >= MaxPages) std::abort();
+        auto* page = ensurePage(pIdx);
+        (*page)[idx % PageSize] = value;
+        count_.store(idx + 1u, std::memory_order_release);
+    }
+    void push_back(T&& value) {
+        const std::size_t idx = count_.load(std::memory_order_relaxed);
+        const std::size_t pIdx = idx / PageSize;
+        if (pIdx >= MaxPages) std::abort();
+        auto* page = ensurePage(pIdx);
+        (*page)[idx % PageSize] = std::move(value);
+        count_.store(idx + 1u, std::memory_order_release);
+    }
+    template <typename... Args>
+    void emplace_back(Args&&... args) {
+        const std::size_t idx = count_.load(std::memory_order_relaxed);
+        const std::size_t pIdx = idx / PageSize;
+        if (pIdx >= MaxPages) std::abort();
+        auto* page = ensurePage(pIdx);
+        (*page)[idx % PageSize] = T(std::forward<Args>(args)...);
+        count_.store(idx + 1u, std::memory_order_release);
+    }
+
+    [[nodiscard]] std::size_t size() const noexcept {
+        return count_.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] bool empty() const noexcept { return size() == 0u; }
+    void shrink_to_fit() noexcept {}
+
+    [[nodiscard]] const T& operator[](std::size_t idx) const noexcept {
+        const auto* page = pages_[idx / PageSize].load(std::memory_order_acquire);
+        return (*page)[idx % PageSize];
+    }
+    [[nodiscard]] T& operator[](std::size_t idx) noexcept {
+        auto* page = pages_[idx / PageSize].load(std::memory_order_acquire);
+        return (*page)[idx % PageSize];
+    }
+
+private:
+    using PageArray = std::array<T, PageSize>;
+    PageArray* ensurePage(std::size_t pIdx) {
+        auto* page = pages_[pIdx].load(std::memory_order_relaxed);
+        if (!page) {
+            page = new PageArray();
+            pages_[pIdx].store(page, std::memory_order_release);
+        }
+        return page;
+    }
+
+    std::array<std::atomic<PageArray*>, MaxPages> pages_{};
+    std::atomic<std::size_t> count_{0};
+};
 
 struct ExecutionEdge {
     std::size_t target = InvalidBlockIndex;
@@ -635,6 +739,8 @@ struct ExecutionFunction {
     bool hasFastParamToLocalPrologue = false;
     bool isAsyncFunction = false;
     bool hasStructPayloads = false;
+    AtomicBoolFlag compiled{false};
+    std::uint32_t lazyLocIndex = InvalidStreamOffset;
     std::uint16_t singleZoneSlots = 0;
     std::uint16_t payloadOffset = 0;
     std::uint16_t edgeStructScratchOffset = InvalidCompactReg;
@@ -727,21 +833,78 @@ struct FastFunctionDispatchEntry {
     const ExecutionFunction* execution = nullptr;
 };
 
+struct FieldMetaPairHash {
+    std::size_t operator()(
+        const std::pair<semantic::SymbolId, semantic::SymbolId>& key) const noexcept {
+        const std::uint64_t a = key.first;
+        const std::uint64_t b = key.second;
+        const std::uint64_t h =
+            a ^ (b * 0x9e3779b97f4a7c15ULL + 0x517cc1b727220a95ULL + (a << 6) + (a >> 2));
+        return static_cast<std::size_t>(h);
+    }
+};
+
+struct LazyCompileState {
+    static constexpr std::size_t kMaxDecodedChunks = 16u;
+    struct DecodedChunkEntry {
+        std::uint32_t chunkIndex = std::numeric_limits<std::uint32_t>::max();
+        std::vector<std::uint8_t> bytes;
+    };
+
+    mutable std::mutex mutex;
+    std::shared_ptr<const bytecode::LazyBytecodeBundle> baseBundle;
+    std::vector<DecodedChunkEntry> decodedChunkLru;
+    std::atomic<std::size_t> evictedChunkCount{0};
+    const std::vector<bytecode::Module>* modules = nullptr;
+    const std::unordered_map<semantic::SymbolId, ProgramImage::FunctionLocation>* functions = nullptr;
+    const std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*>* types = nullptr;
+    std::unordered_map<std::string, std::uint32_t> stringLiteralMap;
+    std::unordered_map<semantic::SymbolId, std::uint16_t> objectTemplateByTypeId;
+    std::unordered_map<
+        std::pair<semantic::SymbolId, semantic::SymbolId>,
+        std::uint32_t,
+        FieldMetaPairHash> fieldMetaMap;
+    std::atomic<std::size_t> compiledLazyCount{0};
+    std::size_t totalLazyCount = 0;
+
+    std::uint32_t sinCalleeBaseCost = 0;
+    std::uint16_t sinCalleeCalls = 0;
+    std::uint32_t sinWrapExtraCost = 0;
+    std::uint32_t cosCalleeBaseCost = 0;
+    std::uint16_t cosCalleeCalls = 0;
+    std::uint32_t sqrt64NegCalleeCost = 0;
+    std::uint32_t sqrt64PosBaseCalleeCost = 0;
+    std::uint32_t sqrt64LoopIterCost = 0;
+    std::uint32_t fixedSqrtNegCalleeCost = 0;
+    std::uint32_t fixedSqrtPosBaseCalleeCost = 0;
+    std::uint32_t quatLenPosBaseCalleeCost = 0;
+    std::uint16_t quatLenPosCalls = 0;
+    std::uint32_t quatNormPosBaseCalleeCost = 0;
+    std::uint16_t quatNormPosCalls = 0;
+    std::uint32_t quatFromEulerBaseCalleeCost = 0;
+    std::uint16_t quatFromEulerBaseCalls = 0;
+    std::uint32_t quatLerpPosBaseCalleeCost = 0;
+    std::uint16_t quatLerpPosBaseCalls = 0;
+    std::uint32_t quatLerpDotNegExtraCost = 0;
+    std::uint16_t quatLerpDotNegExtraCalls = 0;
+};
+
 struct ExecutionMirror {
     std::uint64_t instanceId = 0;
-    bool hasAsyncOperations = false;
+    AtomicBoolFlag hasAsyncOperations{false};
     std::unordered_map<const bytecode::Function*, ExecutionFunction> functions;
     std::vector<FastFunctionDispatchEntry> fastFunctionTable;
-    std::vector<FieldAccessMeta> fieldMetas;
-    std::vector<ObjectAllocationTemplate> objectTemplates;
-    std::vector<std::string> stringLiterals;
-    std::vector<Value> constPoolValues;
-    std::vector<StackRefTemplate> stackRefTemplates;
+    StablePagedVector<FieldAccessMeta, 256> fieldMetas;
+    StablePagedVector<ObjectAllocationTemplate, 256> objectTemplates;
+    StablePagedVector<std::string, 256> stringLiterals;
+    StablePagedVector<Value, 256> constPoolValues;
+    StablePagedVector<StackRefTemplate, 256> stackRefTemplates;
     std::unordered_map<semantic::SymbolId, std::uint16_t> stackRefTemplateByTypeId;
     std::unordered_map<semantic::SymbolId, TypeDispatchMetadata> typeDispatch;
-    std::vector<PolymorphicCallSiteDesc> polyCallSites;
-    std::vector<NewDelegateSiteDesc> newDelegateSites;
-    std::vector<InvokeDelegateSiteDesc> invokeDelegateSites;
+    StablePagedVector<PolymorphicCallSiteDesc, 256> polyCallSites;
+    StablePagedVector<NewDelegateSiteDesc, 256> newDelegateSites;
+    StablePagedVector<InvokeDelegateSiteDesc, 256> invokeDelegateSites;
+    mutable std::unique_ptr<LazyCompileState> lazyState;
     struct ParallelBatchFactorySlot {
         std::mutex mutex;
         ParallelBatchKernelFactory factory;
@@ -770,10 +933,27 @@ struct ExecutionMirror {
     }
 };
 
+[[nodiscard]] bool ensureFunctionCompiledSlow(
+    const ExecutionMirror& mirror,
+    const ExecutionFunction& execFn);
+
+[[nodiscard]] inline bool ensureFunctionCompiled(
+    const ExecutionMirror& mirror,
+    const ExecutionFunction& execFn) {
+    if (execFn.compiled.load(std::memory_order_acquire)) {
+        return true;
+    }
+    return ensureFunctionCompiledSlow(mirror, execFn);
+}
+
 [[nodiscard]] std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
     const std::vector<bytecode::Module>& modules,
     const std::unordered_map<
-        semantic::SymbolId, ProgramImage::FunctionLocation>& functions);
+        semantic::SymbolId, ProgramImage::FunctionLocation>& functions,
+    const std::unordered_map<
+        semantic::SymbolId, const semantic::TypeSymbol*>& types,
+    const std::shared_ptr<const bytecode::LazyBytecodeBundle>& lazyBaseBundle = nullptr,
+    const std::unordered_map<const bytecode::Function*, std::uint32_t>* lazyFuncLocIndex = nullptr);
 
 [[nodiscard]] inline const ExecutionFunction* findExecutionFunction(
     const ExecutionMirror& mirror,

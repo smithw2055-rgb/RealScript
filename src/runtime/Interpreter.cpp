@@ -50,28 +50,32 @@ struct InvokeScratchGuard {
                 buf.inlineCacheHeapId = heapId;
                 buf.inlineCacheRestoreEpoch = restoreEpoch;
             }
-            const bool sharedPolyMismatch =
-                (scratch.sharedMirrorId != mirrorId ||
-                 scratch.sharedPolyCallCache.size() != polyCount);
-            const bool sharedDelegateMismatch =
-                (sharedPolyMismatch ||
-                 scratch.sharedDelegateCallCache.size() != delCount ||
+            const bool sharedPolyMirrorMismatch = (scratch.sharedMirrorId != mirrorId);
+            const bool sharedDelegateHeapMismatch =
+                (sharedPolyMirrorMismatch ||
                  scratch.sharedDelegateHeapId != heapId ||
                  scratch.sharedDelegateRestoreEpoch != restoreEpoch);
             if (depthBefore == 0) {
-                if (sharedPolyMismatch) {
+                if (sharedPolyMirrorMismatch) {
                     scratch.sharedPolyCallCache.assign(polyCount, PolymorphicPicSite{});
                     scratch.sharedMirrorId = mirrorId;
+                } else if (scratch.sharedPolyCallCache.size() < polyCount) {
+                    scratch.sharedPolyCallCache.resize(polyCount);
                 }
-                if (sharedDelegateMismatch) {
+                if (sharedDelegateHeapMismatch) {
                     scratch.sharedDelegateCallCache.assign(delCount, DelegateCallSiteCache{});
                     scratch.sharedDelegateHeapId = heapId;
                     scratch.sharedDelegateRestoreEpoch = restoreEpoch;
+                } else if (scratch.sharedDelegateCallCache.size() < delCount) {
+                    scratch.sharedDelegateCallCache.resize(delCount);
                 }
                 state.inlineCallCache = &buf.inlineCallCache;
                 state.polyCallCache = &scratch.sharedPolyCallCache;
                 state.delegateCallCache = &scratch.sharedDelegateCallCache;
-            } else if (!sharedDelegateMismatch) {
+            } else if (!sharedPolyMirrorMismatch &&
+                       !sharedDelegateHeapMismatch &&
+                       scratch.sharedPolyCallCache.size() >= polyCount &&
+                       scratch.sharedDelegateCallCache.size() >= delCount) {
                 state.inlineCallCache = &buf.inlineCallCache;
                 state.polyCallCache = &scratch.sharedPolyCallCache;
                 state.delegateCallCache = &scratch.sharedDelegateCallCache;
@@ -85,12 +89,13 @@ struct InvokeScratchGuard {
             }
             if (bufMirrorChanged ||
                 buf.stringLiteralHeapId != heapId ||
-                buf.stringLiteralGcEpoch != stringEpoch ||
-                buf.stringLiteralCache.size() != mirror.stringLiterals.size()) {
+                buf.stringLiteralGcEpoch != stringEpoch) {
                 buf.stringLiteralCache.assign(mirror.stringLiterals.size(), ObjectRef{});
                 buf.stringLiteralHeapId = heapId;
                 buf.stringLiteralGcEpoch = stringEpoch;
                 buf.stringMirrorId = mirrorId;
+            } else if (buf.stringLiteralCache.size() < mirror.stringLiterals.size()) {
+                buf.stringLiteralCache.resize(mirror.stringLiterals.size());
             }
             state.values = std::move(buf.values);
             state.stack = std::move(buf.stack);
