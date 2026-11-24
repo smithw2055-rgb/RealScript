@@ -1223,13 +1223,51 @@ inline void substituteCompilationUnit(
 
 } // namespace ast_monomorphizer
 
+struct CachedTemplateEntry {
+    std::string key;
+    NativeGenericTemplate tmpl;
+    std::size_t unitIndexInModule = 0;
+};
+
+struct CachedMemberTemplateEntry {
+    std::string methodName;
+    NativeGenericTemplate tmpl;
+    std::size_t unitIndexInModule = 0;
+};
+
+struct CachedSpecializedModule {
+    std::uint64_t transitivePreSpecFp = 0;
+    std::vector<ParsedUnit> postUnits;
+    std::set<std::string> hygienicModules;
+    std::vector<CachedTemplateEntry> typeTemplates;
+    std::vector<CachedTemplateEntry> funcTemplates;
+    std::vector<CachedMemberTemplateEntry> memberTemplates;
+    std::set<std::string> specializations;
+    std::map<std::string, std::pair<std::string, std::vector<std::string>>> instantiatedTypes;
+    std::map<std::string, std::string> specializedReturnTypes;
+    std::vector<LanguageGenericInstantiation> instantiations;
+};
+
+struct ConcreteSpecializedModuleCache final : SpecializedModuleCacheHolder {
+    std::unordered_map<std::string, CachedSpecializedModule> entries;
+    void clear() override { entries.clear(); }
+};
+
 class NativeGenericSpecializer {
 public:
     NativeGenericSpecializer(
         std::vector<std::unique_ptr<ParsedUnit>>& units,
         std::map<std::string, ModuleWork>& modules,
-        BuildResult& result)
-        : units_(units), modules_(modules), result_(result) {}
+        BuildResult& result,
+        CompilerSession::Impl* sessionImpl,
+        std::uint64_t configFp,
+        bool populateSessionCaches)
+        : units_(units),
+          modules_(modules),
+          result_(result),
+          sessionImpl_(sessionImpl),
+          configFp_(configFp),
+          populateSessionCaches_(populateSessionCaches) {}
 
     void run() {
         bool anyGenericSyntax = false;
@@ -1240,13 +1278,119 @@ public:
             }
         }
         if (!anyGenericSyntax) return;
-        for (auto& u : units_) {
-            if (u) detachSyntaxTree(*u);
+
+        std::unordered_map<std::string, std::uint64_t> preSpecTransFp;
+        if (sessionImpl_ != nullptr) {
+            std::unordered_map<std::string, int> state;
+            std::function<std::uint64_t(const std::string&)> computeFp =
+                [&](const std::string& modName) -> std::uint64_t {
+                const auto it = modules_.find(modName);
+                if (it == modules_.end() || it->second.invalid || modName == "$global") return 0;
+                const int st = state[modName];
+                if (st == 1) return 0;
+                if (st == 2) return preSpecTransFp[modName];
+                state[modName] = 1;
+                std::uint64_t fp = combineFingerprint(configFp_, stableFingerprint("mod:" + modName));
+                for (const auto* u : it->second.units) {
+                    if (!u) continue;
+                    fp = combineFingerprint(fp, stableFingerprint(u->source ? u->source->name() : std::string{}));
+                    fp = combineFingerprint(fp, u->sourceFingerprint);
+                }
+                for (const auto& imp : it->second.imports) {
+                    const std::uint64_t subFp = computeFp(imp);
+                    if (subFp == 0) {
+                        state[modName] = 2;
+                        preSpecTransFp[modName] = 0;
+                        return 0;
+                    }
+                    fp = combineFingerprint(fp, subFp);
+                }
+                state[modName] = 2;
+                preSpecTransFp[modName] = fp;
+                return fp;
+            };
+            for (const auto& [modName, mod] : modules_) {
+                (void)mod;
+                (void)computeFp(modName);
+            }
+
+            std::lock_guard<std::mutex> lock(sessionSpecializedModuleCacheMutex(*sessionImpl_));
+            auto& holder = sessionSpecializedModuleCache(*sessionImpl_);
+            auto* concrete = static_cast<ConcreteSpecializedModuleCache*>(holder.get());
+            if (concrete != nullptr) {
+                for (auto& [modName, mod] : modules_) {
+                    const std::uint64_t tfp = preSpecTransFp[modName];
+                    if (tfp == 0 || mod.invalid) continue;
+                    const std::string cacheKey = modName + "#" + std::to_string(tfp);
+                    const auto hit = concrete->entries.find(cacheKey);
+                    if (hit == concrete->entries.end() || hit->second.transitivePreSpecFp != tfp) {
+                        continue;
+                    }
+                    const auto& entry = hit->second;
+                    std::unordered_set<const ParsedUnit*> oldModUnits(
+                        mod.units.begin(), mod.units.end());
+                    units_.erase(
+                        std::remove_if(
+                            units_.begin(),
+                            units_.end(),
+                            [&](const std::unique_ptr<ParsedUnit>& up) {
+                                return up && oldModUnits.count(up.get()) != 0;
+                            }),
+                        units_.end());
+                    mod.units.clear();
+                    mod.units.reserve(entry.postUnits.size());
+                    for (const auto& cu : entry.postUnits) {
+                        auto nu = std::make_unique<ParsedUnit>(cu);
+                        auto* ptr = nu.get();
+                        mod.units.push_back(ptr);
+                        processed_.insert(ptr);
+                        units_.push_back(std::move(nu));
+                    }
+                    mod.hygienicModules.insert(
+                        entry.hygienicModules.begin(), entry.hygienicModules.end());
+                    for (const auto& te : entry.typeTemplates) {
+                        if (te.unitIndexInModule >= mod.units.size()) continue;
+                        auto cp = te.tmpl;
+                        cp.unit = mod.units[te.unitIndexInModule];
+                        registry_.types[modName][te.key] = std::move(cp);
+                    }
+                    for (const auto& fe : entry.funcTemplates) {
+                        if (fe.unitIndexInModule >= mod.units.size()) continue;
+                        auto cp = fe.tmpl;
+                        cp.unit = mod.units[fe.unitIndexInModule];
+                        registry_.functions[modName][fe.key] = std::move(cp);
+                    }
+                    for (const auto& me : entry.memberTemplates) {
+                        if (me.unitIndexInModule >= mod.units.size()) continue;
+                        auto cp = me.tmpl;
+                        cp.unit = mod.units[me.unitIndexInModule];
+                        registry_.members[modName][me.methodName].push_back(std::move(cp));
+                    }
+                    specializations_.insert(
+                        entry.specializations.begin(), entry.specializations.end());
+                    for (const auto& [k, v] : entry.instantiatedTypes) {
+                        instantiatedTypes_[k] = v;
+                    }
+                    for (const auto& [k, v] : entry.specializedReturnTypes) {
+                        specializedReturnTypes_[k] = v;
+                    }
+                    result_.nativeGenericInstantiations.insert(
+                        result_.nativeGenericInstantiations.end(),
+                        entry.instantiations.begin(),
+                        entry.instantiations.end());
+                    preCachedModules_.insert(modName);
+                }
+            }
         }
+
         collectTemplates();
         validateTemplateDeclarationConstraints();
         std::vector<ParsedUnit*> queue;
-        for (auto& unit : units_) queue.push_back(unit.get());
+        for (auto& unit : units_) {
+            if (unit && processed_.find(unit.get()) == processed_.end()) {
+                queue.push_back(unit.get());
+            }
+        }
         for (std::size_t index = 0; index < queue.size(); ++index) {
             auto* unit = queue[index];
             if (!unit || !processed_.insert(unit).second) continue;
@@ -1282,11 +1426,152 @@ public:
                         left.arguments == right.arguments;
                 }),
             result_.nativeGenericInstantiations.end());
+
+        if (sessionImpl_ != nullptr && populateSessionCaches_ && !result_.diagnostics.hasErrors()) {
+            std::lock_guard<std::mutex> lock(sessionSpecializedModuleCacheMutex(*sessionImpl_));
+            auto& holder = sessionSpecializedModuleCache(*sessionImpl_);
+            if (!holder) {
+                holder = std::make_shared<ConcreteSpecializedModuleCache>();
+            }
+            auto* concrete = static_cast<ConcreteSpecializedModuleCache*>(holder.get());
+            if (concrete->entries.size() > 256) {
+                for (auto it = concrete->entries.begin(); it != concrete->entries.end();) {
+                    if (it->first.find(".__spec.") == std::string::npos &&
+                        (it->first.rfind("Aero.", 0) == 0 || it->first.rfind("RealScript.", 0) == 0)) {
+                        ++it;
+                    } else {
+                        it = concrete->entries.erase(it);
+                    }
+                }
+                if (concrete->entries.size() > 256) {
+                    concrete->entries.clear();
+                }
+            }
+            std::unordered_set<std::string> importedByAny;
+            for (const auto& [mn, mw] : modules_) {
+                (void)mn;
+                for (const auto& imp : mw.imports) importedByAny.insert(imp);
+            }
+            for (const auto& [modName, mod] : modules_) {
+                if (modName == "$global" ||
+                    mod.invalid ||
+                    preCachedModules_.count(modName) != 0 ||
+                    (!preCachedModules_.empty() && importedByAny.count(modName) == 0) ||
+                    mutatedModulesByMemberSpec_.count(modName) != 0 ||
+                    modName.find(".__spec.") != std::string::npos) {
+                    continue;
+                }
+                const auto fpIt = preSpecTransFp.find(modName);
+                if (fpIt == preSpecTransFp.end() || fpIt->second == 0) continue;
+                bool hasExternalHygienic = false;
+                for (const auto& hm : mod.hygienicModules) {
+                    if (!moduleImportsTransitively(modName, hm) &&
+                        hm != "RealScript.Async" &&
+                        hm != "RealScript.Resource") {
+                        hasExternalHygienic = true;
+                        break;
+                    }
+                }
+                if (hasExternalHygienic) continue;
+
+                CachedSpecializedModule entry;
+                entry.transitivePreSpecFp = fpIt->second;
+                std::unordered_map<const ParsedUnit*, std::size_t> unitIdxMap;
+                entry.postUnits.reserve(mod.units.size());
+                for (std::size_t idx = 0; idx < mod.units.size(); ++idx) {
+                    unitIdxMap[mod.units[idx]] = idx;
+                    entry.postUnits.push_back(*mod.units[idx]);
+                }
+                entry.hygienicModules = mod.hygienicModules;
+                if (const auto tIt = registry_.types.find(modName); tIt != registry_.types.end()) {
+                    for (const auto& [k, tmpl] : tIt->second) {
+                        const auto uIt = unitIdxMap.find(tmpl.unit);
+                        if (uIt == unitIdxMap.end()) continue;
+                        entry.typeTemplates.push_back(CachedTemplateEntry{k, tmpl, uIt->second});
+                    }
+                }
+                if (const auto fIt = registry_.functions.find(modName); fIt != registry_.functions.end()) {
+                    for (const auto& [k, tmpl] : fIt->second) {
+                        const auto uIt = unitIdxMap.find(tmpl.unit);
+                        if (uIt == unitIdxMap.end()) continue;
+                        entry.funcTemplates.push_back(CachedTemplateEntry{k, tmpl, uIt->second});
+                    }
+                }
+                if (const auto mIt = registry_.members.find(modName); mIt != registry_.members.end()) {
+                    for (const auto& [mName, dq] : mIt->second) {
+                        for (const auto& tmpl : dq) {
+                            const auto uIt = unitIdxMap.find(tmpl.unit);
+                            if (uIt == unitIdxMap.end()) continue;
+                            entry.memberTemplates.push_back(CachedMemberTemplateEntry{mName, tmpl, uIt->second});
+                        }
+                    }
+                }
+                const std::string modSpecPrefix = modName + "::";
+                for (const auto& sp : specializations_) {
+                    if (sp.rfind(modSpecPrefix, 0) == 0) {
+                        entry.specializations.insert(sp);
+                        const auto colonPos = sp.find(':', modSpecPrefix.size());
+                        if (colonPos != std::string::npos) {
+                            const std::string genName = sp.substr(colonPos + 1);
+                            if (const auto itT = instantiatedTypes_.find(genName); itT != instantiatedTypes_.end()) {
+                                entry.instantiatedTypes[genName] = itT->second;
+                            }
+                            if (const auto itR = specializedReturnTypes_.find(genName); itR != specializedReturnTypes_.end()) {
+                                entry.specializedReturnTypes[genName] = itR->second;
+                            }
+                            for (const auto& inst : result_.nativeGenericInstantiations) {
+                                if (inst.generatedName == genName) {
+                                    entry.instantiations.push_back(inst);
+                                }
+                            }
+                        }
+                    }
+                }
+                concrete->entries[modName + "#" + std::to_string(fpIt->second)] = std::move(entry);
+            }
+        }
     }
 
 private:
+    bool moduleImportsTransitively(
+        const std::string& fromMod,
+        const std::string& targetMod) const {
+        if (fromMod == targetMod) return true;
+        std::unordered_set<std::string> visited;
+        std::vector<std::string> stack{fromMod};
+        visited.insert(fromMod);
+        while (!stack.empty()) {
+            const std::string cur = std::move(stack.back());
+            stack.pop_back();
+            const auto it = modules_.find(cur);
+            if (it == modules_.end()) continue;
+            for (const auto& imp : it->second.imports) {
+                if (imp == targetMod) return true;
+                if (visited.insert(imp).second) {
+                    stack.push_back(imp);
+                }
+            }
+        }
+        return false;
+    }
+
+    static std::string sanitizeSpecModulePart(std::string_view modName) {
+        std::string out;
+        out.reserve(modName.size());
+        for (char ch : modName) {
+            if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                (ch >= '0' && ch <= '9') || ch == '_') {
+                out.push_back(ch);
+            } else {
+                out.push_back('_');
+            }
+        }
+        return out.empty() ? std::string("Global") : out;
+    }
+
     void collectTemplates() {
         for (auto& [moduleName, module] : modules_) {
+            if (preCachedModules_.count(moduleName) != 0) continue;
             for (const auto* unit : module.units) {
                 for (const auto& declaration : unit->syntaxTree->classes) {
                     if (declaration.typeParameters.empty()) continue;
@@ -2484,16 +2769,75 @@ private:
         };
 
         const bool isBuiltin = (declaration == nullptr);
-        const auto targetModule = declaration
-            ? declaration->moduleName
-            : ((simpleGenericName == "Awaitable" && resolvedArgs.size() == 1)
-                   ? resolveAwaitableOwnerModule(resolvedArgs[0])
-                   : ((simpleGenericName == "ResourceHandle" &&
-                       modules_.find("RealScript.Resource") != modules_.end() &&
-                       !resolvedArgs.empty() &&
-                       !resolvedArgs[0].ownerModule.empty())
-                          ? resolvedArgs[0].ownerModule
-                          : consumerModule));
+        std::string targetModule;
+        if (declaration) {
+            const std::string& declMod = declaration->moduleName;
+            std::set<std::string> downstreamOwners;
+            if (!function && !declMod.empty() && declMod != "$global") {
+                for (const auto& rArg : resolvedArgs) {
+                    if (!rArg.ownerModule.empty() &&
+                        rArg.ownerModule != "$global" &&
+                        !isBuiltinOrMathTypeArg(rArg) &&
+                        !moduleImportsTransitively(declMod, rArg.ownerModule)) {
+                        downstreamOwners.insert(rArg.ownerModule);
+                    }
+                }
+            }
+            std::vector<std::string> declMangleArgs;
+            declMangleArgs.reserve(resolvedArgs.size());
+            for (const auto& rArg : resolvedArgs) {
+                declMangleArgs.push_back(formatMangleArgument(rArg, declMod, false));
+            }
+            const std::string declGeneratedName =
+                nativeGenericGeneratedName(declaration->name, declMangleArgs);
+            const std::string declKey =
+                declMod + "::" + (function ? "function:" : "type:") + declGeneratedName;
+            if (!function && !declMod.empty() && declMod != "$global" &&
+                declMod.rfind("RealScript.", 0) != 0 &&
+                preCachedModules_.count(declMod) != 0 &&
+                (!downstreamOwners.empty() ||
+                 specializations_.find(declKey) == specializations_.end())) {
+                std::string suffix;
+                if (downstreamOwners.empty()) {
+                    suffix = "__shared";
+                } else {
+                    for (const auto& dm : downstreamOwners) {
+                        if (!suffix.empty()) suffix += "__";
+                        suffix += sanitizeSpecModulePart(dm);
+                    }
+                }
+                const std::string baseDeclMod = [&]() {
+                    const auto sp = declMod.find(".__spec.");
+                    return sp != std::string::npos ? declMod.substr(0, sp) : declMod;
+                }();
+                targetModule = baseDeclMod + ".__spec." + suffix;
+                auto& specMod = modules_[targetModule];
+                specMod.name = targetModule;
+                const auto declModIt = modules_.find(declMod);
+                if (declModIt != modules_.end()) {
+                    specMod.deterministic = declModIt->second.deterministic;
+                    specMod.imports.insert(declMod);
+                    for (const auto& imp : declModIt->second.imports) {
+                        if (imp != targetModule) specMod.imports.insert(imp);
+                    }
+                    specMod.hygienicModules.insert(declMod);
+                    for (const auto& hm : declModIt->second.hygienicModules) {
+                        if (hm != targetModule) specMod.hygienicModules.insert(hm);
+                    }
+                }
+            } else {
+                targetModule = declMod;
+            }
+        } else {
+            targetModule = (simpleGenericName == "Awaitable" && resolvedArgs.size() == 1)
+                ? resolveAwaitableOwnerModule(resolvedArgs[0])
+                : ((simpleGenericName == "ResourceHandle" &&
+                    modules_.find("RealScript.Resource") != modules_.end() &&
+                    !resolvedArgs.empty() &&
+                    !resolvedArgs[0].ownerModule.empty())
+                       ? resolvedArgs[0].ownerModule
+                       : consumerModule);
+        }
 
         if (simpleGenericName == "ResourceHandle" &&
             modules_.find("RealScript.Resource") != modules_.end()) {
@@ -2532,6 +2876,12 @@ private:
         std::set<std::string> specUnitHygienic;
         if (declaration && !declaration->moduleName.empty()) {
             specUnitHygienic.insert(declaration->moduleName);
+            if (const auto dmIt = modules_.find(declaration->moduleName); dmIt != modules_.end()) {
+                specUnitHygienic.insert(
+                    dmIt->second.imports.begin(), dmIt->second.imports.end());
+                specUnitHygienic.insert(
+                    dmIt->second.hygienicModules.begin(), dmIt->second.hygienicModules.end());
+            }
         } else if (simpleGenericName == "ResourceHandle") {
             specUnitHygienic.insert("RealScript.Resource");
         } else if (simpleGenericName == "Awaitable") {
@@ -3886,6 +4236,9 @@ private:
         }
 
         auto* ownerUnit = const_cast<ParsedUnit*>(pending.declaration->unit);
+        if (ownerUnit) {
+            mutatedModulesByMemberSpec_.insert(ownerUnit->moduleName);
+        }
         detachSyntaxTree(*ownerUnit);
         ownerUnit->sourceFingerprint = combineFingerprint(
             ownerUnit->sourceFingerprint,
@@ -4865,11 +5218,8 @@ private:
     }
 
     static void detachSyntaxTree(ParsedUnit& unit) {
-        if (unit.syntaxTree.use_count() > 1 && unit.source) {
-            diagnostics::DiagnosticBag ignored;
-            syntax::Parser parser(*unit.source, ignored);
-            unit.syntaxTree = std::make_shared<syntax::CompilationUnitSyntax>(
-                parser.parseCompilationUnit());
+        if (unit.syntaxTree && unit.syntaxTree.use_count() > 1) {
+            unit.syntaxTree = detail::cloneCompilationUnitSyntax(*unit.syntaxTree);
         }
     }
 
@@ -4933,6 +5283,11 @@ private:
     std::string currentOwnerTypeName_;
     std::map<std::string, std::pair<std::string, std::vector<std::string>>> instantiatedTypes_;
     std::map<std::string, std::string> specializedReturnTypes_;
+    CompilerSession::Impl* sessionImpl_ = nullptr;
+    std::uint64_t configFp_ = 0;
+    bool populateSessionCaches_ = true;
+    std::unordered_set<std::string> preCachedModules_;
+    std::unordered_set<std::string> mutatedModulesByMemberSpec_;
 };
 
 
@@ -4941,8 +5296,12 @@ private:
 void specializeNativeGenerics(
     std::vector<std::unique_ptr<ParsedUnit>>& units,
     std::map<std::string, ModuleWork>& modules,
-    BuildResult& result) {
-    NativeGenericSpecializer specializer(units, modules, result);
+    BuildResult& result,
+    CompilerSession::Impl* sessionImpl,
+    std::uint64_t configFp,
+    bool populateSessionCaches) {
+    NativeGenericSpecializer specializer(
+        units, modules, result, sessionImpl, configFp, populateSessionCaches);
     specializer.run();
 }
 

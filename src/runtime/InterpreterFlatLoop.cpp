@@ -82,7 +82,7 @@ bool executeFunction(
         }
     }
 
-    if (state.executionPolicy != nullptr) {
+    if (state.executionPolicy != nullptr && state.executionPolicy->interceptsCalls()) {
         std::array<Value, 8> policyStackArgs{};
         std::vector<Value> policyHeapArgs;
         const ValueSpan policyArgSpan =
@@ -610,6 +610,10 @@ bool executeFunction(
         const std::uint64_t budgetLimit = state.limits.instructionBudget;
         const detail::FlatInstruction* const streamBase = execution->flatStream.data();
         const detail::FlatInstruction* ip = streamBase + initialEntryOffset;
+        const bool policyInterceptsCalls =
+            state.executionPolicy != nullptr && state.executionPolicy->interceptsCalls();
+        const bool policyChecksSameHeapWrites =
+            state.executionPolicy != nullptr && state.executionPolicy->interceptsSameHeapWrites();
 
         const auto checkFlatFieldWrite = [&](
             const detail::FlatInstruction* curIp,
@@ -1549,7 +1553,7 @@ bool executeFunction(
                         goto L_FlatMathFallback;
                     }
                     RS_FLAT_SPAN_CHECK();
-                    if (RS_FLAT_UNLIKELY(state.executionPolicy != nullptr) &&
+                    if (RS_FLAT_UNLIKELY(policyChecksSameHeapWrites) &&
                         !checkFlatArrayWrite(ip, ce.ref, storeVal)) {
                         goto L_FlatError;
                     }
@@ -1589,7 +1593,7 @@ bool executeFunction(
                     }
                     uIdx = static_cast<std::size_t>(idx);
                 }
-                if (RS_FLAT_UNLIKELY(state.executionPolicy != nullptr) &&
+                if (RS_FLAT_UNLIKELY(policyChecksSameHeapWrites) &&
                     !checkFlatArrayWrite(ip, ce.ref, storeVal)) {
                     goto L_FlatError;
                 }
@@ -1740,7 +1744,8 @@ bool executeFunction(
                             const auto* calleeExec = hit->execution;
                             const auto tKind = calleeExec->trivialKind;
                             if (tKind != detail::TrivialMethodKind::None &&
-                                (state.executionPolicy == nullptr ||
+                                (!(policyInterceptsCalls ||
+                                   (tKind == detail::TrivialMethodKind::StoreThisFieldExact && policyChecksSameHeapWrites)) ||
                                  (ip->inlineArgCount >= 1u && hit->target != nullptr && hit->target->function != nullptr)) &&
                                 RS_FLAT_LIKELY(state.stack.size() < state.limits.recursionLimit)) {
                                 const std::uint64_t totalCost = baseCost + calleeExec->trivialInstCost;
@@ -1861,70 +1866,72 @@ bool executeFunction(
                                         break;
                                     }
                                     if (RS_FLAT_LIKELY(trivialHandled)) {
-                                        if (RS_FLAT_UNLIKELY(state.executionPolicy != nullptr)) {
-                                            std::array<Value, 3> policyArgs{};
-                                            if (ip->inlineArgCount >= 1u) policyArgs[0] = frameBase[ip->src0Slot];
-                                            if (ip->inlineArgCount >= 2u) policyArgs[1] = frameBase[ip->src1Slot];
-                                            if (ip->inlineArgCount >= 3u) policyArgs[2] = frameBase[ip->src2Slot];
-                                            bool intercepted = false;
-                                            Value interceptedResult{};
-                                            RuntimeError policyError{};
-                                            const auto& calleeFn = *hit->target->function;
-                                            if (!state.executionPolicy->interceptCall(
-                                                    calleeFn.symbolId,
-                                                    ValueSpan(policyArgs.data(), ip->inlineArgCount),
-                                                    intercepted,
-                                                    interceptedResult,
-                                                    policyError)) {
-                                                localExecuted += baseCost;
-                                                state.executed = localExecuted;
-                                                state.stack.push_back(&hit->target->qualifiedName);
-                                                state.error = std::move(policyError);
-                                                if (state.error.code == ErrorCode::None) {
-                                                    state.error.code = ErrorCode::CapabilityDenied;
-                                                }
-                                                if (state.error.message.empty()) {
-                                                    state.error.message = "call intercepted and rejected by execution policy";
-                                                }
-                                                state.error.stackTrace = materializeStack(state.stack);
-                                                std::reverse(state.error.stackTrace.begin(), state.error.stackTrace.end());
-                                                populateInterpreterSourceLocations(state);
-                                                state.stack.pop_back();
-                                                goto L_FlatError;
-                                            }
-                                            if (intercepted) {
-                                                localExecuted += baseCost;
-                                                state.executed = localExecuted;
-                                                Value resolvedRet;
-                                                if (calleeFn.returnType == semantic::PrimitiveType::Void) {
-                                                    resolvedRet = std::monostate{};
-                                                } else if (std::holds_alternative<std::monostate>(interceptedResult)) {
-                                                    resolvedRet = hit->target->module
-                                                        ? defaultValue(*hit->target->module, calleeFn.returnType, calleeFn.returnTypeId)
-                                                        : Value{std::monostate{}};
-                                                } else {
-                                                    if (!expectSignatureType(
-                                                            state,
-                                                            interceptedResult,
-                                                            calleeFn.returnType,
-                                                            calleeFn.returnTypeId,
-                                                            "intercepted return value")) {
-                                                        goto L_FlatError;
+                                        if (RS_FLAT_UNLIKELY(policyInterceptsCalls || (doStoreField && policyChecksSameHeapWrites))) {
+                                            if (policyInterceptsCalls) {
+                                                std::array<Value, 3> policyArgs{};
+                                                if (ip->inlineArgCount >= 1u) policyArgs[0] = frameBase[ip->src0Slot];
+                                                if (ip->inlineArgCount >= 2u) policyArgs[1] = frameBase[ip->src1Slot];
+                                                if (ip->inlineArgCount >= 3u) policyArgs[2] = frameBase[ip->src2Slot];
+                                                bool intercepted = false;
+                                                Value interceptedResult{};
+                                                RuntimeError policyError{};
+                                                const auto& calleeFn = *hit->target->function;
+                                                if (!state.executionPolicy->interceptCall(
+                                                        calleeFn.symbolId,
+                                                        ValueSpan(policyArgs.data(), ip->inlineArgCount),
+                                                        intercepted,
+                                                        interceptedResult,
+                                                        policyError)) {
+                                                    localExecuted += baseCost;
+                                                    state.executed = localExecuted;
+                                                    state.stack.push_back(&hit->target->qualifiedName);
+                                                    state.error = std::move(policyError);
+                                                    if (state.error.code == ErrorCode::None) {
+                                                        state.error.code = ErrorCode::CapabilityDenied;
                                                     }
-                                                    resolvedRet = std::move(interceptedResult);
+                                                    if (state.error.message.empty()) {
+                                                        state.error.message = "call intercepted and rejected by execution policy";
+                                                    }
+                                                    state.error.stackTrace = materializeStack(state.stack);
+                                                    std::reverse(state.error.stackTrace.begin(), state.error.stackTrace.end());
+                                                    populateInterpreterSourceLocations(state);
+                                                    state.stack.pop_back();
+                                                    goto L_FlatError;
                                                 }
-                                                ++state.statistics.functionCalls;
-                                                if (state.stack.size() + 1 > state.statistics.maximumCallDepth) {
-                                                    state.statistics.maximumCallDepth = state.stack.size() + 1;
+                                                if (intercepted) {
+                                                    localExecuted += baseCost;
+                                                    state.executed = localExecuted;
+                                                    Value resolvedRet;
+                                                    if (calleeFn.returnType == semantic::PrimitiveType::Void) {
+                                                        resolvedRet = std::monostate{};
+                                                    } else if (std::holds_alternative<std::monostate>(interceptedResult)) {
+                                                        resolvedRet = hit->target->module
+                                                            ? defaultValue(*hit->target->module, calleeFn.returnType, calleeFn.returnTypeId)
+                                                            : Value{std::monostate{}};
+                                                    } else {
+                                                        if (!expectSignatureType(
+                                                                state,
+                                                                interceptedResult,
+                                                                calleeFn.returnType,
+                                                                calleeFn.returnTypeId,
+                                                                "intercepted return value")) {
+                                                            goto L_FlatError;
+                                                        }
+                                                        resolvedRet = std::move(interceptedResult);
+                                                    }
+                                                    ++state.statistics.functionCalls;
+                                                    if (state.stack.size() + 1 > state.statistics.maximumCallDepth) {
+                                                        state.statistics.maximumCallDepth = state.stack.size() + 1;
+                                                    }
+                                                    if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
+                                                    if (ip->dstSlot != detail::InvalidCompactReg) {
+                                                        storeValueIntoFlatFrameSlot(
+                                                            state, *execution, frameOffset, frameBase, ip->dstSlot, resolvedRet);
+                                                    }
+                                                    RS_FLAT_DISPATCH_NEXT();
                                                 }
-                                                if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
-                                                if (ip->dstSlot != detail::InvalidCompactReg) {
-                                                    storeValueIntoFlatFrameSlot(
-                                                        state, *execution, frameOffset, frameBase, ip->dstSlot, resolvedRet);
-                                                }
-                                                RS_FLAT_DISPATCH_NEXT();
                                             }
-                                            if (doStoreField) {
+                                            if (doStoreField && policyChecksSameHeapWrites) {
                                                 const semantic::SymbolId declTid = calleeExec->trivialOwnerTypeId;
                                                 std::string_view fieldName;
                                                 if (state.program != nullptr && declTid != 0) {
@@ -1946,7 +1953,9 @@ bool executeFunction(
                                                         policyErr)) {
                                                     localExecuted += totalCost;
                                                     state.executed = localExecuted;
-                                                    state.stack.push_back(&hit->target->qualifiedName);
+                                                    if (hit->target != nullptr) {
+                                                        state.stack.push_back(&hit->target->qualifiedName);
+                                                    }
                                                     fail(state,
                                                         policyErr.code == ErrorCode::None
                                                             ? ErrorCode::CapabilityDenied
@@ -1954,7 +1963,9 @@ bool executeFunction(
                                                         policyErr.message.empty()
                                                             ? "field write rejected by active execution policy"
                                                             : policyErr.message);
-                                                    state.stack.pop_back();
+                                                    if (hit->target != nullptr) {
+                                                        state.stack.pop_back();
+                                                    }
                                                     goto L_FlatError;
                                                 }
                                             }
@@ -2224,6 +2235,14 @@ bool executeFunction(
                                                ev.typeId == activeMirror.fieldMetas[ip->auxImm32].fieldTypeId);
                                     break;
                                 }
+                                case detail::FastFieldKind::Handle: {
+                                    NativeHandle h{};
+                                    if (val.tryGetNativeHandle(h)) {
+                                        const auto expTid = activeMirror.fieldMetas[ip->auxImm32].fieldTypeId;
+                                        fieldOk = h.valid() ? (h.typeId == expTid) : (h.typeId == 0 || h.typeId == expTid);
+                                    }
+                                    break;
+                                }
                                 default:
                                     break;
                                 }
@@ -2271,7 +2290,7 @@ bool executeFunction(
                                 if (RS_FLAT_LIKELY(static_cast<std::uint8_t>(rhs.rawTag()) ==
                                                    static_cast<std::uint8_t>(ip->binaryOpcode1))) {
                                     RS_FLAT_SPAN_CHECK();
-                                    if (RS_FLAT_UNLIKELY(state.executionPolicy != nullptr) &&
+                                    if (RS_FLAT_UNLIKELY(policyChecksSameHeapWrites) &&
                                         !checkFlatFieldWrite(ip, ref, expectedOwnerTid, fIdx, rhs)) {
                                         goto L_FlatError;
                                     }
@@ -2370,6 +2389,14 @@ bool executeFunction(
                                     }
                                     break;
                                 }
+                                case detail::FastFieldKind::Handle: {
+                                    NativeHandle h{};
+                                    if (rhs.tryGetNativeHandle(h)) {
+                                        const auto expTid = activeMirror.fieldMetas[ip->auxImm32].fieldTypeId;
+                                        rhsOk = h.valid() ? (h.typeId == expTid) : (h.typeId == 0 || h.typeId == expTid);
+                                    }
+                                    break;
+                                }
                                 default:
                                     break;
                                 }
@@ -2378,7 +2405,7 @@ bool executeFunction(
                                     if (RS_FLAT_UNLIKELY(fk == detail::FastFieldKind::UserStruct &&
                                                          rhs.u_.structVal.isFrameSlice())) {
                                         Value detached = detachFrameSliceValue(rhs);
-                                        if (RS_FLAT_UNLIKELY(state.executionPolicy != nullptr) &&
+                                        if (RS_FLAT_UNLIKELY(policyChecksSameHeapWrites) &&
                                             !checkFlatFieldWrite(ip, ref, expectedOwnerTid, fIdx, detached)) {
                                             goto L_FlatError;
                                         }
@@ -2402,7 +2429,7 @@ bool executeFunction(
                                         }
                                         RS_FLAT_DISPATCH_NEXT();
                                     }
-                                    if (RS_FLAT_UNLIKELY(state.executionPolicy != nullptr) &&
+                                    if (RS_FLAT_UNLIKELY(policyChecksSameHeapWrites) &&
                                         !checkFlatFieldWrite(ip, ref, expectedOwnerTid, fIdx, rhs)) {
                                         goto L_FlatError;
                                     }
@@ -4453,7 +4480,7 @@ bool executeFunction(
                 }
                 const std::uint32_t nArgs = ip->inlineArgCount;
                 const std::uint32_t nLocals = ip->aux0Slot;
-                if (RS_FLAT_UNLIKELY(state.executionPolicy != nullptr)) {
+                if (RS_FLAT_UNLIKELY(policyInterceptsCalls)) {
                     const auto enterCold = execution->resolveCold(static_cast<std::size_t>(ip - streamBase));
                     if (enterCold.directTarget != nullptr && enterCold.directTarget->function != nullptr) {
                         std::array<Value, 4> policyArgs{};
@@ -4965,7 +4992,7 @@ bool executeFunction(
                         }
                         uIdx = static_cast<std::size_t>(idx);
                     }
-                    if (RS_FLAT_UNLIKELY(state.executionPolicy != nullptr) &&
+                    if (RS_FLAT_UNLIKELY(policyChecksSameHeapWrites) &&
                         !checkFlatArrayWrite(ip, ce.ref, storeVal)) {
                         goto L_FlatError;
                     }
@@ -5043,7 +5070,7 @@ bool executeFunction(
                     }
                     uIdx = static_cast<std::size_t>(idx);
                 }
-                if (RS_FLAT_UNLIKELY(state.executionPolicy != nullptr) &&
+                if (RS_FLAT_UNLIKELY(policyChecksSameHeapWrites) &&
                     !checkFlatArrayWrite(ip, ce.ref, storeVal)) {
                     goto L_FlatError;
                 }
@@ -5053,7 +5080,7 @@ bool executeFunction(
             }
 
             RS_FLAT_CASE(StoreElementStructFast) {
-                if (RS_FLAT_UNLIKELY(state.executionPolicy != nullptr)) goto L_FlatMathFallback;
+                if (RS_FLAT_UNLIKELY(policyChecksSameHeapWrites)) goto L_FlatMathFallback;
                 const std::uint32_t arrCacheIdx = ip->src0Slot & 3u;
                 auto& ce = arrayCache[arrCacheIdx].entry;
                 const Value& arrVal = frameBase[ip->src0Slot];
@@ -5223,7 +5250,7 @@ bool executeFunction(
                     }
                     uIdx = static_cast<std::size_t>(idx);
                 }
-                if (RS_FLAT_UNLIKELY(state.executionPolicy != nullptr) &&
+                if (RS_FLAT_UNLIKELY(policyChecksSameHeapWrites) &&
                     !checkFlatArrayWrite(ip, ce.ref, storeVal)) {
                     goto L_FlatError;
                 }
@@ -5327,7 +5354,7 @@ bool executeFunction(
                     }
                     uIdx = static_cast<std::size_t>(idx);
                 }
-                if (RS_FLAT_UNLIKELY(state.executionPolicy != nullptr) &&
+                if (RS_FLAT_UNLIKELY(policyChecksSameHeapWrites) &&
                     !checkFlatArrayWrite(ip, ce.ref, storeVal)) {
                     goto L_FlatError;
                 }
@@ -5506,7 +5533,7 @@ bool executeFunction(
                                     if (spanCost > 1u) goto L_FlatSuperFallback;
                                     goto L_FlatBudgetExceeded;
                                 }
-                                if (RS_FLAT_UNLIKELY(state.executionPolicy != nullptr) &&
+                                if (RS_FLAT_UNLIKELY(policyChecksSameHeapWrites) &&
                                     !checkFlatFieldWrite(ip, ref, expectedOwnerTid, fIdx, rhs)) {
                                     goto L_FlatError;
                                 }
@@ -5895,10 +5922,14 @@ bool executeFunction(
 
                 auto& siteCache = (*state.delegateCallCache)[ip->auxImm32];
 
+                const auto calleeExec_isStore = [](const detail::ExecutionFunction* ef) noexcept -> bool {
+                    return ef != nullptr && ef->trivialKind == detail::TrivialMethodKind::StoreThisFieldExact;
+                };
                 const auto tryEvalTrivialLeaf = [&](const ResolvedDelegateLeaf& leaf,
                                                     std::uint64_t preCallCost,
                                                     Value& outTrivialVal) -> bool {
-                    if (state.executionPolicy != nullptr) return false;
+                    if (policyInterceptsCalls ||
+                        (calleeExec_isStore(leaf.execution) && policyChecksSameHeapWrites)) return false;
                     const auto* calleeExec = leaf.execution;
                     const auto tKind = calleeExec->trivialKind;
                     if (tKind == detail::TrivialMethodKind::None ||
@@ -6758,7 +6789,7 @@ bool executeFunction(
                 if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) {
                     goto L_FlatSuperFallback;
                 }
-                if (RS_FLAT_UNLIKELY(state.executionPolicy != nullptr)) {
+                if (RS_FLAT_UNLIKELY(policyChecksSameHeapWrites)) {
                     goto L_FlatSuperFallback;
                 }
                 std::int64_t idx = 0;
@@ -7402,12 +7433,26 @@ bool executeFunction(
                 case detail::FastIntrinsicKind::ArrayPop:
                 case detail::FastIntrinsicKind::ArrayClear:
                 default: {
-                    if (RS_FLAT_UNLIKELY(state.executionPolicy != nullptr)) goto L_FlatGenericFallback;
+                    if (RS_FLAT_UNLIKELY(state.heap == nullptr)) goto L_FlatGenericFallback;
+                    if (RS_FLAT_UNLIKELY(policyChecksSameHeapWrites) &&
+                        (ikind == detail::FastIntrinsicKind::ArrayPop ||
+                         ikind == detail::FastIntrinsicKind::ArrayClear)) {
+                        goto L_FlatGenericFallback;
+                    }
                     std::array<Value, 3> intrArgs{};
                     const std::size_t nArgs = ip->inlineArgCount;
                     if (nArgs >= 1u) intrArgs[0] = frameBase[ip->src0Slot];
                     if (nArgs >= 2u) intrArgs[1] = frameBase[ip->src1Slot];
                     if (nArgs >= 3u) intrArgs[2] = frameBase[ip->src2Slot];
+                    if (RS_FLAT_UNLIKELY(state.executionPolicy != nullptr)) {
+                        const std::uint32_t activeHid = static_cast<std::uint32_t>(state.heap->heapId());
+                        for (std::size_t ai = 0; ai < nArgs; ++ai) {
+                            if (intrArgs[ai].rawTag() == ValueTag::ObjectRef &&
+                                intrArgs[ai].u_.objectRef.heapId != activeHid) {
+                                goto L_FlatGenericFallback;
+                            }
+                        }
+                    }
                     if (RS_FLAT_UNLIKELY(gcActive)) flushFlatGc();
                     Value intrOut;
                     RuntimeError intrErr;
@@ -7453,11 +7498,14 @@ bool executeFunction(
                     RS_FLAT_DISPATCH_NEXT();
                 }
                 case detail::FastIntrinsicKind::ArrayPush: {
-                    if (RS_FLAT_UNLIKELY(state.heap == nullptr || state.executionPolicy != nullptr)) {
+                    if (RS_FLAT_UNLIKELY(state.heap == nullptr || policyChecksSameHeapWrites)) {
                         goto L_FlatGenericFallback;
                     }
                     const Value& arrVal = frameBase[ip->src0Slot];
-                    if (RS_FLAT_UNLIKELY(arrVal.rawTag() != ValueTag::ObjectRef)) goto L_FlatGenericFallback;
+                    if (RS_FLAT_UNLIKELY(arrVal.rawTag() != ValueTag::ObjectRef ||
+                                         arrVal.u_.objectRef.heapId != static_cast<std::uint32_t>(state.heap->heapId()))) {
+                        goto L_FlatGenericFallback;
+                    }
                     const Value& elemVal = frameBase[ip->src1Slot];
                     const Value cleanElem =
                         (elemVal.rawTag() == ValueTag::Struct && elemVal.u_.structVal.isFrameSlice())
@@ -7496,12 +7544,13 @@ bool executeFunction(
                     RS_FLAT_DISPATCH_NEXT();
                 }
                 case detail::FastIntrinsicKind::ArrayRemoveAt: {
-                    if (RS_FLAT_UNLIKELY(state.heap == nullptr || state.executionPolicy != nullptr)) {
+                    if (RS_FLAT_UNLIKELY(state.heap == nullptr || policyChecksSameHeapWrites)) {
                         goto L_FlatGenericFallback;
                     }
                     const Value& arrVal = frameBase[ip->src0Slot];
                     const Value& idxVal = frameBase[ip->src1Slot];
                     if (RS_FLAT_UNLIKELY(arrVal.rawTag() != ValueTag::ObjectRef ||
+                                         arrVal.u_.objectRef.heapId != static_cast<std::uint32_t>(state.heap->heapId()) ||
                                          idxVal.rawTag() != ValueTag::Int64 ||
                                          idxVal.u_.int64Cell.payload < 0)) {
                         goto L_FlatGenericFallback;

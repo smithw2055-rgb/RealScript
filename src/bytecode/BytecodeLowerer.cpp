@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace realscript::bytecode {
 namespace {
@@ -163,7 +165,118 @@ Module Lowerer::lower(const mir::Module& source) const {
         result.version.minor = 9;
     }
     result.sourceFiles = source.sourceFiles;
-    result.types = source.types;
+    if (source.types.size() > 64u) {
+        std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> byId;
+        std::unordered_map<std::string, semantic::SymbolId> byCanon;
+        std::unordered_map<semantic::SymbolId, semantic::SymbolId> arrayElemById;
+        byId.reserve(source.types.size());
+        byCanon.reserve(source.types.size() * 2u);
+        arrayElemById.reserve(source.types.size());
+        for (const auto& t : source.types) {
+            if (t.id != 0) {
+                const std::string canon = semantic::canonicalTypeName(t);
+                byId.emplace(t.id, &t);
+                byCanon.emplace(canon, t.id);
+                byCanon.try_emplace(t.name, t.id);
+                const auto elemPrim = (t.kind == semantic::TypeKind::Struct)
+                    ? semantic::PrimitiveType::Struct
+                    : ((t.kind == semantic::TypeKind::Enum)
+                           ? semantic::PrimitiveType::Enum
+                           : semantic::PrimitiveType::Object);
+                arrayElemById.emplace(
+                    semantic::stableTypeId(semantic::arrayTypeName(elemPrim, canon)),
+                    t.id);
+            }
+        }
+        std::unordered_set<semantic::SymbolId> keepIds;
+        std::vector<semantic::SymbolId> queue;
+        auto markId = [&](semantic::SymbolId tid) {
+            while (tid != 0 && byId.find(tid) == byId.end()) {
+                const auto ait = arrayElemById.find(tid);
+                if (ait == arrayElemById.end()) return;
+                tid = ait->second;
+            }
+            if (tid != 0 && keepIds.insert(tid).second) {
+                queue.push_back(tid);
+            }
+        };
+        auto markName = [&](const std::string& nm, std::string_view fallbackMod) {
+            if (nm.empty()) return;
+            if (nm.find("::") == std::string::npos && !fallbackMod.empty()) {
+                const std::string qual = std::string(fallbackMod) + "::" + nm;
+                if (const auto qit = byCanon.find(qual); qit != byCanon.end()) {
+                    markId(qit->second);
+                    return;
+                }
+            }
+            if (const auto it = byCanon.find(nm); it != byCanon.end()) {
+                markId(it->second);
+                return;
+            }
+            markId(semantic::stableTypeId(nm));
+        };
+        for (const auto& t : source.types) {
+            if (t.moduleName == source.name || t.id == 0) {
+                if (t.id != 0) markId(t.id);
+            }
+        }
+        for (const auto& fn : source.functions) {
+            markId(fn.returnTypeId);
+            for (const auto pid : fn.parameterTypeIds) markId(pid);
+            for (const auto lid : fn.localTypeIds) markId(lid);
+            for (const auto& eh : fn.exceptionHandlers) markId(eh.catchTypeId);
+            for (const auto& bb : fn.blocks) {
+                for (const auto& bp : bb.parameters) markId(bp.typeId);
+                for (const auto& inst : bb.instructions) {
+                    markId(inst.typeId);
+                    markId(inst.resultTypeId);
+                    markId(inst.elementTypeId);
+                    markId(inst.interfaceTypeId);
+                    for (const auto pid : inst.parameterTypeIds) markId(pid);
+                    if (inst.opcode == mir::Opcode::ConstantTypeId &&
+                        inst.integerImmediate != 0) {
+                        markId(static_cast<semantic::SymbolId>(inst.integerImmediate));
+                    }
+                }
+            }
+        }
+        while (!queue.empty()) {
+            const auto curId = queue.back();
+            queue.pop_back();
+            const auto* tPtr = byId[curId];
+            if (!tPtr) continue;
+            markId(tPtr->baseTypeId);
+            markName(tPtr->baseTypeName, tPtr->moduleName);
+            for (const auto& ifn : tPtr->baseInterfaceNames) markName(ifn, tPtr->moduleName);
+            for (const auto& imap : tPtr->interfaceDispatchMaps) {
+                markId(imap.interfaceTypeId);
+            }
+            for (const auto& fld : tPtr->fields) {
+                if (fld.type == semantic::PrimitiveType::Array) {
+                    std::string curArr = fld.typeName;
+                    semantic::PrimitiveType ep = semantic::PrimitiveType::Error;
+                    std::string en;
+                    while (semantic::decodeArrayTypeName(curArr, ep, en)) {
+                        if (ep != semantic::PrimitiveType::Array) {
+                            markName(en, tPtr->moduleName);
+                            break;
+                        }
+                        curArr = en;
+                    }
+                } else {
+                    markName(fld.typeName, tPtr->moduleName);
+                }
+            }
+        }
+        result.types.reserve(keepIds.size() + 4u);
+        for (const auto& t : source.types) {
+            if (t.id == 0 || t.moduleName == source.name || keepIds.count(t.id) != 0u) {
+                result.types.push_back(t);
+            }
+        }
+    } else {
+        result.types = source.types;
+    }
 
     std::unordered_map<std::string, std::uint32_t> referenceIndices;
     std::unordered_map<semantic::SymbolId, std::uint32_t> typeIndices;

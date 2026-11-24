@@ -3725,6 +3725,16 @@ struct ManagedHeap::Impl {
     std::unordered_map<semantic::SymbolId, std::vector<std::uint8_t>> typeDirtyBitMaps;
     std::unordered_map<semantic::SymbolId, semantic::SymbolId> typeBaseIds;
     std::unordered_map<std::uint32_t, std::uint64_t> observerDirtyMasks;
+    std::unordered_map<std::uint32_t, std::uint64_t> objectMutationVersions;
+
+    void bumpMutationVersionUnlocked(std::uint32_t slotIdx) noexcept {
+        auto& ver = objectMutationVersions[slotIdx];
+        if (ver < 2ULL || ver >= 0x3fffffffULL) {
+            ver = 2ULL;
+        } else {
+            ++ver;
+        }
+    }
     std::vector<ObjectRef> dirtyObjectQueue;
     FieldMutationCallback fieldMutationCallback = nullptr;
     void* fieldMutationUserData = nullptr;
@@ -4056,6 +4066,7 @@ struct ManagedHeap::Impl {
         const std::uint64_t dirtyMask = layout.flattenedFieldDirtyMasks[fieldIndex];
         if (dirtyMask != 0ULL) {
             observerDirtyMasks[reference.slot] |= dirtyMask;
+            bumpMutationVersionUnlocked(reference.slot);
             if (!slot) {
                 slot = getSlot(reference);
             }
@@ -4087,6 +4098,7 @@ struct ManagedHeap::Impl {
                         matchedBit = bit;
                     }
                     observerDirtyMasks[reference.slot] |= (std::uint64_t{1} << bit);
+                    bumpMutationVersionUnlocked(reference.slot);
                     if (auto* slot = getSlot(reference); slot && !slot->hasFlag(GcFlag::InDirtyQueue)) {
                         slot->gcFlags |= GcFlag::InDirtyQueue;
                         dirtyObjectQueue.push_back(reference);
@@ -5112,8 +5124,13 @@ struct ManagedHeap::Impl {
             objectViewEpoch.fetch_add(1, std::memory_order_release);
         }
         slot.gcFlags &= static_cast<std::uint8_t>(~GcFlag::InDirtyQueue);
-        if (hasDirtyTrackingTypes && !observerDirtyMasks.empty()) {
-            observerDirtyMasks.erase(slotIdx);
+        if (hasDirtyTrackingTypes) {
+            if (!observerDirtyMasks.empty()) {
+                observerDirtyMasks.erase(slotIdx);
+            }
+            if (!objectMutationVersions.empty()) {
+                objectMutationVersions.erase(slotIdx);
+            }
         }
         if (slotSweepCallback && slot.hasFlag(GcFlag::HasObserver)) {
             const ObjectRef observedRef(
@@ -5813,6 +5830,20 @@ std::size_t ManagedHeap::trimExcessCapacity() noexcept {
         if (impl_->observerDirtyMasks.empty()) {
             reclaimed += impl_->observerDirtyMasks.bucket_count() * sizeof(void*);
             std::unordered_map<std::uint32_t, std::uint64_t>().swap(impl_->observerDirtyMasks);
+        }
+        if (!impl_->objectMutationVersions.empty()) {
+            for (auto vit = impl_->objectMutationVersions.begin();
+                 vit != impl_->objectMutationVersions.end();) {
+                const std::uint32_t idx = vit->first;
+                if (idx >= impl_->slots.size() || !impl_->slots[idx].occupied()) {
+                    vit = impl_->objectMutationVersions.erase(vit);
+                } else {
+                    ++vit;
+                }
+            }
+            if (impl_->objectMutationVersions.empty()) {
+                std::unordered_map<std::uint32_t, std::uint64_t>().swap(impl_->objectMutationVersions);
+            }
         }
         impl_->hasDirtyTrackingTypes =
             !impl_->typeDirtyBitMaps.empty() ||
@@ -8400,6 +8431,27 @@ void ManagedHeap::enableTypeDirtyTracking(
     impl_->objectViewEpoch.fetch_add(1, std::memory_order_release);
 }
 
+void ManagedHeap::enableTypeDirtyTrackingBatch(
+    std::vector<std::pair<semantic::SymbolId, std::vector<std::uint8_t>>> entries) {
+    if (entries.empty()) return;
+    HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
+    bool anyInserted = false;
+    impl_->typeDirtyBitMaps.reserve(impl_->typeDirtyBitMaps.size() + entries.size());
+    for (auto& entry : entries) {
+        if (entry.first == 0) continue;
+        impl_->typeDirtyBitMaps[entry.first] = std::move(entry.second);
+        anyInserted = true;
+    }
+    if (!anyInserted) return;
+    impl_->hasDirtyTrackingTypes =
+        !impl_->typeDirtyBitMaps.empty() ||
+        impl_->fieldMutationCallback != nullptr ||
+        !impl_->observerDirtyMasks.empty();
+    hasDirtyTracking_ = impl_->hasDirtyTrackingTypes;
+    impl_->refreshAllLayoutDirtyMetadataUnlocked();
+    impl_->objectViewEpoch.fetch_add(1, std::memory_order_release);
+}
+
 bool ManagedHeap::markDirtyBit(ObjectRef reference, std::uint8_t bitIndex) noexcept {
     if (bitIndex >= 64u) return false;
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
@@ -8408,6 +8460,7 @@ bool ManagedHeap::markDirtyBit(ObjectRef reference, std::uint8_t bitIndex) noexc
     impl_->hasDirtyTrackingTypes = true;
     hasDirtyTracking_ = true;
     impl_->observerDirtyMasks[reference.slot] |= (std::uint64_t{1} << bitIndex);
+    impl_->bumpMutationVersionUnlocked(reference.slot);
     if (!slot->hasFlag(GcFlag::InDirtyQueue)) {
         slot->gcFlags |= GcFlag::InDirtyQueue;
         impl_->dirtyObjectQueue.push_back(reference);
@@ -8422,6 +8475,14 @@ std::uint64_t ManagedHeap::peekDirtyMask(ObjectRef reference) const noexcept {
     if (!impl_->hasDirtyTrackingTypes || !impl_->getSlot(reference)) return 0u;
     const auto it = impl_->observerDirtyMasks.find(reference.slot);
     return it != impl_->observerDirtyMasks.end() ? it->second : 0u;
+}
+
+std::uint64_t ManagedHeap::peekMutationVersion(ObjectRef reference) const noexcept {
+    HeapReadOrDisjointGuard heapLock(*impl_->syncState);
+    if (!impl_->getSlot(reference)) return 0u;
+    if (!impl_->hasDirtyTrackingTypes || impl_->objectMutationVersions.empty()) return 1u;
+    const auto it = impl_->objectMutationVersions.find(reference.slot);
+    return it != impl_->objectMutationVersions.end() ? it->second : 1u;
 }
 
 std::uint64_t ManagedHeap::consumeDirtyMask(ObjectRef reference) noexcept {
@@ -10301,6 +10362,7 @@ bool ManagedHeap::restore(
     impl_->cardArena.clear();
     impl_->customSlotSizes.clear();
     impl_->observerDirtyMasks.clear();
+    impl_->objectMutationVersions.clear();
     impl_->dirtyObjectQueue.clear();
     impl_->pendingObservedSlotSweeps.clear();
     impl_->hasDirtyTrackingTypes =

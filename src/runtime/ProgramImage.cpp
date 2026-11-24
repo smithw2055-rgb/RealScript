@@ -745,8 +745,7 @@ QuickOpcode computeQuickOpcode(
             instruction.index < module.types[instruction.typeIndex].fields.size() &&
             instruction.index < InvalidCompactReg) {
             const auto& fld = module.types[instruction.typeIndex].fields[instruction.index];
-            if (fld.type != semantic::PrimitiveType::Handle &&
-                fld.type != semantic::PrimitiveType::Void &&
+            if (fld.type != semantic::PrimitiveType::Void &&
                 fld.type != semantic::PrimitiveType::Null &&
                 fld.type != semantic::PrimitiveType::Error &&
                 function.registerTypes[instruction.result] == fld.type) {
@@ -766,8 +765,7 @@ QuickOpcode computeQuickOpcode(
             instruction.index < module.types[instruction.typeIndex].fields.size() &&
             instruction.index < InvalidCompactReg) {
             const auto& fld = module.types[instruction.typeIndex].fields[instruction.index];
-            if (fld.type != semantic::PrimitiveType::Handle &&
-                fld.type != semantic::PrimitiveType::Void &&
+            if (fld.type != semantic::PrimitiveType::Void &&
                 fld.type != semantic::PrimitiveType::Null &&
                 fld.type != semantic::PrimitiveType::Error &&
                 function.registerTypes[instruction.operands[1]] == fld.type) {
@@ -1308,7 +1306,11 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                          (function.returnType == semantic::PrimitiveType::Enum &&
                           function.returnTypeId != 0 &&
                           bb.terminator.value < function.registerTypeIds.size() &&
-                          function.registerTypeIds[bb.terminator.value] == function.returnTypeId))) {
+                          function.registerTypeIds[bb.terminator.value] == function.returnTypeId) ||
+                         (function.returnType == semantic::PrimitiveType::Handle &&
+                          (function.returnTypeId == 0 ||
+                           (bb.terminator.value < function.registerTypeIds.size() &&
+                            function.registerTypeIds[bb.terminator.value] == function.returnTypeId))))) {
                         blockMirror.returnPrevalidatedScalar = true;
                     }
                 }
@@ -1956,6 +1958,17 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
         case semantic::PrimitiveType::String:
             outKind = FastFieldKind::String;
             return true;
+        case semantic::PrimitiveType::Handle: {
+            const auto fTid = exactTypeId(fld.type, fld.typeName);
+            if (fTid == 0) {
+                outKind = FastFieldKind::ExactValueTag;
+                outExactTag = static_cast<std::uint8_t>(ValueTag::NativeHandle);
+                return true;
+            }
+            outKind = FastFieldKind::Handle;
+            outMetaIdx = internFieldMeta(ownerTid, fTid);
+            return true;
+        }
         case semantic::PrimitiveType::Object: {
             const auto fTid = exactTypeId(fld.type, fld.typeName);
             outKind = FastFieldKind::Object;
@@ -7324,7 +7337,7 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
                                computedExprKind == TrivialMethodKind::None) {
                         const auto tag = static_cast<ValueTag>(static_cast<std::uint8_t>(fi.binaryOpcode1));
                         const bool nonRefScalarTag =
-                            (tag >= ValueTag::Bool && tag <= ValueTag::QuatInline) ||
+                            (tag >= ValueTag::Bool && tag <= ValueTag::NativeHandle) ||
                             (tag >= ValueTag::Fixed64 && tag <= ValueTag::QuatfInline);
                         if (nonRefScalarTag &&
                             fi.src0Slot < execFunc.totalFrameSlots &&

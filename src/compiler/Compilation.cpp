@@ -91,7 +91,27 @@ struct CompilerSession::Impl {
     std::unordered_map<std::uint64_t, ParsedUnit> parsedUnitCache;
     mutable std::mutex moduleFrontendCacheMutex;
     std::unordered_map<std::string, CachedModuleFrontend> moduleFrontendCache;
+    mutable std::mutex macroModuleCacheMutex;
+    std::unordered_map<std::string, std::vector<ParsedUnit>> macroModuleCache;
+    mutable std::mutex mergedModuleCacheMutex;
+    std::unordered_map<std::string, detail::CachedMergedModuleEntry> mergedModuleCache;
+    mutable std::mutex specializedModuleCacheMutex;
+    std::shared_ptr<detail::SpecializedModuleCacheHolder> specializedModuleCache;
 };
+
+namespace detail {
+
+std::shared_ptr<SpecializedModuleCacheHolder>&
+sessionSpecializedModuleCache(CompilerSession::Impl& sessionImpl) {
+    return sessionImpl.specializedModuleCache;
+}
+
+std::mutex&
+sessionSpecializedModuleCacheMutex(CompilerSession::Impl& sessionImpl) {
+    return sessionImpl.specializedModuleCacheMutex;
+}
+
+} // namespace detail
 
 CompilerSession::CompilerSession() : impl_(std::make_unique<Impl>()) {}
 CompilerSession::~CompilerSession() = default;
@@ -104,6 +124,20 @@ void CompilerSession::clearCaches() {
     {
         std::lock_guard<std::mutex> lock(impl_->moduleFrontendCacheMutex);
         impl_->moduleFrontendCache.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl_->macroModuleCacheMutex);
+        impl_->macroModuleCache.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl_->mergedModuleCacheMutex);
+        impl_->mergedModuleCache.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(impl_->specializedModuleCacheMutex);
+        if (impl_->specializedModuleCache) {
+            impl_->specializedModuleCache->clear();
+        }
     }
 }
 
@@ -198,6 +232,26 @@ const ModulePackRegistry& ModulePackRegistry::builtinDefaults() {
 }
 
 namespace {
+
+bool isCoreStdlibCacheKey(std::string_view key) noexcept {
+    return key.find(".__spec.") == std::string_view::npos &&
+           (key.rfind("Aero.", 0) == 0 || key.rfind("RealScript.", 0) == 0);
+}
+
+template <typename MapT>
+void trimSessionMapPreservingStdlib(MapT& map, std::size_t maxEntries) {
+    if (map.size() <= maxEntries) return;
+    for (auto it = map.begin(); it != map.end();) {
+        if (isCoreStdlibCacheKey(it->first)) {
+            ++it;
+        } else {
+            it = map.erase(it);
+        }
+    }
+    if (map.size() > maxEntries) {
+        map.clear();
+    }
+}
 
 std::string formatTypeSyntaxKey(const syntax::TypeSyntax& type) {
     std::string out = type.name.text;
@@ -673,7 +727,7 @@ void mergePartialRecordDeclarations(
 
 } // namespace detail
 
-namespace {
+namespace detail {
 
 std::shared_ptr<syntax::CompilationUnitSyntax> cloneCompilationUnitSyntax(
     const syntax::CompilationUnitSyntax& src) {
@@ -706,6 +760,12 @@ std::shared_ptr<syntax::CompilationUnitSyntax> cloneCompilationUnitSyntax(
     cloned->endOfFileToken = src.endOfFileToken;
     return cloned;
 }
+
+} // namespace detail
+
+namespace {
+
+using detail::cloneCompilationUnitSyntax;
 
 template <typename Fn>
 void scanIdentifiersInSource(std::string_view text, Fn&& onIdent) {
@@ -1135,7 +1195,31 @@ void pruneUnreachableAstDeclarations(
     result.prunedFrontendFunctions += prunedFunctions;
 }
 
-void mergePartialTypesInModule(ModuleWork& module, BuildResult& result) {
+void mergePartialTypesInModule(
+    ModuleWork& module,
+    BuildResult& result,
+    CompilerSession::Impl* sessionImpl) {
+    std::string mergeCacheKey;
+    if (sessionImpl != nullptr && !module.invalid && module.name != "$global") {
+        std::uint64_t fp = 14695981039346656037ull;
+        for (const auto* u : module.units) {
+            fp = combineFingerprint(fp, stableFingerprint(u->source ? u->source->name() : std::string{}));
+            fp = combineFingerprint(fp, u->sourceFingerprint);
+        }
+        mergeCacheKey = module.name + "#" + std::to_string(module.units.size()) + "#" + std::to_string(fp);
+        std::lock_guard<std::mutex> lock(sessionImpl->mergedModuleCacheMutex);
+        const auto it = sessionImpl->mergedModuleCache.find(mergeCacheKey);
+        if (it != sessionImpl->mergedModuleCache.end() &&
+            it->second.mergedTrees.size() == module.units.size() &&
+            it->second.hasGenericSyntax.size() == module.units.size()) {
+            for (std::size_t i = 0; i < module.units.size(); ++i) {
+                module.units[i]->syntaxTree = it->second.mergedTrees[i];
+                module.units[i]->hasGenericSyntax = it->second.hasGenericSyntax[i];
+            }
+            return;
+        }
+    }
+
     // Clone shared syntaxTree before mutating so parsedUnitCache stays immutable!
     bool needsTreeMutation = false;
     std::unordered_map<std::string, std::size_t> classCounts;
@@ -1184,6 +1268,20 @@ void mergePartialTypesInModule(ModuleWork& module, BuildResult& result) {
             if (u) u->hasGenericSyntax = true;
         }
     }
+
+    if (sessionImpl != nullptr && !mergeCacheKey.empty() &&
+        !module.invalid && !result.diagnostics.hasErrors()) {
+        detail::CachedMergedModuleEntry entry;
+        entry.mergedTrees.reserve(module.units.size());
+        entry.hasGenericSyntax.reserve(module.units.size());
+        for (const auto* u : module.units) {
+            entry.mergedTrees.push_back(u->syntaxTree);
+            entry.hasGenericSyntax.push_back(u->hasGenericSyntax);
+        }
+        std::lock_guard<std::mutex> lock(sessionImpl->mergedModuleCacheMutex);
+        trimSessionMapPreservingStdlib(sessionImpl->mergedModuleCache, 512);
+        sessionImpl->mergedModuleCache[mergeCacheKey] = std::move(entry);
+    }
 }
 
 } // namespace
@@ -1218,6 +1316,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
     }
     std::uint64_t configFp = 14695981039346656037ull;
     configFp = combineFingerprint(configFp, options_.allowDefaultBuiltinPacks ? 1ull : 0ull);
+    configFp = combineFingerprint(configFp, options_.emitDebugInfo ? 1ull : 0ull);
     configFp = combineFingerprint(configFp, options_.projectConfigFingerprint);
     {
         std::vector<std::string> sortedDisabled(
@@ -1288,7 +1387,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 }
             }
             unit->hasGenericSyntax = (sourceFile.content.find('<') != std::string::npos);
-            if (sessionImpl != nullptr) {
+            if (sessionImpl != nullptr && options_.populateSnapshot) {
                 std::lock_guard<std::mutex> lock(sessionImpl->parsedUnitCacheMutex);
                 if (sessionImpl->parsedUnitCache.size() > 8192) sessionImpl->parsedUnitCache.clear();
                 sessionImpl->parsedUnitCache[fp] = *unit;
@@ -1333,25 +1432,97 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
 
     // Execute registered ICompilerMacroPlugin source generators prior to pack mounting & semantic binding
     if (!options_.macroPlugins.empty()) {
-        std::vector<MacroAstUnitView> views;
-        views.reserve(units.size());
-        for (const auto& u : units) {
-            if (!u || !u->source || !u->syntaxTree) continue;
-            views.push_back(MacroAstUnitView{
-                u->source->name(),
-                u->moduleName,
-                u->imports,
-                u->source.get(),
-                u->syntaxTree.get()});
-        }
-        MacroExpansionContext ctx{views};
-        std::vector<SourceFile> generatedFiles;
+        bool allModuleLocal = (sessionImpl != nullptr);
         for (const auto& plugin : options_.macroPlugins) {
-            if (!plugin) continue;
-            plugin->expand(ctx, generatedFiles, result.diagnostics);
+            if (plugin && !plugin->isModuleLocal()) {
+                allModuleLocal = false;
+                break;
+            }
         }
-        for (const auto& genFile : generatedFiles) {
-            addSourceUnit(genFile);
+        if (allModuleLocal) {
+            std::map<std::string, std::vector<ParsedUnit*>> initialModUnits;
+            for (const auto& u : units) {
+                if (!u || !u->source || !u->syntaxTree) continue;
+                initialModUnits[u->moduleName].push_back(u.get());
+            }
+            for (auto& [modName, modUnits] : initialModUnits) {
+                const auto& modRef = modules[modName];
+                std::string macroKey;
+                if (!modRef.invalid && modName != "$global") {
+                    std::uint64_t fp = configFp;
+                    for (const auto* u : modUnits) {
+                        fp = combineFingerprint(fp, stableFingerprint(u->source->name()));
+                        fp = combineFingerprint(fp, u->sourceFingerprint);
+                    }
+                    for (const auto& imp : modRef.imports) {
+                        fp = combineFingerprint(fp, stableFingerprint("imp:" + imp));
+                    }
+                    macroKey = modName + "#" + std::to_string(fp);
+                    std::lock_guard<std::mutex> lock(sessionImpl->macroModuleCacheMutex);
+                    const auto hit = sessionImpl->macroModuleCache.find(macroKey);
+                    if (hit != sessionImpl->macroModuleCache.end()) {
+                        for (const auto& cachedGen : hit->second) {
+                            auto clonedUnit = std::make_unique<ParsedUnit>(cachedGen);
+                            const std::string fallbackPath =
+                                clonedUnit->source ? clonedUnit->source->name() : std::string{};
+                            registerParsedUnit(std::move(clonedUnit), fallbackPath);
+                        }
+                        continue;
+                    }
+                }
+                std::vector<MacroAstUnitView> views;
+                views.reserve(modUnits.size());
+                for (const auto* u : modUnits) {
+                    views.push_back(MacroAstUnitView{
+                        u->source->name(),
+                        u->moduleName,
+                        u->imports,
+                        u->source.get(),
+                        u->syntaxTree.get()});
+                }
+                MacroExpansionContext ctx{views};
+                std::vector<SourceFile> generatedFiles;
+                const std::size_t diagBefore = result.diagnostics.items().size();
+                for (const auto& plugin : options_.macroPlugins) {
+                    if (!plugin) continue;
+                    plugin->expand(ctx, generatedFiles, result.diagnostics);
+                }
+                std::vector<ParsedUnit> parsedGenerated;
+                parsedGenerated.reserve(generatedFiles.size());
+                for (const auto& genFile : generatedFiles) {
+                    auto genUnit = parseOneSource(genFile);
+                    if (!macroKey.empty() && !genUnit->invalid) {
+                        parsedGenerated.push_back(*genUnit);
+                    }
+                    registerParsedUnit(std::move(genUnit), genFile.path);
+                }
+                if (options_.populateSnapshot && !macroKey.empty() && result.diagnostics.items().size() == diagBefore) {
+                    std::lock_guard<std::mutex> lock(sessionImpl->macroModuleCacheMutex);
+                    trimSessionMapPreservingStdlib(sessionImpl->macroModuleCache, 512);
+                    sessionImpl->macroModuleCache[macroKey] = std::move(parsedGenerated);
+                }
+            }
+        } else {
+            std::vector<MacroAstUnitView> views;
+            views.reserve(units.size());
+            for (const auto& u : units) {
+                if (!u || !u->source || !u->syntaxTree) continue;
+                views.push_back(MacroAstUnitView{
+                    u->source->name(),
+                    u->moduleName,
+                    u->imports,
+                    u->source.get(),
+                    u->syntaxTree.get()});
+            }
+            MacroExpansionContext ctx{views};
+            std::vector<SourceFile> generatedFiles;
+            for (const auto& plugin : options_.macroPlugins) {
+                if (!plugin) continue;
+                plugin->expand(ctx, generatedFiles, result.diagnostics);
+            }
+            for (const auto& genFile : generatedFiles) {
+                addSourceUnit(genFile);
+            }
         }
     }
 
@@ -1404,10 +1575,25 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
     // Merge partial class / partial struct declarations & reconcile partial methods
     for (auto& [modName, mod] : modules) {
         (void)modName;
-        mergePartialTypesInModule(mod, result);
+        mergePartialTypesInModule(mod, result, sessionImpl);
+        if (!options_.populateSnapshot && sessionImpl != nullptr &&
+            modName != "Aero.UI" && modName != "Aero.Native" &&
+            modName.rfind("RealScript.", 0) != 0) {
+            // Avoid retaining one-off leaf user module merged ASTs in shared stdlib session
+            std::lock_guard<std::mutex> lock(sessionImpl->mergedModuleCacheMutex);
+            for (auto it = sessionImpl->mergedModuleCache.begin();
+                 it != sessionImpl->mergedModuleCache.end();) {
+                if (it->first.rfind(modName + "#", 0) == 0) {
+                    it = sessionImpl->mergedModuleCache.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
     }
 
-    specializeNativeGenerics(units, modules, result);
+    specializeNativeGenerics(
+        units, modules, result, sessionImpl, configFp, options_.populateSnapshot);
 
     {
         bool changed = true;
@@ -1458,7 +1644,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         module.sourceFingerprint = sourceFingerprint;
     }
 
-    if (result.nativeGenericInstantiations.empty()) {
+    {
         std::unordered_map<std::string, int> fpState;
         std::function<std::uint64_t(const std::string&)> computeTransitiveFp =
             [&](const std::string& modName) -> std::uint64_t {
@@ -1487,6 +1673,22 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
         for (auto& [moduleName, module] : modules) {
             (void)module;
             (void)computeTransitiveFp(moduleName);
+        }
+        for (auto& [moduleName, module] : modules) {
+            (void)moduleName;
+            if (module.transitiveSourceFingerprint == 0) continue;
+            std::uint64_t tfp = module.transitiveSourceFingerprint;
+            for (const auto& hm : module.hygienicModules) {
+                const auto hmIt = modules.find(hm);
+                if (hmIt == modules.end() || hmIt->second.invalid) {
+                    tfp = 0;
+                    break;
+                }
+                tfp = combineFingerprint(tfp, stableFingerprint("hyg:" + hm));
+                tfp = combineFingerprint(tfp, hmIt->second.sourceFingerprint);
+                tfp = combineFingerprint(tfp, hmIt->second.deterministic ? 1ull : 0ull);
+            }
+            module.transitiveSourceFingerprint = tfp;
         }
         if (previous && sessionImpl != nullptr) {
             std::lock_guard<std::mutex> lock(sessionImpl->moduleFrontendCacheMutex);
@@ -1523,12 +1725,26 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                     result.nativeInterfaces.end(),
                     fcIt->second.nativeInterfaces.begin(),
                     fcIt->second.nativeInterfaces.end());
+                for (const auto& inst : fcIt->second.nativeGenericInstantiations) {
+                    const bool exists = std::any_of(
+                        result.nativeGenericInstantiations.begin(),
+                        result.nativeGenericInstantiations.end(),
+                        [&](const auto& cur) {
+                            return cur.generatedName == inst.generatedName &&
+                                cur.genericName == inst.genericName &&
+                                cur.arguments == inst.arguments;
+                        });
+                    if (!exists) {
+                        result.nativeGenericInstantiations.push_back(inst);
+                    }
+                }
             }
-            // Mark frontendCached modules that are transitively imported by any non-frontendCached module
+            // Mark frontendCached modules that are transitively imported or hygienically referenced by any non-frontendCached module
             std::vector<std::string> dirtyQueue;
             for (const auto& [moduleName, module] : modules) {
                 if (!module.frontendCached) {
                     for (const auto& imp : module.imports) dirtyQueue.push_back(imp);
+                    for (const auto& hm : module.hygienicModules) dirtyQueue.push_back(hm);
                 }
             }
             while (!dirtyQueue.empty()) {
@@ -1538,6 +1754,7 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
                 if (it == modules.end() || it->second.neededByDirtyModule) continue;
                 it->second.neededByDirtyModule = true;
                 for (const auto& imp : it->second.imports) dirtyQueue.push_back(imp);
+                for (const auto& hm : it->second.hygienicModules) dirtyQueue.push_back(hm);
             }
             for (auto& [moduleName, module] : modules) {
                 if (module.frontendCached && module.neededByDirtyModule) {
@@ -1562,9 +1779,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
     closeGlobalInterfacesValidateAttributesAndLayouts(
         modules, result, globalObsoleteSymbols);
 
-    if (sessionImpl != nullptr && result.nativeGenericInstantiations.empty()) {
+    if (sessionImpl != nullptr && options_.populateSnapshot) {
         std::lock_guard<std::mutex> lock(sessionImpl->moduleFrontendCacheMutex);
-        if (sessionImpl->moduleFrontendCache.size() > 4096) sessionImpl->moduleFrontendCache.clear();
+        trimSessionMapPreservingStdlib(sessionImpl->moduleFrontendCache, 4096);
         for (const auto& [moduleName, module] : modules) {
             if (moduleName == "$global" || module.frontendCached || module.invalid || module.transitiveSourceFingerprint == 0) {
                 continue;
@@ -1597,6 +1814,32 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             for (const auto& impl : result.nativeInterfaces) {
                 if (impl.typeName.rfind(prefix, 0) == 0) {
                     fc.nativeInterfaces.push_back(impl);
+                }
+            }
+            for (const auto& inst : result.nativeGenericInstantiations) {
+                bool emitted = false;
+                for (const auto& t : module.types) {
+                    if (t.moduleName == moduleName && t.name == inst.generatedName) {
+                        emitted = true;
+                        break;
+                    }
+                }
+                if (!emitted) {
+                    const auto dotPos = inst.genericName.find('.');
+                    const std::string expectedMemberFnName = dotPos != std::string::npos
+                        ? (inst.genericName.substr(0, dotPos + 1) + inst.generatedName)
+                        : std::string{};
+                    for (const auto& fn : module.declarations) {
+                        if (fn.moduleName == moduleName &&
+                            (fn.name == inst.generatedName ||
+                             (!expectedMemberFnName.empty() && fn.name == expectedMemberFnName))) {
+                            emitted = true;
+                            break;
+                        }
+                    }
+                }
+                if (emitted) {
+                    fc.nativeGenericInstantiations.push_back(inst);
                 }
             }
             const std::string cacheKey =
@@ -1659,6 +1902,9 @@ BuildResult Compilation::build(const BuildSnapshot* previous) const {
             }
             if (cached != previous->modules.end() && !module.invalid &&
                 inlinedUpstreamUnchanged &&
+                (!options_.emitDebugInfo ||
+                 !cached->second.module.sourceFiles.empty() ||
+                 cached->second.module.functions.empty()) &&
                 cached->second.sourceFingerprint == module.sourceFingerprint &&
                 cached->second.publicFingerprint == module.publicFingerprint &&
                 cached->second.dependencyFingerprint == module.dependencyFingerprint) {

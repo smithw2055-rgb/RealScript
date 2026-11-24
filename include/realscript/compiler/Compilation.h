@@ -73,6 +73,7 @@ public:
     [[nodiscard]] virtual std::string name() const = 0;
     [[nodiscard]] virtual std::vector<std::string> macroNames() const { return {}; }
     [[nodiscard]] virtual std::uint64_t fingerprint() const { return 0; }
+    [[nodiscard]] virtual bool isModuleLocal() const noexcept { return false; }
     virtual void expand(
         const MacroExpansionContext& context,
         std::vector<SourceFile>& outGeneratedSources,

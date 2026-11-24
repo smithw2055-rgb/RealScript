@@ -1890,6 +1890,14 @@ class IExecutionPolicy {
 public:
     virtual ~IExecutionPolicy() = default;
 
+    [[nodiscard]] virtual bool interceptsCalls() const noexcept {
+        return true;
+    }
+
+    [[nodiscard]] virtual bool interceptsSameHeapWrites() const noexcept {
+        return true;
+    }
+
     [[nodiscard]] virtual ManagedHeap* resolveHeap(
         ObjectRef reference,
         ManagedHeap* defaultHeap) const noexcept {
@@ -2666,8 +2674,11 @@ public:
     void enableTypeDirtyTracking(
         semantic::SymbolId typeId,
         std::vector<std::uint8_t> fieldToBitMap);
+    void enableTypeDirtyTrackingBatch(
+        std::vector<std::pair<semantic::SymbolId, std::vector<std::uint8_t>>> entries);
     bool markDirtyBit(ObjectRef reference, std::uint8_t bitIndex) noexcept;
     [[nodiscard]] std::uint64_t peekDirtyMask(ObjectRef reference) const noexcept;
+    [[nodiscard]] std::uint64_t peekMutationVersion(ObjectRef reference) const noexcept;
     [[nodiscard]] std::uint64_t consumeDirtyMask(ObjectRef reference) noexcept;
     bool readFieldWithPolicy(
         const ManagedHeap& targetHeap,

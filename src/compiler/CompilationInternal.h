@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -126,7 +127,18 @@ struct CachedModuleFrontend {
     std::vector<LanguageAttributeRecord> nativeAttributes;
     std::vector<LanguageSequenceRecord> nativeSequences;
     std::vector<LanguageInterfaceImplementation> nativeInterfaces;
+    std::vector<LanguageGenericInstantiation> nativeGenericInstantiations;
     std::vector<std::shared_ptr<syntax::CompilationUnitSyntax>> keptSyntaxTrees;
+};
+
+struct CachedMergedModuleEntry {
+    std::vector<std::shared_ptr<syntax::CompilationUnitSyntax>> mergedTrees;
+    std::vector<bool> hasGenericSyntax;
+};
+
+struct SpecializedModuleCacheHolder {
+    virtual ~SpecializedModuleCacheHolder() = default;
+    virtual void clear() = 0;
 };
 
 template <typename T>
@@ -274,10 +286,21 @@ void mergePartialRecordDeclarations(
     std::unordered_map<std::string, MergedPartialTypeOriginInfo>* outMultiPartRecords = nullptr);
 
 // Pipeline stage passes
+[[nodiscard]] std::shared_ptr<syntax::CompilationUnitSyntax> cloneCompilationUnitSyntax(
+    const syntax::CompilationUnitSyntax& src);
+
 void specializeNativeGenerics(
     std::vector<std::unique_ptr<ParsedUnit>>& units,
     std::map<std::string, ModuleWork>& modules,
-    BuildResult& result);
+    BuildResult& result,
+    CompilerSession::Impl* sessionImpl = nullptr,
+    std::uint64_t configFp = 0,
+    bool populateSessionCaches = true);
+
+[[nodiscard]] std::shared_ptr<SpecializedModuleCacheHolder>&
+sessionSpecializedModuleCache(CompilerSession::Impl& sessionImpl);
+[[nodiscard]] std::mutex&
+sessionSpecializedModuleCacheMutex(CompilerSession::Impl& sessionImpl);
 
 void discoverTypesContractsAndLayouts(
     std::map<std::string, ModuleWork>& modules,

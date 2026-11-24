@@ -245,6 +245,10 @@ public:
         return stableFingerprint("realscript.standard_reactive_macros.v1");
     }
 
+    bool isModuleLocal() const noexcept override {
+        return true;
+    }
+
     void expand(
         const MacroExpansionContext& context,
         std::vector<SourceFile>& outGeneratedSources,
