@@ -846,7 +846,7 @@ struct FieldMetaPairHash {
 };
 
 struct LazyCompileState {
-    static constexpr std::size_t kMaxDecodedChunks = 4u;
+    static constexpr std::size_t kMaxDecodedChunks = 2u;
     struct DecodedChunkEntry {
         std::uint32_t chunkIndex = std::numeric_limits<std::uint32_t>::max();
         std::vector<std::uint8_t> bytes;

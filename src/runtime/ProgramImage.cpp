@@ -8580,6 +8580,18 @@ bool ensureFunctionCompiledSlow(
         mutableMirror, *state, *state->functions, *state->types, *execFn.module, *mutableBytecodeFn, mutableExec);
     optimizeSingleExecutionFunctionPass4(mutableExec);
     finalizeCompiledExecutionFunction(mutableExec);
+    mutableBytecodeFn->parameterTypes.shrink_to_fit();
+    mutableBytecodeFn->parameterTypeIds.shrink_to_fit();
+    mutableBytecodeFn->localTypes.shrink_to_fit();
+    mutableBytecodeFn->localTypeIds.shrink_to_fit();
+    mutableBytecodeFn->registerTypes.shrink_to_fit();
+    mutableBytecodeFn->registerTypeIds.shrink_to_fit();
+    mutableBytecodeFn->exceptionHandlers.shrink_to_fit();
+    mutableBytecodeFn->blocks.shrink_to_fit();
+    for (auto& bb : mutableBytecodeFn->blocks) {
+        bb.parameters.shrink_to_fit();
+        bb.instructions.shrink_to_fit();
+    }
     state->compiledLazyCount.fetch_add(1u, std::memory_order_release);
     return true;
 }
