@@ -563,11 +563,299 @@ public int CallAll() {
     std::int64_t val = 0;
     require(res.succeeded && res.value.tryGetInt64(val) && val == 22 + 231,
         "LRU consume-header invoke failed");
-    require(img->decodedLazyChunkCacheSize() <= 16u,
-        "LRU chunk cache exceeded bound 16: " + std::to_string(img->decodedLazyChunkCacheSize()));
+    require(img->decodedLazyChunkCacheSize() <= 4u,
+        "LRU chunk cache exceeded bound 4: " + std::to_string(img->decodedLazyChunkCacheSize()));
     require(img->evictedLazyChunkCount() >= 5u,
         "Expected LRU chunk eviction across 22 distinct chunks, got " +
         std::to_string(img->evictedLazyChunkCount()));
+}
+
+void testM1LazyV3AndRuntimeOptimizations() {
+    auto writeU32Le = [](std::vector<std::uint8_t>& buf, std::size_t off, std::uint32_t v) {
+        buf[off + 0] = static_cast<std::uint8_t>(v & 0xFFu);
+        buf[off + 1] = static_cast<std::uint8_t>((v >> 8u) & 0xFFu);
+        buf[off + 2] = static_cast<std::uint8_t>((v >> 16u) & 0xFFu);
+        buf[off + 3] = static_cast<std::uint8_t>((v >> 24u) & 0xFFu);
+    };
+    auto appendU32Le = [](std::vector<std::uint8_t>& buf, std::uint32_t v) {
+        buf.push_back(static_cast<std::uint8_t>(v & 0xFFu));
+        buf.push_back(static_cast<std::uint8_t>((v >> 8u) & 0xFFu));
+        buf.push_back(static_cast<std::uint8_t>((v >> 16u) & 0xFFu));
+        buf.push_back(static_cast<std::uint8_t>((v >> 24u) & 0xFFu));
+    };
+
+    // 1. Lazy polymorphic dispatch, interface dispatch, NewObject templates, and string predicates
+    std::ostringstream polyBaseSrc;
+    polyBaseSrc << R"RS(
+module Precompiled.PolyBase;
+
+public interface IMeter {
+    int measure();
+}
+
+public class WidgetBase : IMeter {
+    public int tag = 10;
+    public WidgetBase(int t) { tag = t; }
+    public virtual int score() { return tag + 1; }
+    public int measure() { return score(); }
+}
+
+public class WidgetDerived : WidgetBase {
+    public int extra = 20;
+    public WidgetDerived(int t, int e) : base(t) { extra = e; }
+    public override int score() { return tag + extra; }
+}
+
+public WidgetBase makeWidget(bool derived, int a, int b) {
+    if (derived) return new WidgetDerived(a, b);
+    return new WidgetBase(a);
+}
+
+public int measureMeter(IMeter m) {
+    return m.measure();
+}
+
+public int checkLazyExtra(int x) {
+    return x * 3 + 7;
+}
+)RS";
+
+    std::ostringstream userSrc;
+    userSrc << R"RS(
+module User.M1Ops;
+import Precompiled.PolyBase;
+
+)RS";
+    for (int i = 0; i < 80; ++i) {
+        userSrc << "int hostForward" << i << "(int x);\n";
+    }
+    userSrc << R"RS(
+public int polyC1() { WidgetBase b = makeWidget(false, 5, 0); return measureMeter(b); }
+public int polyC2() { WidgetBase d = makeWidget(true, 5, 30); return measureMeter(d); }
+public int polyC3() {
+    WidgetBase b = makeWidget(false, 5, 0);
+    WidgetBase d = makeWidget(true, 5, 30);
+    return (d is WidgetDerived && !(b is WidgetDerived)) ? 100 : 0;
+}
+public int polyC4() {
+    WidgetBase d = makeWidget(true, 5, 30);
+    WidgetDerived casted = d as WidgetDerived;
+    return (casted != null) ? casted.extra : 0;
+}
+public int runPolyChecks() {
+    return polyC1() + polyC2() + polyC3() + polyC4();
+}
+
+public int runStringChecks(string prefixIn, string nullIn) {
+    int total = 0;
+    string hay = "alpha-beta-γδ";
+    string emptyS = "";
+    string pref = "alpha";
+    string suff = "γδ";
+    string mid = "-beta-";
+    if (emptyS.IsEmpty() && !hay.IsEmpty()) {
+        total = total + 1;
+    }
+    if (hay.StartsWith(pref) && hay.EndsWith(suff) && hay.Contains(mid) &&
+        hay.StartsWith(emptyS) && hay.EndsWith(emptyS) && hay.Contains(emptyS) &&
+        hay.Contains(hay) && hay.StartsWith(hay) && hay.EndsWith(hay) &&
+        !hay.StartsWith("beta") && !hay.EndsWith("alpha") && !hay.Contains("zzz")) {
+        total = total + 10;
+    }
+    if (hay.StartsWith(prefixIn) && prefixIn.Contains("-")) {
+        total = total + 2;
+    }
+    if (nullIn != null && nullIn.IsEmpty()) {
+        total = total + 1000;
+    }
+    return total;
+}
+
+public int runManyNatives() {
+    int acc = 0;
+)RS";
+    for (int i = 0; i < 80; ++i) {
+        userSrc << "    acc = acc + hostForward" << i << "(1);\n";
+    }
+    userSrc << R"RS(    return acc;
+}
+
+public int runAfterRelease() {
+    return checkLazyExtra(10);
+}
+
+public bool checkNullStringThrows() {
+    string s = null;
+    return s.StartsWith("a");
+}
+)RS";
+
+    compiler::Compilation baseComp({{"poly_base.rscript", polyBaseSrc.str()}}, {});
+    auto baseBuild = baseComp.build();
+    require(!baseBuild.diagnostics.hasErrors(),
+        "Poly base compile failed:\n" + formatDiagnostics(baseBuild.diagnostics));
+    auto baseBc = lowerMirModules(baseBuild.modules);
+
+    const auto rslbV3 = bytecode::encodeLazyBytecodeBundle(baseBc, /*targetChunkBytes=*/0u);
+    auto v3Bundle = std::make_shared<bytecode::LazyBytecodeBundle>();
+    diagnostics::DiagnosticBag diag;
+    require(bytecode::decodeLazyBytecodeBundleHeader(
+                rslbV3.data(), rslbV3.size(), *v3Bundle, /*copyBlob=*/true, diag, /*skipChecksum=*/false),
+        "RSLB v3 header decode failed");
+    require(rslbV3.size() >= 8u &&
+            (static_cast<std::uint32_t>(rslbV3[4]) |
+             (static_cast<std::uint32_t>(rslbV3[5]) << 8u) |
+             (static_cast<std::uint32_t>(rslbV3[6]) << 16u) |
+             (static_cast<std::uint32_t>(rslbV3[7]) << 24u)) == 3u,
+        "Expected encodeLazyBytecodeBundle binary header version == 3u");
+    require(v3Bundle->sharedStrings.empty(),
+        "Expected RSLB v3 sharedStrings to remain empty");
+    require(!v3Bundle->flatStringSpans.empty() && !v3Bundle->flatStringData.empty(),
+        "Expected RSLB v3 flat string pool to be populated");
+    require(v3Bundle->stringViewAt(0) == v3Bundle->stringCopyAt(0),
+        "Expected stringViewAt and stringCopyAt parity on v3 bundle");
+
+    // 2. Verify RSLB v2 header backward compatibility
+    {
+        std::vector<std::uint8_t> rawV2;
+        appendU32Le(rawV2, 1u); // string count
+        appendU32Le(rawV2, 4u); // "v2ok" len
+        rawV2.push_back('v');
+        rawV2.push_back('2');
+        rawV2.push_back('o');
+        rawV2.push_back('k');
+        appendU32Le(rawV2, 0u); // moduleCount = 0
+        appendU32Le(rawV2, 0u); // locCount = 0
+
+        std::vector<std::uint8_t> compV2;
+        require(bytecode::lz4CompressBlock(rawV2.data(), rawV2.size(), compV2),
+            "Failed to compress synthetic v2 header");
+
+        std::vector<std::uint8_t> rslbV2;
+        rslbV2.insert(rslbV2.end(), rslbV3.begin(), rslbV3.begin() + 40);
+        writeU32Le(rslbV2, 4u, 2u); // formatVersion = 2
+        writeU32Le(rslbV2, 16u, 0u); // chunkCount = 0
+        writeU32Le(rslbV2, 20u, 40u); // compHdrOffset = 40
+        writeU32Le(rslbV2, 24u, static_cast<std::uint32_t>(compV2.size()));
+        writeU32Le(rslbV2, 28u, static_cast<std::uint32_t>(rawV2.size()));
+        writeU32Le(rslbV2, 32u, 0u);
+        writeU32Le(rslbV2, 36u, 0u);
+        rslbV2.insert(rslbV2.end(), compV2.begin(), compV2.end());
+
+        bytecode::LazyBytecodeBundle v2Bundle;
+        diagnostics::DiagnosticBag v2Diag;
+        require(bytecode::decodeLazyBytecodeBundleHeader(
+                    rslbV2.data(), rslbV2.size(), v2Bundle, /*copyBlob=*/true, v2Diag, /*skipChecksum=*/true),
+            "RSLB v2 compat decode failed: " + formatDiagnostics(v2Diag));
+        require(v2Bundle.flatStringSpans.empty(), "Expected v2 bundle flatStringSpans empty");
+        require(v2Bundle.sharedStrings.size() == 1u && v2Bundle.stringViewAt(0) == "v2ok",
+            "Expected v2 bundle stringViewAt(0) == v2ok");
+    }
+
+    // 3. Compile user module against PolyBase sources & link layered
+    compiler::Compilation userComp(
+        {{"poly_base_sig.rscript", polyBaseSrc.str()}, {"m1_user.rscript", userSrc.str()}},
+        {});
+    auto userAllBuild = userComp.build();
+    require(!userAllBuild.diagnostics.hasErrors(),
+        "M1 user compile failed:\n" + formatDiagnostics(userAllBuild.diagnostics));
+    std::vector<bytecode::Module> userOnlyBc;
+    for (const auto& m : lowerMirModules(userAllBuild.modules)) {
+        if (m.name != "Precompiled.PolyBase") {
+            userOnlyBc.push_back(m);
+        }
+    }
+
+    runtime::RuntimeError linkErr;
+    auto layeredOpt = runtime::ProgramImage::linkLayered(v3Bundle, userOnlyBc, linkErr, true);
+    require(layeredOpt.has_value(), "M1 linkLayered failed: " + linkErr.message);
+    auto img = std::make_shared<runtime::ProgramImage>(std::move(*layeredOpt));
+
+    // Confirm findFunction zero-alloc lookup matches Precompiled.PolyBase::checkLazyExtra
+    require(img->findFunction("Precompiled.PolyBase::checkLazyExtra").has_value(),
+        "findFunction failed on Precompiled.PolyBase::checkLazyExtra");
+    require(!img->findFunction("Missing.Module::nope").has_value(),
+        "findFunction unexpectedly matched missing function");
+
+    // Compare eager link vs lazy link on same modules
+    std::vector<bytecode::Module> eagerMods = baseBc;
+    eagerMods.insert(eagerMods.end(), userOnlyBc.begin(), userOnlyBc.end());
+    auto eagerOpt = runtime::ProgramImage::link(std::move(eagerMods), linkErr, true);
+    require(eagerOpt.has_value(), "Eager link failed: " + linkErr.message);
+    auto eagerImg = std::make_shared<runtime::ProgramImage>(std::move(*eagerOpt));
+    runtime::Interpreter eagerInterp(eagerImg);
+    auto eagerPolyRes = eagerInterp.invoke("User.M1Ops::runPolyChecks");
+    std::int64_t eagerPolyVal = 0;
+    require(eagerPolyRes.succeeded && eagerPolyRes.value.tryGetInt64(eagerPolyVal) && eagerPolyVal == 171,
+        "Eager runPolyChecks mismatch");
+
+    runtime::Interpreter interp(img);
+    auto polyRes = interp.invoke("User.M1Ops::runPolyChecks");
+    std::int64_t polyVal = 0;
+    const bool polyOk = polyRes.succeeded && polyRes.value.tryGetInt64(polyVal);
+    require(polyOk && polyVal == 171,
+        "Unexpected runPolyChecks result (tag=" +
+        std::to_string(static_cast<int>(polyRes.value.rawTag())) + "): " +
+        std::to_string(polyVal) + " err=" + polyRes.error.message);
+
+    auto strRes = interp.invoke(
+        "User.M1Ops::runStringChecks",
+        {runtime::Value{std::string{"alpha-"}}, runtime::Value{runtime::NullString{}}});
+    std::int64_t strVal = 0;
+    const bool strOk = strRes.succeeded && strRes.value.tryGetInt64(strVal);
+    require(strOk && strVal == 13,
+        "Unexpected runStringChecks result (tag=" +
+        std::to_string(static_cast<int>(strRes.value.rawTag())) + "): " +
+        std::to_string(strVal) + " err=" + strRes.error.message);
+
+    // Verify decoded lazy chunks > 0 then releaseTransientLazyCaches() -> 0, then call another lazy fn
+    require(img->decodedLazyChunkCacheSize() > 0u && img->decodedLazyChunkCacheSize() <= 4u,
+        "Expected decoded lazy chunks in (0, 4], got " + std::to_string(img->decodedLazyChunkCacheSize()));
+    img->releaseTransientLazyCaches();
+    require(img->decodedLazyChunkCacheSize() == 0u,
+        "Expected releaseTransientLazyCaches() to reset cache size to 0");
+
+    auto afterReleaseRes = interp.invoke("User.M1Ops::runAfterRelease");
+    std::int64_t afterVal = 0;
+    require(afterReleaseRes.succeeded && afterReleaseRes.value.tryGetInt64(afterVal) && afterVal == 37,
+        "runAfterRelease after releaseTransientLazyCaches failed");
+    require(img->decodedLazyChunkCacheSize() == 1u,
+        "Expected post-release lazy execution to repopulate cache to 1 chunk");
+
+    // 4. Null-string intrinsic must fail cleanly with NullReference
+    auto nullRes = interp.invoke("User.M1Ops::checkNullStringThrows");
+    require(!nullRes.succeeded && nullRes.error.code == runtime::ErrorCode::NullReference,
+        "Expected NullReference error for null string StartsWith");
+
+    // 5. Exercise >64 distinct native forwarder bindings across repeated invokes (512-entry TLS cache)
+    auto bindings = std::make_shared<runtime::BindingRegistry>();
+    for (int i = 0; i < 80; ++i) {
+        const std::string bindName = "User.M1Ops::hostForward" + std::to_string(i);
+        require(
+            bindings->bind(
+                bindName,
+                [i](const bytecode::FunctionReference&,
+                    runtime::ValueSpan args,
+                    runtime::RuntimeError&) -> std::optional<runtime::Value> {
+                    return runtime::Value{std::get<std::int64_t>(args[0]) + i};
+                }),
+            "Failed to bind " + bindName);
+    }
+    interp.setBindingRegistry(bindings);
+    std::int64_t expectedNativeSum = 80; // 80 * 1 + sum(0..79)=3160 => 3240
+    for (int i = 0; i < 80; ++i) expectedNativeSum += i;
+    for (int round = 0; round < 3; ++round) {
+        auto natRes = interp.invoke("User.M1Ops::runManyNatives");
+        std::int64_t natVal = 0;
+        require(natRes.succeeded && natRes.value.tryGetInt64(natVal) && natVal == expectedNativeSum,
+            "runManyNatives mismatch on round " + std::to_string(round) + ": " + natRes.error.message);
+    }
+
+    std::cout << "  [M1Stats] rslbV3Bytes=" << rslbV3.size()
+              << " flatPoolBytes=" << v3Bundle->flatStringData.size()
+              << " flatStringCount=" << v3Bundle->flatStringSpans.size()
+              << " decodedChunksAfterRelease=" << img->decodedLazyChunkCacheSize()
+              << "\n";
 }
 
 } // namespace
@@ -577,6 +865,7 @@ int main() {
         testLz4CodecRoundTripAndCorruption();
         testPrecompiledFrontendPackAndLayeredLazyRuntime();
         testConsumeHeaderAndLruChunkEvictionAndLazyGenericsSkip();
+        testM1LazyV3AndRuntimeOptimizations();
         std::cout << "All precompiled_lazy_runtime_tests passed.\n";
         return 0;
     } catch (const std::exception& ex) {

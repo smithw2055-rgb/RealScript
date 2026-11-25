@@ -1631,19 +1631,19 @@ void finalizeCompiledExecutionFunction(ExecutionFunction& execFn) {
     execFn.compiled.store(true, std::memory_order_release);
 }
 
-void populateTypeDispatchAndFastTable(
-    ExecutionMirror& mirror,
-    const std::vector<bytecode::Module>& modules,
-    const std::unordered_map<semantic::SymbolId, ProgramImage::FunctionLocation>& functions) {
-    std::size_t totalTypeCount = 0;
-    for (const auto& module : modules) totalTypeCount += module.types.size();
-    std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> allTypesById;
-    allTypesById.reserve(totalTypeCount);
-    for (const auto& module : modules) {
-        for (const auto& type : module.types) {
-            if (type.id != 0) allTypesById.emplace(type.id, &type);
-        }
+TypeDispatchMetadata buildSingleTypeDispatchMetadata(
+    const ExecutionMirror& mirror,
+    const std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*>& typesById,
+    const std::unordered_map<semantic::SymbolId, ProgramImage::FunctionLocation>& functions,
+    semantic::SymbolId tid) {
+    TypeDispatchMetadata meta;
+    meta.typeId = tid;
+    const auto selfIt = typesById.find(tid);
+    if (selfIt == typesById.end() || selfIt->second == nullptr) {
+        return meta;
     }
+    const auto& type = *selfIt->second;
+
     const auto resolvePrelinkedTarget = [&](semantic::SymbolId symId) noexcept -> PrelinkedDispatchTarget {
         PrelinkedDispatchTarget out{};
         out.symbolId = symId;
@@ -1656,69 +1656,181 @@ void populateTypeDispatchAndFastTable(
         return out;
     };
 
-    mirror.typeDispatch.reserve(allTypesById.size());
-    for (const auto& [tid, typePtr] : allTypesById) {
-        const auto& type = *typePtr;
-        TypeDispatchMetadata meta;
-        meta.typeId = tid;
-
-        auto cur = tid;
-        for (std::size_t depth = 0; cur != 0 && depth < 256; ++depth) {
-            if (std::find(meta.assignableTargetIds.begin(), meta.assignableTargetIds.end(), cur) ==
-                meta.assignableTargetIds.end()) {
-                meta.assignableTargetIds.push_back(cur);
+    auto cur = tid;
+    for (std::size_t depth = 0; cur != 0 && depth < 256; ++depth) {
+        if (std::find(meta.assignableTargetIds.begin(), meta.assignableTargetIds.end(), cur) ==
+            meta.assignableTargetIds.end()) {
+            meta.assignableTargetIds.push_back(cur);
+        }
+        const auto cIt = typesById.find(cur);
+        if (cIt == typesById.end() || cIt->second == nullptr) break;
+        for (const auto& imap : cIt->second->interfaceDispatchMaps) {
+            if (imap.interfaceTypeId != 0 &&
+                std::find(meta.assignableTargetIds.begin(),
+                          meta.assignableTargetIds.end(),
+                          imap.interfaceTypeId) == meta.assignableTargetIds.end()) {
+                meta.assignableTargetIds.push_back(imap.interfaceTypeId);
             }
-            const auto cIt = allTypesById.find(cur);
-            if (cIt == allTypesById.end()) break;
+        }
+        cur = cIt->second->baseTypeId;
+    }
+
+    if (type.kind == semantic::TypeKind::Class) {
+        meta.virtualTargets.reserve(type.virtualDispatchTable.size());
+        for (const auto vSym : type.virtualDispatchTable) {
+            meta.virtualTargets.push_back(resolvePrelinkedTarget(vSym));
+        }
+
+        cur = tid;
+        for (std::size_t depth = 0; cur != 0 && depth < 256; ++depth) {
+            const auto cIt = typesById.find(cur);
+            if (cIt == typesById.end() || cIt->second == nullptr) break;
             for (const auto& imap : cIt->second->interfaceDispatchMaps) {
-                if (imap.interfaceTypeId != 0 &&
-                    std::find(meta.assignableTargetIds.begin(),
-                              meta.assignableTargetIds.end(),
-                              imap.interfaceTypeId) == meta.assignableTargetIds.end()) {
-                    meta.assignableTargetIds.push_back(imap.interfaceTypeId);
+                if (imap.interfaceTypeId == 0) continue;
+                const bool exists = std::any_of(
+                    meta.interfaceMaps.begin(),
+                    meta.interfaceMaps.end(),
+                    [&](const PrelinkedInterfaceMap& m) {
+                        return m.interfaceTypeId == imap.interfaceTypeId;
+                    });
+                if (!exists) {
+                    PrelinkedInterfaceMap pmap;
+                    pmap.interfaceTypeId = imap.interfaceTypeId;
+                    pmap.slots.reserve(imap.slots.size());
+                    for (const auto sSym : imap.slots) {
+                        pmap.slots.push_back(resolvePrelinkedTarget(sSym));
+                    }
+                    meta.interfaceMaps.push_back(std::move(pmap));
                 }
             }
             cur = cIt->second->baseTypeId;
         }
+        std::sort(
+            meta.interfaceMaps.begin(),
+            meta.interfaceMaps.end(),
+            [](const PrelinkedInterfaceMap& a, const PrelinkedInterfaceMap& b) {
+                return a.interfaceTypeId < b.interfaceTypeId;
+            });
+    }
+    return meta;
+}
 
-        if (type.kind == semantic::TypeKind::Class) {
-            meta.virtualTargets.reserve(type.virtualDispatchTable.size());
-            for (const auto vSym : type.virtualDispatchTable) {
-                meta.virtualTargets.push_back(resolvePrelinkedTarget(vSym));
-            }
-
-            cur = tid;
-            for (std::size_t depth = 0; cur != 0 && depth < 256; ++depth) {
-                const auto cIt = allTypesById.find(cur);
-                if (cIt == allTypesById.end()) break;
-                for (const auto& imap : cIt->second->interfaceDispatchMaps) {
-                    if (imap.interfaceTypeId == 0) continue;
-                    const bool exists = std::any_of(
-                        meta.interfaceMaps.begin(),
-                        meta.interfaceMaps.end(),
-                        [&](const PrelinkedInterfaceMap& m) {
-                            return m.interfaceTypeId == imap.interfaceTypeId;
-                        });
-                    if (!exists) {
-                        PrelinkedInterfaceMap pmap;
-                        pmap.interfaceTypeId = imap.interfaceTypeId;
-                        pmap.slots.reserve(imap.slots.size());
-                        for (const auto sSym : imap.slots) {
-                            pmap.slots.push_back(resolvePrelinkedTarget(sSym));
-                        }
-                        meta.interfaceMaps.push_back(std::move(pmap));
-                    }
-                }
-                cur = cIt->second->baseTypeId;
-            }
-            std::sort(
-                meta.interfaceMaps.begin(),
-                meta.interfaceMaps.end(),
-                [](const PrelinkedInterfaceMap& a, const PrelinkedInterfaceMap& b) {
-                    return a.interfaceTypeId < b.interfaceTypeId;
-                });
+bool tryBuildObjectAllocationTemplate(
+    ExecutionMirror& mirror,
+    LazyCompileState& ctx,
+    const semantic::TypeSymbol& type,
+    std::uint16_t& outTemplateIdx) {
+    if (type.id == 0) {
+        return false;
+    }
+    if (const auto it = ctx.objectTemplateByTypeId.find(type.id);
+        it != ctx.objectTemplateByTypeId.end()) {
+        if (it->second == InvalidCompactReg) {
+            return false;
         }
-        mirror.typeDispatch.emplace(tid, std::move(meta));
+        outTemplateIdx = it->second;
+        return true;
+    }
+    if (type.kind != semantic::TypeKind::Class ||
+        type.interfaceType || type.delegateType ||
+        mirror.objectTemplates.size() >= InvalidCompactReg) {
+        ctx.objectTemplateByTypeId.emplace(type.id, InvalidCompactReg);
+        return false;
+    }
+    ObjectAllocationTemplate tmpl;
+    tmpl.typeId = type.id;
+    tmpl.defaultFields.reserve(type.fields.size());
+    std::vector<std::size_t> refIndices;
+    bool allInlineSafe = true;
+    for (std::size_t fIdx = 0; fIdx < type.fields.size(); ++fIdx) {
+        const auto fType = type.fields[fIdx].type;
+        const auto fTid = exactTypeId(fType, type.fields[fIdx].typeName);
+        Value defVal{};
+        switch (fType) {
+        case semantic::PrimitiveType::Bool: defVal = false; break;
+        case semantic::PrimitiveType::Byte: defVal = ByteValue{}; break;
+        case semantic::PrimitiveType::SByte: defVal = SByteValue{}; break;
+        case semantic::PrimitiveType::Short: defVal = ShortValue{}; break;
+        case semantic::PrimitiveType::UShort: defVal = UShortValue{}; break;
+        case semantic::PrimitiveType::Int: defVal = std::int64_t{0}; break;
+        case semantic::PrimitiveType::UInt: defVal = UIntValue{}; break;
+        case semantic::PrimitiveType::Long: defVal = LongValue{}; break;
+        case semantic::PrimitiveType::ULong: defVal = ULongValue{}; break;
+        case semantic::PrimitiveType::Float: defVal = FloatValue{}; break;
+        case semantic::PrimitiveType::Double: defVal = 0.0; break;
+        case semantic::PrimitiveType::Char: defVal = CharValue{}; break;
+        case semantic::PrimitiveType::String:
+            defVal = NullString{};
+            refIndices.push_back(fIdx);
+            break;
+        case semantic::PrimitiveType::Object:
+            defVal = NullObject{};
+            refIndices.push_back(fIdx);
+            break;
+        case semantic::PrimitiveType::Array:
+            defVal = NullArray{};
+            refIndices.push_back(fIdx);
+            break;
+        case semantic::PrimitiveType::Enum:
+            defVal = EnumValue{fTid, 0};
+            break;
+        case semantic::PrimitiveType::Handle: {
+            NativeHandle h{};
+            h.typeId = fTid;
+            defVal = h;
+            break;
+        }
+        case semantic::PrimitiveType::Struct:
+            if (const auto inl = makeDefaultInlineStructValue(fTid); inl.has_value()) {
+                defVal = *inl;
+            } else {
+                allInlineSafe = false;
+            }
+            break;
+        default:
+            allInlineSafe = false;
+            break;
+        }
+        if (!allInlineSafe || defVal.isTraceable()) {
+            allInlineSafe = false;
+            break;
+        }
+        tmpl.defaultFields.push_back(defVal);
+    }
+    if (!allInlineSafe) {
+        ctx.objectTemplateByTypeId.emplace(type.id, InvalidCompactReg);
+        return false;
+    }
+    tmpl.referenceFields = std::make_shared<const std::vector<std::size_t>>(std::move(refIndices));
+    const auto tIdx = static_cast<std::uint16_t>(mirror.objectTemplates.size());
+    mirror.objectTemplates.push_back(std::move(tmpl));
+    ctx.objectTemplateByTypeId.emplace(type.id, tIdx);
+    outTemplateIdx = tIdx;
+    return true;
+}
+
+void populateTypeDispatchAndFastTable(
+    ExecutionMirror& mirror,
+    const std::vector<bytecode::Module>& modules,
+    const std::unordered_map<semantic::SymbolId, ProgramImage::FunctionLocation>& functions,
+    bool lazyMode) {
+    if (!lazyMode) {
+        std::size_t totalTypeCount = 0;
+        for (const auto& module : modules) totalTypeCount += module.types.size();
+        std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> allTypesById;
+        allTypesById.reserve(totalTypeCount);
+        for (const auto& module : modules) {
+            for (const auto& type : module.types) {
+                if (type.id != 0) allTypesById.emplace(type.id, &type);
+            }
+        }
+        mirror.typeDispatch.reserve(allTypesById.size());
+        for (const auto& [tid, typePtr] : allTypesById) {
+            (void)typePtr;
+            mirror.typeDispatch.emplace(
+                tid,
+                buildSingleTypeDispatchMetadata(mirror, allTypesById, functions, tid));
+        }
     }
 
     if (!functions.empty()) {
@@ -1974,81 +2086,14 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
         }
     }
 
-    // Pre-build zero-malloc ObjectAllocationTemplates for concrete classes whose default fields are non-traceable
-    auto& objectTemplateByTypeId = ctx.objectTemplateByTypeId;
-    for (const auto& module : modules) {
-        for (const auto& type : module.types) {
-            if (type.id == 0 || type.kind != semantic::TypeKind::Class ||
-                type.interfaceType || type.delegateType ||
-                objectTemplateByTypeId.find(type.id) != objectTemplateByTypeId.end() ||
-                mirror->objectTemplates.size() >= InvalidCompactReg) {
-                continue;
+    // Pre-build zero-malloc ObjectAllocationTemplates for concrete classes in eager mode;
+    // lazy bundles construct templates on demand during compileSingleExecutionFunctionPass3.
+    if (lazyBaseBundle == nullptr) {
+        for (const auto& module : modules) {
+            for (const auto& type : module.types) {
+                std::uint16_t ignoredIdx = InvalidCompactReg;
+                (void)tryBuildObjectAllocationTemplate(*mirror, ctx, type, ignoredIdx);
             }
-            ObjectAllocationTemplate tmpl;
-            tmpl.typeId = type.id;
-            tmpl.defaultFields.reserve(type.fields.size());
-            std::vector<std::size_t> refIndices;
-            bool allInlineSafe = true;
-            for (std::size_t fIdx = 0; fIdx < type.fields.size(); ++fIdx) {
-                const auto fType = type.fields[fIdx].type;
-                const auto fTid = exactTypeId(fType, type.fields[fIdx].typeName);
-                Value defVal{};
-                switch (fType) {
-                case semantic::PrimitiveType::Bool: defVal = false; break;
-                case semantic::PrimitiveType::Byte: defVal = ByteValue{}; break;
-                case semantic::PrimitiveType::SByte: defVal = SByteValue{}; break;
-                case semantic::PrimitiveType::Short: defVal = ShortValue{}; break;
-                case semantic::PrimitiveType::UShort: defVal = UShortValue{}; break;
-                case semantic::PrimitiveType::Int: defVal = std::int64_t{0}; break;
-                case semantic::PrimitiveType::UInt: defVal = UIntValue{}; break;
-                case semantic::PrimitiveType::Long: defVal = LongValue{}; break;
-                case semantic::PrimitiveType::ULong: defVal = ULongValue{}; break;
-                case semantic::PrimitiveType::Float: defVal = FloatValue{}; break;
-                case semantic::PrimitiveType::Double: defVal = 0.0; break;
-                case semantic::PrimitiveType::Char: defVal = CharValue{}; break;
-                case semantic::PrimitiveType::String:
-                    defVal = NullString{};
-                    refIndices.push_back(fIdx);
-                    break;
-                case semantic::PrimitiveType::Object:
-                    defVal = NullObject{};
-                    refIndices.push_back(fIdx);
-                    break;
-                case semantic::PrimitiveType::Array:
-                    defVal = NullArray{};
-                    refIndices.push_back(fIdx);
-                    break;
-                case semantic::PrimitiveType::Enum:
-                    defVal = EnumValue{fTid, 0};
-                    break;
-                case semantic::PrimitiveType::Handle: {
-                    NativeHandle h{};
-                    h.typeId = fTid;
-                    defVal = h;
-                    break;
-                }
-                case semantic::PrimitiveType::Struct:
-                    if (const auto inl = makeDefaultInlineStructValue(fTid); inl.has_value()) {
-                        defVal = *inl;
-                    } else {
-                        allInlineSafe = false;
-                    }
-                    break;
-                default:
-                    allInlineSafe = false;
-                    break;
-                }
-                if (!allInlineSafe || defVal.isTraceable()) {
-                    allInlineSafe = false;
-                    break;
-                }
-                tmpl.defaultFields.push_back(defVal);
-            }
-            if (!allInlineSafe) continue;
-            tmpl.referenceFields = std::make_shared<const std::vector<std::size_t>>(std::move(refIndices));
-            const auto tIdx = static_cast<std::uint16_t>(mirror->objectTemplates.size());
-            mirror->objectTemplates.push_back(std::move(tmpl));
-            objectTemplateByTypeId.emplace(type.id, tIdx);
         }
     }
 
@@ -2131,8 +2176,8 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
         }
     }
 
-    // Pass 3b: Pre-link per-type virtual & interface dispatch tables + flattened O(1) assignable IDs
-    populateTypeDispatchAndFastTable(*mirror, modules, functions);
+    // Pass 3b: Pre-link per-type virtual & interface dispatch tables (lazy when backed by bundle) + fast table
+    populateTypeDispatchAndFastTable(*mirror, modules, functions, lazyBaseBundle != nullptr);
 
     // Pass 4: Unfold small-frame leaf script functions & thread Jump chains for non-lazy functions
     for (const auto& module : modules) {
@@ -2187,7 +2232,6 @@ void compileSingleExecutionFunctionPass3(
         stringLiteralMap.emplace(text, idx);
         return idx;
     };
-    const auto& objectTemplateByTypeId = ctx.objectTemplateByTypeId;
     auto& fieldMetaMap = ctx.fieldMetaMap;
     const auto internFieldMeta = [&](semantic::SymbolId ownerTid, semantic::SymbolId fieldTid) -> std::uint32_t {
         const auto [it, inserted] = fieldMetaMap.emplace(
@@ -5363,11 +5407,14 @@ void compileSingleExecutionFunctionPass3(
                                         break;
                                     }
                                 }
-                                const auto itTmpl = objectTemplateByTypeId.find(objType.id);
-                                if (itTmpl != objectTemplateByTypeId.end()) {
+                                const auto tIt = types.find(objType.id);
+                                const semantic::TypeSymbol& canonicalType =
+                                    (tIt != types.end() && tIt->second) ? *tIt->second : objType;
+                                std::uint16_t tmplIdx = InvalidCompactReg;
+                                if (tryBuildObjectAllocationTemplate(*mirror, ctx, canonicalType, tmplIdx)) {
                                     flat.flatOpcode = FlatOpcode::NewObjectFast;
                                     flat.dstSlot = regSlot(static_cast<std::uint16_t>(bcInst.result));
-                                    flat.aux0Slot = itTmpl->second;
+                                    flat.aux0Slot = tmplIdx;
                                     break;
                                 }
                             }
@@ -8588,6 +8635,37 @@ const ExecutionMirror& executionMirrorSlow(const ProgramImage& program) {
     return *program.executionMirror_;
 }
 
+const TypeDispatchMetadata* resolveTypeDispatch(
+    const ExecutionMirror& mirror,
+    semantic::SymbolId typeId) noexcept {
+    if (typeId == 0) {
+        return nullptr;
+    }
+    const auto eagerIt = mirror.typeDispatch.find(typeId);
+    if (eagerIt != mirror.typeDispatch.end()) {
+        return &eagerIt->second;
+    }
+    auto* state = mirror.lazyState.get();
+    if (!state || !state->types || !state->functions) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(state->typeDispatchMutex);
+    if (const auto cachedIt = state->lazyTypeDispatchMap.find(typeId);
+        cachedIt != state->lazyTypeDispatchMap.end()) {
+        return cachedIt->second;
+    }
+    if (state->types->find(typeId) == state->types->end()) {
+        state->lazyTypeDispatchMap.emplace(typeId, nullptr);
+        return nullptr;
+    }
+    TypeDispatchMetadata meta = buildSingleTypeDispatchMetadata(
+        mirror, *state->types, *state->functions, typeId);
+    state->lazyTypeDispatchStorage.push_back(std::move(meta));
+    const TypeDispatchMetadata* ptr = &state->lazyTypeDispatchStorage.back();
+    state->lazyTypeDispatchMap.emplace(typeId, ptr);
+    return ptr;
+}
+
 } // namespace detail
 
 namespace {
@@ -8650,7 +8728,6 @@ ProgramImage::ProgramImage(std::vector<bytecode::Module> modules)
     }
     types_.reserve(totalTypes);
     functions_.reserve(totalFunctions);
-    names_.reserve(totalFunctions);
     for (const auto& module : modules_) {
         for (const auto& type : module.types) {
             const auto [it, inserted] = types_.emplace(type.id, &type);
@@ -8664,7 +8741,6 @@ ProgramImage::ProgramImage(std::vector<bytecode::Module> modules)
             functions_.emplace(
                 function.symbolId,
                 FunctionLocation{&module, &function, qualified});
-            names_.emplace(qualified, function.symbolId);
         }
     }
     // ExecutionMirror is built lazily on first detail::executionMirror(program) access.
@@ -9053,15 +9129,50 @@ std::size_t ProgramImage::evictedLazyChunkCount() const noexcept {
     return cached->lazyState->evictedChunkCount.load(std::memory_order_acquire);
 }
 
+void ProgramImage::releaseTransientLazyCaches() const noexcept {
+    const auto* cached = executionMirrorFast_.ptr.load(std::memory_order_acquire);
+    if (!cached || !cached->lazyState) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(cached->lazyState->mutex);
+    std::vector<detail::LazyCompileState::DecodedChunkEntry>().swap(
+        cached->lazyState->decodedChunkLru);
+    auto* mutableMirror = const_cast<detail::ExecutionMirror*>(cached);
+    mutableMirror->fieldMetas.shrink_to_fit();
+    mutableMirror->objectTemplates.shrink_to_fit();
+    mutableMirror->stringLiterals.shrink_to_fit();
+    mutableMirror->constPoolValues.shrink_to_fit();
+    mutableMirror->stackRefTemplates.shrink_to_fit();
+    mutableMirror->polyCallSites.shrink_to_fit();
+    mutableMirror->newDelegateSites.shrink_to_fit();
+    mutableMirror->invokeDelegateSites.shrink_to_fit();
+}
+
 std::size_t ProgramImage::functionCount() const noexcept { return functions_.size(); }
 std::size_t ProgramImage::moduleCount() const noexcept { return modules_.size(); }
 bool ProgramImage::contains(semantic::SymbolId symbolId) const noexcept {
     return functions_.find(symbolId) != functions_.end();
 }
 std::optional<semantic::SymbolId> ProgramImage::findFunction(const std::string& qualifiedName) const {
-    const auto found = names_.find(qualifiedName);
-    if (found == names_.end()) return std::nullopt;
-    return found->second;
+    const auto sep = qualifiedName.find("::");
+    if (sep == std::string::npos) {
+        return std::nullopt;
+    }
+    const std::string_view modName(qualifiedName.data(), sep);
+    const std::string_view fnName(
+        qualifiedName.data() + sep + 2,
+        qualifiedName.size() - (sep + 2));
+    for (const auto& module : modules_) {
+        if (module.name != modName) {
+            continue;
+        }
+        for (const auto& function : module.functions) {
+            if (function.name == fnName) {
+                return function.symbolId;
+            }
+        }
+    }
+    return std::nullopt;
 }
 
 const ProgramImage::FunctionLocation* ProgramImage::resolveFunction(

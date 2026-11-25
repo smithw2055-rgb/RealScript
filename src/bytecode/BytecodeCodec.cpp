@@ -493,12 +493,39 @@ struct FunctionRecord {
     std::uint32_t codeSize = 0;
 };
 
+struct StringLookup {
+    const std::vector<std::string>* vec = nullptr;
+    const LazyBytecodeBundle* bundle = nullptr;
+
+    StringLookup() noexcept = default;
+    StringLookup(const std::vector<std::string>& strings) noexcept : vec(&strings) {}
+    StringLookup(const LazyBytecodeBundle& b) noexcept : bundle(&b) {}
+
+    [[nodiscard]] std::size_t size() const noexcept {
+        return bundle ? bundle->stringCount() : (vec ? vec->size() : 0u);
+    }
+
+    [[nodiscard]] bool validIndex(std::uint32_t index) const noexcept {
+        return static_cast<std::size_t>(index) < size();
+    }
+
+    [[nodiscard]] std::string copyAt(std::uint32_t index) const {
+        if (bundle) {
+            return bundle->stringCopyAt(index);
+        }
+        if (vec && index < vec->size()) {
+            return (*vec)[index];
+        }
+        return {};
+    }
+};
+
 bool validStringIndex(
     std::uint32_t index,
-    const std::vector<std::string>& strings,
+    const StringLookup& strings,
     diagnostics::DiagnosticBag& diagnostics,
     const char* message) {
-    if (index >= strings.size()) {
+    if (!strings.validIndex(index)) {
         diagnostics.report("RS5007", message, {});
         return false;
     }
@@ -895,6 +922,69 @@ void writeStringTable(Writer& out, const StringPool& strings) {
     }
 }
 
+void writeStringTableV3(Writer& out, const StringPool& strings) {
+    const auto& vals = strings.values();
+    std::size_t totalChars = 0u;
+    for (const auto& value : vals) {
+        totalChars += value.size();
+    }
+    out.u32(static_cast<std::uint32_t>(vals.size()));
+    out.u32(static_cast<std::uint32_t>(totalChars));
+    for (const auto& value : vals) {
+        out.u32(static_cast<std::uint32_t>(value.size()));
+    }
+    for (const auto& value : vals) {
+        if (!value.empty()) {
+            out.bytes(value.data(), value.size());
+        }
+    }
+}
+
+bool readFlatStringPoolV3(
+    Reader& reader,
+    LazyBytecodeBundle& outBundle,
+    diagnostics::DiagnosticBag& diagnostics) {
+    const auto count = reader.u32();
+    const auto totalChars = reader.u32();
+    if (!reader.valid() ||
+        count == 0u ||
+        count > reader.remaining() / 4u ||
+        static_cast<std::size_t>(totalChars) > reader.remaining() - static_cast<std::size_t>(count) * 4u) {
+        diagnostics.report("RS5003", "truncated v3 flat string pool", {});
+        return false;
+    }
+    outBundle.flatStringSpans.resize(count);
+    std::size_t runningOffset = 0u;
+    for (std::uint32_t index = 0u; index < count; ++index) {
+        const auto len = reader.u32();
+        if (!reader.valid() || static_cast<std::size_t>(len) > static_cast<std::size_t>(totalChars) - runningOffset) {
+            diagnostics.report("RS5003", "invalid v3 flat string span", {});
+            outBundle.flatStringSpans.clear();
+            return false;
+        }
+        outBundle.flatStringSpans[index] = LazyStringSpan{
+            static_cast<std::uint32_t>(runningOffset),
+            len};
+        runningOffset += len;
+    }
+    if (runningOffset != static_cast<std::size_t>(totalChars)) {
+        diagnostics.report("RS5003", "v3 flat string byte total mismatch", {});
+        outBundle.flatStringSpans.clear();
+        return false;
+    }
+    outBundle.flatStringData.resize(totalChars);
+    for (std::uint32_t i = 0u; i < totalChars; ++i) {
+        outBundle.flatStringData[i] = static_cast<char>(reader.u8());
+    }
+    if (!reader.valid()) {
+        diagnostics.report("RS5003", "truncated v3 flat string bytes", {});
+        outBundle.flatStringSpans.clear();
+        outBundle.flatStringData.clear();
+        return false;
+    }
+    return true;
+}
+
 bool readStringTable(
     Reader& reader,
     std::vector<std::string>& strings,
@@ -1084,7 +1174,7 @@ void writeReferenceSectionBody(
 
 bool readReferenceSectionBody(
     Reader& reader,
-    const std::vector<std::string>& strings,
+    const StringLookup& strings,
     Module& module,
     diagnostics::DiagnosticBag& diagnostics) {
     const auto count = reader.u32();
@@ -1101,7 +1191,7 @@ bool readReferenceSectionBody(
                 "invalid reference name string index")) {
             return false;
         }
-        reference.name = strings[nameIndex];
+        reference.name = strings.copyAt(nameIndex);
         if (!decodeType(reader.u8(), reference.returnType)) {
             diagnostics.report("RS5004", "invalid function reference return type", {});
             return false;
@@ -1541,7 +1631,7 @@ void writeLanguageMetadataSectionBody(
 
 bool readLanguageMetadataSectionBody(
     Reader& reader,
-    const std::vector<std::string>& strings,
+    const StringLookup& strings,
     Module& module,
     std::vector<DecodedTypeSchema>& decodedTypeSchemas,
     diagnostics::DiagnosticBag& diagnostics,
@@ -1552,7 +1642,7 @@ bool readLanguageMetadataSectionBody(
         if (!reader.valid() || !validStringIndex(index, strings, diagnostics, message)) {
             return false;
         }
-        value = strings[index];
+        value = strings.copyAt(index);
         return true;
     };
 
@@ -1832,7 +1922,7 @@ void writeFunctionCodeBody(
 
 bool readFunctionCodeBody(
     Reader& reader,
-    const std::vector<std::string>& strings,
+    const StringLookup& strings,
     Function& function,
     bool includeExceptions,
     diagnostics::DiagnosticBag& diagnostics) {
@@ -1915,7 +2005,7 @@ bool readFunctionCodeBody(
                         "invalid constant string index")) {
                     return false;
                 }
-                instruction.stringImmediate = strings[stringIndex];
+                instruction.stringImmediate = strings.copyAt(stringIndex);
             } else if (stringIndex != InvalidIndex) {
                 diagnostics.report("RS5007", "unexpected instruction string index", {});
                 return false;
@@ -1989,7 +2079,7 @@ void writeSourceFilesTable(
 
 bool readSourceFilesTable(
     Reader& reader,
-    const std::vector<std::string>& strings,
+    const StringLookup& strings,
     std::vector<debug::SourceFileInfo>& sourceFiles,
     diagnostics::DiagnosticBag& diagnostics) {
     const auto sourceCount = reader.u32();
@@ -2006,7 +2096,7 @@ bool readSourceFilesTable(
                 "invalid debug source-file path index")) {
             return false;
         }
-        source.path = strings[pathIndex];
+        source.path = strings.copyAt(pathIndex);
         source.contentHash = reader.u64();
         const auto lineCount = reader.u32();
         if (!reader.valid() || lineCount > reader.remaining() / 4) {
@@ -2057,7 +2147,7 @@ void writeFunctionDebugCore(
 
 bool readFunctionDebugCore(
     Reader& reader,
-    const std::vector<std::string>& strings,
+    const StringLookup& strings,
     const std::vector<debug::SourceFileInfo>& sourceFiles,
     Function& function,
     bool inlineLineMap,
@@ -2091,7 +2181,7 @@ bool readFunctionDebugCore(
                         "invalid sequence-point mapped path index")) {
                     return false;
                 }
-                point.mappedPath = strings[pathIdx];
+                point.mappedPath = strings.copyAt(pathIdx);
             }
         }
         info.sequencePoints.push_back(std::move(point));
@@ -2109,7 +2199,7 @@ bool readFunctionDebugCore(
                 "invalid local-debug name index")) {
             return false;
         }
-        local.name = strings[nameIndex];
+        local.name = strings.copyAt(nameIndex);
         local.slot = reader.u32();
         if (!decodeType(reader.u8(), local.type)) {
             diagnostics.report("RS5004", "invalid local-debug type", {});
@@ -2669,21 +2759,31 @@ bool readSparseTypeIds(
     return r.valid();
 }
 
-void addLazyFunctionSymbolStringsV2(
+void addLazyFunctionSymbolStringsV3(
     StringPool& strings,
-    const semantic::FunctionSymbol& fn) {
-    strings.add(fn.declaringTypeName);
-    strings.add(fn.moduleName);
+    const semantic::FunctionSymbol& fn,
+    semantic::SymbolId ownerTypeId,
+    std::string_view ownerModName) {
+    if (fn.declaringTypeId != ownerTypeId && !fn.declaringTypeName.empty()) {
+        strings.add(fn.declaringTypeName);
+    }
+    if (fn.moduleName != ownerModName && !fn.moduleName.empty()) {
+        strings.add(fn.moduleName);
+    }
     strings.add(fn.name);
-    strings.add(fn.returnTypeName);
-    strings.add(fn.storageReturnTypeName);
+    if (!fn.returnTypeName.empty()) strings.add(fn.returnTypeName);
+    if (!fn.storageReturnTypeName.empty() && fn.storageReturnTypeName != fn.returnTypeName) {
+        strings.add(fn.storageReturnTypeName);
+    }
     for (const auto& p : fn.parameters) {
-        strings.add(p.typeName);
-        strings.add(p.storageTypeName);
+        if (!p.typeName.empty()) strings.add(p.typeName);
+        if (!p.storageTypeName.empty() && p.storageTypeName != p.typeName) {
+            strings.add(p.storageTypeName);
+        }
     }
 }
 
-void collectLazyStringsV2(
+void collectLazyStringsV3(
     StringPool& strings,
     const std::vector<Module>& modules) {
     for (const auto& module : modules) {
@@ -2695,7 +2795,9 @@ void collectLazyStringsV2(
             for (const auto& field : type.fields) {
                 strings.add(field.name);
                 if (!field.typeName.empty()) strings.add(field.typeName);
-                strings.add(field.declaringTypeName);
+                if (field.declaringTypeId != type.id && !field.declaringTypeName.empty()) {
+                    strings.add(field.declaringTypeName);
+                }
                 if (field.hasConstantValue &&
                     std::holds_alternative<std::string>(field.constantValue)) {
                     strings.add(std::get<std::string>(field.constantValue));
@@ -2709,14 +2811,14 @@ void collectLazyStringsV2(
                 if (keepAllMethods ||
                     method.declaringTypeId == 0u ||
                     method.declaringTypeId == type.id) {
-                    addLazyFunctionSymbolStringsV2(strings, method);
+                    addLazyFunctionSymbolStringsV3(strings, method, type.id, module.name);
                 }
             }
             for (const auto& ctor : type.constructors) {
-                addLazyFunctionSymbolStringsV2(strings, ctor);
+                addLazyFunctionSymbolStringsV3(strings, ctor, type.id, module.name);
             }
             if (type.staticConstructor) {
-                addLazyFunctionSymbolStringsV2(strings, *type.staticConstructor);
+                addLazyFunctionSymbolStringsV3(strings, *type.staticConstructor, type.id, module.name);
             }
             for (const auto& prop : type.properties) {
                 if (!type.interfaceType &&
@@ -2726,9 +2828,11 @@ void collectLazyStringsV2(
                     continue;
                 }
                 strings.add(prop.name);
-                strings.add(prop.declaringTypeName);
-                if (prop.getter) addLazyFunctionSymbolStringsV2(strings, *prop.getter);
-                if (prop.setter) addLazyFunctionSymbolStringsV2(strings, *prop.setter);
+                if (prop.declaringTypeId != type.id && !prop.declaringTypeName.empty()) {
+                    strings.add(prop.declaringTypeName);
+                }
+                if (prop.getter) addLazyFunctionSymbolStringsV3(strings, *prop.getter, type.id, module.name);
+                if (prop.setter) addLazyFunctionSymbolStringsV3(strings, *prop.setter, type.id, module.name);
             }
             for (const auto& member : type.enumMembers) strings.add(member.name);
         }
@@ -2785,14 +2889,18 @@ void collectLazyStringsV2(
     }
 }
 
-void writeSlimFunctionSymbolV2(
+void writeSlimFunctionSymbolV3(
     Writer& writer,
     const StringPool& strings,
-    const semantic::FunctionSymbol& fn) {
+    const semantic::FunctionSymbol& fn,
+    semantic::SymbolId ownerTypeId,
+    std::string_view ownerModName) {
     writer.u64(fn.id);
     writer.u8(static_cast<std::uint8_t>(fn.accessibility));
     writer.u64(fn.declaringTypeId);
-    writer.u32(strings.indexOf(fn.declaringTypeName));
+    writer.u32((fn.declaringTypeId == ownerTypeId || fn.declaringTypeName.empty())
+        ? InvalidIndex
+        : strings.indexOf(fn.declaringTypeName));
     std::uint16_t flags = 0u;
     if (fn.virtualMethod) flags |= (1u << 0u);
     if (fn.overrideMethod) flags |= (1u << 1u);
@@ -2808,38 +2916,53 @@ void writeSlimFunctionSymbolV2(
     writer.u16(flags);
     writer.u32(fn.virtualSlot);
     writer.u32(fn.interfaceSlot);
-    writer.u32(strings.indexOf(fn.moduleName));
+    writer.u32((fn.moduleName == ownerModName || fn.moduleName.empty())
+        ? InvalidIndex
+        : strings.indexOf(fn.moduleName));
     writer.u32(strings.indexOf(fn.name));
     writer.u8(encodeType(fn.returnType));
-    writer.u32(strings.indexOf(fn.returnTypeName));
+    writer.u32(fn.returnTypeName.empty() ? InvalidIndex : strings.indexOf(fn.returnTypeName));
     writer.u8(static_cast<std::uint8_t>(fn.returnModifier));
     writer.u8(encodeOptionalType(fn.storageReturnType));
-    writer.u32(strings.indexOf(fn.storageReturnTypeName));
+    writer.u32(fn.storageReturnTypeName.empty()
+        ? InvalidIndex
+        : (fn.storageReturnTypeName == fn.returnTypeName
+               ? static_cast<std::uint32_t>(InvalidIndex - 1u)
+               : strings.indexOf(fn.storageReturnTypeName)));
     writer.u32(static_cast<std::uint32_t>(fn.parameters.size()));
     for (const auto& p : fn.parameters) {
         writer.u8(encodeType(p.type));
-        writer.u32(strings.indexOf(p.typeName));
+        writer.u32(p.typeName.empty() ? InvalidIndex : strings.indexOf(p.typeName));
         writer.u8(encodeOptionalType(p.storageType));
-        writer.u32(strings.indexOf(p.storageTypeName));
+        writer.u32(p.storageTypeName.empty()
+            ? InvalidIndex
+            : (p.storageTypeName == p.typeName
+                   ? static_cast<std::uint32_t>(InvalidIndex - 1u)
+                   : strings.indexOf(p.storageTypeName)));
         writer.u8(static_cast<std::uint8_t>(p.modifier));
     }
 }
 
 bool readSlimFunctionSymbolV2(
     Reader& reader,
-    const std::vector<std::string>& strings,
+    const StringLookup& strings,
     semantic::FunctionSymbol& fn,
-    diagnostics::DiagnosticBag& diagnostics) {
-    auto readString = [&](std::string& value, const char* msg) -> bool {
+    diagnostics::DiagnosticBag& diagnostics,
+    bool v3Format = false) {
+    auto readString = [&](std::string& value, const char* msg, bool allowSentinel = false) -> bool {
         const auto idx = reader.u32();
+        if (allowSentinel && idx == InvalidIndex) {
+            value.clear();
+            return true;
+        }
         if (!validStringIndex(idx, strings, diagnostics, msg)) return false;
-        value = strings[idx];
+        value = strings.copyAt(idx);
         return true;
     };
     fn.id = reader.u64();
     const auto acc = reader.u8();
     fn.declaringTypeId = reader.u64();
-    if (!readString(fn.declaringTypeName, "invalid slim method declaring-type string")) return false;
+    if (!readString(fn.declaringTypeName, "invalid slim method declaring-type string", v3Format)) return false;
     const auto flags = reader.u16();
     if (!reader.valid() ||
         acc > static_cast<std::uint8_t>(semantic::Accessibility::Private)) {
@@ -2860,21 +2983,31 @@ bool readSlimFunctionSymbolV2(
     fn.synthetic = (flags & (1u << 10u)) != 0u;
     fn.virtualSlot = reader.u32();
     fn.interfaceSlot = reader.u32();
-    if (!readString(fn.moduleName, "invalid slim method module string") ||
+    if (!readString(fn.moduleName, "invalid slim method module string", v3Format) ||
         !readString(fn.name, "invalid slim method name string")) {
         return false;
     }
     if (!decodeType(reader.u8(), fn.returnType) ||
-        !readString(fn.returnTypeName, "invalid slim method return type-name")) {
+        !readString(fn.returnTypeName, "invalid slim method return type-name", v3Format)) {
         diagnostics.report("RS5004", "invalid slim method return", {});
         return false;
     }
     const auto retMod = reader.u8();
     if (retMod > static_cast<std::uint8_t>(semantic::ParameterModifier::In) ||
-        !decodeOptionalType(reader.u8(), fn.storageReturnType) ||
-        !readString(fn.storageReturnTypeName, "invalid slim method storage return name")) {
+        !decodeOptionalType(reader.u8(), fn.storageReturnType)) {
         diagnostics.report("RS5004", "invalid slim method storage return", {});
         return false;
+    }
+    const auto srIdx = reader.u32();
+    if (v3Format && srIdx == InvalidIndex) {
+        fn.storageReturnTypeName.clear();
+    } else if (v3Format && srIdx == static_cast<std::uint32_t>(InvalidIndex - 1u)) {
+        fn.storageReturnTypeName = fn.returnTypeName;
+    } else {
+        if (!validStringIndex(srIdx, strings, diagnostics, "invalid slim method storage return name")) {
+            return false;
+        }
+        fn.storageReturnTypeName = strings.copyAt(srIdx);
     }
     fn.returnModifier = static_cast<semantic::ParameterModifier>(retMod);
     const auto pCount = reader.u32();
@@ -2886,11 +3019,21 @@ bool readSlimFunctionSymbolV2(
     for (std::uint32_t i = 0u; i < pCount; ++i) {
         semantic::VariableSymbol p;
         if (!decodeType(reader.u8(), p.type) ||
-            !readString(p.typeName, "invalid slim param type-name") ||
-            !decodeOptionalType(reader.u8(), p.storageType) ||
-            !readString(p.storageTypeName, "invalid slim param storage type-name")) {
+            !readString(p.typeName, "invalid slim param type-name", v3Format) ||
+            !decodeOptionalType(reader.u8(), p.storageType)) {
             diagnostics.report("RS5004", "invalid slim parameter descriptor", {});
             return false;
+        }
+        const auto pstIdx = reader.u32();
+        if (v3Format && pstIdx == InvalidIndex) {
+            p.storageTypeName.clear();
+        } else if (v3Format && pstIdx == static_cast<std::uint32_t>(InvalidIndex - 1u)) {
+            p.storageTypeName = p.typeName;
+        } else {
+            if (!validStringIndex(pstIdx, strings, diagnostics, "invalid slim param storage type-name")) {
+                return false;
+            }
+            p.storageTypeName = strings.copyAt(pstIdx);
         }
         const auto pMod = reader.u8();
         if (!reader.valid() || pMod > static_cast<std::uint8_t>(semantic::ParameterModifier::In)) {
@@ -2939,15 +3082,19 @@ bool readSlimFunctionSymbolV2(
     return static_cast<std::uint32_t>(base.fields.size());
 }
 
-void writeLazyPropertySymbolV2(
+void writeLazyPropertySymbolV3(
     Writer& w,
     const StringPool& strings,
     const semantic::PropertySymbol& prop,
-    const std::unordered_map<semantic::SymbolId, const semantic::FunctionSymbol*>& keptMethodById) {
+    const std::unordered_map<semantic::SymbolId, const semantic::FunctionSymbol*>& keptMethodById,
+    semantic::SymbolId ownerTypeId,
+    std::string_view ownerModName) {
     w.u32(strings.indexOf(prop.name));
     w.u8(static_cast<std::uint8_t>(prop.accessibility));
     w.u64(prop.declaringTypeId);
-    w.u32(strings.indexOf(prop.declaringTypeName));
+    w.u32((prop.declaringTypeId == ownerTypeId || prop.declaringTypeName.empty())
+        ? InvalidIndex
+        : strings.indexOf(prop.declaringTypeName));
     w.u8(encodeType(prop.type));
     w.u8(prop.staticProperty ? 1u : 0u);
 
@@ -2962,7 +3109,7 @@ void writeLazyPropertySymbolV2(
             return;
         }
         w.u8(2u);
-        writeSlimFunctionSymbolV2(w, strings, *acc);
+        writeSlimFunctionSymbolV3(w, strings, *acc, ownerTypeId, ownerModName);
     };
     writeAccessor(prop.getter);
     writeAccessor(prop.setter);
@@ -2975,20 +3122,25 @@ void writeLazyPropertySymbolV2(
 
 bool readLazyPropertySymbolV2(
     Reader& reader,
-    const std::vector<std::string>& strings,
+    const StringLookup& strings,
     const std::vector<semantic::FunctionSymbol>& keptMethods,
     semantic::PropertySymbol& prop,
-    diagnostics::DiagnosticBag& diagnostics) {
-    auto readString = [&](std::string& value, const char* msg) -> bool {
+    diagnostics::DiagnosticBag& diagnostics,
+    bool v3Format = false) {
+    auto readString = [&](std::string& value, const char* msg, bool allowSentinel = false) -> bool {
         const auto idx = reader.u32();
+        if (allowSentinel && idx == InvalidIndex) {
+            value.clear();
+            return true;
+        }
         if (!validStringIndex(idx, strings, diagnostics, msg)) return false;
-        value = strings[idx];
+        value = strings.copyAt(idx);
         return true;
     };
     if (!readString(prop.name, "invalid lazy property name")) return false;
     const auto acc = reader.u8();
     prop.declaringTypeId = reader.u64();
-    if (!readString(prop.declaringTypeName, "invalid lazy property declaring-type") ||
+    if (!readString(prop.declaringTypeName, "invalid lazy property declaring-type", v3Format) ||
         !decodeType(reader.u8(), prop.type)) {
         diagnostics.report("RS5004", "invalid lazy property header", {});
         return false;
@@ -3023,7 +3175,7 @@ bool readLazyPropertySymbolV2(
         }
         if (tag == 2u) {
             semantic::FunctionSymbol fn;
-            if (!readSlimFunctionSymbolV2(reader, strings, fn, diagnostics)) return false;
+            if (!readSlimFunctionSymbolV2(reader, strings, fn, diagnostics, v3Format)) return false;
             outAcc = std::move(fn);
             return true;
         }
@@ -3039,7 +3191,7 @@ bool readLazyPropertySymbolV2(
     return reader.valid();
 }
 
-void writeLazyHeaderTypeAndObjectModelV2(
+void writeLazyHeaderTypeAndObjectModelV3(
     Writer& out,
     const StringPool& strings,
     const Module& mod,
@@ -3083,7 +3235,9 @@ void writeLazyHeaderTypeAndObjectModelV2(
             out.u8(fFlags);
             out.u8(static_cast<std::uint8_t>(field.accessibility));
             out.u64(field.declaringTypeId);
-            out.u32(strings.indexOf(field.declaringTypeName));
+            out.u32((field.declaringTypeId == type.id || field.declaringTypeName.empty())
+                ? InvalidIndex
+                : strings.indexOf(field.declaringTypeName));
             out.u64(field.id);
             if (!field.hasConstantValue) {
                 out.u8(0u);
@@ -3110,7 +3264,6 @@ void writeLazyHeaderTypeAndObjectModelV2(
             out.i64(member.value);
         }
 
-        // Methods (own/overridden only for derived non-interface classes)
         const bool keepAllMethods = type.interfaceType || type.baseTypeId == 0u;
         std::vector<const semantic::FunctionSymbol*> keptMethods;
         std::unordered_map<semantic::SymbolId, const semantic::FunctionSymbol*> keptMethodById;
@@ -3127,16 +3280,16 @@ void writeLazyHeaderTypeAndObjectModelV2(
         }
         out.u32(static_cast<std::uint32_t>(keptMethods.size()));
         for (const auto* m : keptMethods) {
-            writeSlimFunctionSymbolV2(out, strings, *m);
+            writeSlimFunctionSymbolV3(out, strings, *m, type.id, mod.name);
         }
 
         out.u32(static_cast<std::uint32_t>(
             type.constructors.size() + (type.staticConstructor ? 1u : 0u)));
         for (const auto& c : type.constructors) {
-            writeSlimFunctionSymbolV2(out, strings, c);
+            writeSlimFunctionSymbolV3(out, strings, c, type.id, mod.name);
         }
         if (type.staticConstructor) {
-            writeSlimFunctionSymbolV2(out, strings, *type.staticConstructor);
+            writeSlimFunctionSymbolV3(out, strings, *type.staticConstructor, type.id, mod.name);
         }
 
         std::vector<const semantic::PropertySymbol*> keptProps;
@@ -3150,7 +3303,7 @@ void writeLazyHeaderTypeAndObjectModelV2(
         }
         out.u32(static_cast<std::uint32_t>(keptProps.size()));
         for (const auto* p : keptProps) {
-            writeLazyPropertySymbolV2(out, strings, *p, keptMethodById);
+            writeLazyPropertySymbolV3(out, strings, *p, keptMethodById, type.id, mod.name);
         }
 
         out.u32(static_cast<std::uint32_t>(type.virtualDispatchTable.size()));
@@ -3178,10 +3331,11 @@ void writeLazyHeaderTypeAndObjectModelV2(
 
 bool readLazyHeaderTypeAndObjectModelV2(
     Reader& reader,
-    const std::vector<std::string>& strings,
+    const StringLookup& strings,
     Module& module,
     std::vector<std::uint32_t>& outInheritedPrefixes,
-    diagnostics::DiagnosticBag& diagnostics) {
+    diagnostics::DiagnosticBag& diagnostics,
+    bool v3Format = false) {
     const auto count = reader.u32();
     if (!reader.valid() || count > 65536u) {
         diagnostics.report("RS5003", "invalid lazy v2 type count", {});
@@ -3216,15 +3370,15 @@ bool readLazyHeaderTypeAndObjectModelV2(
             !validStringIndex(nameIdx, strings, diagnostics, "invalid lazy type name string")) {
             return false;
         }
-        type.moduleName = strings[modNameIdx];
-        type.name = strings[nameIdx];
+        type.moduleName = strings.copyAt(modNameIdx);
+        type.name = strings.copyAt(nameIdx);
         type.baseTypeId = reader.u64();
         const auto baseNameIdx = reader.u32();
         if (baseNameIdx != InvalidIndex) {
             if (!validStringIndex(baseNameIdx, strings, diagnostics, "invalid lazy baseTypeName")) {
                 return false;
             }
-            type.baseTypeName = strings[baseNameIdx];
+            type.baseTypeName = strings.copyAt(baseNameIdx);
         }
 
         const auto inheritedPrefix = reader.u32();
@@ -3239,7 +3393,7 @@ bool readLazyHeaderTypeAndObjectModelV2(
             semantic::FieldSymbol f;
             const auto fNameIdx = reader.u32();
             if (!validStringIndex(fNameIdx, strings, diagnostics, "invalid lazy field name")) return false;
-            f.name = strings[fNameIdx];
+            f.name = strings.copyAt(fNameIdx);
             if (!decodeType(reader.u8(), f.type)) {
                 diagnostics.report("RS5004", "invalid lazy field type", {});
                 return false;
@@ -3249,7 +3403,7 @@ bool readLazyHeaderTypeAndObjectModelV2(
                 if (!validStringIndex(ftNameIdx, strings, diagnostics, "invalid lazy field typeName")) {
                     return false;
                 }
-                f.typeName = strings[ftNameIdx];
+                f.typeName = strings.copyAt(ftNameIdx);
             }
             f.index = reader.u32();
             const auto fFlags = reader.u8();
@@ -3262,13 +3416,20 @@ bool readLazyHeaderTypeAndObjectModelV2(
             const auto declNameIdx = reader.u32();
             f.id = reader.u64();
             if (!reader.valid() ||
-                fAcc > static_cast<std::uint8_t>(semantic::Accessibility::Private) ||
-                !validStringIndex(declNameIdx, strings, diagnostics, "invalid lazy field declaringTypeName")) {
+                fAcc > static_cast<std::uint8_t>(semantic::Accessibility::Private)) {
                 diagnostics.report("RS5004", "invalid lazy field metadata", {});
                 return false;
             }
             f.accessibility = static_cast<semantic::Accessibility>(fAcc);
-            f.declaringTypeName = strings[declNameIdx];
+            if (v3Format && declNameIdx == InvalidIndex) {
+                f.declaringTypeName.clear();
+            } else {
+                if (!validStringIndex(declNameIdx, strings, diagnostics, "invalid lazy field declaringTypeName")) {
+                    diagnostics.report("RS5004", "invalid lazy field metadata", {});
+                    return false;
+                }
+                f.declaringTypeName = strings.copyAt(declNameIdx);
+            }
             const auto constKind = reader.u8();
             if (!reader.valid() || constKind > 4u) {
                 diagnostics.report("RS5004", "invalid lazy field const kind", {});
@@ -3291,7 +3452,7 @@ bool readLazyHeaderTypeAndObjectModelV2(
                     return false;
                 }
                 f.hasConstantValue = true;
-                f.constantValue = strings[strIdx];
+                f.constantValue = strings.copyAt(strIdx);
             }
             type.fields.push_back(std::move(f));
         }
@@ -3306,7 +3467,7 @@ bool readLazyHeaderTypeAndObjectModelV2(
             semantic::EnumMemberSymbol em;
             const auto emIdx = reader.u32();
             if (!validStringIndex(emIdx, strings, diagnostics, "invalid lazy enum member")) return false;
-            em.name = strings[emIdx];
+            em.name = strings.copyAt(emIdx);
             em.value = reader.i64();
             type.enumMembers.push_back(std::move(em));
         }
@@ -3319,7 +3480,7 @@ bool readLazyHeaderTypeAndObjectModelV2(
         type.methods.reserve(mCount);
         for (std::uint32_t mi = 0u; mi < mCount; ++mi) {
             semantic::FunctionSymbol fn;
-            if (!readSlimFunctionSymbolV2(reader, strings, fn, diagnostics)) return false;
+            if (!readSlimFunctionSymbolV2(reader, strings, fn, diagnostics, v3Format)) return false;
             type.methods.push_back(std::move(fn));
         }
 
@@ -3331,7 +3492,7 @@ bool readLazyHeaderTypeAndObjectModelV2(
         type.constructors.reserve(cCount);
         for (std::uint32_t ci = 0u; ci < cCount; ++ci) {
             semantic::FunctionSymbol ctor;
-            if (!readSlimFunctionSymbolV2(reader, strings, ctor, diagnostics)) return false;
+            if (!readSlimFunctionSymbolV2(reader, strings, ctor, diagnostics, v3Format)) return false;
             if (ctor.staticMethod) type.staticConstructor = std::move(ctor);
             else type.constructors.push_back(std::move(ctor));
         }
@@ -3344,7 +3505,7 @@ bool readLazyHeaderTypeAndObjectModelV2(
         type.properties.reserve(pCount);
         for (std::uint32_t pi = 0u; pi < pCount; ++pi) {
             semantic::PropertySymbol prop;
-            if (!readLazyPropertySymbolV2(reader, strings, type.methods, prop, diagnostics)) {
+            if (!readLazyPropertySymbolV2(reader, strings, type.methods, prop, diagnostics, v3Format)) {
                 return false;
             }
             type.properties.push_back(std::move(prop));
@@ -3407,7 +3568,7 @@ std::vector<std::uint8_t> encodeLazyBytecodeBundle(
     const std::vector<Module>& modules,
     std::size_t targetChunkBytes) {
     StringPool strings;
-    collectLazyStringsV2(strings, modules);
+    collectLazyStringsV3(strings, modules);
     if (strings.values().empty()) {
         strings.add(std::string{});
     }
@@ -3506,7 +3667,7 @@ std::vector<std::uint8_t> encodeLazyBytecodeBundle(
     flushChunk();
 
     Writer headerPayload;
-    writeStringTable(headerPayload, strings);
+    writeStringTableV3(headerPayload, strings);
     headerPayload.u32(static_cast<std::uint32_t>(modules.size()));
     for (const auto& mod : modules) {
         headerPayload.u16(mod.version.major);
@@ -3519,7 +3680,7 @@ std::vector<std::uint8_t> encodeLazyBytecodeBundle(
         headerPayload.bytes(metaWriter.data());
 
         writeReferenceSectionBody(headerPayload, strings, mod);
-        writeLazyHeaderTypeAndObjectModelV2(headerPayload, strings, mod, allTypesById);
+        writeLazyHeaderTypeAndObjectModelV3(headerPayload, strings, mod, allTypesById);
         writeSourceFilesTable(headerPayload, strings, mod.sourceFiles);
 
         headerPayload.u32(static_cast<std::uint32_t>(mod.functions.size()));
@@ -3560,7 +3721,7 @@ std::vector<std::uint8_t> encodeLazyBytecodeBundle(
 
     Writer out;
     out.bytes("RSLB", 4);
-    out.u32(2u);
+    out.u32(3u);
     out.u16(kVersionMajor);
     out.u16(kVersionMinor);
     out.u32(kSdkCompatibilityVersion);
@@ -3616,13 +3777,14 @@ bool decodeLazyBytecodeBundleHeader(
         diagnostics.report("RS5003", "truncated lazy bytecode bundle header", {});
         return false;
     }
-    if (formatVersion != 2u ||
+    if ((formatVersion != 2u && formatVersion != 3u) ||
         verMajor != kVersionMajor ||
         verMinor != kVersionMinor ||
         sdkVer != kSdkCompatibilityVersion) {
         diagnostics.report("RS5001", "incompatible lazy bytecode bundle version", {});
         return false;
     }
+    const bool v3Format = (formatVersion == 3u);
     if (chunkCount > (size - 40u) / 20u) {
         diagnostics.report("RS5003", "invalid lazy bytecode chunk directory size", {});
         return false;
@@ -3676,10 +3838,18 @@ bool decodeLazyBytecodeBundleHeader(
     }
 
     Reader reader(rawHeader, 0u, rawHeader.size());
-    if (!readStringTable(reader, outBundle.sharedStrings, diagnostics, false)) {
-        outBundle = {};
-        return false;
+    if (v3Format) {
+        if (!readFlatStringPoolV3(reader, outBundle, diagnostics)) {
+            outBundle = {};
+            return false;
+        }
+    } else {
+        if (!readStringTable(reader, outBundle.sharedStrings, diagnostics, false)) {
+            outBundle = {};
+            return false;
+        }
     }
+    const StringLookup strings(outBundle);
     const auto moduleCount = reader.u32();
     if (!reader.valid() || moduleCount > reader.remaining() / 24u + 1u) {
         diagnostics.report("RS5003", "truncated lazy bytecode module count", {});
@@ -3696,12 +3866,12 @@ bool decodeLazyBytecodeBundleHeader(
         mod.version.minor = reader.u16();
         const auto nameIdx = reader.u32();
         if (!reader.valid() ||
-            !validStringIndex(nameIdx, outBundle.sharedStrings, diagnostics,
+            !validStringIndex(nameIdx, strings, diagnostics,
                 "invalid lazy module name string index")) {
             outBundle = {};
             return false;
         }
-        mod.name = outBundle.sharedStrings[nameIdx];
+        mod.name = strings.copyAt(nameIdx);
         if (mod.version.major != 0 ||
             (mod.version.minor != 6 &&
              mod.version.minor != 7 &&
@@ -3716,17 +3886,17 @@ bool decodeLazyBytecodeBundleHeader(
         auto metaReader = reader.subReader(metaLen);
         if (!metaReader.valid() ||
             !readLanguageMetadataSectionBody(
-                metaReader, outBundle.sharedStrings, mod, decodedSchemasByMod[m], diagnostics) ||
+                metaReader, strings, mod, decodedSchemasByMod[m], diagnostics) ||
             !metaReader.empty()) {
             diagnostics.report("RS5010", "invalid lazy module language metadata", {});
             outBundle = {};
             return false;
         }
 
-        if (!readReferenceSectionBody(reader, outBundle.sharedStrings, mod, diagnostics) ||
+        if (!readReferenceSectionBody(reader, strings, mod, diagnostics) ||
             !readLazyHeaderTypeAndObjectModelV2(
-                reader, outBundle.sharedStrings, mod, inheritedPrefixesByMod[m], diagnostics) ||
-            !readSourceFilesTable(reader, outBundle.sharedStrings, mod.sourceFiles, diagnostics)) {
+                reader, strings, mod, inheritedPrefixesByMod[m], diagnostics, v3Format) ||
+            !readSourceFilesTable(reader, strings, mod.sourceFiles, diagnostics)) {
             outBundle = {};
             return false;
         }
@@ -3743,12 +3913,12 @@ bool decodeLazyBytecodeBundleHeader(
             fn.symbolId = reader.u64();
             const auto fnNameIdx = reader.u32();
             if (!reader.valid() ||
-                !validStringIndex(fnNameIdx, outBundle.sharedStrings, diagnostics,
+                !validStringIndex(fnNameIdx, strings, diagnostics,
                     "invalid lazy function name string index")) {
                 outBundle = {};
                 return false;
             }
-            fn.name = outBundle.sharedStrings[fnNameIdx];
+            fn.name = strings.copyAt(fnNameIdx);
             if (!decodeType(reader.u8(), fn.returnType)) {
                 diagnostics.report("RS5004", "invalid lazy function return type", {});
                 outBundle = {};
@@ -4012,16 +4182,17 @@ bool decodeLazyFunctionBody(
         diagnostics.report("RS5004", "invalid lazy function local/register metadata", {});
         return false;
     }
+    const StringLookup strings(bundle);
     if (!readFunctionCodeBody(
             reader,
-            bundle.sharedStrings,
+            strings,
             outFunction,
             hasExceptionMetadata(mod.version),
             diagnostics)) {
         return false;
     }
     if (!readFunctionDebugCore(
-            reader, bundle.sharedStrings, mod.sourceFiles, outFunction, true, diagnostics)) {
+            reader, strings, mod.sourceFiles, outFunction, true, diagnostics)) {
         return false;
     }
     if (!reader.valid() || !reader.empty()) {

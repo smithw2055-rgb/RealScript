@@ -8,7 +8,7 @@ thread_local ThreadInvokeScratch tlsInvokeScratch;
 
 struct FallbackInvokeBuffers {
     std::array<InlineCallCacheEntry, 64> inlineCallCache{};
-    std::array<FastNativeBindEntry, 64> nativeBindCache{};
+    std::array<FastNativeBindEntry, kFastNativeBindCacheSize> nativeBindCache{};
     std::vector<PolymorphicPicSite> polyCallCache;
     std::vector<DelegateCallSiteCache> delegateCallCache;
     std::vector<ObjectRef> stringLiteralCache;
@@ -99,7 +99,7 @@ struct InvokeScratchGuard {
             }
             state.values = std::move(buf.values);
             state.stack = std::move(buf.stack);
-            state.nativeBindCache = &buf.nativeBindCache;
+            state.nativeBindCache = &scratch.sharedNativeBindCache;
             state.stringLiteralCache = &buf.stringLiteralCache;
             state.stringLiteralCacheEpoch = stringEpoch;
             active = true;

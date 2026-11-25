@@ -3870,6 +3870,7 @@ public:
         bool verifyUserModules = true);
 
     void compactForRuntime();
+    void releaseTransientLazyCaches() const noexcept;
 
     [[nodiscard]] std::size_t totalLazyFunctionCount() const noexcept;
     [[nodiscard]] std::size_t compiledLazyFunctionCount() const noexcept;
@@ -3938,7 +3939,6 @@ private:
     std::vector<bytecode::Module> modules_;
     std::unordered_map<semantic::SymbolId, FunctionLocation> functions_;
     std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> types_;
-    std::unordered_map<std::string, semantic::SymbolId> names_;
     std::shared_ptr<const bytecode::LazyBytecodeBundle> lazyBaseBundle_;
     std::size_t baseModuleCount_ = 0;
     std::unordered_map<const bytecode::Function*, std::uint32_t> lazyFuncLocIndex_;

@@ -93,6 +93,12 @@ namespace realscript::runtime::detail {
     ObjectRef strRef,
     std::size_t index,
     ObjectRef& outRef) noexcept;
+[[nodiscard]] bool heapStringPredicateWithToken(
+    const void* heapImplToken,
+    ObjectRef haystack,
+    ObjectRef needle,
+    std::uint8_t op,
+    bool& outResult) noexcept;
 [[nodiscard]] bool tryExecuteFastIntrinsic(
     std::uint8_t intrinsicKind,
     const Value* args,

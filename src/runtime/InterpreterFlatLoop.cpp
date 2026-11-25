@@ -179,7 +179,8 @@ bool executeFunction(
             !state.enforceCapabilities && fallback == nullptr &&
             state.bindings != nullptr && state.nativeBindCache != nullptr) {
             const std::size_t cacheIdx = static_cast<std::size_t>(
-                (reference.symbolId ^ (reference.symbolId >> 7u)) & 63u);
+                (reference.symbolId ^ (reference.symbolId >> 9u) ^ (reference.symbolId >> 18u)) &
+                (kFastNativeBindCacheSize - 1u));
             auto& cached = (*state.nativeBindCache)[cacheIdx];
             const std::uint64_t regId = state.bindings->instanceId();
             const std::uint64_t regEpoch = state.bindings->mutationEpoch();
@@ -7416,12 +7417,26 @@ bool executeFunction(
                 case detail::FastIntrinsicKind::StringIsEmpty: {
                     const Value& sv = frameBase[ip->src0Slot];
                     if (sv.rawTag() == ValueTag::ObjectRef &&
-                        sv.u_.objectRef.kind == ObjectKind::String &&
-                        state.heap != nullptr) {
-                        if (const auto viewOpt = state.heap->stringView(sv.u_.objectRef)) {
-                            ++localExecuted;
-                            frameBase[ip->dstSlot].storeBool(viewOpt->empty());
-                            RS_FLAT_DISPATCH_NEXT();
+                        sv.u_.objectRef.kind == ObjectKind::String) {
+                        if (state.executionPolicy == nullptr) {
+                            bool isEmpty = false;
+                            if (RS_FLAT_LIKELY(detail::heapStringPredicateWithToken(
+                                    state.heapImplFast,
+                                    sv.u_.objectRef,
+                                    sv.u_.objectRef,
+                                    3u,
+                                    isEmpty))) {
+                                ++localExecuted;
+                                frameBase[ip->dstSlot].storeBool(isEmpty);
+                                RS_FLAT_DISPATCH_NEXT();
+                            }
+                        }
+                        if (state.heap != nullptr) {
+                            if (const auto viewOpt = state.heap->stringView(sv.u_.objectRef)) {
+                                ++localExecuted;
+                                frameBase[ip->dstSlot].storeBool(viewOpt->empty());
+                                RS_FLAT_DISPATCH_NEXT();
+                            }
                         }
                     }
                     goto L_FlatGenericFallback;
@@ -7447,11 +7462,36 @@ bool executeFunction(
                             RS_FLAT_DISPATCH_NEXT();
                         }
                     }
-                    [[fallthrough]];
+                    goto L_StringIntrinsicSlow;
                 }
                 case detail::FastIntrinsicKind::StringContains:
                 case detail::FastIntrinsicKind::StringStartsWith:
-                case detail::FastIntrinsicKind::StringEndsWith:
+                case detail::FastIntrinsicKind::StringEndsWith: {
+                    const Value& haystackVal = frameBase[ip->src0Slot];
+                    const Value& needleVal = frameBase[ip->src1Slot];
+                    if (state.executionPolicy == nullptr &&
+                        haystackVal.rawTag() == ValueTag::ObjectRef &&
+                        haystackVal.u_.objectRef.kind == ObjectKind::String &&
+                        needleVal.rawTag() == ValueTag::ObjectRef &&
+                        needleVal.u_.objectRef.kind == ObjectKind::String) {
+                        const std::uint8_t predOp =
+                            (ikind == detail::FastIntrinsicKind::StringContains)
+                                ? 0u
+                                : ((ikind == detail::FastIntrinsicKind::StringStartsWith) ? 1u : 2u);
+                        bool predResult = false;
+                        if (RS_FLAT_LIKELY(detail::heapStringPredicateWithToken(
+                                state.heapImplFast,
+                                haystackVal.u_.objectRef,
+                                needleVal.u_.objectRef,
+                                predOp,
+                                predResult))) {
+                            ++localExecuted;
+                            frameBase[ip->dstSlot].storeBool(predResult);
+                            RS_FLAT_DISPATCH_NEXT();
+                        }
+                    }
+                    goto L_StringIntrinsicSlow;
+                }
                 case detail::FastIntrinsicKind::StringSubstring1:
                 case detail::FastIntrinsicKind::StringTrim:
                 case detail::FastIntrinsicKind::StringToLower:
@@ -7461,6 +7501,7 @@ bool executeFunction(
                 case detail::FastIntrinsicKind::ArrayPop:
                 case detail::FastIntrinsicKind::ArrayClear:
                 default: {
+                L_StringIntrinsicSlow:
                     if (RS_FLAT_UNLIKELY(state.heap == nullptr)) goto L_FlatGenericFallback;
                     if (RS_FLAT_UNLIKELY(policyChecksSameHeapWrites) &&
                         (ikind == detail::FastIntrinsicKind::ArrayPop ||

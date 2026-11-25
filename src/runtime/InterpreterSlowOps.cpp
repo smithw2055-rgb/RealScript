@@ -355,10 +355,9 @@ bool runtimeAssignable(
     if (actual == expected) return true;
     if (actual == 0) return false;
     if (state.mirror) {
-        const auto it = state.mirror->typeDispatch.find(actual);
-        if (it != state.mirror->typeDispatch.end()) {
+        if (const auto* meta = detail::resolveTypeDispatch(*state.mirror, actual)) {
             if (expected == 0) return true;
-            for (const auto cand : it->second.assignableTargetIds) {
+            for (const auto cand : meta->assignableTargetIds) {
                 if (cand == expected) return true;
             }
             return false;
@@ -385,9 +384,9 @@ const detail::PrelinkedDispatchTarget* resolvePrelinkedPolymorphicTarget(
     semantic::SymbolId actualTypeId,
     const detail::PolymorphicCallSiteDesc& site) noexcept {
     if (!site.valid || actualTypeId == 0) return nullptr;
-    const auto tIt = mirror.typeDispatch.find(actualTypeId);
-    if (tIt == mirror.typeDispatch.end()) return nullptr;
-    const auto& meta = tIt->second;
+    const auto* metaPtr = detail::resolveTypeDispatch(mirror, actualTypeId);
+    if (!metaPtr) return nullptr;
+    const auto& meta = *metaPtr;
     if (!site.isInterface) {
         if (site.slot >= meta.virtualTargets.size()) return nullptr;
         const auto& target = meta.virtualTargets[site.slot];

@@ -469,14 +469,44 @@ struct LazyBytecodeChunk {
     std::uint64_t checksum = 0;
 };
 
+struct LazyStringSpan {
+    std::uint32_t offset = 0;
+    std::uint32_t length = 0;
+};
+
 struct LazyBytecodeBundle {
     std::vector<Module> headerModules;
     std::vector<std::string> sharedStrings;
+    std::vector<char> flatStringData;
+    std::vector<LazyStringSpan> flatStringSpans;
     std::vector<LazyFunctionBodyLoc> functionLocs;
     std::vector<LazyBytecodeChunk> chunks;
     const std::uint8_t* rawBlobData = nullptr;
     std::size_t rawBlobSize = 0;
     std::vector<std::uint8_t> ownedBlob;
+
+    [[nodiscard]] std::size_t stringCount() const noexcept {
+        return !flatStringSpans.empty() ? flatStringSpans.size() : sharedStrings.size();
+    }
+
+    [[nodiscard]] std::string_view stringViewAt(std::uint32_t index) const noexcept {
+        if (!flatStringSpans.empty()) {
+            if (index >= flatStringSpans.size()) return {};
+            const auto& sp = flatStringSpans[index];
+            if (sp.length == 0u ||
+                static_cast<std::size_t>(sp.offset) + sp.length > flatStringData.size()) {
+                return {};
+            }
+            return std::string_view(flatStringData.data() + sp.offset, sp.length);
+        }
+        if (index >= sharedStrings.size()) return {};
+        return sharedStrings[index];
+    }
+
+    [[nodiscard]] std::string stringCopyAt(std::uint32_t index) const {
+        const auto sv = stringViewAt(index);
+        return std::string(sv.data(), sv.size());
+    }
 };
 
 [[nodiscard]] std::vector<std::uint8_t> encodeLazyBytecodeBundle(

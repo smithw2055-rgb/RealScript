@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -845,7 +846,7 @@ struct FieldMetaPairHash {
 };
 
 struct LazyCompileState {
-    static constexpr std::size_t kMaxDecodedChunks = 16u;
+    static constexpr std::size_t kMaxDecodedChunks = 4u;
     struct DecodedChunkEntry {
         std::uint32_t chunkIndex = std::numeric_limits<std::uint32_t>::max();
         std::vector<std::uint8_t> bytes;
@@ -866,6 +867,9 @@ struct LazyCompileState {
         FieldMetaPairHash> fieldMetaMap;
     std::atomic<std::size_t> compiledLazyCount{0};
     std::size_t totalLazyCount = 0;
+    mutable std::mutex typeDispatchMutex;
+    std::deque<TypeDispatchMetadata> lazyTypeDispatchStorage;
+    std::unordered_map<semantic::SymbolId, const TypeDispatchMetadata*> lazyTypeDispatchMap;
 
     std::uint32_t sinCalleeBaseCost = 0;
     std::uint16_t sinCalleeCalls = 0;
@@ -970,6 +974,10 @@ struct ExecutionMirror {
 }
 
 void ensureSlowInstructions(const ExecutionFunction& execFn);
+
+[[nodiscard]] const TypeDispatchMetadata* resolveTypeDispatch(
+    const ExecutionMirror& mirror,
+    semantic::SymbolId typeId) noexcept;
 
 } // namespace realscript::runtime::detail
 

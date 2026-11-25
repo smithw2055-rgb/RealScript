@@ -27,6 +27,8 @@
 
 namespace realscript::runtime::interp_detail {
 
+inline constexpr std::size_t kFastNativeBindCacheSize = 512u;
+
 struct InlineCallCacheEntry {
     const bytecode::Instruction* callSite = nullptr;
     ObjectRef receiver;
@@ -133,7 +135,7 @@ struct State {
     std::vector<DelegateCallSiteCache>* delegateCallCache = nullptr;
     const detail::ExecutionMirror* mirror = nullptr;
     const void* heapImplFast = nullptr;
-    std::array<struct FastNativeBindEntry, 64>* nativeBindCache = nullptr;
+    std::array<struct FastNativeBindEntry, kFastNativeBindCacheSize>* nativeBindCache = nullptr;
     std::vector<ObjectRef>* stringLiteralCache = nullptr;
     std::uint64_t stringLiteralCacheEpoch = 0;
     std::optional<Value> pendingException;
@@ -294,7 +296,6 @@ struct ThreadInvokeScratch {
         std::vector<Value> values;
         std::vector<const std::string*> stack;
         std::array<InlineCallCacheEntry, 64> inlineCallCache{};
-        std::array<FastNativeBindEntry, 64> nativeBindCache{};
         std::vector<ObjectRef> stringLiteralCache;
         std::uint64_t stringLiteralHeapId = 0;
         std::uint64_t stringLiteralGcEpoch = 0;
@@ -304,6 +305,7 @@ struct ThreadInvokeScratch {
     };
     enum : std::size_t { MaxDepth = 8 };
     std::array<Buffers, MaxDepth> pool{};
+    std::array<FastNativeBindEntry, kFastNativeBindCacheSize> sharedNativeBindCache{};
     std::vector<PolymorphicPicSite> sharedPolyCallCache;
     std::vector<DelegateCallSiteCache> sharedDelegateCallCache;
     std::uint64_t sharedMirrorId = 0;

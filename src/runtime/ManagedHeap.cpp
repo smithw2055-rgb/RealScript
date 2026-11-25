@@ -101,6 +101,7 @@ struct alignas(64) HeapSyncState {
     bool (*isObjectAliveFn)(const void*, ObjectRef) noexcept = nullptr;
     bool (*bindObjectFastViewDirtyFn)(const void*, ObjectRef, ObjectFastView&, bool&) noexcept = nullptr;
     bool (*asciiSlice1Fn)(const void*, ObjectRef, std::size_t, ObjectRef&) noexcept = nullptr;
+    bool (*stringPredicateFn)(const void*, ObjectRef, ObjectRef, std::uint8_t, bool&) noexcept = nullptr;
     std::uint64_t heapIdValue = 0;
     std::uint32_t shardIndex = 0;
     std::uint8_t domainId = 0;
@@ -2521,9 +2522,13 @@ static_assert(alignof(CompactSlot) == 32, "CompactSlot must be 32-byte aligned")
 
 class PagedValueSlabPool {
 public:
-    static constexpr std::size_t kBlocksPerPage = 1024;
+    static constexpr std::size_t kMaxBlocksPerPage = 1024;
     static constexpr std::uint16_t kZeroClass = 0xFFFFu;
 
+    [[nodiscard]] static constexpr std::size_t blocksPerPageForClass(std::uint16_t cls) noexcept {
+        constexpr std::size_t kTable[4] = {512u, 256u, 256u, 128u};
+        return cls < 4u ? kTable[cls] : 128u;
+    }
     [[nodiscard]] static constexpr std::uint16_t sizeToClass(std::size_t count) noexcept {
         return count <= 1 ? 0 : (count <= 2 ? 1 : (count <= 4 ? 2 : 3));
     }
@@ -2550,18 +2555,19 @@ public:
             return resolve(cls, outHandle);
         }
         const std::size_t stride = classStride(cls);
-        if (pool.cursor >= kBlocksPerPage ||
+        const std::size_t blocksPerPage = blocksPerPageForClass(cls);
+        if (pool.cursor >= blocksPerPage ||
             pool.currentPageIdx >= pool.pages.size() ||
             !pool.pages[pool.currentPageIdx]) {
             std::uint32_t nextPageIdx = 0u;
             if (!pool.emptyPageIndices.empty()) {
                 nextPageIdx = pool.emptyPageIndices.back();
                 pool.emptyPageIndices.pop_back();
-                pool.pages[nextPageIdx] = std::make_unique<Value[]>(kBlocksPerPage * stride);
+                pool.pages[nextPageIdx] = std::make_unique<Value[]>(blocksPerPage * stride);
                 pool.liveCountPerPage[nextPageIdx] = 0u;
             } else {
                 nextPageIdx = static_cast<std::uint32_t>(pool.pages.size());
-                pool.pages.push_back(std::make_unique<Value[]>(kBlocksPerPage * stride));
+                pool.pages.push_back(std::make_unique<Value[]>(blocksPerPage * stride));
                 pool.liveCountPerPage.push_back(0u);
             }
             pool.currentPageIdx = nextPageIdx;
@@ -2604,7 +2610,8 @@ public:
             auto& pool = classes_[cls];
             if (pool.pages.empty()) continue;
             const std::size_t stride = classStride(cls);
-            const std::size_t pageBytes = kBlocksPerPage * stride * sizeof(Value);
+            const std::size_t blocksPerPage = blocksPerPageForClass(cls);
+            const std::size_t pageBytes = blocksPerPage * stride * sizeof(Value);
             bool anyLive = false;
             for (std::size_t p = 0; p < pool.pages.size(); ++p) {
                 if (pool.pages[p] &&
@@ -2622,7 +2629,7 @@ public:
                 std::vector<std::uint16_t>().swap(pool.liveCountPerPage);
                 std::vector<std::uint32_t>().swap(pool.emptyPageIndices);
                 std::vector<std::uint32_t>().swap(pool.freeList);
-                pool.cursor = kBlocksPerPage;
+                pool.cursor = kMaxBlocksPerPage;
                 pool.currentPageIdx = 0xFFFFFFFFu;
                 continue;
             }
@@ -2637,7 +2644,7 @@ public:
                     anyReclaimed = true;
                     if (pool.currentPageIdx == p) {
                         pool.currentPageIdx = 0xFFFFFFFFu;
-                        pool.cursor = kBlocksPerPage;
+                        pool.cursor = kMaxBlocksPerPage;
                     }
                     pool.emptyPageIndices.push_back(static_cast<std::uint32_t>(p));
                 }
@@ -2666,7 +2673,7 @@ public:
             c.liveCountPerPage.clear();
             c.emptyPageIndices.clear();
             c.freeList.clear();
-            c.cursor = kBlocksPerPage;
+            c.cursor = kMaxBlocksPerPage;
             c.currentPageIdx = 0xFFFFFFFFu;
         }
     }
@@ -2677,7 +2684,7 @@ private:
         std::vector<std::uint16_t> liveCountPerPage;
         std::vector<std::uint32_t> emptyPageIndices;
         std::vector<std::uint32_t> freeList;
-        std::size_t cursor = kBlocksPerPage;
+        std::size_t cursor = kMaxBlocksPerPage;
         std::uint32_t currentPageIdx = 0xFFFFFFFFu;
     };
     std::array<ClassArena, 4> classes_;
@@ -3317,6 +3324,51 @@ struct ManagedHeap::Impl {
         return false;
     }
 
+    static bool stringPredicateCallback(
+        const void* rawImpl,
+        ObjectRef haystack,
+        ObjectRef needle,
+        std::uint8_t op,
+        bool& outResult) noexcept {
+        const auto* self = static_cast<const Impl*>(rawImpl);
+        if (!self) {
+            return false;
+        }
+        const auto* sH = self->getSlot(haystack);
+        if (!sH || sH->kind() != ObjectKind::String) {
+            return false;
+        }
+        const std::string_view sv = self->slotStringView(*sH);
+        if (op == 3u) {
+            outResult = sv.empty();
+            return true;
+        }
+        const auto* sN = self->getSlot(needle);
+        if (!sN || sN->kind() != ObjectKind::String) {
+            return false;
+        }
+        if (haystack == needle) {
+            outResult = true;
+            return true;
+        }
+        const std::string_view sub = self->slotStringView(*sN);
+        switch (op) {
+        case 0u:
+            outResult = (sv.find(sub) != std::string_view::npos);
+            return true;
+        case 1u:
+            outResult = (sv.size() >= sub.size() && sv.compare(0u, sub.size(), sub) == 0);
+            return true;
+        case 2u:
+            outResult =
+                (sv.size() >= sub.size() &&
+                 sv.compare(sv.size() - sub.size(), sub.size(), sub) == 0);
+            return true;
+        default:
+            return false;
+        }
+    }
+
     static std::shared_ptr<HeapSyncState> makeSyncState(
         Impl* implPtr,
         bool (*markFn)(void*),
@@ -3336,6 +3388,7 @@ struct ManagedHeap::Impl {
         sync->isObjectAliveFn = &Impl::isObjectAliveCallback;
         sync->bindObjectFastViewDirtyFn = &Impl::bindObjectFastViewDirtyCallback;
         sync->asciiSlice1Fn = &Impl::asciiSlice1Callback;
+        sync->stringPredicateFn = &Impl::stringPredicateCallback;
         return sync;
     }
 
@@ -3370,6 +3423,7 @@ struct ManagedHeap::Impl {
                 syncState->isObjectAliveFn = nullptr;
                 syncState->bindObjectFastViewDirtyFn = nullptr;
                 syncState->asciiSlice1Fn = nullptr;
+                syncState->stringPredicateFn = nullptr;
             }
             unregisterHeapSyncFromPoolShard(*syncState);
             unregisterHeapSyncFromStringShard(*syncState);
@@ -12688,6 +12742,20 @@ bool heapStringAsciiSlice1WithToken(
     }
     HeapReadOrDisjointGuard heapLock(*const_cast<HeapSyncState*>(sync));
     return sync->asciiSlice1Fn(sync->ownerImpl, strRef, index, outRef);
+}
+
+bool heapStringPredicateWithToken(
+    const void* heapImplToken,
+    ObjectRef haystack,
+    ObjectRef needle,
+    std::uint8_t op,
+    bool& outResult) noexcept {
+    const auto* sync = static_cast<const HeapSyncState*>(heapImplToken);
+    if (!sync || !sync->stringPredicateFn) {
+        return false;
+    }
+    HeapReadOrDisjointGuard heapLock(*const_cast<HeapSyncState*>(sync));
+    return sync->stringPredicateFn(sync->ownerImpl, haystack, needle, op, outResult);
 }
 
 bool heapStringsEqualFast(
