@@ -38,6 +38,10 @@ bool linkFailure(RuntimeError& error, std::string message) {
 semantic::SymbolId exactTypeId(
     semantic::PrimitiveType type,
     const std::string& typeName) noexcept {
+    if (type == semantic::PrimitiveType::Object &&
+        (typeName.empty() || typeName == "object")) {
+        return 0;
+    }
     return (semantic::isExactType(type) ||
             type == semantic::PrimitiveType::Handle) &&
             !typeName.empty()
@@ -1806,6 +1810,147 @@ bool tryBuildObjectAllocationTemplate(
         return false;
     }
     tmpl.referenceFields = std::make_shared<const std::vector<std::size_t>>(std::move(refIndices));
+
+    // Phase 2.2: Build packed HybridRecord layout for classes exceeding SlabValues capacity (> 8 fields)
+    if (instSlotCount > 8u && instSlotCount <= 65535u) {
+        HybridRecordLayout hybrid;
+        hybrid.typeId = type.id;
+        hybrid.fieldCount = static_cast<std::uint32_t>(instSlotCount);
+        hybrid.fields.resize(instSlotCount);
+
+        std::uint16_t refSlotIdx = 0;
+        std::vector<std::size_t> align8Fields;
+        std::vector<std::size_t> align4Fields;
+        std::vector<std::size_t> align2Fields;
+        std::vector<std::size_t> align1Fields;
+        for (std::size_t fIdx = 0; fIdx < instSlotCount; ++fIdx) {
+            const auto& field = type.fields[fIdx];
+            const auto fType = field.type;
+            const auto fTid = exactTypeId(fType, field.typeName);
+            auto& desc = hybrid.fields[fIdx];
+            desc.valueTag = static_cast<std::uint8_t>(tmpl.defaultFields[fIdx].rawTag());
+            switch (fType) {
+            case semantic::PrimitiveType::Bool:
+                desc.kind = HybridScalarKind::Bool;
+                align1Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::Byte:
+                desc.kind = HybridScalarKind::Byte;
+                align1Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::SByte:
+                desc.kind = HybridScalarKind::SByte;
+                align1Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::Short:
+                desc.kind = HybridScalarKind::Short;
+                align2Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::UShort:
+                desc.kind = HybridScalarKind::UShort;
+                align2Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::Char:
+                desc.kind = HybridScalarKind::Char;
+                align2Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::Int:
+                desc.kind = HybridScalarKind::Int32;
+                align4Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::UInt:
+                desc.kind = HybridScalarKind::UInt32;
+                align4Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::Float:
+                desc.kind = HybridScalarKind::Float32;
+                align4Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::Enum:
+                desc.kind = HybridScalarKind::Enum32;
+                desc.enumTypeId = fTid;
+                align4Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::Long:
+                desc.kind = HybridScalarKind::Int64;
+                align8Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::ULong:
+                desc.kind = HybridScalarKind::UInt64;
+                align8Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::Double:
+                desc.kind = HybridScalarKind::Float64;
+                align8Fields.push_back(fIdx);
+                break;
+            default:
+                desc.kind = HybridScalarKind::ValueSlot;
+                desc.offsetOrSlot = refSlotIdx++;
+                break;
+            }
+        }
+        const bool hasPackedScalar =
+            !align8Fields.empty() || !align4Fields.empty() ||
+            !align2Fields.empty() || !align1Fields.empty();
+        if (hasPackedScalar) {
+            hybrid.refSlotCount = refSlotIdx;
+            std::uint32_t cursor = static_cast<std::uint32_t>(refSlotIdx) * static_cast<std::uint32_t>(sizeof(Value));
+            hybrid.scalarOffsetBytes = cursor;
+            for (const auto fIdx : align8Fields) {
+                cursor = (cursor + 7u) & ~7u;
+                hybrid.fields[fIdx].offsetOrSlot = cursor;
+                cursor += 8u;
+            }
+            for (const auto fIdx : align4Fields) {
+                cursor = (cursor + 3u) & ~3u;
+                hybrid.fields[fIdx].offsetOrSlot = cursor;
+                cursor += 4u;
+            }
+            for (const auto fIdx : align2Fields) {
+                cursor = (cursor + 1u) & ~1u;
+                hybrid.fields[fIdx].offsetOrSlot = cursor;
+                cursor += 2u;
+            }
+            for (const auto fIdx : align1Fields) {
+                hybrid.fields[fIdx].offsetOrSlot = cursor;
+                cursor += 1u;
+            }
+            hybrid.totalBytes = (cursor + 7u) & ~7u;
+            const std::size_t flatBytes = instSlotCount * sizeof(Value);
+            if (hybrid.totalBytes > 0u &&
+                static_cast<std::size_t>(hybrid.totalBytes) < flatBytes) {
+                std::vector<std::uint8_t> packedDefaults(hybrid.totalBytes, 0u);
+                auto* payloadBase = reinterpret_cast<Value*>(packedDefaults.data());
+                bool packOk = true;
+                for (std::size_t fIdx = 0; fIdx < instSlotCount; ++fIdx) {
+                    const auto& desc = hybrid.fields[fIdx];
+                    if (desc.kind == HybridScalarKind::ValueSlot) {
+                        std::memcpy(
+                            payloadBase + desc.offsetOrSlot,
+                            &tmpl.defaultFields[fIdx],
+                            sizeof(Value));
+                    } else {
+                        bool dummyChanged = false;
+                        if (!tryWriteHybridFieldRaw(
+                                payloadBase,
+                                desc,
+                                tmpl.defaultFields[fIdx],
+                                false,
+                                dummyChanged)) {
+                            packOk = false;
+                            break;
+                        }
+                    }
+                }
+                if (packOk) {
+                    tmpl.hybridLayout =
+                        std::make_shared<const HybridRecordLayout>(std::move(hybrid));
+                    tmpl.defaultHybridBytes = std::move(packedDefaults);
+                }
+            }
+        }
+    }
+
     const auto tIdx = static_cast<std::uint16_t>(mirror.objectTemplates.size());
     mirror.objectTemplates.push_back(std::move(tmpl));
     ctx.objectTemplateByTypeId.emplace(type.id, tIdx);

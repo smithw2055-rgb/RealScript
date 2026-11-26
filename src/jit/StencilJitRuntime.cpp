@@ -1868,7 +1868,9 @@ std::uint32_t jitFlatStructAndStackRefHelper(JitAbiContext* ctx, std::uint32_t f
                 tmpl.defaultFields.size(),
                 tmpl.referenceFields,
                 &allocErr,
-                &attemptMoved);
+                &attemptMoved,
+                tmpl.hybridLayout,
+                tmpl.defaultHybridBytes.empty() ? nullptr : tmpl.defaultHybridBytes.data());
             slotsMoved = slotsMoved || attemptMoved;
             return res;
         };
@@ -1979,7 +1981,8 @@ std::uint32_t jitFlatStructAndStackRefHelper(JitAbiContext* ctx, std::uint32_t f
             return setHelperError(ctx, flatIdx, runtime::ErrorCode::InstructionBudgetExceeded, "instruction budget exceeded");
         }
         ctx->remainingBudget -= fi.span;
-        ctx->frameBase[fi.dstSlot] = view.fields[fi.aux0Slot];
+        ctx->frameBase[fi.dstSlot] =
+            runtime::detail::loadObjectFastViewField(view, fi.aux0Slot);
         return 0u;
     }
     if (fi.flatOpcode == FO::StoreFieldExactFast || fi.flatOpcode == FO::StoreFieldFast) {

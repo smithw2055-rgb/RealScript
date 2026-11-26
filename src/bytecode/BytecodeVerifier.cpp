@@ -247,7 +247,17 @@ bool validDescriptorIdentity(
         found->second->kind == expectedTypeKind(type);
 }
 
+bool isAnyObjectFieldType(
+    semantic::PrimitiveType type,
+    std::string_view typeName) noexcept {
+    return type == semantic::PrimitiveType::Object &&
+        (typeName.empty() || typeName == "object");
+}
+
 semantic::SymbolId fieldTypeId(const semantic::FieldSymbol& field) noexcept {
+    if (isAnyObjectFieldType(field.type, field.typeName)) {
+        return 0;
+    }
     return semantic::isExactType(field.type)
         ? semantic::stableTypeId(field.typeName)
         : semantic::SymbolId{0};
@@ -495,8 +505,11 @@ bool verifyModule(
 
         for (std::size_t fieldIndex = 0; fieldIndex < type.fields.size(); ++fieldIndex) {
             const auto& field = type.fields[fieldIndex];
+            const bool isAnyObj = isAnyObjectFieldType(field.type, field.typeName);
             bool exactTypeValid = true;
-            if (field.type == semantic::PrimitiveType::Object ||
+            if (isAnyObj) {
+                exactTypeValid = true;
+            } else if (field.type == semantic::PrimitiveType::Object ||
                 field.type == semantic::PrimitiveType::Struct ||
                 field.type == semantic::PrimitiveType::Enum) {
                 const auto fieldTypeId = semantic::stableTypeId(field.typeName);
@@ -520,8 +533,7 @@ bool verifyModule(
             if (field.index != fieldIndex || field.name.empty() ||
                 !fieldNames.insert(field.name).second ||
                 !validStorageType(field.type) ||
-                ((field.type == semantic::PrimitiveType::Object ||
-                  field.type == semantic::PrimitiveType::Struct ||
+                ((field.type == semantic::PrimitiveType::Struct ||
                   field.type == semantic::PrimitiveType::Enum ||
                   field.type == semantic::PrimitiveType::Array) &&
                     field.typeName.empty()) ||

@@ -343,6 +343,10 @@ const semantic::TypeSymbol* typeDescriptorById(
 semantic::SymbolId exactTypeId(
     semantic::PrimitiveType type,
     const std::string& typeName) {
+    if (type == semantic::PrimitiveType::Object &&
+        (typeName.empty() || typeName == "object")) {
+        return 0;
+    }
     return semantic::isExactType(type) && !typeName.empty()
         ? semantic::stableTypeId(typeName)
         : 0;

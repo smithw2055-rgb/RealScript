@@ -252,9 +252,7 @@ void collectUnboxableCustomStructs(
             }
             bool allScalarMathOrNested = true;
             for (const auto& field : type.fields) {
-                const auto fieldTypeId = semantic::isExactType(field.type) && !field.typeName.empty()
-                    ? semantic::stableTypeId(field.typeName)
-                    : 0;
+                const auto fieldTypeId = exactTypeId(field.type, field.typeName);
                 if (field.staticField ||
                     !isTypedAotSlot({field.type, fieldTypeId}, &unboxableCustomStructs)) {
                     allScalarMathOrNested = false;

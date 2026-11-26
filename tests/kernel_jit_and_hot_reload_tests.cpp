@@ -1419,6 +1419,155 @@ public class Worker {
     }
 }
 
+void testHybridRecordStencilJitAndHotReloadMigration() {
+    const std::string srcV1 = R"RS(
+module Kernel.HybridJitHr;
+
+public class Payload {
+    public int Code;
+}
+
+public class RichNode {
+    public string Title;
+    public object Tag;
+    public int Width;
+    public int Height;
+    public float Scale;
+    public double Opacity;
+    public bool Enabled;
+    public byte Mode;
+    public long Revision;
+    public short ZIndex;
+}
+
+public RichNode CreateNode(string title, int w, int h) {
+    RichNode n = new RichNode();
+    n.Title = title;
+    Payload p = new Payload();
+    p.Code = 55;
+    n.Tag = p;
+    n.Width = w;
+    n.Height = h;
+    n.Scale = 1.25f;
+    n.Opacity = 0.875;
+    n.Enabled = true;
+    n.Mode = 3;
+    n.Revision = 9001l;
+    n.ZIndex = (short)(-4);
+    return n;
+}
+
+public int StepNode(RichNode n, int delta) {
+    n.Width = n.Width + delta;
+    int bonus = 0;
+    Payload p = n.Tag as Payload;
+    if (p != null) {
+        bonus = p.Code;
+    }
+    if (n.Enabled && n.Opacity > 0.5 && n.Scale > 1.0f && n.Mode == 3 && n.ZIndex == (short)(-4)) {
+        return n.Width + n.Height + bonus;
+    }
+    return -1;
+}
+)RS";
+
+    const std::string srcV2 = R"RS(
+module Kernel.HybridJitHr;
+
+public class Payload {
+    public int Code;
+}
+
+public class RichNode {
+    public string Title;
+    public object Tag;
+    public int Width;
+    public int Height;
+    public double Scale;
+    public double Opacity;
+    public bool Enabled;
+    public byte Mode;
+    public long Revision;
+    public short ZIndex;
+    public int AddedField = 7;
+}
+
+public RichNode CreateNode(string title, int w, int h) {
+    RichNode n = new RichNode();
+    n.Title = title;
+    return n;
+}
+
+public int StepNode(RichNode n, int delta) {
+    Payload p = n.Tag as Payload;
+    if (p != null) {
+        return n.Width + n.Height + p.Code + n.AddedField;
+    }
+    return -1;
+}
+)RS";
+
+    auto v1 = compileAndLink({{"hybrid_jit_hr.rscript", srcV1}}, optimization::Level::Basic);
+    auto v2 = compileAndLink({{"hybrid_jit_hr.rscript", srcV2}}, optimization::Level::Basic);
+
+    // 1. StencilJit Tier-2 parity on HybridRecord allocation + field read/write
+    jit::StencilJit sjit;
+    jit::StencilJitOptions jitOpts;
+    jitOpts.enableNativeCodegen = true;
+    auto jitCompiled = sjit.compile(v1.program, jitOpts);
+    require(jitCompiled.succeeded(), "StencilJit compile failed: " + jitCompiled.error);
+
+    auto sharedHeap = std::make_shared<runtime::ManagedHeap>();
+    jitCompiled.module->setHeap(sharedHeap);
+    runtime::Interpreter interpV1(v1.program, sharedHeap);
+
+    const auto nRes = jitCompiled.module->invoke(
+        "Kernel.HybridJitHr::CreateNode",
+        {runtime::Value{"card"}, std::int64_t{100}, std::int64_t{40}});
+    require(nRes.succeeded && nRes.value.rawTag() == runtime::ValueTag::ObjectRef,
+        "JIT CreateNode failed: " + nRes.error.message);
+    const auto nodeRef = nRes.value.asObjectRefUnchecked();
+    const auto nodeRoot = sharedHeap->retain(nodeRef);
+    require(sharedHeap->isHybridRecordObject(nodeRef),
+        "Expected JIT-allocated RichNode to use SlotStorage::HybridRecord");
+
+    const auto jitStep = jitCompiled.module->invoke(
+        "Kernel.HybridJitHr::StepNode",
+        {runtime::Value{nodeRef}, std::int64_t{10}});
+    std::int64_t jitStepOut = 0;
+    require(jitStep.succeeded && jitStep.value.tryGetInt64(jitStepOut) && jitStepOut == (110 + 40 + 55),
+        "JIT StepNode on HybridRecord failed");
+
+    const auto vmStep = interpV1.invoke(
+        "Kernel.HybridJitHr::StepNode",
+        {runtime::Value{nodeRef}, std::int64_t{5}});
+    std::int64_t vmStepOut = 0;
+    require(vmStep.succeeded && vmStep.value.tryGetInt64(vmStepOut) && vmStepOut == (115 + 40 + 55),
+        "VM StepNode parity after JIT on HybridRecord failed");
+
+    // 2. HotReload migration of live HybridRecord instance
+    hot_reload::ReloadOptions hrOpts;
+    hrOpts.allowStructuralChanges = true;
+    const auto plan = hot_reload::prepare(*v1.program, v2.bytecodeModules, hrOpts);
+    require(plan.compatible && !plan.typeMigrations.empty(),
+        "HotReload plan failed for HybridRecord class update: " +
+            (plan.issues.empty() ? std::string("none") : plan.issues.front().message));
+    runtime::LayoutMigrationStats hrStats{};
+    runtime::RuntimeError hrErr;
+    require(sharedHeap->migrateTypeLayouts(plan.typeMigrations, &hrStats, &hrErr),
+        "migrateTypeLayouts failed on HybridRecord: " + hrErr.message);
+    require(hrStats.objectsMigrated >= 1u, "Expected HybridRecord instance to be migrated");
+
+    runtime::Interpreter interpV2(v2.program, sharedHeap);
+    const auto afterHr = interpV2.invoke(
+        "Kernel.HybridJitHr::StepNode",
+        {runtime::Value{nodeRef}, std::int64_t{0}});
+    std::int64_t afterHrOut = 0;
+    require(afterHr.succeeded && afterHr.value.tryGetInt64(afterHrOut) && afterHrOut == (115 + 40 + 55 + 7),
+        "Post-HotReload StepNode on migrated HybridRecord failed");
+    (void)nodeRoot;
+}
+
 } // namespace
 
 int main() {
@@ -1434,6 +1583,7 @@ int main() {
             {"StencilJit GC.Alloc attribution & per-function diagnostics", testStencilJitAllocAttributionAndFunctionDiagnostics},
             {"Wave 2 regression: StencilJit IExecutionPolicy & NegateIntChecked/ConvertNumeric/BinaryUInt", testWaveRegressionStencilJitPolicyAndFastOps},
             {"Audit regression: StencilJit struct calls, ValuePoolDomain, Enum->Int & compactForRuntime HotReload", testAuditRegressionStencilStructsPoolDomainEnumAndCompactHr},
+            {"Phase 2.2: HybridRecord StencilJit parity & HotReload migration", testHybridRecordStencilJitAndHotReloadMigration},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

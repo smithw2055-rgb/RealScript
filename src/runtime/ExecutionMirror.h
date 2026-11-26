@@ -638,6 +638,8 @@ struct ObjectAllocationTemplate {
     semantic::SymbolId typeId = 0;
     std::vector<Value> defaultFields;
     std::shared_ptr<const std::vector<std::size_t>> referenceFields;
+    std::shared_ptr<const detail::HybridRecordLayout> hybridLayout;
+    std::vector<std::uint8_t> defaultHybridBytes;
 };
 
 enum class TrivialMethodKind : std::uint8_t {

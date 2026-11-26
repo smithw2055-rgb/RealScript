@@ -2394,6 +2394,244 @@ public static DerivedWidget MakeWidget() {
     }
 }
 
+void testHybridRecordCompressionAccessDemotionGcAndDirty() {
+    const std::string src = R"RS(
+module Kernel.HybridRecordSuite;
+
+public enum DockMode {
+    None = 0,
+    Left = 1,
+    Fill = 2,
+}
+
+public class Tag {
+    public int Value;
+}
+
+public class WidgetLike {
+    public string Name;
+    public object Data;
+    public Tag Linked;
+    public bool Visible;
+    public byte Alpha;
+    public sbyte Layer;
+    public short OffsetX;
+    public ushort Flags;
+    public char Glyph;
+    public int Count;
+    public uint Mask;
+    public long Stamp;
+    public ulong Hash;
+    public float Opacity;
+    public double Width;
+    public DockMode Dock;
+    public int S0;
+    public int S1;
+    public int S2;
+    public int S3;
+    public float F0;
+    public float F1;
+    public bool B0;
+    public bool B1;
+
+    public int GetCount() { return Count; }
+    public void SetCount(int c) { Count = c; }
+}
+
+public WidgetLike MakeWidget(string label) {
+    WidgetLike w = new WidgetLike();
+    w.Name = label;
+    Tag t = new Tag();
+    t.Value = 77;
+    w.Data = t;
+    w.Linked = t;
+    w.Visible = true;
+    w.Alpha = 250;
+    w.Layer = (sbyte)(-12);
+    w.OffsetX = (short)(-320);
+    w.Flags = 51966;
+    w.Glyph = 'A';
+    w.Count = 42;
+    w.Mask = 3735928559u;
+    w.Stamp = 1234567890123l;
+    w.Hash = 9876543210987ul;
+    w.Opacity = 0.75f;
+    w.Width = 320.5;
+    w.Dock = DockMode.Fill;
+    w.S0 = 10;
+    w.S1 = 20;
+    w.S2 = 30;
+    w.S3 = 40;
+    w.F0 = 1.5f;
+    w.F1 = 2.5f;
+    w.B0 = true;
+    w.B1 = false;
+    return w;
+}
+
+public int ExerciseTrivialAndFields(WidgetLike w) {
+    w.SetCount(w.GetCount() + 8);
+    int sum = w.Count + w.S0 + w.S1 + w.S2 + w.S3;
+    if (w.Visible && w.B0 && !w.B1 && w.Dock == DockMode.Fill &&
+        w.Alpha == 250 && w.Layer == (sbyte)(-12) && w.OffsetX == (short)(-320) &&
+        w.Flags == 51966 && w.Glyph == 'A' && w.Mask == 3735928559u &&
+        w.Stamp == 1234567890123l && w.Hash == 9876543210987ul &&
+        w.Width > 320.0 && w.Opacity >= 0.5f && w.Name == "panel") {
+        Tag t = w.Data as Tag;
+        if (t != null) {
+            return sum + t.Value;
+        }
+    }
+    return -1;
+}
+
+public void RebindObjectField(WidgetLike w) {
+    Tag fresh = new Tag();
+    fresh.Value = 321;
+    w.Data = fresh;
+}
+
+public int ReadObjectFieldTag(WidgetLike w) {
+    Tag t = w.Data as Tag;
+    if (t != null) {
+        return t.Value;
+    }
+    return -1;
+}
+)RS";
+
+    auto img = compileAndLink({{"hybrid_record.rscript", src}}, optimization::Level::Aggressive);
+    auto heap = std::make_shared<runtime::ManagedHeap>();
+    runtime::Interpreter interp(img, heap);
+
+    // 1. Dirty callback setup
+    struct DirtyLog {
+        std::size_t count = 0;
+        std::size_t lastField = 0;
+        std::uint8_t lastBit = 0xFFu;
+    } dirtyLog;
+
+    const auto widgetTid = semantic::stableTypeId("Kernel.HybridRecordSuite::WidgetLike");
+    const auto* widgetType = img->resolveType(widgetTid);
+    require(widgetType != nullptr, "Missing WidgetLike type");
+
+    std::size_t countIdx = 0, nameIdx = 0, opacityIdx = 0;
+    for (const auto& f : widgetType->fields) {
+        if (f.name == "Count") countIdx = f.index;
+        if (f.name == "Name") nameIdx = f.index;
+        if (f.name == "Opacity") opacityIdx = f.index;
+    }
+    std::vector<std::uint8_t> dirtyMap(widgetType->fields.size(), 0xFFu);
+    dirtyMap[countIdx] = 3u;
+    dirtyMap[opacityIdx] = 7u;
+    heap->enableTypeDirtyTracking(widgetTid, std::move(dirtyMap));
+    heap->setFieldMutationCallback(
+        [](void* ud, runtime::ManagedHeap&, runtime::ObjectRef, std::size_t fIdx, std::uint8_t dBit) {
+            auto* log = static_cast<DirtyLog*>(ud);
+            ++log->count;
+            log->lastField = fIdx;
+            log->lastBit = dBit;
+        },
+        &dirtyLog);
+
+    // 2. Allocate & verify HybridRecord compression
+    const auto mk1 = interp.invoke("Kernel.HybridRecordSuite::MakeWidget", {runtime::Value{"panel"}});
+    require(mk1.succeeded && mk1.value.rawTag() == runtime::ValueTag::ObjectRef, "MakeWidget #1 failed");
+    const auto wRef = mk1.value.asObjectRefUnchecked();
+    const auto rootW1 = heap->retain(wRef);
+
+    const auto mk2 = interp.invoke("Kernel.HybridRecordSuite::MakeWidget", {runtime::Value{"other"}});
+    require(mk2.succeeded && mk2.value.rawTag() == runtime::ValueTag::ObjectRef, "MakeWidget #2 failed");
+    const auto wOther = mk2.value.asObjectRefUnchecked();
+    const auto rootW2 = heap->retain(wOther);
+
+    require(heap->isHybridRecordObject(wRef), "Expected WidgetLike to use SlotStorage::HybridRecord");
+    require(!heap->isInlineRecordObject(wRef), "Expected WidgetLike not to report SlabValues");
+    const std::size_t flatExpectedBytes = 32u + widgetType->fields.size() * sizeof(runtime::Value);
+    const std::size_t hybridBytes = heap->objectSizeBytes(wRef).value_or(0u);
+    require(hybridBytes > 32u && hybridBytes * 2u < flatExpectedBytes,
+        "Expected HybridRecord objectSizeBytes < 50% of flat layout (got " +
+            std::to_string(hybridBytes) + " vs flat " + std::to_string(flatExpectedBytes) + ")");
+
+    // 3. fieldGetFast vs fieldGetInto
+    require(heap->fieldGetFast(wRef, nameIdx) != nullptr,
+        "Expected fieldGetFast to return non-null for ValueSlot string field");
+    require(heap->fieldGetFast(wRef, countIdx) == nullptr,
+        "Expected fieldGetFast to return nullptr for packed scalar Count field");
+
+    runtime::Value intoVal{};
+    semantic::SymbolId outTid = 0;
+    require(heap->fieldGetInto(wRef, countIdx, intoVal, &outTid) && outTid == widgetTid,
+        "fieldGetInto failed on packed scalar Count");
+    std::int64_t iv = 0;
+    require(intoVal.tryGetInt64(iv) && iv == 42, "Unexpected Count from fieldGetInto");
+    require(heap->fieldGetInto(wRef, opacityIdx, intoVal) &&
+            intoVal.rawTag() == runtime::ValueTag::Float &&
+            intoVal.asFloatUnchecked() == 0.75f,
+        "Unexpected Opacity from fieldGetInto");
+
+    // 4. Dirty notification: unchanged scalar write does NOT fire; changed write DOES fire
+    dirtyLog = {};
+    require(heap->fieldSetFast(wRef, opacityIdx, runtime::Value{runtime::FloatValue{0.75f}}, widgetTid, semantic::PrimitiveType::Float),
+        "fieldSetFast unchanged failed");
+    require(dirtyLog.count == 0u, "Unchanged scalar write should not trigger dirty callback");
+    require(heap->fieldSetFast(wRef, opacityIdx, runtime::Value{runtime::FloatValue{0.5f}}, widgetTid, semantic::PrimitiveType::Float),
+        "fieldSetFast changed failed");
+    require(dirtyLog.count == 1u && dirtyLog.lastField == opacityIdx && dirtyLog.lastBit == 7u,
+        "Changed scalar write did not report expected dirty callback");
+
+    // 5. VM execution + trivial methods + field checks
+    dirtyLog = {};
+    const auto exRes = interp.invoke("Kernel.HybridRecordSuite::ExerciseTrivialAndFields", {runtime::Value{wRef}});
+    std::int64_t exInt = 0;
+    require(exRes.succeeded && exRes.value.tryGetInt64(exInt) && exInt == (50 + 10 + 20 + 30 + 40 + 77),
+        "ExerciseTrivialAndFields parity failed: " + exRes.error.message);
+    require(dirtyLog.count == 1u && dirtyLog.lastField == countIdx && dirtyLog.lastBit == 3u,
+        "VM trivial StoreThisFieldExact on HybridRecord missed dirty notification");
+
+    // 6. GC promotion to old-gen + write barrier + collectYoung + collectFull + snapshot/restore
+    heap->collectYoung(runtime::ShadowStack{});
+    require(interp.invoke("Kernel.HybridRecordSuite::RebindObjectField", {runtime::Value{wRef}}).succeeded,
+        "RebindObjectField failed");
+    heap->collectYoung(runtime::ShadowStack{});
+    heap->collectFull(runtime::ShadowStack{});
+    const auto tagRes = interp.invoke("Kernel.HybridRecordSuite::ReadObjectFieldTag", {runtime::Value{wRef}});
+    std::int64_t tagVal = 0;
+    require(tagRes.succeeded && tagRes.value.tryGetInt64(tagVal) && tagVal == 321,
+        "GC lost young object written into old-gen HybridRecord object field");
+
+    // 7. Lossless demotion on >32-bit int write while leaving sibling instances Hybrid
+    const std::int64_t wideVal = (std::int64_t{1} << 42) + 99;
+    require(heap->fieldSet(wRef, countIdx, runtime::Value{wideVal}),
+        "fieldSet >32-bit int on HybridRecord failed");
+    require(!heap->isHybridRecordObject(wRef),
+        "Expected single demoted instance to leave SlotStorage::HybridRecord");
+    require(heap->isHybridRecordObject(wOther),
+        "Expected sibling instance to remain SlotStorage::HybridRecord");
+    require(heap->fieldGetInto(wRef, countIdx, intoVal) &&
+            intoVal.tryGetInt64(iv) && iv == wideVal,
+        "Wide int value lost after Hybrid->HeapValues demotion");
+    require(heap->fieldGetInto(wRef, opacityIdx, intoVal) &&
+            intoVal.rawTag() == runtime::ValueTag::Float &&
+            intoVal.asFloatUnchecked() == 0.5f,
+        "Neighboring packed scalar corrupted during Hybrid->HeapValues demotion");
+
+    // 8. Snapshot + mutate + restore on the same heap
+    const auto snap = heap->snapshot();
+    require(heap->fieldSetFast(wOther, opacityIdx, runtime::Value{runtime::FloatValue{0.25f}}, widgetTid, semantic::PrimitiveType::Float),
+        "Pre-restore mutation failed");
+    runtime::RuntimeError restoreErr;
+    require(heap->restore(snap, &restoreErr),
+        "ManagedHeap::restore from HybridRecord snapshot failed: " + restoreErr.message);
+    runtime::Value restoredOpacity{};
+    require(heap->fieldGetInto(wOther, opacityIdx, restoredOpacity) &&
+            restoredOpacity.rawTag() == runtime::ValueTag::Float &&
+            restoredOpacity.asFloatUnchecked() == 0.75f,
+        "Restored HybridRecord Opacity mismatch");
+    (void)rootW1;
+    (void)rootW2;
+}
+
 } // namespace
 
 int main() {
@@ -2414,6 +2652,7 @@ int main() {
             {"Waves 1-4 regression: Enum32, concurrent ExecutionMirror, 8-slot slabs & FNV-1a internedStrings", testWaveRegressionEnumMirrorSlabsAndStrings},
             {"Audit regression: incremental ConstantStringFast, intrinsic policy, restoreEpoch PIC & >2k QuatfArena", testAuditRegressionGcCachesAndQuatf},
             {"Static and const fields excluded from instance object layout", testStaticAndConstFieldsExcludedFromInstanceLayout},
+            {"Phase 2.2: HybridRecord compression, scalar fast paths, GC, dirty tracking & demotion", testHybridRecordCompressionAccessDemotionGcAndDirty},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

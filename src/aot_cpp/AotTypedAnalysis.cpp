@@ -60,6 +60,10 @@ std::string typeKindExpression(semantic::TypeKind kind) {
 semantic::SymbolId exactTypeId(
     semantic::PrimitiveType type,
     const std::string& name) {
+    if (type == semantic::PrimitiveType::Object &&
+        (name.empty() || name == "object")) {
+        return 0;
+    }
     return semantic::isExactType(type) && !name.empty()
         ? semantic::stableTypeId(name)
         : 0;
