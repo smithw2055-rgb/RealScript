@@ -461,6 +461,11 @@ struct LazyFunctionBodyLoc {
     std::uint32_t offsetInChunk = 0;
     std::uint32_t uncompressedSize = 0;
 };
+static_assert(
+    sizeof(LazyFunctionBodyLoc) == 20 &&
+    alignof(LazyFunctionBodyLoc) == 4 &&
+    std::is_trivially_copyable_v<LazyFunctionBodyLoc>,
+    "LazyFunctionBodyLoc must match packed v4 .rodata layout");
 
 struct LazyBytecodeChunk {
     std::uint32_t uncompressedSize = 0;
@@ -473,6 +478,11 @@ struct LazyStringSpan {
     std::uint32_t offset = 0;
     std::uint32_t length = 0;
 };
+static_assert(
+    sizeof(LazyStringSpan) == 8 &&
+    alignof(LazyStringSpan) == 4 &&
+    std::is_trivially_copyable_v<LazyStringSpan>,
+    "LazyStringSpan must match packed v4 .rodata layout");
 
 struct LazyBytecodeBundle {
     std::vector<Module> headerModules;
@@ -484,12 +494,86 @@ struct LazyBytecodeBundle {
     const std::uint8_t* rawBlobData = nullptr;
     std::size_t rawBlobSize = 0;
     std::vector<std::uint8_t> ownedBlob;
+    std::uint32_t v4StringCount = 0;
+    std::uint32_t v4StringDataSize = 0;
+    std::uint32_t v4StringSpansOffset = 0;
+    std::uint32_t v4StringDataOffset = 0;
+    std::uint32_t v4FunctionLocCount = 0;
+    std::uint32_t v4FunctionLocsOffset = 0;
+    bool v4ZeroCopyStrings = false;
+    bool v4ZeroCopyFunctionLocs = false;
+
+    [[nodiscard]] const std::uint8_t* blobBase() const noexcept {
+        return !ownedBlob.empty() ? ownedBlob.data() : rawBlobData;
+    }
+
+    [[nodiscard]] std::size_t blobSize() const noexcept {
+        return !ownedBlob.empty() ? ownedBlob.size() : rawBlobSize;
+    }
+
+    [[nodiscard]] bool hasZeroCopyStrings() const noexcept {
+        return v4ZeroCopyStrings && blobBase() != nullptr;
+    }
+
+    [[nodiscard]] bool hasZeroCopyFunctionLocs() const noexcept {
+        return v4ZeroCopyFunctionLocs && blobBase() != nullptr;
+    }
+
+    [[nodiscard]] const LazyStringSpan* flatStringSpansPtr() const noexcept {
+        if (hasZeroCopyStrings()) {
+            return reinterpret_cast<const LazyStringSpan*>(blobBase() + v4StringSpansOffset);
+        }
+        return flatStringSpans.data();
+    }
+
+    [[nodiscard]] const char* flatStringDataPtr() const noexcept {
+        if (hasZeroCopyStrings()) {
+            return reinterpret_cast<const char*>(blobBase() + v4StringDataOffset);
+        }
+        return flatStringData.data();
+    }
+
+    [[nodiscard]] std::size_t flatStringBytes() const noexcept {
+        return hasZeroCopyStrings()
+            ? static_cast<std::size_t>(v4StringDataSize)
+            : flatStringData.size();
+    }
+
+    [[nodiscard]] std::size_t functionLocCount() const noexcept {
+        return hasZeroCopyFunctionLocs()
+            ? static_cast<std::size_t>(v4FunctionLocCount)
+            : functionLocs.size();
+    }
+
+    [[nodiscard]] const LazyFunctionBodyLoc* functionLocsPtr() const noexcept {
+        if (hasZeroCopyFunctionLocs()) {
+            return reinterpret_cast<const LazyFunctionBodyLoc*>(blobBase() + v4FunctionLocsOffset);
+        }
+        return functionLocs.data();
+    }
+
+    [[nodiscard]] const LazyFunctionBodyLoc& functionLocAt(std::uint32_t index) const noexcept {
+        return functionLocsPtr()[index];
+    }
 
     [[nodiscard]] std::size_t stringCount() const noexcept {
+        if (hasZeroCopyStrings()) {
+            return static_cast<std::size_t>(v4StringCount);
+        }
         return !flatStringSpans.empty() ? flatStringSpans.size() : sharedStrings.size();
     }
 
     [[nodiscard]] std::string_view stringViewAt(std::uint32_t index) const noexcept {
+        if (hasZeroCopyStrings()) {
+            if (index >= v4StringCount) return {};
+            const auto& sp = flatStringSpansPtr()[index];
+            if (sp.length == 0u ||
+                sp.offset > v4StringDataSize ||
+                sp.length > v4StringDataSize - sp.offset) {
+                return {};
+            }
+            return std::string_view(flatStringDataPtr() + sp.offset, sp.length);
+        }
         if (!flatStringSpans.empty()) {
             if (index >= flatStringSpans.size()) return {};
             const auto& sp = flatStringSpans[index];

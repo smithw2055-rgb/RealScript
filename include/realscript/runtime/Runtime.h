@@ -3872,8 +3872,50 @@ public:
     void compactForRuntime();
     void releaseTransientLazyCaches() const noexcept;
 
+    struct LazyFunctionLocTable {
+        static constexpr std::uint32_t InvalidIndex =
+            std::numeric_limits<std::uint32_t>::max();
+        std::vector<std::vector<std::uint32_t>> byModuleFunction;
+        std::size_t count = 0;
+
+        void clear() noexcept {
+            byModuleFunction.clear();
+            count = 0;
+        }
+
+        [[nodiscard]] std::uint32_t find(
+            const std::vector<bytecode::Module>& modules,
+            const bytecode::Function* fn) const noexcept {
+            if (!fn) {
+                return InvalidIndex;
+            }
+            const auto fnAddr = reinterpret_cast<std::uintptr_t>(fn);
+            const std::size_t nMods = std::min(byModuleFunction.size(), modules.size());
+            for (std::size_t m = 0u; m < nMods; ++m) {
+                const auto& fns = modules[m].functions;
+                if (fns.empty()) {
+                    continue;
+                }
+                const auto baseAddr = reinterpret_cast<std::uintptr_t>(fns.data());
+                const auto endAddr = reinterpret_cast<std::uintptr_t>(fns.data() + fns.size());
+                if (fnAddr >= baseAddr && fnAddr < endAddr) {
+                    const std::size_t byteOff = static_cast<std::size_t>(fnAddr - baseAddr);
+                    if ((byteOff % sizeof(bytecode::Function)) == 0u) {
+                        const std::size_t idx = byteOff / sizeof(bytecode::Function);
+                        if (idx < byModuleFunction[m].size()) {
+                            return byModuleFunction[m][idx];
+                        }
+                    }
+                    return InvalidIndex;
+                }
+            }
+            return InvalidIndex;
+        }
+    };
+
     [[nodiscard]] std::size_t totalLazyFunctionCount() const noexcept;
     [[nodiscard]] std::size_t compiledLazyFunctionCount() const noexcept;
+    [[nodiscard]] std::size_t materializedExecutionFunctionCount() const noexcept;
     [[nodiscard]] std::size_t decodedLazyChunkCacheSize() const noexcept;
     [[nodiscard]] std::size_t evictedLazyChunkCount() const noexcept;
 
@@ -3941,7 +3983,7 @@ private:
     std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> types_;
     std::shared_ptr<const bytecode::LazyBytecodeBundle> lazyBaseBundle_;
     std::size_t baseModuleCount_ = 0;
-    std::unordered_map<const bytecode::Function*, std::uint32_t> lazyFuncLocIndex_;
+    LazyFunctionLocTable lazyFuncLocTable_;
     mutable std::shared_ptr<std::once_flag> executionMirrorOnce_ = std::make_shared<std::once_flag>();
     mutable std::shared_ptr<const detail::ExecutionMirror> executionMirror_;
     AtomicMirrorCache executionMirrorFast_{};

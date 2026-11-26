@@ -104,12 +104,41 @@ public:
             data_[offset++] = static_cast<std::uint8_t>(value >> shift);
         }
     }
+    void patchU64(std::size_t offset, std::uint64_t value) {
+        if (offset + 8 > data_.size()) {
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+            throw std::logic_error("bytecode writer patch is outside buffer");
+#else
+            std::abort();
+#endif
+        }
+        for (int shift = 0; shift < 64; shift += 8) {
+            data_[offset++] = static_cast<std::uint8_t>(value >> shift);
+        }
+    }
+    void padToAlignment(std::size_t align) {
+        while ((data_.size() % align) != 0u) {
+            data_.push_back(0u);
+        }
+    }
     [[nodiscard]] std::size_t size() const noexcept { return data_.size(); }
     [[nodiscard]] const std::vector<std::uint8_t>& data() const noexcept { return data_; }
     [[nodiscard]] std::vector<std::uint8_t> take() { return std::move(data_); }
 private:
     std::vector<std::uint8_t> data_;
 };
+
+constexpr bool isLittleEndianHost() noexcept {
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    return false;
+#else
+    return true;
+#endif
+}
+
+[[nodiscard]] constexpr std::size_t alignUp8(std::size_t value) noexcept {
+    return (value + 7u) & ~std::size_t(7u);
+}
 
 class Reader {
 public:
@@ -3665,72 +3694,78 @@ std::vector<std::uint8_t> encodeLazyBytecodeBundle(
     }
     flushChunk();
 
-    Writer headerPayload;
-    writeStringTableV3(headerPayload, strings);
-    headerPayload.u32(static_cast<std::uint32_t>(modules.size()));
+    Writer moduleHeaderPayload;
+    moduleHeaderPayload.u32(static_cast<std::uint32_t>(modules.size()));
     for (const auto& mod : modules) {
-        headerPayload.u16(mod.version.major);
-        headerPayload.u16(mod.version.minor);
-        headerPayload.u32(strings.indexOf(mod.name));
+        moduleHeaderPayload.u16(mod.version.major);
+        moduleHeaderPayload.u16(mod.version.minor);
+        moduleHeaderPayload.u32(strings.indexOf(mod.name));
 
         Writer metaWriter;
         writeLanguageMetadataSectionBody(metaWriter, strings, mod);
-        headerPayload.u32(static_cast<std::uint32_t>(metaWriter.size()));
-        headerPayload.bytes(metaWriter.data());
+        moduleHeaderPayload.u32(static_cast<std::uint32_t>(metaWriter.size()));
+        moduleHeaderPayload.bytes(metaWriter.data());
 
-        writeReferenceSectionBody(headerPayload, strings, mod);
-        writeLazyHeaderTypeAndObjectModelV3(headerPayload, strings, mod, allTypesById);
-        writeSourceFilesTable(headerPayload, strings, mod.sourceFiles);
+        writeReferenceSectionBody(moduleHeaderPayload, strings, mod);
+        writeLazyHeaderTypeAndObjectModelV3(moduleHeaderPayload, strings, mod, allTypesById);
+        writeSourceFilesTable(moduleHeaderPayload, strings, mod.sourceFiles);
 
-        headerPayload.u32(static_cast<std::uint32_t>(mod.functions.size()));
+        moduleHeaderPayload.u32(static_cast<std::uint32_t>(mod.functions.size()));
         for (const auto& fn : mod.functions) {
-            headerPayload.u64(fn.symbolId);
-            headerPayload.u32(strings.indexOf(fn.name));
-            headerPayload.u8(encodeType(fn.returnType));
-            headerPayload.u64(fn.returnTypeId);
-            writeTypes(headerPayload, fn.parameterTypes);
-            writeTypeIds(headerPayload, fn.parameterTypeIds);
+            moduleHeaderPayload.u64(fn.symbolId);
+            moduleHeaderPayload.u32(strings.indexOf(fn.name));
+            moduleHeaderPayload.u8(encodeType(fn.returnType));
+            moduleHeaderPayload.u64(fn.returnTypeId);
+            writeTypes(moduleHeaderPayload, fn.parameterTypes);
+            writeTypeIds(moduleHeaderPayload, fn.parameterTypeIds);
         }
     }
-    headerPayload.u32(static_cast<std::uint32_t>(functionLocs.size()));
-    for (const auto& loc : functionLocs) {
-        headerPayload.u32(loc.moduleIndex);
-        headerPayload.u32(loc.functionIndex);
-        headerPayload.u32(loc.chunkIndex);
-        headerPayload.u32(loc.offsetInChunk);
-        headerPayload.u32(loc.uncompressedSize);
-    }
 
-    std::vector<std::uint8_t> compressedHeader;
-    if (!lz4CompressBlock(
-            headerPayload.data().data(), headerPayload.data().size(), compressedHeader)) {
-#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
-        throw std::logic_error("failed to LZ4 compress lazy bytecode header");
-#else
-        std::abort();
-#endif
+    const auto& stringValues = strings.values();
+    std::size_t totalStringBytes = 0u;
+    for (const auto& value : stringValues) {
+        totalStringBytes += value.size();
     }
 
     const std::uint32_t chunkCount = static_cast<std::uint32_t>(encodedChunks.size());
-    const std::uint32_t compressedHeaderOffset = 40u + chunkCount * 20u;
-    const std::uint32_t compressedHeaderSize = static_cast<std::uint32_t>(compressedHeader.size());
-    const std::uint32_t uncompressedHeaderSize = static_cast<std::uint32_t>(headerPayload.size());
-    const std::uint64_t compressedHeaderChecksum =
-        fastChecksum64(compressedHeader.data(), compressedHeader.size());
+    const std::uint32_t functionLocCount = static_cast<std::uint32_t>(functionLocs.size());
+    const std::uint32_t stringCount = static_cast<std::uint32_t>(stringValues.size());
+    const std::uint32_t stringDataSize = static_cast<std::uint32_t>(totalStringBytes);
+    const std::uint32_t moduleHeaderSize = static_cast<std::uint32_t>(moduleHeaderPayload.size());
+
+    const std::size_t chunksOffsetSz = 64u;
+    const std::size_t functionLocsOffsetSz = alignUp8(chunksOffsetSz + static_cast<std::size_t>(chunkCount) * 20u);
+    const std::size_t stringSpansOffsetSz = alignUp8(functionLocsOffsetSz + static_cast<std::size_t>(functionLocCount) * 20u);
+    const std::size_t stringDataOffsetSz = alignUp8(stringSpansOffsetSz + static_cast<std::size_t>(stringCount) * 8u);
+    const std::size_t moduleHeaderOffsetSz = alignUp8(stringDataOffsetSz + static_cast<std::size_t>(stringDataSize));
+    const std::size_t moduleHeaderEndSz = moduleHeaderOffsetSz + static_cast<std::size_t>(moduleHeaderSize);
+    const std::size_t firstChunkOffsetSz = alignUp8(moduleHeaderEndSz);
+
+    const std::uint32_t chunksOffset = static_cast<std::uint32_t>(chunksOffsetSz);
+    const std::uint32_t functionLocsOffset = static_cast<std::uint32_t>(functionLocsOffsetSz);
+    const std::uint32_t stringSpansOffset = static_cast<std::uint32_t>(stringSpansOffsetSz);
+    const std::uint32_t stringDataOffset = static_cast<std::uint32_t>(stringDataOffsetSz);
+    const std::uint32_t moduleHeaderOffset = static_cast<std::uint32_t>(moduleHeaderOffsetSz);
 
     Writer out;
     out.bytes("RSLB", 4);
-    out.u32(3u);
+    out.u32(4u);
     out.u16(kVersionMajor);
     out.u16(kVersionMinor);
     out.u32(kSdkCompatibilityVersion);
     out.u32(chunkCount);
-    out.u32(compressedHeaderOffset);
-    out.u32(compressedHeaderSize);
-    out.u32(uncompressedHeaderSize);
-    out.u64(compressedHeaderChecksum);
+    out.u32(functionLocCount);
+    out.u32(stringCount);
+    out.u32(stringDataSize);
+    out.u32(chunksOffset);
+    out.u32(functionLocsOffset);
+    out.u32(stringSpansOffset);
+    out.u32(stringDataOffset);
+    out.u32(moduleHeaderOffset);
+    out.u32(moduleHeaderSize);
+    out.u64(0ULL); // headerChecksum placeholder patched below
 
-    std::uint32_t nextChunkOffset = compressedHeaderOffset + compressedHeaderSize;
+    std::uint32_t nextChunkOffset = static_cast<std::uint32_t>(firstChunkOffsetSz);
     for (const auto& chunk : encodedChunks) {
         out.u32(chunk.uncompressedSize);
         out.u32(nextChunkOffset);
@@ -3738,121 +3773,58 @@ std::vector<std::uint8_t> encodeLazyBytecodeBundle(
         out.u64(chunk.checksum);
         nextChunkOffset += static_cast<std::uint32_t>(chunk.compressed.size());
     }
-    out.bytes(compressedHeader);
+
+    out.padToAlignment(8u);
+    for (const auto& loc : functionLocs) {
+        out.u32(loc.moduleIndex);
+        out.u32(loc.functionIndex);
+        out.u32(loc.chunkIndex);
+        out.u32(loc.offsetInChunk);
+        out.u32(loc.uncompressedSize);
+    }
+
+    out.padToAlignment(8u);
+    std::uint32_t runningStringOffset = 0u;
+    for (const auto& value : stringValues) {
+        const std::uint32_t len = static_cast<std::uint32_t>(value.size());
+        out.u32(runningStringOffset);
+        out.u32(len);
+        runningStringOffset += len;
+    }
+
+    out.padToAlignment(8u);
+    for (const auto& value : stringValues) {
+        if (!value.empty()) {
+            out.bytes(value.data(), value.size());
+        }
+    }
+
+    out.padToAlignment(8u);
+    out.bytes(moduleHeaderPayload.data());
+
+    const std::uint64_t headerChecksum = fastChecksum64(
+        out.data().data() + chunksOffsetSz,
+        moduleHeaderEndSz - chunksOffsetSz);
+    out.patchU64(56u, headerChecksum);
+
+    out.padToAlignment(8u);
     for (const auto& chunk : encodedChunks) {
         out.bytes(chunk.compressed);
     }
     return out.take();
 }
 
-bool decodeLazyBytecodeBundleHeader(
-    const std::uint8_t* data,
-    std::size_t size,
+namespace {
+
+bool decodeLazyHeaderModulesAndSchemas(
+    Reader& reader,
+    const StringLookup& strings,
+    bool v3OrNewer,
     LazyBytecodeBundle& outBundle,
-    bool copyBlob,
-    diagnostics::DiagnosticBag& diagnostics,
-    bool skipChecksum) {
-    outBundle = {};
-    if (!data || size < 40u) {
-        diagnostics.report("RS5003", "truncated lazy bytecode bundle header", {});
-        return false;
-    }
-
-    Reader hdr(data, size, 0u, size);
-    if (hdr.string(4) != "RSLB") {
-        diagnostics.report("RS5000", "invalid lazy bytecode bundle magic", {});
-        return false;
-    }
-    const auto formatVersion = hdr.u32();
-    const auto verMajor = hdr.u16();
-    const auto verMinor = hdr.u16();
-    const auto sdkVer = hdr.u32();
-    const auto chunkCount = hdr.u32();
-    const auto compHdrOffset = hdr.u32();
-    const auto compHdrSize = hdr.u32();
-    const auto uncompHdrSize = hdr.u32();
-    const auto compHdrChecksum = hdr.u64();
-    if (!hdr.valid()) {
-        diagnostics.report("RS5003", "truncated lazy bytecode bundle header", {});
-        return false;
-    }
-    if ((formatVersion != 2u && formatVersion != 3u) ||
-        verMajor != kVersionMajor ||
-        verMinor != kVersionMinor ||
-        sdkVer != kSdkCompatibilityVersion) {
-        diagnostics.report("RS5001", "incompatible lazy bytecode bundle version", {});
-        return false;
-    }
-    const bool v3Format = (formatVersion == 3u);
-    if (chunkCount > (size - 40u) / 20u) {
-        diagnostics.report("RS5003", "invalid lazy bytecode chunk directory size", {});
-        return false;
-    }
-    const std::size_t dirEnd = 40u + static_cast<std::size_t>(chunkCount) * 20u;
-    if (compHdrOffset < dirEnd ||
-        compHdrOffset > size ||
-        compHdrSize == 0u ||
-        compHdrSize > size - compHdrOffset ||
-        uncompHdrSize == 0u ||
-        uncompHdrSize > 512u * 1024u * 1024u) {
-        diagnostics.report("RS5003", "invalid lazy bytecode header bounds", {});
-        return false;
-    }
-
-    outBundle.chunks.reserve(chunkCount);
-    const std::size_t chunksMinOffset = static_cast<std::size_t>(compHdrOffset) + compHdrSize;
-    for (std::uint32_t i = 0; i < chunkCount; ++i) {
-        LazyBytecodeChunk c;
-        c.uncompressedSize = hdr.u32();
-        c.compressedOffset = hdr.u32();
-        c.compressedSize = hdr.u32();
-        c.checksum = hdr.u64();
-        if (!hdr.valid() ||
-            c.uncompressedSize == 0u ||
-            c.uncompressedSize > 512u * 1024u * 1024u ||
-            c.compressedSize == 0u ||
-            c.compressedOffset < chunksMinOffset ||
-            c.compressedOffset > size ||
-            c.compressedSize > size - c.compressedOffset) {
-            diagnostics.report("RS5003", "invalid lazy bytecode chunk descriptor", {});
-            outBundle = {};
-            return false;
-        }
-        outBundle.chunks.push_back(c);
-    }
-
-    if (!skipChecksum &&
-        fastChecksum64(data + compHdrOffset, compHdrSize) != compHdrChecksum) {
-        diagnostics.report("RS5003", "lazy bytecode header checksum mismatch", {});
-        outBundle = {};
-        return false;
-    }
-
-    std::vector<std::uint8_t> rawHeader;
-    if (!lz4DecompressBlock(data + compHdrOffset, compHdrSize, uncompHdrSize, rawHeader) ||
-        rawHeader.size() != uncompHdrSize) {
-        diagnostics.report("RS5003", "failed to decompress lazy bytecode header", {});
-        outBundle = {};
-        return false;
-    }
-
-    Reader reader(rawHeader, 0u, rawHeader.size());
-    if (v3Format) {
-        if (!readFlatStringPoolV3(reader, outBundle, diagnostics)) {
-            outBundle = {};
-            return false;
-        }
-    } else {
-        if (!readStringTable(reader, outBundle.sharedStrings, diagnostics, false)) {
-            outBundle = {};
-            return false;
-        }
-    }
-    const StringLookup strings(outBundle);
+    diagnostics::DiagnosticBag& diagnostics) {
     const auto moduleCount = reader.u32();
     if (!reader.valid() || moduleCount > reader.remaining() / 24u + 1u) {
         diagnostics.report("RS5003", "truncated lazy bytecode module count", {});
-        outBundle = {};
         return false;
     }
     outBundle.headerModules.reserve(moduleCount);
@@ -3867,7 +3839,6 @@ bool decodeLazyBytecodeBundleHeader(
         if (!reader.valid() ||
             !validStringIndex(nameIdx, strings, diagnostics,
                 "invalid lazy module name string index")) {
-            outBundle = {};
             return false;
         }
         mod.name = strings.copyAt(nameIdx);
@@ -3877,7 +3848,6 @@ bool decodeLazyBytecodeBundleHeader(
              mod.version.minor != 8 &&
              mod.version.minor != 9)) {
             diagnostics.report("RS5001", "unsupported lazy module bytecode version", {});
-            outBundle = {};
             return false;
         }
 
@@ -3888,22 +3858,19 @@ bool decodeLazyBytecodeBundleHeader(
                 metaReader, strings, mod, decodedSchemasByMod[m], diagnostics) ||
             !metaReader.empty()) {
             diagnostics.report("RS5010", "invalid lazy module language metadata", {});
-            outBundle = {};
             return false;
         }
 
         if (!readReferenceSectionBody(reader, strings, mod, diagnostics) ||
             !readLazyHeaderTypeAndObjectModelV2(
-                reader, strings, mod, inheritedPrefixesByMod[m], diagnostics, v3Format) ||
+                reader, strings, mod, inheritedPrefixesByMod[m], diagnostics, v3OrNewer) ||
             !readSourceFilesTable(reader, strings, mod.sourceFiles, diagnostics)) {
-            outBundle = {};
             return false;
         }
 
         const auto fnCount = reader.u32();
         if (!reader.valid() || fnCount > reader.remaining() / 16u + 1u) {
             diagnostics.report("RS5003", "truncated lazy module function header table", {});
-            outBundle = {};
             return false;
         }
         mod.functions.reserve(fnCount);
@@ -3914,19 +3881,16 @@ bool decodeLazyBytecodeBundleHeader(
             if (!reader.valid() ||
                 !validStringIndex(fnNameIdx, strings, diagnostics,
                     "invalid lazy function name string index")) {
-                outBundle = {};
                 return false;
             }
             fn.name = strings.copyAt(fnNameIdx);
             if (!decodeType(reader.u8(), fn.returnType)) {
                 diagnostics.report("RS5004", "invalid lazy function return type", {});
-                outBundle = {};
                 return false;
             }
             fn.returnTypeId = reader.u64();
             if (!readTypes(reader, fn.parameterTypes, diagnostics) ||
                 !readTypeIds(reader, fn.parameterTypeIds, diagnostics)) {
-                outBundle = {};
                 return false;
             }
             mod.functions.push_back(std::move(fn));
@@ -4005,7 +3969,6 @@ bool decodeLazyBytecodeBundleHeader(
         };
         for (std::size_t i = 0u; i < allPositions.size(); ++i) {
             if (!reconstructFields(reconstructFields, i)) {
-                outBundle = {};
                 return false;
             }
         }
@@ -4014,7 +3977,6 @@ bool decodeLazyBytecodeBundleHeader(
             for (const auto& ts : decodedSchemasByMod[mi]) {
                 if (ts.typeIndex >= mod.types.size()) {
                     diagnostics.report("RS5010", "out-of-range type index in schema trailer", {});
-                    outBundle = {};
                     return false;
                 }
                 auto& targetType = mod.types[ts.typeIndex];
@@ -4023,7 +3985,6 @@ bool decodeLazyBytecodeBundleHeader(
                 for (const auto& fs : ts.fields) {
                     if (fs.fieldIndex >= targetType.fields.size()) {
                         diagnostics.report("RS5010", "out-of-range field index in schema trailer", {});
-                        outBundle = {};
                         return false;
                     }
                     auto& targetField = targetType.fields[fs.fieldIndex];
@@ -4032,6 +3993,320 @@ bool decodeLazyBytecodeBundleHeader(
                 }
             }
         }
+    }
+    return true;
+}
+
+bool validLazyFunctionBodyLoc(
+    const LazyFunctionBodyLoc& loc,
+    const LazyBytecodeBundle& bundle) noexcept {
+    return loc.moduleIndex < bundle.headerModules.size() &&
+        loc.functionIndex < bundle.headerModules[loc.moduleIndex].functions.size() &&
+        loc.chunkIndex < bundle.chunks.size() &&
+        loc.offsetInChunk <= bundle.chunks[loc.chunkIndex].uncompressedSize &&
+        loc.uncompressedSize <= bundle.chunks[loc.chunkIndex].uncompressedSize - loc.offsetInChunk;
+}
+
+} // namespace
+
+bool decodeLazyBytecodeBundleHeader(
+    const std::uint8_t* data,
+    std::size_t size,
+    LazyBytecodeBundle& outBundle,
+    bool copyBlob,
+    diagnostics::DiagnosticBag& diagnostics,
+    bool skipChecksum) {
+    outBundle = {};
+    if (!data || size < 40u) {
+        diagnostics.report("RS5003", "truncated lazy bytecode bundle header", {});
+        return false;
+    }
+
+    Reader hdr(data, size, 0u, size);
+    if (hdr.string(4) != "RSLB") {
+        diagnostics.report("RS5000", "invalid lazy bytecode bundle magic", {});
+        return false;
+    }
+    const auto formatVersion = hdr.u32();
+    const auto verMajor = hdr.u16();
+    const auto verMinor = hdr.u16();
+    const auto sdkVer = hdr.u32();
+    if (!hdr.valid()) {
+        diagnostics.report("RS5003", "truncated lazy bytecode bundle header", {});
+        return false;
+    }
+    if ((formatVersion != 2u && formatVersion != 3u && formatVersion != 4u) ||
+        verMajor != kVersionMajor ||
+        verMinor != kVersionMinor ||
+        sdkVer != kSdkCompatibilityVersion) {
+        diagnostics.report("RS5001", "incompatible lazy bytecode bundle version", {});
+        return false;
+    }
+
+    if (formatVersion == 4u) {
+        if (size < 64u) {
+            diagnostics.report("RS5003", "truncated v4 lazy bytecode bundle header", {});
+            return false;
+        }
+        const auto chunkCount = hdr.u32();
+        const auto functionLocCount = hdr.u32();
+        const auto stringCount = hdr.u32();
+        const auto stringDataSize = hdr.u32();
+        const auto chunksOffset = hdr.u32();
+        const auto functionLocsOffset = hdr.u32();
+        const auto stringSpansOffset = hdr.u32();
+        const auto stringDataOffset = hdr.u32();
+        const auto moduleHeaderOffset = hdr.u32();
+        const auto moduleHeaderSize = hdr.u32();
+        const auto headerChecksum = hdr.u64();
+        if (!hdr.valid() ||
+            chunksOffset < 64u ||
+            chunksOffset > size ||
+            chunkCount > (size - chunksOffset) / 20u) {
+            diagnostics.report("RS5003", "invalid v4 lazy bytecode chunk directory bounds", {});
+            return false;
+        }
+        const std::size_t chunksEnd = static_cast<std::size_t>(chunksOffset) +
+            static_cast<std::size_t>(chunkCount) * 20u;
+        if (functionLocsOffset < chunksEnd ||
+            functionLocsOffset > size ||
+            functionLocCount > (size - functionLocsOffset) / 20u) {
+            diagnostics.report("RS5003", "invalid v4 lazy function locator bounds", {});
+            return false;
+        }
+        const std::size_t locsEnd = static_cast<std::size_t>(functionLocsOffset) +
+            static_cast<std::size_t>(functionLocCount) * 20u;
+        if (stringSpansOffset < locsEnd ||
+            stringSpansOffset > size ||
+            stringCount == 0u ||
+            stringCount > (size - stringSpansOffset) / 8u) {
+            diagnostics.report("RS5003", "invalid v4 lazy string span bounds", {});
+            return false;
+        }
+        const std::size_t spansEnd = static_cast<std::size_t>(stringSpansOffset) +
+            static_cast<std::size_t>(stringCount) * 8u;
+        if (stringDataOffset < spansEnd ||
+            stringDataOffset > size ||
+            stringDataSize > size - stringDataOffset) {
+            diagnostics.report("RS5003", "invalid v4 lazy string data bounds", {});
+            return false;
+        }
+        const std::size_t strDataEnd = static_cast<std::size_t>(stringDataOffset) +
+            static_cast<std::size_t>(stringDataSize);
+        if (moduleHeaderOffset < strDataEnd ||
+            moduleHeaderOffset > size ||
+            moduleHeaderSize == 0u ||
+            moduleHeaderSize > size - moduleHeaderOffset) {
+            diagnostics.report("RS5003", "invalid v4 lazy module header bounds", {});
+            return false;
+        }
+        const std::size_t moduleHeaderEnd = static_cast<std::size_t>(moduleHeaderOffset) +
+            static_cast<std::size_t>(moduleHeaderSize);
+
+        if (!skipChecksum &&
+            fastChecksum64(data + chunksOffset, moduleHeaderEnd - chunksOffset) != headerChecksum) {
+            diagnostics.report("RS5003", "lazy bytecode header checksum mismatch", {});
+            return false;
+        }
+
+        if (copyBlob) {
+            outBundle.ownedBlob.assign(data, data + size);
+            outBundle.rawBlobData = outBundle.ownedBlob.data();
+            outBundle.rawBlobSize = outBundle.ownedBlob.size();
+        } else {
+            outBundle.rawBlobData = data;
+            outBundle.rawBlobSize = size;
+        }
+        const std::uint8_t* basePtr = outBundle.blobBase();
+
+        Reader chunkReader(basePtr, size, chunksOffset, static_cast<std::size_t>(chunkCount) * 20u);
+        outBundle.chunks.reserve(chunkCount);
+        for (std::uint32_t i = 0; i < chunkCount; ++i) {
+            LazyBytecodeChunk c;
+            c.uncompressedSize = chunkReader.u32();
+            c.compressedOffset = chunkReader.u32();
+            c.compressedSize = chunkReader.u32();
+            c.checksum = chunkReader.u64();
+            if (!chunkReader.valid() ||
+                c.uncompressedSize == 0u ||
+                c.uncompressedSize > 512u * 1024u * 1024u ||
+                c.compressedSize == 0u ||
+                c.compressedOffset < moduleHeaderEnd ||
+                c.compressedOffset > size ||
+                c.compressedSize > size - c.compressedOffset) {
+                diagnostics.report("RS5003", "invalid lazy bytecode chunk descriptor", {});
+                outBundle = {};
+                return false;
+            }
+            outBundle.chunks.push_back(c);
+        }
+
+        const bool canZeroCopyStrings =
+            isLittleEndianHost() &&
+            (reinterpret_cast<std::uintptr_t>(basePtr + stringSpansOffset) % alignof(LazyStringSpan) == 0u);
+        if (canZeroCopyStrings) {
+            const auto* spansPtr = reinterpret_cast<const LazyStringSpan*>(basePtr + stringSpansOffset);
+            for (std::uint32_t i = 0; i < stringCount; ++i) {
+                const auto& sp = spansPtr[i];
+                if (sp.offset > stringDataSize || sp.length > stringDataSize - sp.offset) {
+                    diagnostics.report("RS5003", "invalid v4 flat string span", {});
+                    outBundle = {};
+                    return false;
+                }
+            }
+            outBundle.v4StringCount = stringCount;
+            outBundle.v4StringDataSize = stringDataSize;
+            outBundle.v4StringSpansOffset = stringSpansOffset;
+            outBundle.v4StringDataOffset = stringDataOffset;
+            outBundle.v4ZeroCopyStrings = true;
+        } else {
+            Reader spanReader(basePtr, size, stringSpansOffset, static_cast<std::size_t>(stringCount) * 8u);
+            outBundle.flatStringSpans.resize(stringCount);
+            for (std::uint32_t i = 0; i < stringCount; ++i) {
+                LazyStringSpan sp;
+                sp.offset = spanReader.u32();
+                sp.length = spanReader.u32();
+                if (!spanReader.valid() ||
+                    sp.offset > stringDataSize ||
+                    sp.length > stringDataSize - sp.offset) {
+                    diagnostics.report("RS5003", "invalid v4 flat string span", {});
+                    outBundle = {};
+                    return false;
+                }
+                outBundle.flatStringSpans[i] = sp;
+            }
+            outBundle.flatStringData.resize(stringDataSize);
+            if (stringDataSize > 0u) {
+                std::memcpy(outBundle.flatStringData.data(), basePtr + stringDataOffset, stringDataSize);
+            }
+        }
+
+        const StringLookup strings(outBundle);
+        Reader reader(basePtr, size, moduleHeaderOffset, moduleHeaderSize);
+        if (!decodeLazyHeaderModulesAndSchemas(reader, strings, /*v3OrNewer=*/true, outBundle, diagnostics) ||
+            !reader.valid() ||
+            !reader.empty()) {
+            if (reader.valid() && !reader.empty()) {
+                diagnostics.report("RS5003", "lazy bytecode header has trailing bytes", {});
+            }
+            outBundle = {};
+            return false;
+        }
+
+        const bool canZeroCopyLocs =
+            isLittleEndianHost() &&
+            (reinterpret_cast<std::uintptr_t>(basePtr + functionLocsOffset) % alignof(LazyFunctionBodyLoc) == 0u);
+        if (canZeroCopyLocs) {
+            const auto* locsPtr = reinterpret_cast<const LazyFunctionBodyLoc*>(basePtr + functionLocsOffset);
+            for (std::uint32_t li = 0; li < functionLocCount; ++li) {
+                if (!validLazyFunctionBodyLoc(locsPtr[li], outBundle)) {
+                    diagnostics.report("RS5003", "invalid lazy function locator entry", {});
+                    outBundle = {};
+                    return false;
+                }
+            }
+            outBundle.v4FunctionLocCount = functionLocCount;
+            outBundle.v4FunctionLocsOffset = functionLocsOffset;
+            outBundle.v4ZeroCopyFunctionLocs = true;
+        } else {
+            Reader locReader(basePtr, size, functionLocsOffset, static_cast<std::size_t>(functionLocCount) * 20u);
+            outBundle.functionLocs.reserve(functionLocCount);
+            for (std::uint32_t li = 0; li < functionLocCount; ++li) {
+                LazyFunctionBodyLoc loc;
+                loc.moduleIndex = locReader.u32();
+                loc.functionIndex = locReader.u32();
+                loc.chunkIndex = locReader.u32();
+                loc.offsetInChunk = locReader.u32();
+                loc.uncompressedSize = locReader.u32();
+                if (!locReader.valid() || !validLazyFunctionBodyLoc(loc, outBundle)) {
+                    diagnostics.report("RS5003", "invalid lazy function locator entry", {});
+                    outBundle = {};
+                    return false;
+                }
+                outBundle.functionLocs.push_back(loc);
+            }
+        }
+        return true;
+    }
+
+    const auto chunkCount = hdr.u32();
+    const auto compHdrOffset = hdr.u32();
+    const auto compHdrSize = hdr.u32();
+    const auto uncompHdrSize = hdr.u32();
+    const auto compHdrChecksum = hdr.u64();
+    if (!hdr.valid()) {
+        diagnostics.report("RS5003", "truncated lazy bytecode bundle header", {});
+        return false;
+    }
+    const bool v3Format = (formatVersion == 3u);
+    if (chunkCount > (size - 40u) / 20u) {
+        diagnostics.report("RS5003", "invalid lazy bytecode chunk directory size", {});
+        return false;
+    }
+    const std::size_t dirEnd = 40u + static_cast<std::size_t>(chunkCount) * 20u;
+    if (compHdrOffset < dirEnd ||
+        compHdrOffset > size ||
+        compHdrSize == 0u ||
+        compHdrSize > size - compHdrOffset ||
+        uncompHdrSize == 0u ||
+        uncompHdrSize > 512u * 1024u * 1024u) {
+        diagnostics.report("RS5003", "invalid lazy bytecode header bounds", {});
+        return false;
+    }
+
+    outBundle.chunks.reserve(chunkCount);
+    const std::size_t chunksMinOffset = static_cast<std::size_t>(compHdrOffset) + compHdrSize;
+    for (std::uint32_t i = 0; i < chunkCount; ++i) {
+        LazyBytecodeChunk c;
+        c.uncompressedSize = hdr.u32();
+        c.compressedOffset = hdr.u32();
+        c.compressedSize = hdr.u32();
+        c.checksum = hdr.u64();
+        if (!hdr.valid() ||
+            c.uncompressedSize == 0u ||
+            c.uncompressedSize > 512u * 1024u * 1024u ||
+            c.compressedSize == 0u ||
+            c.compressedOffset < chunksMinOffset ||
+            c.compressedOffset > size ||
+            c.compressedSize > size - c.compressedOffset) {
+            diagnostics.report("RS5003", "invalid lazy bytecode chunk descriptor", {});
+            outBundle = {};
+            return false;
+        }
+        outBundle.chunks.push_back(c);
+    }
+
+    if (!skipChecksum &&
+        fastChecksum64(data + compHdrOffset, compHdrSize) != compHdrChecksum) {
+        diagnostics.report("RS5003", "lazy bytecode header checksum mismatch", {});
+        outBundle = {};
+        return false;
+    }
+
+    std::vector<std::uint8_t> rawHeader;
+    if (!lz4DecompressBlock(data + compHdrOffset, compHdrSize, uncompHdrSize, rawHeader) ||
+        rawHeader.size() != uncompHdrSize) {
+        diagnostics.report("RS5003", "failed to decompress lazy bytecode header", {});
+        outBundle = {};
+        return false;
+    }
+
+    Reader reader(rawHeader, 0u, rawHeader.size());
+    if (v3Format) {
+        if (!readFlatStringPoolV3(reader, outBundle, diagnostics)) {
+            outBundle = {};
+            return false;
+        }
+    } else {
+        if (!readStringTable(reader, outBundle.sharedStrings, diagnostics, false)) {
+            outBundle = {};
+            return false;
+        }
+    }
+    const StringLookup strings(outBundle);
+    if (!decodeLazyHeaderModulesAndSchemas(reader, strings, v3Format, outBundle, diagnostics)) {
+        outBundle = {};
+        return false;
     }
 
     const auto locCount = reader.u32();
@@ -4048,12 +4323,7 @@ bool decodeLazyBytecodeBundleHeader(
         loc.chunkIndex = reader.u32();
         loc.offsetInChunk = reader.u32();
         loc.uncompressedSize = reader.u32();
-        if (!reader.valid() ||
-            loc.moduleIndex >= outBundle.headerModules.size() ||
-            loc.functionIndex >= outBundle.headerModules[loc.moduleIndex].functions.size() ||
-            loc.chunkIndex >= outBundle.chunks.size() ||
-            loc.offsetInChunk > outBundle.chunks[loc.chunkIndex].uncompressedSize ||
-            loc.uncompressedSize > outBundle.chunks[loc.chunkIndex].uncompressedSize - loc.offsetInChunk) {
+        if (!reader.valid() || !validLazyFunctionBodyLoc(loc, outBundle)) {
             diagnostics.report("RS5003", "invalid lazy function locator entry", {});
             outBundle = {};
             return false;
@@ -4084,17 +4354,19 @@ bool decompressLazyChunk(
     std::vector<std::uint8_t>& outChunk,
     diagnostics::DiagnosticBag& diagnostics) {
     outChunk.clear();
-    if (chunkIndex >= bundle.chunks.size() || !bundle.rawBlobData) {
+    const std::uint8_t* blobPtr = bundle.blobBase();
+    const std::size_t blobSz = bundle.blobSize();
+    if (chunkIndex >= bundle.chunks.size() || !blobPtr) {
         diagnostics.report("RS5003", "lazy chunk index out of range", {});
         return false;
     }
     const auto& chunk = bundle.chunks[chunkIndex];
-    if (chunk.compressedOffset > bundle.rawBlobSize ||
-        chunk.compressedSize > bundle.rawBlobSize - chunk.compressedOffset) {
+    if (chunk.compressedOffset > blobSz ||
+        chunk.compressedSize > blobSz - chunk.compressedOffset) {
         diagnostics.report("RS5003", "lazy chunk range outside bundle blob", {});
         return false;
     }
-    const std::uint8_t* compPtr = bundle.rawBlobData + chunk.compressedOffset;
+    const std::uint8_t* compPtr = blobPtr + chunk.compressedOffset;
     if (fastChecksum64(compPtr, chunk.compressedSize) != chunk.checksum) {
         diagnostics.report("RS5003", "lazy chunk checksum mismatch", {});
         return false;
@@ -4115,11 +4387,11 @@ bool decodeLazyFunctionBody(
     diagnostics::DiagnosticBag& diagnostics,
     const std::vector<std::uint8_t>* preDecompressedChunk,
     const Module* moduleOverride) {
-    if (locIndex >= bundle.functionLocs.size()) {
+    if (locIndex >= bundle.functionLocCount()) {
         diagnostics.report("RS5003", "lazy function locator index out of range", {});
         return false;
     }
-    const auto& loc = bundle.functionLocs[locIndex];
+    const auto& loc = bundle.functionLocAt(locIndex);
     const Module* modPtr = moduleOverride;
     if (!modPtr) {
         if (loc.moduleIndex >= bundle.headerModules.size()) {
