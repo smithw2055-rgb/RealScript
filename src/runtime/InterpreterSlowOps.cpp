@@ -2844,18 +2844,23 @@ bool executeInstruction(
                                      std::vector<std::size_t>& outRefs) {
             outFields.clear();
             outRefs.clear();
-            outFields.reserve(type->fields.size());
-            for (std::size_t index = 0; index < type->fields.size(); ++index) {
-                const auto fieldType = type->fields[index].type;
+            const std::size_t instSlotCount = semantic::requiredInstanceSlotCount(type->fields);
+            outFields.reserve(instSlotCount);
+            for (std::size_t index = 0; index < instSlotCount; ++index) {
+                const auto& field = type->fields[index];
+                const bool isStaticOrConst = field.staticField || field.constField;
+                const auto fieldType = field.type;
                 const auto fieldTypeId =
-                    exactTypeId(fieldType, type->fields[index].typeName);
-                outFields.push_back(defaultValue(
-                    module, fieldType, fieldTypeId));
-                if (fieldType == semantic::PrimitiveType::String ||
-                    fieldType == semantic::PrimitiveType::Object ||
-                    fieldType == semantic::PrimitiveType::Array ||
-                    (fieldType == semantic::PrimitiveType::Struct &&
-                     !makeDefaultInlineStructValue(fieldTypeId).has_value())) {
+                    exactTypeId(fieldType, field.typeName);
+                outFields.push_back(isStaticOrConst
+                    ? Value{}
+                    : defaultValue(module, fieldType, fieldTypeId));
+                if (!isStaticOrConst &&
+                    (fieldType == semantic::PrimitiveType::String ||
+                     fieldType == semantic::PrimitiveType::Object ||
+                     fieldType == semantic::PrimitiveType::Array ||
+                     (fieldType == semantic::PrimitiveType::Struct &&
+                      !makeDefaultInlineStructValue(fieldTypeId).has_value()))) {
                     outRefs.push_back(index);
                 }
             }
@@ -2893,19 +2898,26 @@ bool executeInstruction(
         if (const auto inlined = makeDefaultInlineStructValue(type->id)) {
             return storeResult(*inlined);
         }
-        if (type->fields.size() <= StructValue::MaxInlineFields) {
+        const std::size_t instSlotCount = semantic::requiredInstanceSlotCount(type->fields);
+        if (instSlotCount <= StructValue::MaxInlineFields) {
             std::array<Value, StructValue::MaxInlineFields> stackFields{};
-            for (std::size_t i = 0; i < type->fields.size(); ++i) {
+            for (std::size_t i = 0; i < instSlotCount; ++i) {
                 const auto& field = type->fields[i];
+                if (field.staticField || field.constField) continue;
                 stackFields[i] = defaultValue(
                     module, field.type, exactTypeId(field.type, field.typeName));
             }
             return storeResult(makeStructValueFromFields(
-                type->id, ValueSpan(stackFields.data(), type->fields.size())));
+                type->id, ValueSpan(stackFields.data(), instSlotCount)));
         }
         std::vector<Value> fields;
-        fields.reserve(type->fields.size());
-        for (const auto& field : type->fields) {
+        fields.reserve(instSlotCount);
+        for (std::size_t i = 0; i < instSlotCount; ++i) {
+            const auto& field = type->fields[i];
+            if (field.staticField || field.constField) {
+                fields.emplace_back();
+                continue;
+            }
             fields.push_back(defaultValue(
                 module, field.type, exactTypeId(field.type, field.typeName)));
         }

@@ -2259,6 +2259,141 @@ public int CallTag(ITag t) {
     }
 }
 
+void testStaticAndConstFieldsExcludedFromInstanceLayout() {
+    const std::string src = R"RS(
+module Kernel.InstanceLayout;
+
+public delegate void PingHandler(int code);
+
+public class DepBase {
+    private static string _s0 = "a";
+    private static string _s1 = "b";
+    private static DepBase _s2 = null;
+    private static DepBase _s3 = null;
+    private static int[] _s4 = null;
+    public static int StaticCounter { get; set; } = 7;
+
+    public static string ReadStaticTag() {
+        return _s0 + _s1 + ":" + StaticCounter;
+    }
+}
+
+public class BoxedFloatLike : DepBase {
+    public float Value;
+    public static BoxedFloatLike Zero = null;
+    public BoxedFloatLike(float v) { Value = v; }
+}
+
+public class WidgetBase : DepBase {
+    public int BaseId = 10;
+    public static int BaseStatic = 3;
+}
+
+public class DerivedWidget : WidgetBase {
+    public static string DerivedTag = "dw";
+    public int OwnProp { get; set; }
+    public event PingHandler Pinged;
+    public const int ConstMagic = 42;
+    public int OwnField = 5;
+
+    public void EmitPing(int x) {
+        Pinged(x);
+    }
+}
+
+public struct CompactStruct {
+    public const int K = 9;
+    public static int S = 11;
+    public int X;
+    public int Y;
+}
+
+public static int RunChecks() {
+    var bf = new BoxedFloatLike(2.5f);
+    BoxedFloatLike.Zero = bf;
+    DepBase.StaticCounter = 12;
+
+    var w = new DerivedWidget();
+    w.OwnProp = 100;
+    int captured = 0;
+    w.Pinged += (int c) => { captured = captured + c; };
+    w.EmitPing(8);
+
+    CompactStruct cs = new CompactStruct();
+    cs.X = 3;
+    cs.Y = 4;
+    if (DepBase.ReadStaticTag() != "ab:12") { return -1; }
+    if (DerivedWidget.DerivedTag != "dw" || WidgetBase.BaseStatic != 3) { return -2; }
+    if (w.BaseId != 10 || w.OwnField != 5 || w.OwnProp != 100 || captured != 8) { return -3; }
+    if (cs.X + cs.Y + CompactStruct.K + CompactStruct.S != 27) { return -4; }
+    return (int)(bf.Value * 2.0f);
+}
+
+public static BoxedFloatLike MakeBoxed() {
+    return new BoxedFloatLike(3.5f);
+}
+
+public static DerivedWidget MakeWidget() {
+    return new DerivedWidget();
+}
+)RS";
+
+    auto img = compileAndLink({{"instance_layout.rscript", src}});
+
+    // Verify lazy RSLB round-trip preserves instance-first layout
+    const auto lazyBlob = bytecode::encodeLazyBytecodeBundle(img->modules());
+    auto lazyBundle = std::make_shared<bytecode::LazyBytecodeBundle>();
+    diagnostics::DiagnosticBag lazyDiag;
+    require(bytecode::decodeLazyBytecodeBundleHeader(
+                lazyBlob.data(), lazyBlob.size(), *lazyBundle, true, lazyDiag),
+        "Lazy bundle decode failed");
+    runtime::RuntimeError linkErr;
+    auto lazyImgOpt = runtime::ProgramImage::linkLayered(lazyBundle, {}, linkErr, true);
+    require(lazyImgOpt.has_value(), "linkLayered failed: " + linkErr.message);
+    std::shared_ptr<const runtime::ProgramImage> lazyImg =
+        std::make_shared<const runtime::ProgramImage>(std::move(*lazyImgOpt));
+
+    const std::array<std::shared_ptr<const runtime::ProgramImage>, 2> imgs{img, lazyImg};
+    for (const auto& checkImg : imgs) {
+        auto heap = std::make_shared<runtime::ManagedHeap>();
+        runtime::Interpreter interp(checkImg, heap);
+        auto res = interp.invoke("Kernel.InstanceLayout::RunChecks");
+        std::int64_t out = 0;
+        require(res.succeeded && res.value.tryGetInt64(out) && out == 5,
+            "InstanceLayout RunChecks failed: " + res.error.message);
+
+        auto bfRes = interp.invoke("Kernel.InstanceLayout::MakeBoxed");
+        require(bfRes.succeeded && bfRes.value.rawTag() == runtime::ValueTag::ObjectRef,
+            "MakeBoxed failed");
+        const auto bfRef = std::get<runtime::ObjectRef>(bfRes.value);
+        const std::size_t bfBytes = heap->objectSizeBytes(bfRef).value_or(0u);
+        require(bfBytes == 48u,
+            "Expected BoxedFloatLike size == 48 B (32B slot + 16B float), got " + std::to_string(bfBytes));
+
+        auto wRes = interp.invoke("Kernel.InstanceLayout::MakeWidget");
+        require(wRes.succeeded && wRes.value.rawTag() == runtime::ValueTag::ObjectRef,
+            "MakeWidget failed");
+        const auto wRef = std::get<runtime::ObjectRef>(wRes.value);
+        // DerivedWidget has 4 instance fields: BaseId, OwnProp($OwnProp), OwnField, $event_Pinged_delegate
+        const std::size_t wBytes = heap->objectSizeBytes(wRef).value_or(0u);
+        require(wBytes == 32u + 4u * 16u,
+            "Expected DerivedWidget size == 96 B (32B + 4*16B), got " + std::to_string(wBytes));
+
+        const auto snap = heap->snapshot();
+        bool foundBf = false;
+        for (const auto& obj : snap.objects) {
+            if (obj.reference == bfRef) {
+                foundBf = true;
+                require(obj.valueCount == 1u,
+                    "Expected BoxedFloatLike valueCount == 1, got " + std::to_string(obj.valueCount));
+                require(obj.referenceFields.empty(),
+                    "Expected BoxedFloatLike referenceFields empty (static refs must be excluded)");
+            }
+        }
+        require(foundBf, "BoxedFloatLike missing from heap snapshot");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -2278,6 +2413,7 @@ int main() {
             {"FlatLoop IExecutionPolicy enforcement & new fast opcodes", testFlatLoopExecutionPolicyAndFastOpcodes},
             {"Waves 1-4 regression: Enum32, concurrent ExecutionMirror, 8-slot slabs & FNV-1a internedStrings", testWaveRegressionEnumMirrorSlabsAndStrings},
             {"Audit regression: incremental ConstantStringFast, intrinsic policy, restoreEpoch PIC & >2k QuatfArena", testAuditRegressionGcCachesAndQuatf},
+            {"Static and const fields excluded from instance object layout", testStaticAndConstFieldsExcludedFromInstanceLayout},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

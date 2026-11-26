@@ -3059,12 +3059,11 @@ bool readSlimFunctionSymbolV2(
         return 0u;
     }
     const auto& base = *it->second;
-    if (base.fields.size() > type.fields.size()) {
-        return 0u;
-    }
-    for (std::size_t i = 0u; i < base.fields.size(); ++i) {
-        const auto& a = base.fields[i];
-        const auto& b = type.fields[i];
+    const std::size_t maxPrefix = std::min(base.fields.size(), type.fields.size());
+    std::size_t prefix = 0u;
+    for (; prefix < maxPrefix; ++prefix) {
+        const auto& a = base.fields[prefix];
+        const auto& b = type.fields[prefix];
         if (a.id != b.id ||
             a.name != b.name ||
             a.type != b.type ||
@@ -3076,10 +3075,10 @@ bool readSlimFunctionSymbolV2(
             a.constField != b.constField ||
             a.readonlyField != b.readonlyField ||
             a.accessibility != b.accessibility) {
-            return 0u;
+            break;
         }
     }
-    return static_cast<std::uint32_t>(base.fields.size());
+    return static_cast<std::uint32_t>(prefix);
 }
 
 void writeLazyPropertySymbolV3(

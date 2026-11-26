@@ -661,6 +661,7 @@ SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
                     addBinding(std::move(binding));
                 }
             }
+            compactTypeFieldsInstanceFirst(owner, &input.functionBindings);
             for (auto& type : input.types) {
                 if (type.id == owner.id) type = owner;
             }

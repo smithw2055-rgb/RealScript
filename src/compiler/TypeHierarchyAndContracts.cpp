@@ -282,6 +282,7 @@ void applyInheritedFieldLayouts(
                         field.index = type.fields.size();
                         type.fields.push_back(std::move(field));
                     }
+                    compactTypeFieldsInstanceFirst(type);
                 }
             }
             complete[type.id] = 2;

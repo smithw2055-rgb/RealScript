@@ -1247,6 +1247,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                                 f.index = owner.fields.size();
                                 owner.fields.push_back(f);
                             }
+                            semantic::compactTypeFieldsInstanceFirst(owner);
                             owner.methods = base->methods;
                             owner.virtualDispatchTable =
                                 base->virtualDispatchTable;
@@ -3122,6 +3123,7 @@ void synthesizeDeclarationsSequencesAndMembers(
                         }
                     }
 
+                    semantic::compactTypeFieldsInstanceFirst(owner, &module.functionBindings);
                     validateConcreteClassType(owner, module, result);
                     *ownerPointer = std::move(owner);
                     module.visibleTypes[ownerPointer->name] = *ownerPointer;

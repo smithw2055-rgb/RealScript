@@ -569,6 +569,7 @@ semantic::SymbolId resolveFieldSymbolId(
 bool fieldMayHoldManagedReferences(
     const semantic::FieldSymbol& field,
     semantic::SymbolId fieldTypeId) noexcept {
+    if (field.staticField || field.constField) return false;
     return field.type == semantic::PrimitiveType::String ||
         field.type == semantic::PrimitiveType::Object ||
         field.type == semantic::PrimitiveType::Array ||
@@ -687,18 +688,24 @@ runtime::Value makeFieldDefaultValue(
             return runtime::Value{runtime::StructValue{}};
         }
         const auto& structType = *it->second;
-        if (structType.fields.size() <= runtime::StructValue::MaxInlineFields) {
+        const std::size_t instSlotCount = semantic::requiredInstanceSlotCount(structType.fields);
+        if (instSlotCount <= runtime::StructValue::MaxInlineFields) {
             std::array<runtime::Value, runtime::StructValue::MaxInlineFields> stackFields{};
-            for (std::size_t i = 0; i < structType.fields.size(); ++i) {
+            for (std::size_t i = 0; i < instSlotCount; ++i) {
+                if (structType.fields[i].staticField || structType.fields[i].constField) continue;
                 stackFields[i] = makeFieldDefaultValue(structType.fields[i], allTypes, depth + 1);
             }
             return runtime::Value{runtime::makeStructValueFromFields(
-                fieldTid, runtime::ValueSpan(stackFields.data(), structType.fields.size()))};
+                fieldTid, runtime::ValueSpan(stackFields.data(), instSlotCount))};
         }
         std::vector<runtime::Value> heapFields;
-        heapFields.reserve(structType.fields.size());
-        for (const auto& sf : structType.fields) {
-            heapFields.push_back(makeFieldDefaultValue(sf, allTypes, depth + 1));
+        heapFields.reserve(instSlotCount);
+        for (std::size_t i = 0; i < instSlotCount; ++i) {
+            if (structType.fields[i].staticField || structType.fields[i].constField) {
+                heapFields.emplace_back();
+                continue;
+            }
+            heapFields.push_back(makeFieldDefaultValue(structType.fields[i], allTypes, depth + 1));
         }
         return runtime::Value{runtime::makeStructValueFromFields(fieldTid, std::move(heapFields))};
     }
@@ -940,13 +947,13 @@ bool buildStructuralTypeMigrations(
             mig.addedType = true;
             mig.delegateType = newType.delegateType;
             mig.interfaceType = newType.interfaceType;
-            mig.newFieldCount = newType.fields.size();
+            mig.newFieldCount = semantic::requiredInstanceSlotCount(newType.fields);
             mig.virtualDispatchTable = newType.virtualDispatchTable;
             mig.interfaceDispatchMaps = newType.interfaceDispatchMaps;
             for (std::size_t idx = 0; idx < newType.fields.size(); ++idx) {
                 const auto& nf = newType.fields[idx];
                 const auto nfTid = exactFieldTypeId(nf);
-                if (fieldMayHoldManagedReferences(nf, nfTid)) {
+                if (idx < mig.newFieldCount && fieldMayHoldManagedReferences(nf, nfTid)) {
                     mig.newReferenceFields.push_back(idx);
                 }
                 if (nf.staticField && !nf.constField) {
@@ -1001,7 +1008,7 @@ bool buildStructuralTypeMigrations(
         mig.delegateType = newType.delegateType;
         mig.interfaceType = newType.interfaceType;
         mig.oldFieldCount = oldType.fields.size();
-        mig.newFieldCount = newType.fields.size();
+        mig.newFieldCount = semantic::requiredInstanceSlotCount(newType.fields);
         mig.virtualDispatchTable = newType.virtualDispatchTable;
         mig.interfaceDispatchMaps = newType.interfaceDispatchMaps;
         mig.dispatchTableChanged =
@@ -1042,25 +1049,27 @@ bool buildStructuralTypeMigrations(
             false);
 
         std::unordered_set<semantic::SymbolId> retainedStaticIds;
-        mig.fieldOps.reserve(newType.fields.size());
+        mig.fieldOps.reserve(mig.newFieldCount);
 
         for (std::size_t idx = 0; idx < newType.fields.size(); ++idx) {
             const auto& nf = newType.fields[idx];
             const auto nfTid = exactFieldTypeId(nf);
             const runtime::Value defVal = makeFieldDefaultValue(nf, newTypes);
 
-            if (fieldMayHoldManagedReferences(nf, nfTid)) {
+            if (idx < mig.newFieldCount && fieldMayHoldManagedReferences(nf, nfTid)) {
                 mig.newReferenceFields.push_back(idx);
             }
 
             if (nf.staticField) {
-                runtime::FieldMigrationOp slotPlaceholder;
-                slotPlaceholder.kind = runtime::FieldMigrationKind::Default;
-                slotPlaceholder.targetType = nf.type;
-                slotPlaceholder.targetTypeId = nfTid;
-                slotPlaceholder.fieldName = nf.name;
-                slotPlaceholder.defaultValue = defVal;
-                mig.fieldOps.push_back(std::move(slotPlaceholder));
+                if (idx < mig.newFieldCount) {
+                    runtime::FieldMigrationOp slotPlaceholder;
+                    slotPlaceholder.kind = runtime::FieldMigrationKind::Default;
+                    slotPlaceholder.targetType = nf.type;
+                    slotPlaceholder.targetTypeId = nfTid;
+                    slotPlaceholder.fieldName = nf.name;
+                    slotPlaceholder.defaultValue = defVal;
+                    mig.fieldOps.push_back(std::move(slotPlaceholder));
+                }
 
                 if (!nf.constField) {
                     runtime::StaticFieldMigrationOp sop;

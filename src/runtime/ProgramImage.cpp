@@ -327,14 +327,15 @@ bool validateObjectModel(
                 }
                 if (!visit(*found->second)) return false;
                 const auto& base = *found->second;
-                if (base.fields.size() > type.fields.size()) {
+                const std::size_t baseInstCount = semantic::requiredInstanceSlotCount(base.fields);
+                if (baseInstCount > type.fields.size()) {
                     return linkFailure(
                         error,
                         "derived type '" + semantic::canonicalTypeName(type) +
                             "' truncates its base field layout");
                 }
                 for (std::size_t index = 0;
-                     index < base.fields.size(); ++index) {
+                     index < baseInstCount; ++index) {
                     const auto& first = base.fields[index];
                     const auto& second = type.fields[index];
                     if (first.id != second.id || first.name != second.name ||
@@ -1739,12 +1740,15 @@ bool tryBuildObjectAllocationTemplate(
     }
     ObjectAllocationTemplate tmpl;
     tmpl.typeId = type.id;
-    tmpl.defaultFields.reserve(type.fields.size());
+    const std::size_t instSlotCount = semantic::requiredInstanceSlotCount(type.fields);
+    tmpl.defaultFields.reserve(instSlotCount);
     std::vector<std::size_t> refIndices;
     bool allInlineSafe = true;
-    for (std::size_t fIdx = 0; fIdx < type.fields.size(); ++fIdx) {
-        const auto fType = type.fields[fIdx].type;
-        const auto fTid = exactTypeId(fType, type.fields[fIdx].typeName);
+    for (std::size_t fIdx = 0; fIdx < instSlotCount; ++fIdx) {
+        const auto& field = type.fields[fIdx];
+        const bool isStaticOrConst = field.staticField || field.constField;
+        const auto fType = field.type;
+        const auto fTid = exactTypeId(fType, field.typeName);
         Value defVal{};
         switch (fType) {
         case semantic::PrimitiveType::Bool: defVal = false; break;
@@ -1761,15 +1765,15 @@ bool tryBuildObjectAllocationTemplate(
         case semantic::PrimitiveType::Char: defVal = CharValue{}; break;
         case semantic::PrimitiveType::String:
             defVal = NullString{};
-            refIndices.push_back(fIdx);
+            if (!isStaticOrConst) refIndices.push_back(fIdx);
             break;
         case semantic::PrimitiveType::Object:
             defVal = NullObject{};
-            refIndices.push_back(fIdx);
+            if (!isStaticOrConst) refIndices.push_back(fIdx);
             break;
         case semantic::PrimitiveType::Array:
             defVal = NullArray{};
-            refIndices.push_back(fIdx);
+            if (!isStaticOrConst) refIndices.push_back(fIdx);
             break;
         case semantic::PrimitiveType::Enum:
             defVal = EnumValue{fTid, 0};

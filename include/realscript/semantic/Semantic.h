@@ -721,6 +721,21 @@ struct FunctionBindingInput {
     bool inConstructorInitializer = false;
 };
 
+[[nodiscard]] inline std::size_t requiredInstanceSlotCount(
+    const std::vector<FieldSymbol>& fields) noexcept {
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < fields.size(); ++i) {
+        if (!fields[i].staticField && !fields[i].constField) {
+            count = i + 1;
+        }
+    }
+    return count;
+}
+
+void compactTypeFieldsInstanceFirst(
+    TypeSymbol& type,
+    std::vector<FunctionBindingInput>* optBindings = nullptr);
+
 struct ObsoleteInfo {
     std::string message;
     bool isError = false;
