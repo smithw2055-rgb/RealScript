@@ -228,7 +228,8 @@ void appendAllocationRemark(
 [[nodiscard]] std::string int64Literal(std::int64_t value);
 [[nodiscard]] std::string typedScalarFunctionSignature(
     const FunctionView& view,
-    bool declarationOnly);
+    bool declarationOnly,
+    bool nonTemplate = false);
 void emitTypedTransfer(
     Emitter& output,
     const mir::Function& function,
@@ -237,19 +238,23 @@ void emitTypedTransfer(
     const std::string& prefix,
     const std::string& indent,
     const std::vector<std::size_t>* regGuardSlot = nullptr,
-    const std::string& gcGuardCond = "!FastAccounting && !DeterminismAccounting && !TrustedRelease");
+    const std::string& gcGuardCond = "!FastAccounting && !DeterminismAccounting && !TrustedRelease",
+    bool skipAccounting = false);
 void emitTypedRawConsume(
     Emitter& output,
     std::uint64_t count,
-    const std::string& indent);
+    const std::string& indent,
+    bool skipAccounting = false);
 void emitTypedConsume(
     Emitter& output,
     mir::Opcode opcode,
-    const std::string& indent);
+    const std::string& indent,
+    bool skipAccounting = false);
 void emitTypedConsume(
     Emitter& output,
     mir::TerminatorKind terminator,
-    const std::string& indent);
+    const std::string& indent,
+    bool skipAccounting = false);
 [[nodiscard]] bool typedCheckedArithmeticProvenSafe(
     const TypedRangeAnalysis& analysis,
     const mir::Instruction& instruction) noexcept;
@@ -308,6 +313,20 @@ void emitHotPatchThunks(
 
 [[nodiscard]] bool supportsTypedParallelBatchKernel(const FunctionView& view);
 
+struct SharedPolyDispatchRegistry {
+    std::unordered_map<const mir::Instruction*, std::size_t> helperIdByInstruction;
+    std::size_t helperCount = 0;
+};
+
+[[nodiscard]] SharedPolyDispatchRegistry emitSharedPolyDispatchHelpers(
+    Emitter& source,
+    const std::vector<FunctionView>& functions,
+    const GenerationOptions& options,
+    const std::unordered_map<semantic::SymbolId, const FunctionView*>& typedFunctions,
+    const std::map<semantic::SymbolId, TypeView>& allTypes,
+    const std::unordered_map<const mir::Instruction*, std::size_t>& callIds,
+    const std::unordered_map<semantic::SymbolId, std::size_t>& hotPatchSlots);
+
 void emitTypedPrimitiveFunction(
     Emitter& source,
     const FunctionView& view,
@@ -318,6 +337,7 @@ void emitTypedPrimitiveFunction(
     const std::unordered_map<const mir::Instruction*, std::size_t>& callIds,
     const std::unordered_map<semantic::SymbolId, std::size_t>& hotPatchSlots,
     std::vector<OptimizationRemark>* remarks = nullptr,
-    std::unordered_map<std::string, std::uint32_t>* stringLiteralIndices = nullptr);
+    std::unordered_map<std::string, std::uint32_t>* stringLiteralIndices = nullptr,
+    const SharedPolyDispatchRegistry* polyDispatch = nullptr);
 
 } // namespace realscript::aot::detail

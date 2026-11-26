@@ -1024,11 +1024,14 @@ std::string int64Literal(std::int64_t value) {
 
 std::string typedScalarFunctionSignature(
     const FunctionView& view,
-    bool declarationOnly) {
+    bool declarationOnly,
+    bool nonTemplate) {
     const auto& function = *view.function;
     std::ostringstream out;
-    out << "template <bool FastAccounting, bool DeterminismAccounting, bool TrustedRelease"
-        << (declarationOnly ? " = false" : "") << ">\n";
+    if (!nonTemplate) {
+        out << "template <bool FastAccounting, bool DeterminismAccounting, bool TrustedRelease"
+            << (declarationOnly ? " = false" : "") << ">\n";
+    }
     out << "static bool " << view.cppName << "_scalar(\n";
     out << "    ExecutionContext& context";
     for (std::size_t index = 0; index < function.parameterTypes.size(); ++index) {
@@ -1056,18 +1059,21 @@ void emitTypedTransfer(
     const std::string& prefix,
     const std::string& indent,
     const std::vector<std::size_t>* regGuardSlot,
-    const std::string& gcGuardCond) {
+    const std::string& gcGuardCond,
+    bool skipAccounting) {
     const auto* block = findBlock(function, target);
     if (!block) return;
-    output.line(indent + "if constexpr (FastAccounting && !TrustedRelease) {");
-    output.line(indent + "    rawAccounting.branch();");
-    output.line(indent + "} else if constexpr (DeterminismAccounting && !TrustedRelease) {");
-    output.line(indent + "    determinismAccounting.branch(" +
-        std::to_string(target) + ");");
-    output.line(indent + "} else if constexpr (!TrustedRelease) {");
-    output.line(indent + "    if (!context.branch(" +
-        std::to_string(target) + ")) return false;");
-    output.line(indent + "}");
+    if (!skipAccounting) {
+        output.line(indent + "if constexpr (FastAccounting && !TrustedRelease) {");
+        output.line(indent + "    rawAccounting.branch();");
+        output.line(indent + "} else if constexpr (DeterminismAccounting && !TrustedRelease) {");
+        output.line(indent + "    determinismAccounting.branch(" +
+            std::to_string(target) + ");");
+        output.line(indent + "} else if constexpr (!TrustedRelease) {");
+        output.line(indent + "    if (!context.branch(" +
+            std::to_string(target) + ")) return false;");
+        output.line(indent + "}");
+    }
     for (std::size_t index = 0;
          index < arguments.size() && index < block->parameters.size();
          ++index) {
@@ -1082,15 +1088,21 @@ void emitTypedTransfer(
         output.line(indent +
             typedValueExpression(paramVal) + " = " +
             prefix + "_" + std::to_string(index) + ";");
-        if (regGuardSlot != nullptr && paramVal >= 0) {
+        if (regGuardSlot != nullptr && paramVal >= 0 && gcGuardCond != "false") {
             const auto rIdx = static_cast<std::size_t>(paramVal);
             if (rIdx < regGuardSlot->size() &&
                 (*regGuardSlot)[rIdx] != std::numeric_limits<std::size_t>::max()) {
-                output.line(indent + "if constexpr (" + gcGuardCond + ") {");
-                output.line(indent + "    aot::retainTypedGcSlot(context.rawHeap(), &typedLocalGcGuards[" +
-                    std::to_string((*regGuardSlot)[rIdx]) + "], " +
-                    typedValueExpression(paramVal) + ");");
-                output.line(indent + "}");
+                if (gcGuardCond == "true") {
+                    output.line(indent + "aot::retainTypedGcSlot(context.rawHeap(), &typedLocalGcGuards[" +
+                        std::to_string((*regGuardSlot)[rIdx]) + "], " +
+                        typedValueExpression(paramVal) + ");");
+                } else {
+                    output.line(indent + "if constexpr (" + gcGuardCond + ") {");
+                    output.line(indent + "    aot::retainTypedGcSlot(context.rawHeap(), &typedLocalGcGuards[" +
+                        std::to_string((*regGuardSlot)[rIdx]) + "], " +
+                        typedValueExpression(paramVal) + ");");
+                    output.line(indent + "}");
+                }
             }
         }
     }
@@ -1100,8 +1112,9 @@ void emitTypedTransfer(
 void emitTypedRawConsume(
     Emitter& output,
     std::uint64_t count,
-    const std::string& indent) {
-    if (count == 0) return;
+    const std::string& indent,
+    bool skipAccounting) {
+    if (skipAccounting || count == 0) return;
     output.line(indent + "if constexpr (FastAccounting && !TrustedRelease) {");
     output.line(indent + "    if (!rawAccounting.consume(" +
         std::to_string(count) + "ULL)) return false;");
@@ -1111,7 +1124,9 @@ void emitTypedRawConsume(
 void emitTypedConsume(
     Emitter& output,
     mir::Opcode opcode,
-    const std::string& indent) {
+    const std::string& indent,
+    bool skipAccounting) {
+    if (skipAccounting) return;
     const auto operationId = std::to_string(
         runtime::determinismOperationId(mir::opcodeName(opcode))) + "ULL";
     output.line(indent + "if constexpr (DeterminismAccounting && !TrustedRelease) {");
@@ -1128,7 +1143,9 @@ void emitTypedConsume(
 void emitTypedConsume(
     Emitter& output,
     mir::TerminatorKind terminator,
-    const std::string& indent) {
+    const std::string& indent,
+    bool skipAccounting) {
+    if (skipAccounting) return;
     const auto operationId = std::to_string(
         runtime::determinismOperationId(
             mir::terminatorName(terminator))) + "ULL";

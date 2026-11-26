@@ -39,7 +39,8 @@ void emitTransfer(
     mir::BlockId target,
     const std::vector<mir::ValueId>& arguments,
     const std::string& prefix,
-    const std::string& indent) {
+    const std::string& indent,
+    bool skipBranchAccounting = false) {
     const auto* block = findBlock(function, target);
     if (!block) return;
     if (!arguments.empty()) {
@@ -56,8 +57,10 @@ void emitTransfer(
                 " = std::move(" + prefix + "[" + std::to_string(index) + "]);");
         }
     }
-    output.line(indent + "if (!context.trustedReleaseEnabled() && !context.branch(" +
-        std::to_string(target) + ")) return false;");
+    if (!skipBranchAccounting) {
+        output.line(indent + "if (!context.trustedReleaseEnabled() && !context.branch(" +
+            std::to_string(target) + ")) return false;");
+    }
     output.line(indent + "currentBlock = " + std::to_string(target) + ";");
 }
 
@@ -74,6 +77,7 @@ std::string canonicalInput(
         options.querySymbol + "\n" +
         "emitLineDirectives=" + (options.emitLineDirectives ? "1" : "0") + "\n" +
         "trustedRelease=" + (options.trustedRelease ? "1" : "0") + "\n" +
+        "emitMode=" + std::to_string(static_cast<unsigned>(options.emitMode)) + "\n" +
         "enableSharedReferenceGenerics=" +
         (options.enableSharedReferenceGenerics ? "1" : "0") + "\n" +
         "emitHotPatchThunks=" + (options.emitHotPatchThunks ? "1" : "0") + "\n";
@@ -534,18 +538,99 @@ GeneratedProgram CppGenerator::generate(
     });
 
     std::vector<CallSite> callSites;
-    for (const auto& view : functions) {
-        for (const auto& block : view.function->blocks) {
-            for (const auto& instruction : block.instructions) {
-                if (instruction.opcode == mir::Opcode::Call ||
-                    instruction.opcode == mir::Opcode::NewDelegate) {
-                    callSites.push_back(CallSite{callSites.size(), &instruction});
+    std::unordered_map<const mir::Instruction*, std::size_t> callIds;
+    {
+        struct CallSigKey {
+            semantic::SymbolId symbolId = 0;
+            std::string symbolName;
+            semantic::PrimitiveType resultType = semantic::PrimitiveType::Void;
+            semantic::SymbolId resultTypeId = 0;
+            std::vector<semantic::PrimitiveType> parameterTypes;
+            std::vector<semantic::SymbolId> parameterTypeIds;
+            bool virtualDispatch = false;
+            std::uint32_t virtualSlot = 0;
+            bool interfaceDispatch = false;
+            semantic::SymbolId interfaceTypeId = 0;
+            std::uint32_t interfaceSlot = 0;
+
+            bool operator==(const CallSigKey& o) const noexcept {
+                return symbolId == o.symbolId &&
+                    virtualDispatch == o.virtualDispatch &&
+                    virtualSlot == o.virtualSlot &&
+                    interfaceDispatch == o.interfaceDispatch &&
+                    interfaceTypeId == o.interfaceTypeId &&
+                    interfaceSlot == o.interfaceSlot &&
+                    resultType == o.resultType &&
+                    resultTypeId == o.resultTypeId &&
+                    parameterTypes == o.parameterTypes &&
+                    parameterTypeIds == o.parameterTypeIds &&
+                    symbolName == o.symbolName;
+            }
+        };
+        struct CallSigKeyHash {
+            std::size_t operator()(const CallSigKey& k) const noexcept {
+                std::size_t h = std::hash<semantic::SymbolId>{}(k.symbolId);
+                auto mix = [&](std::size_t v) noexcept {
+                    h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6u) + (h >> 2u);
+                };
+                mix(std::hash<std::string>{}(k.symbolName));
+                mix(static_cast<std::size_t>(k.resultType));
+                mix(std::hash<semantic::SymbolId>{}(k.resultTypeId));
+                mix(static_cast<std::size_t>(k.virtualSlot));
+                mix(std::hash<semantic::SymbolId>{}(k.interfaceTypeId));
+                mix(static_cast<std::size_t>(k.interfaceSlot));
+                mix(static_cast<std::size_t>(
+                    (k.virtualDispatch ? 1u : 0u) | (k.interfaceDispatch ? 2u : 0u)));
+                mix(k.parameterTypes.size());
+                for (const auto pt : k.parameterTypes) mix(static_cast<std::size_t>(pt));
+                for (const auto ptId : k.parameterTypeIds) mix(std::hash<semantic::SymbolId>{}(ptId));
+                return h;
+            }
+        };
+        std::unordered_map<CallSigKey, std::size_t, CallSigKeyHash> uniqueCallSigMap;
+        for (const auto& view : functions) {
+            for (const auto& block : view.function->blocks) {
+                for (const auto& instruction : block.instructions) {
+                    if (instruction.opcode != mir::Opcode::Call &&
+                        instruction.opcode != mir::Opcode::NewDelegate) {
+                        continue;
+                    }
+                    CallSigKey key{};
+                    key.symbolId = instruction.symbolId;
+                    key.symbolName = instruction.symbolName;
+                    key.resultType = instruction.opcode == mir::Opcode::NewDelegate
+                        ? instruction.elementType
+                        : instruction.resultType;
+                    key.resultTypeId = instruction.opcode == mir::Opcode::NewDelegate
+                        ? instruction.elementTypeId
+                        : instruction.resultTypeId;
+                    key.parameterTypes = instruction.parameterTypes;
+                    key.parameterTypeIds.reserve(instruction.parameterTypes.size());
+                    for (std::size_t pi = 0; pi < instruction.parameterTypes.size(); ++pi) {
+                        key.parameterTypeIds.push_back(
+                            pi < instruction.parameterTypeIds.size() ? instruction.parameterTypeIds[pi] : 0);
+                    }
+                    key.virtualDispatch = instruction.virtualDispatch;
+                    key.virtualSlot = instruction.virtualSlot;
+                    key.interfaceDispatch = instruction.interfaceDispatch;
+                    key.interfaceTypeId = instruction.interfaceTypeId;
+                    key.interfaceSlot = instruction.interfaceSlot;
+                    const auto [it, inserted] = uniqueCallSigMap.emplace(std::move(key), callSites.size());
+                    if (inserted) {
+                        callSites.push_back(CallSite{it->second, &instruction});
+                    }
+                    callIds.emplace(&instruction, it->second);
                 }
             }
         }
     }
+    generated.uniqueCallSignatureCount = callSites.size();
 
     generated.contentHash = compiler::stableFingerprint(canonicalInput(modules, options));
+    const bool trustedReleaseOnly = (options.emitMode == AotEmitMode::TrustedReleaseOnly);
+    if (trustedReleaseOnly) {
+        options.trustedRelease = true;
+    }
     std::vector<std::string> moduleNames;
     moduleNames.reserve(modules.size());
     for (const auto& module : modules) moduleNames.push_back(module.name);
@@ -981,9 +1066,6 @@ GeneratedProgram CppGenerator::generate(
     }
     source.line();
 
-    std::unordered_map<const mir::Instruction*, std::size_t> callIds;
-    for (const auto& call : callSites) callIds.emplace(call.instruction, call.id);
-
     struct SharedGenericMemberSpec {
         const FunctionView* view = nullptr;
         std::vector<semantic::SymbolId> typeIds;
@@ -1303,7 +1385,7 @@ GeneratedProgram CppGenerator::generate(
             source.line("};");
         }
         if (typedFunctions.find(function.symbolId) != typedFunctions.end()) {
-            source.line(typedScalarFunctionSignature(view, true));
+            source.line(typedScalarFunctionSignature(view, true, trustedReleaseOnly));
             if (supportsTypedParallelBatchKernel(view)) {
                 source.line("static bool " + view.cppName + "_parallel_batch(");
                 source.line("    ExecutionContext& context,");
@@ -1380,6 +1462,16 @@ GeneratedProgram CppGenerator::generate(
         source.line("};");
     }
     source.line();
+
+    const auto polyDispatch = emitSharedPolyDispatchHelpers(
+        source,
+        functions,
+        options,
+        typedFunctions,
+        types,
+        callIds,
+        hotPatchSlotsBySymbol);
+    generated.sharedPolyDispatchHelperCount = polyDispatch.helperCount;
 
     std::vector<SourceMapRecord> sourceMap;
     std::unordered_map<std::string, std::uint32_t> stringLiteralIndices;
@@ -1992,7 +2084,8 @@ GeneratedProgram CppGenerator::generate(
                         block.terminator.target,
                         block.terminator.arguments,
                         "edgeValues",
-                        "            ");
+                        "            ",
+                        trustedReleaseOnly);
                     source.line("            continue;");
                     break;
                 case mir::TerminatorKind::Branch:
@@ -2008,7 +2101,8 @@ GeneratedProgram CppGenerator::generate(
                         block.terminator.target,
                         block.terminator.arguments,
                         "trueEdgeValues",
-                        "                ");
+                        "                ",
+                        trustedReleaseOnly);
                     source.line("            } else {");
                     emitTransfer(
                         source,
@@ -2016,7 +2110,8 @@ GeneratedProgram CppGenerator::generate(
                         block.terminator.falseTarget,
                         block.terminator.falseArguments,
                         "falseEdgeValues",
-                        "                ");
+                        "                ",
+                        trustedReleaseOnly);
                     source.line("            }");
                     source.line("            continue;");
                     break;
@@ -2122,7 +2217,8 @@ GeneratedProgram CppGenerator::generate(
                 source, view, options, sourceMap, typedFunctions, types, callIds,
                 hotPatchSlotsBySymbol,
                 options.collectOptimizationRemarks ? &generated.optimizationRemarks : nullptr,
-                &stringLiteralIndices);
+                &stringLiteralIndices,
+                &polyDispatch);
             if (options.collectOptimizationRemarks) {
                 generated.optimizationRemarks.push_back(makeFunctionRemark(
                     OptimizationRemarkKind::Passed,
@@ -2672,7 +2768,8 @@ GeneratedProgram CppGenerator::generate(
                     block.terminator.target,
                     block.terminator.arguments,
                     "edgeValues",
-                    "            ");
+                    "            ",
+                    trustedReleaseOnly);
                 source.line("            continue;");
                 break;
             case mir::TerminatorKind::Branch:
@@ -2688,7 +2785,8 @@ GeneratedProgram CppGenerator::generate(
                     block.terminator.target,
                     block.terminator.arguments,
                     "trueEdgeValues",
-                    "                ");
+                    "                ",
+                    trustedReleaseOnly);
                 source.line("            } else {");
                 emitTransfer(
                     source,
@@ -2696,7 +2794,8 @@ GeneratedProgram CppGenerator::generate(
                     block.terminator.falseTarget,
                     block.terminator.falseArguments,
                     "falseEdgeValues",
-                    "                ");
+                    "                ",
+                    trustedReleaseOnly);
                 source.line("            }");
                 source.line("            continue;");
                 break;
@@ -2930,6 +3029,8 @@ GeneratedProgram CppGenerator::generate(
         << ",\n  \"sourceMapCount\": " << sourceMap.size()
         << ",\n  \"sharedGenericBodyCount\": " << generated.sharedGenericBodyCount
         << ",\n  \"foldedGenericFunctionCount\": " << generated.foldedGenericFunctionCount
+        << ",\n  \"uniqueCallSignatureCount\": " << generated.uniqueCallSignatureCount
+        << ",\n  \"sharedPolyDispatchHelperCount\": " << generated.sharedPolyDispatchHelperCount
         << ",\n  \"languageMetadata\": {\n";
 
     manifest << "    \"attributes\": [";

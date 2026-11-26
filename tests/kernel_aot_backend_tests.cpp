@@ -1854,6 +1854,102 @@ void testAuditRegressionULongAsyncCoroAndHotPatchStrings() {
     }
 }
 
+void testAotSlimEmitModeAndPolyDispatchDeduplication() {
+    const std::string src = R"RS(
+module Kernel.AotSlimProbe;
+
+public interface IWidgetMetric {
+    int Measure(int scale);
+}
+
+public class BaseWidget : IWidgetMetric {
+    public virtual int Score(int x) { return x + 1; }
+    public virtual int Measure(int scale) { return scale * 2; }
+}
+
+public class ButtonWidget : BaseWidget {
+    public override int Score(int x) { return x + 10; }
+    public override int Measure(int scale) { return scale * 3; }
+}
+
+public class LabelWidget : BaseWidget {
+    public override int Score(int x) { return x + 20; }
+}
+
+public class CardWidget : BaseWidget {
+    public override int Score(int x) { return x + 30; }
+    public override int Measure(int scale) { return scale * 5; }
+}
+
+int CallScoreOnce(BaseWidget w, int x) {
+    return w.Score(x);
+}
+
+int CallScoreAgain(BaseWidget w, int x) {
+    return w.Score(x + 1);
+}
+
+int CallMetricTwice(IWidgetMetric m, int s) {
+    return m.Measure(s) + m.Measure(s + 1);
+}
+
+public int Run(int seed) {
+    BaseWidget b = new ButtonWidget();
+    BaseWidget l = new LabelWidget();
+    BaseWidget c = new CardWidget();
+    int total = CallScoreOnce(b, seed) + CallScoreOnce(l, seed) + CallScoreAgain(c, seed);
+    total += CallMetricTwice(b, seed) + CallMetricTwice(c, seed);
+    return total;
+}
+)RS";
+
+    compiler::Compilation comp({{"aot_slim_probe.rscript", src}});
+    auto build = comp.build();
+    require(!build.diagnostics.hasErrors(), "AotSlimProbe build failed");
+    diagnostics::DiagnosticBag optDiag;
+    optimization::Options optOpts;
+    optOpts.level = optimization::Level::Aggressive;
+    const auto optRes = optimization::Optimizer{}.optimize(std::move(build.modules), optDiag, optOpts);
+    require(!optDiag.hasErrors(), "AotSlimProbe optimize failed");
+
+    diagnostics::DiagnosticBag fullDiag;
+    aot::GenerationOptions fullOpts;
+    fullOpts.programName = "SlimProbeFull";
+    fullOpts.emitLineDirectives = false;
+    fullOpts.emitMode = aot::AotEmitMode::FullMultiTier;
+    const auto fullGen = aot::CppGenerator{}.generate(optRes.modules, fullDiag, fullOpts);
+    require(!fullDiag.hasErrors(), "FullMultiTier AOT generation failed");
+
+    diagnostics::DiagnosticBag slimDiag;
+    aot::GenerationOptions slimOpts;
+    slimOpts.programName = "SlimProbeSlim";
+    slimOpts.emitLineDirectives = false;
+    slimOpts.emitMode = aot::AotEmitMode::TrustedReleaseOnly;
+    const auto slimGen = aot::CppGenerator{}.generate(optRes.modules, slimDiag, slimOpts);
+    require(!slimDiag.hasErrors(), "TrustedReleaseOnly AOT generation failed");
+
+    require(slimGen.contentHash != fullGen.contentHash,
+        "TrustedReleaseOnly contentHash must differ from FullMultiTier");
+    require(slimGen.uniqueCallSignatureCount == fullGen.uniqueCallSignatureCount &&
+            slimGen.uniqueCallSignatureCount > 0u &&
+            slimGen.uniqueCallSignatureCount < 14u,
+        "Expected CallSignature deduplication to collapse repeated calls");
+    require(fullGen.sharedPolyDispatchHelperCount > 0u &&
+            slimGen.sharedPolyDispatchHelperCount == fullGen.sharedPolyDispatchHelperCount,
+        "Expected shared polymorphic dispatch helpers in both modes");
+    require(fullGen.source.find("poly_dispatch_0(") != std::string::npos &&
+            slimGen.source.find("poly_dispatch_0(") != std::string::npos,
+        "Expected poly_dispatch_0 call sites in AOT output");
+    require(slimGen.source.find("template <bool FastAccounting") == std::string::npos,
+        "TrustedReleaseOnly output must not emit FastAccounting templates");
+    require(slimGen.source.find("context.consume(") == std::string::npos,
+        "TrustedReleaseOnly output must not emit per-opcode context.consume calls");
+    require(slimGen.source.find("determinismAccounting") == std::string::npos,
+        "TrustedReleaseOnly output must not emit determinismAccounting");
+    require(slimGen.source.size() < fullGen.source.size(),
+        "TrustedReleaseOnly AOT source must be smaller than FullMultiTier source");
+}
+
 } // namespace
 
 int main() {
@@ -1871,6 +1967,7 @@ int main() {
             {"AotRuntime GC.Alloc attribution, CppGenerator optimization remarks & rsaot CLI", testAotAllocAttributionRemarksAndCli},
             {"Wave 3 regression: AOT typed attributed call, int32 AotStruct & FastAccounting SIMD", testWaveRegressionAttributedTypedAndStructInt32},
             {"Audit regression: ulong arithmetic/overflow/SIMD, async string GC & literal slot collision", testAuditRegressionULongAsyncCoroAndHotPatchStrings},
+            {"Phase 3.2: AotEmitMode::TrustedReleaseOnly & shared polymorphic dispatch dedup", testAotSlimEmitModeAndPolyDispatchDeduplication},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';
