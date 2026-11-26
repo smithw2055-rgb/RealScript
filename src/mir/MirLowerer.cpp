@@ -643,6 +643,33 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
         check.resultTypeId = subscription.ownerType->id;
         check.symbolName = semantic::canonicalTypeName(
             subscription.ownerType);
+        const auto& customAccessor = subscription.adding
+            ? subscription.event.addAccessor
+            : subscription.event.removeAccessor;
+        const auto handler = lowerExpression(*subscription.handler);
+        if (customAccessor.has_value()) {
+            Instruction call;
+            call.resultType = semantic::PrimitiveType::Void;
+            call.opcode = Opcode::Call;
+            call.operands = {receiver, handler};
+            call.symbolId = customAccessor->id;
+            call.symbolName = customAccessor->moduleName + "::" +
+                (customAccessor->ownerTypeName.empty()
+                    ? customAccessor->name
+                    : customAccessor->ownerTypeName + "." + customAccessor->name);
+            for (const auto& parameter : customAccessor->parameters) {
+                const auto storageType = semantic::storageTypeOf(parameter);
+                const auto& storageTypeName = semantic::storageTypeNameOf(parameter);
+                call.parameterTypes.push_back(storageType);
+                call.parameterTypeIds.push_back(
+                    semantic::isExactType(storageType)
+                        ? semantic::stableTypeId(storageTypeName)
+                        : 0);
+            }
+            call.sourceSpan = statement.span;
+            block(*currentBlockId_).instructions.push_back(std::move(call));
+            return;
+        }
         const auto current = emitValue(
             Opcode::LoadField,
             semantic::PrimitiveType::Object,
@@ -653,7 +680,6 @@ void Lowerer::lowerStatement(const semantic::BoundStatement& statement) {
         load.resultTypeId = subscription.delegateType->id;
         load.symbolName = semantic::canonicalTypeName(
             subscription.ownerType);
-        const auto handler = lowerExpression(*subscription.handler);
         const auto combined = emitValue(
             subscription.adding
                 ? Opcode::CombineDelegate

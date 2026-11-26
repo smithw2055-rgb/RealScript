@@ -1132,6 +1132,14 @@ inline void substituteTypeLikeDeclaration(
     }
     for (auto& e : decl.events) {
         substituteType(e.delegateType, subs, hasGenericSyntax);
+        auto shadowed = memberNames;
+        shadowed.insert("value");
+        if (e.addAccessor && e.addAccessor->body) {
+            substituteStatement(*e.addAccessor->body, subs, shadowed, hasGenericSyntax);
+        }
+        if (e.removeAccessor && e.removeAccessor->body) {
+            substituteStatement(*e.removeAccessor->body, subs, shadowed, hasGenericSyntax);
+        }
     }
     for (auto& ctor : decl.constructors) {
         if (ctor.identifierToken.text == originalName) {
@@ -6397,14 +6405,29 @@ private:
             rewriteType(field.type, moduleName, sourceName, queue);
             if (field.initializer) rewriteExpression(*field.initializer, moduleName, sourceName, queue);
         }
-        for (auto& event : declaration.events) rewriteType(event.delegateType, moduleName, sourceName, queue);
-        for (auto& method : declaration.methods) rewriteFunction(method, moduleName, sourceName, queue);
         auto hasStaticModifier = [](const std::vector<syntax::SyntaxToken>& modifiers) noexcept {
             for (const auto& modifier : modifiers) {
                 if (modifier.text == "static") return true;
             }
             return false;
         };
+        for (auto& event : declaration.events) {
+            rewriteType(event.delegateType, moduleName, sourceName, queue);
+            const auto previousLocalTypes = localTypes_;
+            localTypes_.clear();
+            if (!currentOwnerTypeName_.empty()) {
+                localTypes_["this"] = currentOwnerTypeName_;
+            }
+            localTypes_["value"] = typeText(event.delegateType);
+            if (event.addAccessor && event.addAccessor->body) {
+                rewriteStatement(*event.addAccessor->body, moduleName, sourceName, queue);
+            }
+            if (event.removeAccessor && event.removeAccessor->body) {
+                rewriteStatement(*event.removeAccessor->body, moduleName, sourceName, queue);
+            }
+            localTypes_ = previousLocalTypes;
+        }
+        for (auto& method : declaration.methods) rewriteFunction(method, moduleName, sourceName, queue);
         for (auto& sequence : declaration.sequences) {
             const auto previousLocalTypes = localTypes_;
             localTypes_.clear();

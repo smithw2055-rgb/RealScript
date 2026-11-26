@@ -2901,18 +2901,24 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
                 stubBody << ";\n";
             }
 
-            // Events (all events add synthetic $event_*_delegate field to class layout)
+            // Events (field-backed events add synthetic $event_*_delegate field; custom add/remove events do not)
             for (const auto& ev : decl.events) {
                 const auto& evUnit = unitForOrigin(ev.originSourceName, u);
                 const auto evAcc = semantic::accessibilityFromModifiers(ev.modifiers);
+                const bool customEv = ev.addAccessor != nullptr || ev.removeAccessor != nullptr;
                 collectReferencedTypeNames(ev.delegateType, neededLayoutPrivateTypes);
-                sig << "event:" << static_cast<int>(evAcc) << ':'
+                sig << (customEv ? "customevent:" : "event:") << static_cast<int>(evAcc) << ':'
                     << canonicalizeTypeSyntax(ev.delegateType, visibleTypes) << ':'
                     << ev.identifierToken.text << ';';
                 stubBody << renderAttributesForStub(ev.attributes, *evUnit.sourceText, "    ", &unitByPath);
                 stubBody << "    " << accessibilityLabel(evAcc) << " event "
                          << renderTypeSyntaxForStub(ev.delegateType) << ' '
-                         << ev.identifierToken.text << ";\n";
+                         << ev.identifierToken.text;
+                if (customEv) {
+                    stubBody << " {\n        add { return; }\n        remove { return; }\n    }\n";
+                } else {
+                    stubBody << ";\n";
+                }
             }
 
             // Constructors (public & protected; plus implicit synthesized parameterless .ctor check)
@@ -3486,10 +3492,12 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
                 }
                 for (const auto& ev : ps->second->events) {
                     enqueueLayoutDeps(ev.delegateType);
-                    ls << "ev:" << canonicalizeTypeSyntax(ev.delegateType, visibleTypes) << ':'
+                    const bool customEv = ev.addAccessor != nullptr || ev.removeAccessor != nullptr;
+                    ls << (customEv ? "cev:" : "ev:") << canonicalizeTypeSyntax(ev.delegateType, visibleTypes) << ':'
                        << ev.identifierToken.text << ';';
                     privateLayoutStubs << "    event " << renderTypeSyntaxForStub(ev.delegateType)
-                                       << ' ' << ev.identifierToken.text << ";\n";
+                                       << ' ' << ev.identifierToken.text
+                                       << (customEv ? " { add { return; } remove { return; } }\n" : ";\n");
                 }
                 for (const auto& prop : ps->second->properties) {
                     const bool autoProp =
@@ -3536,10 +3544,12 @@ ModuleGraphExtraction ModuleBuildCache::extractModuleGraph(
                 }
                 for (const auto& ev : pc->second->events) {
                     enqueueLayoutDeps(ev.delegateType);
-                    ls << "ev:" << canonicalizeTypeSyntax(ev.delegateType, visibleTypes) << ':'
+                    const bool customEv = ev.addAccessor != nullptr || ev.removeAccessor != nullptr;
+                    ls << (customEv ? "cev:" : "ev:") << canonicalizeTypeSyntax(ev.delegateType, visibleTypes) << ':'
                        << ev.identifierToken.text << ';';
                     privateLayoutStubs << "    event " << renderTypeSyntaxForStub(ev.delegateType)
-                                       << ' ' << ev.identifierToken.text << ";\n";
+                                       << ' ' << ev.identifierToken.text
+                                       << (customEv ? " { add { return; } remove { return; } }\n" : ";\n");
                 }
                 for (const auto& prop : pc->second->properties) {
                     const bool autoProp =

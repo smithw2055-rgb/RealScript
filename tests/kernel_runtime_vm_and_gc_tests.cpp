@@ -1,5 +1,6 @@
 #include "realscript/bytecode/Bytecode.h"
 #include "realscript/compiler/Compilation.h"
+#include "realscript/compiler/PrecompiledModule.h"
 #include "realscript/optimization/Optimizer.h"
 #include "realscript/runtime/Runtime.h"
 
@@ -2632,6 +2633,133 @@ public int ReadObjectFieldTag(WidgetLike w) {
     (void)rootW2;
 }
 
+void testCustomEventAccessorsZeroBackingFieldsAndInheritance() {
+    const std::string src = R"RS(
+module Kernel.CustomEvents;
+
+public delegate void IntChangedHandler(int delta);
+
+public class Store {
+    public event IntChangedHandler handler;
+    public void Fire(int d) { handler(d); }
+}
+
+public class Base {
+    private Store _store;
+    public int tag = 7;
+
+    public Base() {
+        _store = null;
+    }
+
+    public event IntChangedHandler Changed {
+        add {
+            if (_store == null) { _store = new Store(); }
+            _store.handler += value;
+        }
+        remove {
+            if (_store != null) { _store.handler -= value; }
+        }
+    }
+
+    public void Raise(int d) {
+        if (_store != null) {
+            _store.Fire(d);
+        }
+    }
+}
+
+public class Derived : Base {
+    public int extra = 3;
+    public Derived() : base() {}
+}
+
+public int RunScenario() {
+    var d = new Derived();
+    int total = 0;
+    IntChangedHandler h1 = (int v) => { total = total + v; };
+    IntChangedHandler h2 = (int v) => { total = total + v * 10; };
+    d.Changed += h1;
+    d.Changed += h2;
+    d.Raise(4);
+    d.Changed -= h1;
+    d.Raise(2);
+    return total + d.tag + d.extra;
+}
+)RS";
+
+    compiler::CompilationOptions opts;
+    opts.capturePrecompiledFrontend = true;
+    compiler::Compilation comp({compiler::SourceFile{"custom_events.rs", src}}, opts);
+    auto build = comp.build();
+    require(!build.diagnostics.hasErrors(), "Custom event compile failed:\n" + formatDiags(build.diagnostics));
+    require(build.precompiledFrontend != nullptr, "Expected precompiledFrontend pack");
+
+    const semantic::TypeSymbol* baseType = nullptr;
+    const semantic::TypeSymbol* derivedType = nullptr;
+    for (const auto& mod : build.modules) {
+        for (const auto& t : mod.types) {
+            if (t.name == "Base") baseType = &t;
+            else if (t.name == "Derived") derivedType = &t;
+        }
+    }
+    require(baseType != nullptr && derivedType != nullptr, "Missing Base/Derived types");
+    // Only _store and tag on Base; Derived adds extra -> no synthetic $event_Changed_delegate field.
+    require(baseType->fields.size() == 2u, "Expected Base to have 2 fields (zero event delegate field)");
+    require(derivedType->fields.size() == 3u, "Expected Derived to have 3 fields (zero event delegate field)");
+
+    auto prog = compileAndLink({{"custom_events.rs", src}});
+    auto heap = std::make_shared<runtime::ManagedHeap>();
+    runtime::Interpreter interp(prog, heap);
+    const auto res = interp.invoke("Kernel.CustomEvents::RunScenario", {});
+    std::int64_t val = 0;
+    // (4 + 40) + 20 + 7 + 3 = 74
+    require(res.succeeded && res.value.tryGetInt64(val) && val == 74,
+        "Custom event subscribe/raise/unsubscribe mismatch");
+
+    // Verify RS8316 when invoking a custom event directly from inside the declaring class.
+    const std::string badInvokeSrc = R"RS(
+module Kernel.CustomEventsBadInvoke;
+public delegate void PingHandler();
+public class Bad {
+    public event PingHandler Ping {
+        add { return; }
+        remove { return; }
+    }
+    public void Trigger() {
+        Ping();
+    }
+}
+)RS";
+    compiler::Compilation badComp({compiler::SourceFile{"bad_invoke.rs", badInvokeSrc}});
+    const auto badBuild = badComp.build();
+    require(badBuild.diagnostics.hasErrors(), "Expected direct custom event invocation to fail");
+    bool saw8316 = false;
+    for (const auto& d : badBuild.diagnostics.items()) {
+        if (d.code == "RS8316") { saw8316 = true; break; }
+    }
+    require(saw8316, "Expected RS8316 diagnostic for direct custom event invocation");
+
+    // Verify precompiled (.rsm) round-trip preserves custom event zero backing field for subclasses.
+    std::string rsmErr;
+    const auto rsmBytes = compiler::encodePrecompiledFrontendPack(*build.precompiledFrontend);
+    require(!rsmBytes.empty(), "encodePrecompiledFrontendPack failed");
+    compiler::PrecompiledFrontendPack decodedPack;
+    require(compiler::decodePrecompiledFrontendPack(rsmBytes, decodedPack, &rsmErr),
+        "decodePrecompiledFrontendPack failed: " + rsmErr);
+    decodedPack.materializeAllTypes();
+    const auto* decodedMod = decodedPack.findModule("Kernel.CustomEvents");
+    require(decodedMod != nullptr, "Missing decoded module in PrecompiledFrontendPack");
+    bool decodedCustomEventOk = false;
+    for (const auto& t : decodedMod->types) {
+        if (t.name == "Base") {
+            decodedCustomEventOk = (t.fields.size() == 2u && t.events.size() == 1u &&
+                t.events[0].hasCustomAccessors() && t.events[0].storageField.name.empty());
+        }
+    }
+    require(decodedCustomEventOk, "PrecompiledModule round-trip did not preserve custom event accessors");
+}
+
 } // namespace
 
 int main() {
@@ -2653,6 +2781,7 @@ int main() {
             {"Audit regression: incremental ConstantStringFast, intrinsic policy, restoreEpoch PIC & >2k QuatfArena", testAuditRegressionGcCachesAndQuatf},
             {"Static and const fields excluded from instance object layout", testStaticAndConstFieldsExcludedFromInstanceLayout},
             {"Phase 2.2: HybridRecord compression, scalar fast paths, GC, dirty tracking & demotion", testHybridRecordCompressionAccessDemotionGcAndDirty},
+            {"Phase 2.3: Custom event accessors (zero backing fields, inheritance & RSFP roundtrip)", testCustomEventAccessorsZeroBackingFieldsAndInheritance},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

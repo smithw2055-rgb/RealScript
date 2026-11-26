@@ -238,11 +238,17 @@ struct EventSymbol {
     std::string name;
     std::string delegateName;
     FieldSymbol storageField;
+    std::optional<FunctionSymbol> addAccessor;
+    std::optional<FunctionSymbol> removeAccessor;
     std::vector<VariableSymbol> parameters;
     std::vector<EventHandlerSymbol> handlers;
     std::vector<EventSubscriptionSymbol> subscriptions;
     std::string sourceName;
     text::TextSpan declarationSpan;
+
+    [[nodiscard]] bool hasCustomAccessors() const noexcept {
+        return addAccessor.has_value() || removeAccessor.has_value();
+    }
 };
 
 struct PropertySymbol {

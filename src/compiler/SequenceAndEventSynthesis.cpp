@@ -2649,27 +2649,113 @@ void synthesizeDeclarationsSequencesAndMembers(
                                     event.parameters.push_back(
                                         std::move(value));
                                 }
-                                semantic::FieldSymbol storage;
-                                storage.name = "$event_" + event.name +
-                                    "_delegate";
-                                storage.accessibility =
-                                    semantic::Accessibility::Private;
-                                storage.declaringTypeId = owner.id;
-                                storage.declaringTypeName =
-                                    semantic::canonicalTypeName(owner);
-                                storage.type =
-                                    semantic::PrimitiveType::Object;
-                                storage.typeName = event.delegateName;
-                                storage.index = owner.fields.size();
-                                storage.synthetic = true;
-                                storage.sourceName = eventSrc;
-                                storage.declarationSpan =
-                                    eventSyntax.identifierToken.span;
-                                storage.id = semantic::stableTypeId(
-                                    semantic::canonicalTypeName(owner) +
-                                    "::field:" + storage.name);
-                                event.storageField = storage;
-                                owner.fields.push_back(storage);
+                                const bool customEvent =
+                                    eventSyntax.addAccessor != nullptr ||
+                                    eventSyntax.removeAccessor != nullptr;
+                                if (customEvent) {
+                                    if (!eventSyntax.addAccessor || !eventSyntax.addAccessor->body ||
+                                        !eventSyntax.removeAccessor || !eventSyntax.removeAccessor->body) {
+                                        result.diagnostics.report(
+                                            "RS8317",
+                                            "custom event '" + event.name +
+                                                "' must declare both add and remove accessors",
+                                            eventSyntax.identifierToken.span,
+                                            diagnostics::DiagnosticSeverity::Error,
+                                            eventSrc);
+                                        module.invalid = true;
+                                        continue;
+                                    }
+                                    auto makeEventAccessor = [&](bool isAdd,
+                                                                 const syntax::AccessorDeclarationSyntax& accSyn)
+                                        -> semantic::FunctionSymbol {
+                                        semantic::FunctionSymbol fn;
+                                        fn.moduleName = moduleName;
+                                        fn.name = (isAdd ? "add_" : "remove_") + event.name;
+                                        fn.ownerTypeName = owner.name;
+                                        fn.ownerTypeId = owner.id;
+                                        fn.declaringTypeId = owner.id;
+                                        fn.declaringTypeName = semantic::canonicalTypeName(owner);
+                                        fn.returnType = semantic::PrimitiveType::Void;
+                                        fn.method = true;
+                                        fn.staticMethod = false;
+                                        fn.accessibility = event.accessibility;
+                                        fn.deterministic = owner.deterministic;
+                                        fn.sourceName = eventSrc;
+                                        fn.declarationSpan = eventSyntax.identifierToken.span;
+                                        fn.bodySpan = accSyn.span();
+
+                                        semantic::VariableSymbol selfParam;
+                                        selfParam.name = "this";
+                                        selfParam.type = semantic::PrimitiveType::Object;
+                                        selfParam.typeName = semantic::canonicalTypeName(owner);
+                                        selfParam.storageType = selfParam.type;
+                                        selfParam.storageTypeName = selfParam.typeName;
+                                        selfParam.index = 0;
+                                        selfParam.parameter = true;
+                                        selfParam.declarationSpan = owner.declarationSpan;
+                                        fn.parameters.push_back(std::move(selfParam));
+
+                                        semantic::VariableSymbol valueParam;
+                                        valueParam.name = "value";
+                                        valueParam.type = semantic::PrimitiveType::Object;
+                                        valueParam.typeName = event.delegateName;
+                                        valueParam.storageType = valueParam.type;
+                                        valueParam.storageTypeName = valueParam.typeName;
+                                        valueParam.index = 1;
+                                        valueParam.parameter = true;
+                                        valueParam.declarationSpan = eventSyntax.identifierToken.span;
+                                        fn.parameters.push_back(std::move(valueParam));
+
+                                        fn.id = semantic::stableFunctionId(fn);
+                                        for (auto& parameter : fn.parameters) {
+                                            parameter.id = semantic::stableTypeId(
+                                                std::to_string(fn.id) + "::local:" +
+                                                std::to_string(parameter.index) + ":" +
+                                                parameter.name);
+                                        }
+                                        return fn;
+                                    };
+
+                                    event.addAccessor = makeEventAccessor(true, *eventSyntax.addAccessor);
+                                    event.removeAccessor = makeEventAccessor(false, *eventSyntax.removeAccessor);
+
+                                    auto registerAccessorBinding = [&](const semantic::FunctionSymbol& fnSym,
+                                                                       const syntax::BlockStatementSyntax* accBody) {
+                                        semantic::FunctionBindingInput binding;
+                                        binding.symbol = fnSym;
+                                        binding.sourceName = eventSrc;
+                                        binding.body = accBody;
+                                        binding.parameterNames.push_back("this");
+                                        binding.parameterSpans.push_back(typeSyntax.identifierToken.span);
+                                        binding.parameterNames.push_back("value");
+                                        binding.parameterSpans.push_back(eventSyntax.identifierToken.span);
+                                        addBinding(module, std::move(binding), eventSyntax.identifierToken.span);
+                                    };
+                                    registerAccessorBinding(*event.addAccessor, eventSyntax.addAccessor->body.get());
+                                    registerAccessorBinding(*event.removeAccessor, eventSyntax.removeAccessor->body.get());
+                                } else {
+                                    semantic::FieldSymbol storage;
+                                    storage.name = "$event_" + event.name +
+                                        "_delegate";
+                                    storage.accessibility =
+                                        semantic::Accessibility::Private;
+                                    storage.declaringTypeId = owner.id;
+                                    storage.declaringTypeName =
+                                        semantic::canonicalTypeName(owner);
+                                    storage.type =
+                                        semantic::PrimitiveType::Object;
+                                    storage.typeName = event.delegateName;
+                                    storage.index = owner.fields.size();
+                                    storage.synthetic = true;
+                                    storage.sourceName = eventSrc;
+                                    storage.declarationSpan =
+                                        eventSyntax.identifierToken.span;
+                                    storage.id = semantic::stableTypeId(
+                                        semantic::canonicalTypeName(owner) +
+                                        "::field:" + storage.name);
+                                    event.storageField = storage;
+                                    owner.fields.push_back(storage);
+                                }
                                 eventIndices.emplace(
                                     event.name,
                                     owner.events.size());

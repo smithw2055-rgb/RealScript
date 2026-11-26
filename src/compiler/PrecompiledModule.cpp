@@ -14,7 +14,7 @@
 namespace realscript::compiler {
 namespace {
 
-constexpr std::uint32_t kFormatVersionV2 = 2u;
+constexpr std::uint32_t kFormatVersionV3 = 3u;
 constexpr std::uint8_t kMagic[4] = {'R', 'S', 'F', 'P'};
 constexpr std::uint32_t kHeaderSizeV2 = 72u;
 constexpr std::size_t kTypeChunkTargetBytes = 16384u;
@@ -309,11 +309,15 @@ private:
         a.name != b.name ||
         a.delegateName != b.delegateName ||
         !sameSemanticField(a.storageField, b.storageField) ||
+        a.addAccessor.has_value() != b.addAccessor.has_value() ||
+        a.removeAccessor.has_value() != b.removeAccessor.has_value() ||
         a.parameters.size() != b.parameters.size() ||
         a.handlers.size() != b.handlers.size() ||
         a.subscriptions.size() != b.subscriptions.size()) {
         return false;
     }
+    if (a.addAccessor && !sameSemanticFunction(*a.addAccessor, *b.addAccessor)) return false;
+    if (a.removeAccessor && !sameSemanticFunction(*a.removeAccessor, *b.removeAccessor)) return false;
     for (std::size_t i = 0u; i < a.parameters.size(); ++i) {
         if (!sameSemanticVariable(a.parameters[i], b.parameters[i])) return false;
     }
@@ -616,6 +620,8 @@ void internEvent(StringInterner& s, const semantic::EventSymbol& e) {
     s.add(e.name);
     s.add(e.delegateName);
     internField(s, e.storageField);
+    if (e.addAccessor) internFunction(s, *e.addAccessor);
+    if (e.removeAccessor) internFunction(s, *e.removeAccessor);
     for (const auto& p : e.parameters) internVariable(s, p);
     for (const auto& h : e.handlers) {
         internFunction(s, h.function);
@@ -632,6 +638,10 @@ void writeEventCompact(Writer& w, const StringInterner& s, const semantic::Event
     w.u32(s.indexOf(e.name));
     w.u32(s.indexOf(e.delegateName));
     writeFieldCompact(w, s, e.storageField);
+    w.boolByte(e.addAccessor.has_value());
+    if (e.addAccessor) writeFunctionCompact(w, s, *e.addAccessor);
+    w.boolByte(e.removeAccessor.has_value());
+    if (e.removeAccessor) writeFunctionCompact(w, s, *e.removeAccessor);
     w.u32(static_cast<std::uint32_t>(e.parameters.size()));
     for (const auto& p : e.parameters) writeVariableCompact(w, s, p);
     w.u32(static_cast<std::uint32_t>(e.handlers.size()));
@@ -657,6 +667,20 @@ bool readEventCompact(
     e.name = r.strFromTable(strings);
     e.delegateName = r.strFromTable(strings);
     if (!readFieldCompact(r, strings, e.storageField)) return false;
+    if (r.boolByte()) {
+        semantic::FunctionSymbol fn;
+        if (!readFunctionCompact(r, strings, fn)) return false;
+        e.addAccessor = std::move(fn);
+    } else {
+        e.addAccessor.reset();
+    }
+    if (r.boolByte()) {
+        semantic::FunctionSymbol fn;
+        if (!readFunctionCompact(r, strings, fn)) return false;
+        e.removeAccessor = std::move(fn);
+    } else {
+        e.removeAccessor.reset();
+    }
     const std::uint32_t pCount = r.u32();
     if (!r.valid() || pCount > 4096u) return false;
     e.parameters.resize(pCount);
@@ -1813,7 +1837,7 @@ std::vector<std::uint8_t> encodePrecompiledFrontendPack(
 
     Writer out;
     out.bytes(kMagic, 4u);
-    out.u32(kFormatVersionV2);
+    out.u32(kFormatVersionV3);
     out.u32(realscript::kVersionMajor);
     out.u32(realscript::kVersionMinor);
     out.u32(realscript::kVersionPatch);
@@ -1869,7 +1893,7 @@ bool decodePrecompiledFrontendPack(
     const std::uint32_t genericUncompSize = hdr.u32();
     const std::uint64_t storedChecksum = hdr.u64();
 
-    if (!hdr.valid() || fmtVer != kFormatVersionV2) {
+    if (!hdr.valid() || fmtVer != kFormatVersionV3) {
         return fail("unsupported RSFP format version");
     }
     if (vMaj != realscript::kVersionMajor ||

@@ -329,9 +329,12 @@ text::TextSpan FieldDeclarationSyntax::span() const noexcept {
 }
 
 text::TextSpan EventDeclarationSyntax::span() const noexcept {
+    const auto endSpan = closeBraceToken
+        ? closeBraceToken->span
+        : (semicolonToken ? semicolonToken->span : identifierToken.span);
     return combine(
         declarationStart(attributes, eventKeyword.span),
-        semicolonToken.span);
+        endSpan);
 }
 
 text::TextSpan ConstructorDeclarationSyntax::span() const noexcept {
@@ -1094,6 +1097,22 @@ FieldDeclarationSyntax cloneFieldDeclarationSyntax(const FieldDeclarationSyntax&
     return out;
 }
 
+EventDeclarationSyntax cloneEventDeclarationSyntax(const EventDeclarationSyntax& value) {
+    EventDeclarationSyntax out;
+    out.attributes = value.attributes;
+    out.modifiers = value.modifiers;
+    out.eventKeyword = value.eventKeyword;
+    out.delegateType = value.delegateType;
+    out.identifierToken = value.identifierToken;
+    out.semicolonToken = value.semicolonToken;
+    out.openBraceToken = value.openBraceToken;
+    if (value.addAccessor) out.addAccessor = cloneAccessorDeclaration(*value.addAccessor);
+    if (value.removeAccessor) out.removeAccessor = cloneAccessorDeclaration(*value.removeAccessor);
+    out.closeBraceToken = value.closeBraceToken;
+    out.originSourceName = value.originSourceName;
+    return out;
+}
+
 ConstructorDeclarationSyntax cloneConstructorDeclarationSyntax(
     const ConstructorDeclarationSyntax& value) {
     ConstructorDeclarationSyntax out;
@@ -1205,7 +1224,7 @@ ClassDeclarationSyntax cloneClassDeclarationSyntax(const ClassDeclarationSyntax&
     out.interfaceCommaTokens = value.interfaceCommaTokens;
     out.openBraceToken = value.openBraceToken;
     for (const auto& f : value.fields) out.fields.push_back(cloneFieldDeclarationSyntax(f));
-    out.events = value.events;
+    for (const auto& e : value.events) out.events.push_back(cloneEventDeclarationSyntax(e));
     for (const auto& m : value.methods) out.methods.push_back(cloneFunctionDeclarationSyntax(m));
     for (const auto& s : value.sequences) out.sequences.push_back(cloneSequenceDeclarationSyntax(s));
     for (const auto& c : value.constructors) out.constructors.push_back(cloneConstructorDeclarationSyntax(c));
@@ -1230,7 +1249,7 @@ StructDeclarationSyntax cloneStructDeclarationSyntax(const StructDeclarationSynt
     out.interfaceCommaTokens = value.interfaceCommaTokens;
     out.openBraceToken = value.openBraceToken;
     for (const auto& f : value.fields) out.fields.push_back(cloneFieldDeclarationSyntax(f));
-    out.events = value.events;
+    for (const auto& e : value.events) out.events.push_back(cloneEventDeclarationSyntax(e));
     for (const auto& m : value.methods) out.methods.push_back(cloneFunctionDeclarationSyntax(m));
     for (const auto& s : value.sequences) out.sequences.push_back(cloneSequenceDeclarationSyntax(s));
     for (const auto& c : value.constructors) out.constructors.push_back(cloneConstructorDeclarationSyntax(c));

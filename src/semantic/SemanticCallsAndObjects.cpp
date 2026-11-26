@@ -1613,6 +1613,14 @@ std::unique_ptr<BoundExpression> Binder::bindCallExpression(
     if (currentOwnerType_ && !currentStaticMethod_) {
         for (const auto& event : currentOwnerType_->events) {
             if (event.name != syntaxTree.identifierToken.text) continue;
+            if (event.hasCustomAccessors() || event.storageField.name.empty()) {
+                diagnostics_.report(
+                    "RS8316",
+                    "custom event '" + event.name +
+                        "' cannot be invoked directly; invoke its backing delegate",
+                    syntaxTree.span());
+                return makeError(syntaxTree.span());
+            }
             if (bindingConstructorInitializer_) {
                 diagnostics_.report(
                     "RS2536",
