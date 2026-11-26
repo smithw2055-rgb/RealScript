@@ -1485,7 +1485,8 @@ void linkSingleExecutionFunctionPass2(
                     inst.index < module.functionReferences.size()) {
                     const auto& ref = module.functionReferences[inst.index];
                     if (!ref.virtualDispatch && !ref.interfaceDispatch &&
-                        ref.name.rfind("__rs_native_", 0) == 0 &&
+                        (ref.name.rfind("__rs_native_", 0) == 0 ||
+                         ref.name.find("::__rs_native_") != std::string::npos) &&
                         functions.find(ref.symbolId) == functions.end() &&
                         inst.operands.size() == function.parameterTypes.size() &&
                         ref.parameterTypes == function.parameterTypes &&

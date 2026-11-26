@@ -200,10 +200,31 @@ using JitDirectInvokeFn = std::uint32_t (*)(
     runtime::Value* outResult,
     bool forceSimulateArm64) noexcept;
 
+struct JitPolyCallCacheEntry {
+    std::uint32_t siteIdx = 0xffffffffu;
+    semantic::SymbolId receiverTypeId = 0;
+    semantic::SymbolId targetSymbolId = 0;
+};
+
+struct JitAssignableCacheEntry {
+    semantic::SymbolId subTypeId = 0;
+    semantic::SymbolId targetTypeId = 0;
+    bool assignable = false;
+};
+
+struct JitNativeBindCacheEntry {
+    std::uint64_t registryId = 0;
+    std::uint64_t registryEpoch = 0;
+    semantic::SymbolId symbolId = 0;
+    const runtime::ExternalFunction* fn = nullptr;
+};
+
 struct JitRuntimeSession {
     const runtime::ProgramImage* program = nullptr;
     runtime::ManagedHeap* heap = nullptr;
     runtime::IExecutionPolicy* executionPolicy = nullptr;
+    const runtime::BindingRegistry* bindings = nullptr;
+    const runtime::ExternalFunction* externalResolver = nullptr;
     runtime::Limits limits{};
     runtime::RuntimeStatistics stats{};
     runtime::RuntimeError error{};
@@ -222,6 +243,9 @@ struct JitRuntimeSession {
     std::vector<runtime::ObjectRef>* stringLiteralCache = nullptr;
     std::uint64_t* stringLiteralCacheEpoch = nullptr;
     std::uint64_t* stringLiteralCacheHeapId = nullptr;
+    std::array<JitPolyCallCacheEntry, 16> polyCallCache{};
+    std::array<JitAssignableCacheEntry, 8> assignableCache{};
+    std::array<JitNativeBindCacheEntry, 32> nativeBindCache{};
 };
 
 struct StencilTlsScratch {

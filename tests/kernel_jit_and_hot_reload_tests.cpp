@@ -1568,6 +1568,332 @@ public int StepNode(RichNode n, int delta) {
     (void)nodeRoot;
 }
 
+void testStencilJitIsTypeAsTypeAndDelegatesParity() {
+    const std::string src = R"RS(
+module Kernel.JitUiParity;
+
+public delegate int PingHandler(int x);
+
+public interface IPingable {
+    int Ping(int x);
+}
+
+public class RootObj {
+}
+
+public class BaseWidget : RootObj, IPingable {
+    public int Bias = 10;
+    public virtual int Ping(int x) { return x + Bias; }
+}
+
+public class SubWidget : BaseWidget {
+    public int Scale = 3;
+    public override int Ping(int x) { return (x + Bias) * Scale; }
+}
+
+public class DummyBox : RootObj {
+    public int Value = 99;
+}
+
+public int StaticMul(int x) { return x * 5; }
+
+public int RunParity(int seed) {
+    BaseWidget b = new BaseWidget();
+    BaseWidget s = new SubWidget();
+    RootObj aSub = s;
+    RootObj aDummy = new DummyBox();
+    RootObj aNull = null;
+
+    int score = 0;
+    if (b is IPingable) { score += 1; }
+    if (s is SubWidget) { score += 2; }
+    if (!(b is SubWidget)) { score += 4; }
+    if (!(aNull is SubWidget)) { score += 8; }
+    if (!(aDummy is IPingable)) { score += 16; }
+
+    SubWidget castOk = aSub as SubWidget;
+    SubWidget castFail = aDummy as SubWidget;
+    SubWidget castNull = aNull as SubWidget;
+    if (castOk != null && castFail == null && castNull == null) {
+        score += castOk.Ping(seed);
+    }
+
+    PingHandler h = null;
+    PingHandler hStatic = StaticMul;
+    PingHandler hVirt = b.Ping;
+    PingHandler hSub = s.Ping;
+    h += hStatic;
+    h += hVirt;
+    h += hSub;
+    h -= hVirt;
+    int delRes = h(seed);
+    return score + delRes;
+}
+
+public int RunNullDelegate() {
+    PingHandler empty = null;
+    return empty(1);
+}
+)RS";
+
+    auto bundle = compileAndLink({{"jit_ui_parity.rscript", src}}, optimization::Level::Basic);
+    runtime::Interpreter interp(bundle.program);
+    const auto interpRes = interp.invoke("Kernel.JitUiParity::RunParity", {std::int64_t{4}});
+    std::int64_t interpVal = 0;
+    require(interpRes.succeeded && interpRes.value.tryGetInt64(interpVal),
+        "Interpreter RunParity failed: " + interpRes.error.message);
+
+    jit::StencilJit sjit;
+    jit::StencilJitOptions natOpts{};
+    natOpts.enableNativeCodegen = true;
+    natOpts.enableThreadedFallback = false;
+    natOpts.hotnessThreshold = 0;
+    auto natRes = sjit.compile(bundle.program, natOpts);
+    require(natRes.succeeded(), "StencilJit RunParity native compile failed: " + natRes.error);
+    const auto jitMod = natRes.module;
+    require(jitMod->functionTier("Kernel.JitUiParity::RunParity") == jit::StencilTier::NativeMachineCode,
+        "RunParity must compile to NativeMachineCode");
+
+    jitMod->resetInterpreterFallbackCount();
+    const auto jitExec = jitMod->invoke("Kernel.JitUiParity::RunParity", {std::int64_t{4}});
+    std::int64_t jitVal = 0;
+    require(jitExec.succeeded && jitExec.value.tryGetInt64(jitVal) && jitVal == interpVal,
+        "Native StencilJit RunParity mismatch");
+    require(jitMod->interpreterFallbackCount() == 0u,
+        "Native RunParity must have zero interpreter fallback");
+
+    const auto armExec = jitMod->invokeSimulatedArm64("Kernel.JitUiParity::RunParity", {std::int64_t{4}});
+    std::int64_t armVal = 0;
+    require(armExec.succeeded && armExec.value.tryGetInt64(armVal) && armVal == interpVal,
+        "Simulated ARM64 RunParity mismatch");
+
+    const auto nullExec = jitMod->invoke("Kernel.JitUiParity::RunNullDelegate");
+    require(!nullExec.succeeded && nullExec.error.code == runtime::ErrorCode::NullReference,
+        "Expected NullReference when invoking null delegate in StencilJit");
+
+    jit::StencilJitOptions thOpts{};
+    thOpts.enableNativeCodegen = false;
+    thOpts.enableThreadedFallback = true;
+    auto thRes = sjit.compile(bundle.program, thOpts);
+    require(thRes.succeeded(), "Threaded StencilJit compile failed");
+    const auto thExec = thRes.module->invoke("Kernel.JitUiParity::RunParity", {std::int64_t{4}});
+    std::int64_t thVal = 0;
+    require(thExec.succeeded && thExec.value.tryGetInt64(thVal) && thVal == interpVal,
+        "Threaded StencilJit RunParity mismatch");
+}
+
+void testStencilJitPolymorphicCallIcParity() {
+    const std::string src = R"RS(
+module Kernel.PolyIc;
+
+public interface IShape {
+    int Area();
+}
+
+public class BaseShape : IShape {
+    public virtual int KindScore() { return 1; }
+    public virtual int Area() { return 2; }
+}
+
+public class RectShape : BaseShape {
+    public int W = 3;
+    public int H = 4;
+    public override int KindScore() { return 5; }
+    public override int Area() { return W * H; }
+}
+
+public class SquareShape : BaseShape {
+    public int S = 6;
+    public override int KindScore() { return 9; }
+    public override int Area() { return S * S; }
+}
+
+public int MeasureLoop(int reps) {
+    BaseShape a = new BaseShape();
+    BaseShape b = new RectShape();
+    BaseShape c = new SquareShape();
+    IShape ia = a;
+    IShape ib = b;
+    IShape ic = c;
+    BaseShape[] arr = new BaseShape[3];
+    arr[0] = a;
+    arr[1] = b;
+    arr[2] = null;
+    arr[2] = c;
+    int sum = 0;
+    for (int i = 0; i < reps; i += 1) {
+        int m = i % 3;
+        BaseShape cur = arr[m];
+        IShape icur = m == 0 ? ia : (m == 1 ? ib : ic);
+        sum += cur.KindScore() + icur.Area();
+    }
+    arr[2] = null;
+    if (arr[2] != null) {
+        return -1;
+    }
+    return sum;
+}
+)RS";
+
+    auto bundle = compileAndLink({{"jit_poly_ic.rscript", src}}, optimization::Level::Basic);
+    runtime::Interpreter interp(bundle.program);
+    const auto interpRes = interp.invoke("Kernel.PolyIc::MeasureLoop", {std::int64_t{30}});
+    std::int64_t expected = 0;
+    require(interpRes.succeeded && interpRes.value.tryGetInt64(expected),
+        "Interpreter MeasureLoop failed");
+
+    jit::StencilJit sjit;
+    jit::StencilJitOptions opts{};
+    opts.enableNativeCodegen = true;
+    opts.enableThreadedFallback = false;
+    opts.hotnessThreshold = 0;
+    auto compiled = sjit.compile(bundle.program, opts);
+    require(compiled.succeeded(), "PolyIc StencilJit compile failed: " + compiled.error);
+    compiled.module->resetInterpreterFallbackCount();
+
+    const auto jitRes = compiled.module->invoke("Kernel.PolyIc::MeasureLoop", {std::int64_t{30}});
+    std::int64_t actual = 0;
+    require(jitRes.succeeded && jitRes.value.tryGetInt64(actual) && actual == expected,
+        "Native PolyIc MeasureLoop mismatch");
+    require(compiled.module->interpreterFallbackCount() == 0u,
+        "PolyIc MeasureLoop must have zero interpreter fallback");
+
+    const auto armRes = compiled.module->invokeSimulatedArm64("Kernel.PolyIc::MeasureLoop", {std::int64_t{30}});
+    std::int64_t armActual = 0;
+    require(armRes.succeeded && armRes.value.tryGetInt64(armActual) && armActual == expected,
+        "ARM64 PolyIc MeasureLoop mismatch");
+}
+
+void testStencilJitLazyBundleHotnessPromotionAndInvokeSpan() {
+    const std::string libSrc = R"RS(
+module Kernel.LazyLib;
+
+int __rs_native_HostMul(int a, int b) { return 0; }
+public int HostMul(int a, int b) { return __rs_native_HostMul(a, b); }
+
+public int ColdUnused(int x) {
+    return x * 17 + 3;
+}
+
+public int Compute(int x) {
+    return HostMul(x, 4) + 7;
+}
+)RS";
+    const std::string appSrc = R"RS(
+module Kernel.LazyApp;
+import Kernel.LazyLib;
+
+public int RunApp(int v) {
+    return Compute(v) + 1;
+}
+)RS";
+
+    compiler::Compilation combinedComp({{"lazy_lib.rscript", libSrc}, {"lazy_app.rscript", appSrc}});
+    auto combinedBuild = combinedComp.build();
+    require(!combinedBuild.diagnostics.hasErrors(), "LazyLib+App compile failed:\n" + formatDiags(combinedBuild.diagnostics));
+    bytecode::Lowerer lowerer;
+    std::vector<bytecode::Module> libBc;
+    std::vector<bytecode::Module> appBc;
+    for (const auto& m : combinedBuild.modules) {
+        if (m.name == "Kernel.LazyLib") {
+            auto bm = lowerer.lower(m);
+            bm.functions.erase(
+                std::remove_if(
+                    bm.functions.begin(),
+                    bm.functions.end(),
+                    [](const bytecode::Function& fn) {
+                        return fn.name.rfind("__rs_native_", 0) == 0;
+                    }),
+                bm.functions.end());
+            libBc.push_back(std::move(bm));
+        } else if (m.name == "Kernel.LazyApp") {
+            appBc.push_back(lowerer.lower(m));
+        }
+    }
+
+    const auto rslb = bytecode::encodeLazyBytecodeBundle(libBc, /*targetChunkBytes=*/0u);
+    auto lazyBundle = std::make_shared<bytecode::LazyBytecodeBundle>();
+    diagnostics::DiagnosticBag bDiag;
+    require(bytecode::decodeLazyBytecodeBundleHeader(
+                rslb.data(), rslb.size(), *lazyBundle, /*copyBlob=*/true, bDiag, /*skipChecksum=*/true),
+        "RSLB header decode failed");
+
+    runtime::RuntimeError linkErr;
+    auto linkedOpt = runtime::ProgramImage::linkLayeredConsumeHeader(
+        lazyBundle, std::move(appBc), linkErr, true);
+    require(linkedOpt.has_value(), "linkLayeredConsumeHeader failed: " + linkErr.message);
+    linkedOpt->compactForRuntime();
+    auto prog = std::make_shared<const runtime::ProgramImage>(std::move(*linkedOpt));
+
+    auto bindings = std::make_shared<runtime::BindingRegistry>();
+    require(
+        bindings->bind(
+            "Kernel.LazyLib::__rs_native_HostMul",
+            [](const bytecode::FunctionReference&,
+               runtime::ValueSpan args,
+               runtime::RuntimeError&) -> std::optional<runtime::Value> {
+                return runtime::Value{args[0].asInt64Unchecked() * args[1].asInt64Unchecked()};
+            }),
+        "Failed to bind Kernel.LazyLib::__rs_native_HostMul");
+
+    jit::StencilJit sjit;
+    jit::StencilJitOptions lazyOpts{};
+    lazyOpts.enableNativeCodegen = true;
+    lazyOpts.enableThreadedFallback = false;
+    lazyOpts.hotnessThreshold = 4;
+    auto compiled = sjit.compile(prog, lazyOpts);
+    require(compiled.succeeded() && compiled.module, "Lazy StencilJit compile failed: " + compiled.error);
+    compiled.module->setBindings(bindings);
+    require(prog->compiledLazyFunctionCount() == 0u,
+        "StencilJit::compile on LazyBytecodeBundle must decode 0 lazy functions upfront");
+
+    const auto computeSymOpt = prog->findFunction("Kernel.LazyLib::Compute");
+    require(computeSymOpt.has_value(), "Compute symbol missing");
+    const semantic::SymbolId computeSym = *computeSymOpt;
+    const std::array<runtime::Value, 1> spanArgs{{runtime::Value{std::int64_t{5}}}};
+
+    for (int i = 0; i < 3; ++i) {
+        runtime::ExecutionResult skipped{};
+        require(!compiled.module->tryInvokeSpan(
+                    computeSym, runtime::ValueSpan(spanArgs), {}, skipped),
+            "Expected tryInvokeSpan to defer calls 1..3 before hotnessThreshold");
+        require(compiled.module->functionTier(computeSym) == jit::StencilTier::InterpreterFallback,
+            "Expected Compute tier to stay InterpreterFallback before threshold");
+    }
+
+    compiled.module->resetInterpreterFallbackCount();
+    runtime::ExecutionResult promotedRes{};
+    if (!compiled.module->tryInvokeSpan(
+            computeSym, runtime::ValueSpan(spanArgs), {}, promotedRes)) {
+        std::string diagMsg = "Expected tryInvokeSpan call 4 to promote synchronously and execute;";
+        for (const auto& fd : compiled.module->functionDiagnostics()) {
+            diagMsg += " [" + fd.qualifiedName + " tier=" + std::to_string(static_cast<int>(fd.tier)) +
+                " elig=" + std::to_string(fd.eligibleForNative ? 1 : 0) + " reason=" + fd.fallbackReason + "]";
+        }
+        require(false, diagMsg);
+    }
+    std::int64_t promotedVal = -999;
+    require(promotedRes.succeeded && promotedRes.value.tryGetInt64(promotedVal) && promotedVal == 27,
+        "Promoted lazy Compute result mismatch: succeeded=" + std::to_string(promotedRes.succeeded ? 1 : 0) +
+        " val=" + std::to_string(promotedVal) + " err=" + promotedRes.error.message);
+    require(compiled.module->functionTier(computeSym) == jit::StencilTier::NativeMachineCode,
+        "Expected Compute tier to be NativeMachineCode after promotion");
+
+    const auto spanRes = compiled.module->invokeSpan(computeSym, runtime::ValueSpan(spanArgs));
+    std::int64_t spanVal = 0;
+    require(spanRes.succeeded && spanRes.value.tryGetInt64(spanVal) && spanVal == 27,
+        "invokeSpan on promoted Compute failed");
+    require(compiled.module->interpreterFallbackCount() == 0u,
+        "Direct host-native forwarder inside JIT must have zero interpreter fallback");
+
+    const auto appRes = compiled.module->invoke("Kernel.LazyApp::RunApp", {std::int64_t{6}});
+    std::int64_t appVal = 0;
+    require(appRes.succeeded && appRes.value.tryGetInt64(appVal) && appVal == 32,
+        "RunApp calling promoted lazy Compute with HostMul failed");
+    require(prog->compiledLazyFunctionCount() < prog->totalLazyFunctionCount(),
+        "ColdUnused lazy function must remain undecoded");
+}
+
 } // namespace
 
 int main() {
@@ -1584,6 +1910,9 @@ int main() {
             {"Wave 2 regression: StencilJit IExecutionPolicy & NegateIntChecked/ConvertNumeric/BinaryUInt", testWaveRegressionStencilJitPolicyAndFastOps},
             {"Audit regression: StencilJit struct calls, ValuePoolDomain, Enum->Int & compactForRuntime HotReload", testAuditRegressionStencilStructsPoolDomainEnumAndCompactHr},
             {"Phase 2.2: HybridRecord StencilJit parity & HotReload migration", testHybridRecordStencilJitAndHotReloadMigration},
+            {"Phase 3.1: StencilJit IsTypeObjFast/AsTypeObjFast & delegate opcodes parity", testStencilJitIsTypeAsTypeAndDelegatesParity},
+            {"Phase 3.1: StencilJit polymorphic call IC hit/miss parity", testStencilJitPolymorphicCallIcParity},
+            {"Phase 3.1: StencilJit LazyBytecodeBundle hotness promotion, invokeSpan & native forwarder", testStencilJitLazyBundleHotnessPromotionAndInvokeSpan},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

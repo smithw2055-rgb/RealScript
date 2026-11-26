@@ -122,6 +122,15 @@ public:
         semantic::SymbolId symbolId,
         const std::vector<runtime::Value>& arguments,
         runtime::Limits limits) const;
+    [[nodiscard]] runtime::ExecutionResult invokeSpan(
+        semantic::SymbolId symbolId,
+        runtime::ValueSpan arguments,
+        runtime::ExecutionOptions options = {}) const;
+    [[nodiscard]] bool tryInvokeSpan(
+        semantic::SymbolId symbolId,
+        runtime::ValueSpan arguments,
+        runtime::ExecutionOptions options,
+        runtime::ExecutionResult& outResult) const;
 
     [[nodiscard]] std::size_t totalFunctionCount() const noexcept;
     [[nodiscard]] std::size_t nativeFunctionCount() const noexcept;
