@@ -238,11 +238,17 @@ struct EventSymbol {
     std::string name;
     std::string delegateName;
     FieldSymbol storageField;
+    std::optional<FunctionSymbol> addAccessor;
+    std::optional<FunctionSymbol> removeAccessor;
     std::vector<VariableSymbol> parameters;
     std::vector<EventHandlerSymbol> handlers;
     std::vector<EventSubscriptionSymbol> subscriptions;
     std::string sourceName;
     text::TextSpan declarationSpan;
+
+    [[nodiscard]] bool hasCustomAccessors() const noexcept {
+        return addAccessor.has_value() || removeAccessor.has_value();
+    }
 };
 
 struct PropertySymbol {
@@ -720,6 +726,21 @@ struct FunctionBindingInput {
     std::unordered_set<std::string> hygienicAccessibleModules;
     bool inConstructorInitializer = false;
 };
+
+[[nodiscard]] inline std::size_t requiredInstanceSlotCount(
+    const std::vector<FieldSymbol>& fields) noexcept {
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < fields.size(); ++i) {
+        if (!fields[i].staticField && !fields[i].constField) {
+            count = i + 1;
+        }
+    }
+    return count;
+}
+
+void compactTypeFieldsInstanceFirst(
+    TypeSymbol& type,
+    std::vector<FunctionBindingInput>* optBindings = nullptr);
 
 struct ObsoleteInfo {
     std::string message;

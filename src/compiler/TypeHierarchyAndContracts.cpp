@@ -282,6 +282,7 @@ void applyInheritedFieldLayouts(
                         field.index = type.fields.size();
                         type.fields.push_back(std::move(field));
                     }
+                    compactTypeFieldsInstanceFirst(type);
                 }
             }
             complete[type.id] = 2;
@@ -729,7 +730,8 @@ std::string typeSignature(const semantic::TypeSymbol& type) {
         out << "];";
     }
     for (const auto& event : type.events) {
-        out << "event:" << event.name << ':' << event.delegateName << '(';
+        out << "event:" << event.name << ':' << event.delegateName
+            << (event.hasCustomAccessors() ? ":custom(" : ":field(");
         for (const auto& parameter : event.parameters) {
             out << semantic::primitiveTypeName(parameter.type) << '#'
                 << parameter.typeName << ';';

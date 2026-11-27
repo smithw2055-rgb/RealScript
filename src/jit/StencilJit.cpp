@@ -2,6 +2,7 @@
 #include "realscript/runtime/ParallelJob.h"
 
 #include <chrono>
+#include <shared_mutex>
 
 namespace realscript::jit {
 using namespace jit_detail;
@@ -855,6 +856,12 @@ void buildThreadedStream(CompiledFunctionRecord& rec) {
         case FO::CallDirectN:
         case FO::CallPolledFast:
         case FO::SuperCheckNotNullCallPolledFast:
+        case FO::IsTypeObjFast:
+        case FO::AsTypeObjFast:
+        case FO::NewDelegateFast:
+        case FO::CombineDelegateFast:
+        case FO::RemoveDelegateFast:
+        case FO::InvokeDelegateFast:
         case FO::GenericBytecode:
             op.handler = &th_FlatStructOrStackRef;
             break;
@@ -1027,7 +1034,7 @@ void buildThreadedStream(CompiledFunctionRecord& rec) {
     const runtime::ProgramImage* program,
     runtime::ManagedHeap* heap,
     runtime::IExecutionPolicy* executionPolicy,
-    const std::vector<runtime::Value>& arguments,
+    runtime::ValueSpan arguments,
     bool& outAllIntArgsFit32,
     runtime::ErrorCode& outCode,
     std::string& outMsg) {
@@ -1261,8 +1268,10 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
     ExecutableCodeArena primaryArena;
     mutable std::vector<ExecutableCodeArena> lazyTierArenas;
     mutable std::mutex tierPromotionMutex;
+    mutable std::shared_mutex recordsMutex;
 
-    std::unordered_map<semantic::SymbolId, std::unique_ptr<CompiledFunctionRecord>> records;
+    mutable std::unordered_map<semantic::SymbolId, std::unique_ptr<CompiledFunctionRecord>> records;
+    bool hasLazyFunctions = false;
     mutable std::atomic<std::size_t> nativeCount{0};
     mutable std::atomic<std::size_t> threadedCount{0};
     mutable std::atomic<std::size_t> fallbackCount{0};
@@ -1600,11 +1609,76 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
 #endif
     }
 
+    CompiledFunctionRecord* ensureRecordForSymbol(semantic::SymbolId symbolId) const {
+        if (!hasLazyFunctions) {
+            const auto it = records.find(symbolId);
+            return it == records.end() ? nullptr : it->second.get();
+        }
+        {
+            std::shared_lock<std::shared_mutex> rlock(recordsMutex);
+            const auto it = records.find(symbolId);
+            if (it != records.end()) {
+                return it->second.get();
+            }
+        }
+        if (!program) {
+            return nullptr;
+        }
+        const auto* fnLoc = program->resolveFunction(symbolId);
+        if (!fnLoc || !fnLoc->function) {
+            return nullptr;
+        }
+        const auto& mirror = runtime::detail::executionMirror(*program);
+        const auto* execFunc = runtime::detail::findExecutionFunction(mirror, *fnLoc->function);
+        if (!execFunc || !runtime::detail::ensureFunctionCompiled(mirror, *execFunc)) {
+            return nullptr;
+        }
+        auto rec = std::make_unique<CompiledFunctionRecord>();
+        rec->symbolId = symbolId;
+        rec->location = fnLoc;
+        rec->execFunc = execFunc;
+        if (isFunctionEligibleForStencilJit(*execFunc)) {
+            rec->unexecutedAfterOp.resize(execFunc->flatStream.size(), 0u);
+            for (std::size_t idx = 0; idx < execFunc->flatStream.size(); ++idx) {
+                rec->unexecutedAfterOp[idx] = computeUnexecutedAfterOp(*execFunc, idx);
+            }
+            rec->eligibleForNative = true;
+            rec->eligibleForThreaded = options.enableThreadedFallback;
+            if (options.enableThreadedFallback) {
+                buildThreadedStream(*rec);
+                rec->tier.store(StencilTier::ThreadedStencils, std::memory_order_relaxed);
+                rec->fallbackReason = !nativeBackendAvailable
+                    ? "native codegen disabled by options"
+                    : "awaiting hotness threshold (" + std::to_string(options.hotnessThreshold) + ") in threaded stencil tier";
+            } else {
+                rec->tier.store(StencilTier::InterpreterFallback, std::memory_order_relaxed);
+                rec->fallbackReason = !nativeBackendAvailable
+                    ? "native codegen and threaded fallback disabled by options"
+                    : "awaiting hotness threshold (" + std::to_string(options.hotnessThreshold) + ") with threaded fallback disabled";
+            }
+        } else {
+            rec->tier.store(StencilTier::InterpreterFallback, std::memory_order_relaxed);
+            rec->fallbackReason = explainStencilJitIneligibility(*execFunc);
+        }
+        std::unique_lock<std::shared_mutex> wlock(recordsMutex);
+        const auto [it, inserted] = records.try_emplace(symbolId, std::move(rec));
+        if (inserted && it->second) {
+            const auto t = it->second->tier.load(std::memory_order_relaxed);
+            if (t == StencilTier::ThreadedStencils) {
+                threadedCount.fetch_add(1, std::memory_order_relaxed);
+            } else if (t == StencilTier::InterpreterFallback) {
+                fallbackCount.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        return it->second.get();
+    }
+
     runtime::ExecutionResult invokeFallbackInterpreter(
         semantic::SymbolId symbolId,
-        const std::vector<runtime::Value>& arguments,
+        runtime::ValueSpan arguments,
         runtime::ExecutionOptions execOptions) const {
         interpreterFallbackInvocations.fetch_add(1, std::memory_order_relaxed);
+        std::vector<runtime::Value> argVec(arguments.begin(), arguments.end());
         auto* const policy = execOptions.executionPolicy;
         bool expected = false;
         if (fallbackInterpInUse.compare_exchange_strong(
@@ -1632,14 +1706,14 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
             }
             cachedFallbackInterp->setExecutionPolicy(policy);
             FallbackCacheGuard guard{this, cachedFallbackInterp.get()};
-            return cachedFallbackInterp->invoke(symbolId, arguments, std::move(execOptions));
+            return cachedFallbackInterp->invoke(symbolId, argVec, std::move(execOptions));
         }
         runtime::Interpreter interp(program, heap);
         if (bindings) interp.setBindingRegistry(bindings);
         if (externalResolver) interp.setExternalResolver(externalResolver);
         if (asyncRuntime) interp.setAsyncRuntime(asyncRuntime);
         interp.setExecutionPolicy(policy);
-        return interp.invoke(symbolId, arguments, std::move(execOptions));
+        return interp.invoke(symbolId, argVec, std::move(execOptions));
     }
 
     static std::uint32_t jitDirectInvokeTarget(
@@ -1713,19 +1787,97 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
             return static_cast<std::uint32_t>(runtime::ErrorCode::RecursionLimitExceeded);
         }
 
-        const auto recIt = impl->records.find(targetSymbolId);
-        if (recIt != impl->records.end() &&
-            recIt->second &&
-            recIt->second->location &&
-            recIt->second->location->function &&
-            recIt->second->execFunc &&
+        CompiledFunctionRecord* recPtr = impl->ensureRecordForSymbol(targetSymbolId);
+        if (recPtr != nullptr &&
+            recPtr->location != nullptr &&
+            recPtr->location->function != nullptr &&
+            recPtr->execFunc != nullptr &&
+            recPtr->execFunc->directNativeReference != nullptr &&
+            impl->bindings != nullptr &&
+            !impl->externalResolver) {
+            const auto& fnLoc = *recPtr->location;
+            const auto& bcFunc = *fnLoc.function;
+            const auto& ref = *recPtr->execFunc->directNativeReference;
+            const std::uint64_t cost = recPtr->execFunc->nativeForwarderInstructionCost;
+            if (callerCtx->remainingBudget < cost) {
+                callerCtx->remainingBudget = 0;
+                session.error.code = runtime::ErrorCode::InstructionBudgetExceeded;
+                session.error.message = "instruction budget exceeded";
+                return static_cast<std::uint32_t>(runtime::ErrorCode::InstructionBudgetExceeded);
+            }
+            const std::uint64_t regId = impl->bindings->instanceId();
+            const std::uint64_t regEpoch = impl->bindings->mutationEpoch();
+            const std::size_t bindIdx = static_cast<std::size_t>(
+                (ref.symbolId ^ (ref.symbolId >> 9u) ^ (ref.symbolId >> 18u)) & 31u);
+            auto& cached = session.nativeBindCache[bindIdx];
+            if (cached.symbolId != ref.symbolId ||
+                cached.registryId != regId ||
+                cached.registryEpoch != regEpoch) {
+                if (const auto resolved = impl->bindings->resolve(ref)) {
+                    if (resolved->function && *resolved->function &&
+                        resolved->requiredCapability.empty()) {
+                        cached = JitNativeBindCacheEntry{regId, regEpoch, ref.symbolId, resolved->function};
+                    }
+                }
+            }
+            if (cached.symbolId == ref.symbolId &&
+                cached.registryId == regId &&
+                cached.registryEpoch == regEpoch &&
+                cached.fn != nullptr &&
+                *cached.fn) {
+                callerCtx->remainingBudget -= cost;
+                ++session.stats.functionCalls;
+                ++session.stats.externalCalls;
+                if (session.callDepth + 1u > session.stats.maximumCallDepth) {
+                    session.stats.maximumCallDepth = session.callDepth + 1u;
+                }
+                runtime::RuntimeError extErr;
+                auto extRes = (*cached.fn)(ref, runtime::ValueSpan(args, argCount), extErr);
+                if (session.values != nullptr) {
+                    session.valuesBase = session.values->data();
+                    callerCtx->frameBase = session.valuesBase + session.frameOffset;
+                }
+                if (!extRes.has_value()) {
+                    session.error = std::move(extErr);
+                    if (session.error.code == runtime::ErrorCode::None) {
+                        session.error.code = runtime::ErrorCode::ExternalFunctionUnresolved;
+                        session.error.message = "external function '" + ref.name + "' failed";
+                    }
+                    return static_cast<std::uint32_t>(session.error.code);
+                }
+                if (bcFunc.returnType == semantic::PrimitiveType::Void) {
+                    if (outResult != nullptr) {
+                        *outResult = std::monostate{};
+                    }
+                    return 0u;
+                }
+                runtime::Value resolvedRet = runtime::detachFrameSliceValue(*extRes);
+                runtime::ErrorCode retCode = runtime::ErrorCode::TypeMismatch;
+                std::string retMsg;
+                if (!normalizeAndValidateJitInterceptedReturn(
+                        fnLoc, session.program, session.heap, session.executionPolicy,
+                        *extRes, resolvedRet, retCode, retMsg)) {
+                    session.error.code = retCode;
+                    session.error.message = std::move(retMsg);
+                    return static_cast<std::uint32_t>(retCode);
+                }
+                if (outResult != nullptr) {
+                    *outResult = std::move(resolvedRet);
+                }
+                return 0u;
+            }
+        }
+        if (recPtr != nullptr &&
+            recPtr->location &&
+            recPtr->location->function &&
+            recPtr->execFunc &&
             session.values != nullptr) {
-            CompiledFunctionRecord& rec = *recIt->second;
+            CompiledFunctionRecord& rec = *recPtr;
             const auto& fnLoc = *rec.location;
             const auto& bcFunc = *fnLoc.function;
             const auto& execFunc = *rec.execFunc;
             StencilTier currentTier = rec.tier.load(std::memory_order_acquire);
-            if (impl->options.hotnessThreshold > 0 &&
+            if ((impl->options.hotnessThreshold > 0 || impl->hasLazyFunctions) &&
                 currentTier != StencilTier::NativeMachineCode &&
                 rec.eligibleForNative &&
                 impl->nativeBackendAvailable) {
@@ -1871,10 +2023,6 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
             }
         }
 
-        std::vector<runtime::Value> argVec;
-        if (args != nullptr && argCount > 0u) {
-            argVec.assign(args, args + argCount);
-        }
         runtime::ExecutionOptions subOpts{};
         subOpts.limits = session.limits;
         subOpts.limits.instructionBudget = callerCtx->remainingBudget;
@@ -1883,7 +2031,8 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
             : 0u;
         subOpts.executionPolicy = session.executionPolicy;
 
-        const auto res = impl->invokeFallbackInterpreter(targetSymbolId, argVec, std::move(subOpts));
+        const auto res = impl->invokeFallbackInterpreter(
+            targetSymbolId, runtime::ValueSpan(args, argCount), std::move(subOpts));
         if (res.statistics.instructionsExecuted >= callerCtx->remainingBudget) {
             callerCtx->remainingBudget = 0;
         } else {
@@ -1915,38 +2064,53 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
 
     runtime::ExecutionResult invokeBySymbol(
         semantic::SymbolId symbolId,
-        const std::vector<runtime::Value>& arguments,
+        runtime::ValueSpan arguments,
         runtime::ExecutionOptions execOptions,
         bool forceSimulateArm64 = false,
         std::size_t baseFrameOffset = 0) const {
-        if (!program) {
-            runtime::ExecutionResult invalid;
-            invalid.error.code = runtime::ErrorCode::InvalidProgram;
-            invalid.error.message = "StencilJit module has no linked program image";
-            return invalid;
+        runtime::ExecutionResult out{};
+        if (tryInvokeBySymbol(
+                symbolId, arguments, execOptions, out, forceSimulateArm64, baseFrameOffset)) {
+            return out;
         }
-
-        const auto recIt = records.find(symbolId);
-        if (recIt == records.end() || !recIt->second || !recIt->second->location) {
+        if (program && program->resolveFunction(symbolId) == nullptr) {
             runtime::ExecutionResult missing;
             missing.error.code = runtime::ErrorCode::FunctionNotFound;
             missing.error.message = "entry function was not found";
             return missing;
         }
+        return invokeFallbackInterpreter(symbolId, arguments, std::move(execOptions));
+    }
 
+    bool tryInvokeBySymbol(
+        semantic::SymbolId symbolId,
+        runtime::ValueSpan arguments,
+        const runtime::ExecutionOptions& execOptions,
+        runtime::ExecutionResult& outResult,
+        bool forceSimulateArm64 = false,
+        std::size_t baseFrameOffset = 0) const {
+        if (!program) {
+            outResult = {};
+            outResult.error.code = runtime::ErrorCode::InvalidProgram;
+            outResult.error.message = "StencilJit module has no linked program image";
+            return true;
+        }
         const bool hasTraceOrDebugOrStrictEvents =
             execOptions.determinism.mode != runtime::DeterminismMode::Off ||
             (execOptions.trace && static_cast<bool>(execOptions.trace)) ||
-            execOptions.debugger != nullptr;
-
+            execOptions.debugger != nullptr ||
+            execOptions.limits.recursionLimit == 0;
         if (hasTraceOrDebugOrStrictEvents) {
-            return invokeFallbackInterpreter(symbolId, arguments, std::move(execOptions));
+            return false;
         }
-
-        CompiledFunctionRecord& rec = *recIt->second;
+        CompiledFunctionRecord* recPtr = ensureRecordForSymbol(symbolId);
+        if (!recPtr || !recPtr->location || !recPtr->location->function || !recPtr->execFunc) {
+            return false;
+        }
+        CompiledFunctionRecord& rec = *recPtr;
         StencilTier currentTier = rec.tier.load(std::memory_order_acquire);
 
-        if (options.hotnessThreshold > 0 &&
+        if ((options.hotnessThreshold > 0 || hasLazyFunctions) &&
             currentTier != StencilTier::NativeMachineCode &&
             rec.eligibleForNative &&
             nativeBackendAvailable) {
@@ -1960,39 +2124,30 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
 
         if (currentTier == StencilTier::InterpreterFallback &&
             !(forceSimulateArm64 && rec.eligibleForNative)) {
-            return invokeFallbackInterpreter(symbolId, arguments, std::move(execOptions));
+            return false;
         }
 
         const auto& fnLoc = *rec.location;
         const auto& bcFunc = *fnLoc.function;
         const auto& execFunc = *rec.execFunc;
 
-        if (execOptions.limits.recursionLimit == 0) {
-            return invokeFallbackInterpreter(symbolId, arguments, std::move(execOptions));
-        }
-
         bool allIntArgsFit32 = true;
         runtime::ErrorCode argErrCode = runtime::ErrorCode::None;
         std::string argErrMsg;
         if (!validateJitEntryArguments(
-                bcFunc,
-                program.get(),
-                heap.get(),
-                execOptions.executionPolicy,
-                arguments,
-                allIntArgsFit32,
-                argErrCode,
-                argErrMsg)) {
+                bcFunc, program.get(), heap.get(), execOptions.executionPolicy,
+                arguments, allIntArgsFit32, argErrCode, argErrMsg)) {
             runtime::ExecutionResult argFail;
             argFail.error.code = argErrCode;
             argFail.error.message = std::move(argErrMsg);
-            runtime::DeterminismSession det(std::move(execOptions.determinism));
+            runtime::DeterminismSession det(execOptions.determinism);
             (void)det.finish(false, runtime::Value{}, argFail.error, argFail.statistics);
             argFail.determinismDigest = det.digest();
-            return argFail;
+            outResult = std::move(argFail);
+            return true;
         }
         if (!allIntArgsFit32) {
-            return invokeFallbackInterpreter(symbolId, arguments, std::move(execOptions));
+            return false;
         }
 
         runtime::ScopedValuePoolDomain domainScope(heap ? heap->valuePoolDomain().get() : nullptr);
@@ -2024,7 +2179,8 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
             runtime::ExecutionResult invalid;
             invalid.error.code = runtime::ErrorCode::InvalidProgram;
             invalid.error.message = "frameOffset exceeds 24-bit FlatStruct slice address space";
-            return invalid;
+            outResult = std::move(invalid);
+            return true;
         }
         const std::size_t totalSlots = baseFrameOffset + frameSlots;
         if (arenaPtr->size() < totalSlots) {
@@ -2057,6 +2213,8 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
         session.program = program.get();
         session.heap = heap.get();
         session.executionPolicy = execOptions.executionPolicy;
+        session.bindings = bindings.get();
+        session.externalResolver = externalResolver ? &externalResolver : nullptr;
         session.limits = execOptions.limits;
         session.stats.functionCalls = 1;
         session.stats.maximumCallDepth = 1;
@@ -2171,7 +2329,7 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
                 simDiag);
         }
 
-        runtime::DeterminismSession det(std::move(execOptions.determinism));
+        runtime::DeterminismSession det(execOptions.determinism);
         succeeded = det.finish(succeeded, retValue, session.error, session.stats);
         if (execOptions.profile) {
             const std::uint64_t profileEndNs = execOptions.profile->nowSteadyNs();
@@ -2210,7 +2368,8 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
         out.statistics = session.stats;
         out.determinismDigest = det.digest();
         out.replayEntriesConsumed = det.replayEntriesConsumed();
-        return out;
+        outResult = std::move(out);
+        return true;
     }
 
     void attachToProgramImage(const runtime::ProgramImage& targetProgram) const {
@@ -2256,12 +2415,11 @@ struct StencilModule::Impl : public std::enable_shared_from_this<Impl> {
             }
         }
 
-        const auto recIt = records.find(symbolId);
-        if (recIt == records.end() || !recIt->second || !recIt->second->location ||
-            !recIt->second->location->function || !recIt->second->execFunc) {
+        CompiledFunctionRecord* foundRec = ensureRecordForSymbol(symbolId);
+        if (!foundRec || !foundRec->location || !foundRec->location->function || !foundRec->execFunc) {
             return {};
         }
-        CompiledFunctionRecord& rec = *recIt->second;
+        CompiledFunctionRecord& rec = *foundRec;
         StencilTier currentTier = rec.tier.load(std::memory_order_acquire);
         if (currentTier != StencilTier::NativeMachineCode &&
             rec.eligibleForNative &&
@@ -2852,8 +3010,37 @@ runtime::ExecutionResult StencilModule::invoke(
     return invoke(symbolId, arguments, std::move(opts));
 }
 
+runtime::ExecutionResult StencilModule::invokeSpan(
+    semantic::SymbolId symbolId,
+    runtime::ValueSpan arguments,
+    runtime::ExecutionOptions options) const {
+    if (!valid()) {
+        runtime::ExecutionResult invalid;
+        invalid.error.code = runtime::ErrorCode::InvalidProgram;
+        invalid.error.message = "StencilJit module is not loaded";
+        return invalid;
+    }
+    return impl_->invokeBySymbol(symbolId, arguments, std::move(options));
+}
+
+bool StencilModule::tryInvokeSpan(
+    semantic::SymbolId symbolId,
+    runtime::ValueSpan arguments,
+    runtime::ExecutionOptions options,
+    runtime::ExecutionResult& outResult) const {
+    if (!valid()) {
+        return false;
+    }
+    return impl_->tryInvokeBySymbol(symbolId, arguments, options, outResult);
+}
+
 std::size_t StencilModule::totalFunctionCount() const noexcept {
-    return impl_ ? impl_->records.size() : 0;
+    if (!impl_) return 0;
+    if (impl_->hasLazyFunctions) {
+        std::shared_lock<std::shared_mutex> rlock(impl_->recordsMutex);
+        return impl_->records.size();
+    }
+    return impl_->records.size();
 }
 
 std::size_t StencilModule::nativeFunctionCount() const noexcept {
@@ -2928,6 +3115,13 @@ bool StencilModule::nativeBackendActive() const noexcept {
 
 StencilTier StencilModule::functionTier(semantic::SymbolId symbolId) const noexcept {
     if (!impl_) return StencilTier::InterpreterFallback;
+    if (impl_->hasLazyFunctions) {
+        std::shared_lock<std::shared_mutex> rlock(impl_->recordsMutex);
+        const auto it = impl_->records.find(symbolId);
+        return it == impl_->records.end()
+            ? StencilTier::InterpreterFallback
+            : it->second->tier.load(std::memory_order_acquire);
+    }
     const auto it = impl_->records.find(symbolId);
     return it == impl_->records.end()
         ? StencilTier::InterpreterFallback
@@ -2942,11 +3136,23 @@ StencilTier StencilModule::functionTier(const std::string& qualifiedName) const 
 
 std::vector<StencilFunctionDiagnostic> StencilModule::functionDiagnostics() const {
     if (!impl_) return {};
+    std::vector<std::pair<semantic::SymbolId, const CompiledFunctionRecord*>> snapshot;
+    if (impl_->hasLazyFunctions) {
+        std::shared_lock<std::shared_mutex> rlock(impl_->recordsMutex);
+        snapshot.reserve(impl_->records.size());
+        for (const auto& [sym, rec] : impl_->records) {
+            if (rec) snapshot.emplace_back(sym, rec.get());
+        }
+    } else {
+        snapshot.reserve(impl_->records.size());
+        for (const auto& [sym, rec] : impl_->records) {
+            if (rec) snapshot.emplace_back(sym, rec.get());
+        }
+    }
     std::lock_guard<std::mutex> lock(impl_->tierPromotionMutex);
     std::vector<StencilFunctionDiagnostic> diagnostics;
-    diagnostics.reserve(impl_->records.size());
-    for (const auto& [sym, rec] : impl_->records) {
-        if (!rec) continue;
+    diagnostics.reserve(snapshot.size());
+    for (const auto& [sym, rec] : snapshot) {
         StencilFunctionDiagnostic entry;
         entry.symbolId = sym;
         entry.qualifiedName = rec->location ? rec->location->qualifiedName : std::string{};
@@ -2989,11 +3195,11 @@ std::vector<std::uint8_t> StencilModule::inspectMachineCode(
     if (!valid()) return {};
     const auto sym = impl_->program->findFunction(qualifiedName);
     if (!sym) return {};
-    const auto it = impl_->records.find(*sym);
-    if (it == impl_->records.end() || !it->second) {
+    const CompiledFunctionRecord* recPtr = impl_->ensureRecordForSymbol(*sym);
+    if (!recPtr) {
         return {};
     }
-    const CompiledFunctionRecord& rec = *it->second;
+    const CompiledFunctionRecord& rec = *recPtr;
     if (targetArch == StencilTargetArch::Host || targetArch == hostTargetArch()) {
         if (rec.rawCodePtr && rec.rawCodeSize > 0) {
             return std::vector<std::uint8_t>(rec.rawCodePtr, rec.rawCodePtr + rec.rawCodeSize);
@@ -3092,6 +3298,7 @@ StencilCompileResult StencilJit::compile(
     const bool canEmitNative =
         options.enableNativeCodegen && ExecutableCodeArena::nativeCodeExecutionSupported();
     impl->nativeBackendAvailable = canEmitNative;
+    impl->hasLazyFunctions = (program->totalLazyFunctionCount() > 0u);
 
     const auto& mirror = runtime::detail::executionMirror(*program);
     std::vector<CompiledFunctionRecord*> eagerNativeQueue;
@@ -3100,7 +3307,13 @@ StencilCompileResult StencilJit::compile(
         for (const auto& func : module.functions) {
             const auto* fnLoc = program->resolveFunction(func.symbolId);
             if (!fnLoc) continue;
-            const auto* execFunc = runtime::detail::findExecutionFunction(mirror, func);
+            const auto* execFunc = impl->hasLazyFunctions
+                ? runtime::detail::findExistingExecutionFunction(mirror, func)
+                : runtime::detail::findExecutionFunction(mirror, func);
+            if (impl->hasLazyFunctions &&
+                (!execFunc || !execFunc->compiled.load(std::memory_order_acquire))) {
+                continue;
+            }
 
             auto rec = std::make_unique<CompiledFunctionRecord>();
             rec->symbolId = func.symbolId;

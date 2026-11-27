@@ -1,5 +1,6 @@
 #include "realscript/bytecode/Bytecode.h"
 #include "realscript/compiler/Compilation.h"
+#include "realscript/compiler/PrecompiledModule.h"
 #include "realscript/optimization/Optimizer.h"
 #include "realscript/runtime/Runtime.h"
 
@@ -2259,6 +2260,506 @@ public int CallTag(ITag t) {
     }
 }
 
+void testStaticAndConstFieldsExcludedFromInstanceLayout() {
+    const std::string src = R"RS(
+module Kernel.InstanceLayout;
+
+public delegate void PingHandler(int code);
+
+public class DepBase {
+    private static string _s0 = "a";
+    private static string _s1 = "b";
+    private static DepBase _s2 = null;
+    private static DepBase _s3 = null;
+    private static int[] _s4 = null;
+    public static int StaticCounter { get; set; } = 7;
+
+    public static string ReadStaticTag() {
+        return _s0 + _s1 + ":" + StaticCounter;
+    }
+}
+
+public class BoxedFloatLike : DepBase {
+    public float Value;
+    public static BoxedFloatLike Zero = null;
+    public BoxedFloatLike(float v) { Value = v; }
+}
+
+public class WidgetBase : DepBase {
+    public int BaseId = 10;
+    public static int BaseStatic = 3;
+}
+
+public class DerivedWidget : WidgetBase {
+    public static string DerivedTag = "dw";
+    public int OwnProp { get; set; }
+    public event PingHandler Pinged;
+    public const int ConstMagic = 42;
+    public int OwnField = 5;
+
+    public void EmitPing(int x) {
+        Pinged(x);
+    }
+}
+
+public struct CompactStruct {
+    public const int K = 9;
+    public static int S = 11;
+    public int X;
+    public int Y;
+}
+
+public static int RunChecks() {
+    var bf = new BoxedFloatLike(2.5f);
+    BoxedFloatLike.Zero = bf;
+    DepBase.StaticCounter = 12;
+
+    var w = new DerivedWidget();
+    w.OwnProp = 100;
+    int captured = 0;
+    w.Pinged += (int c) => { captured = captured + c; };
+    w.EmitPing(8);
+
+    CompactStruct cs = new CompactStruct();
+    cs.X = 3;
+    cs.Y = 4;
+    if (DepBase.ReadStaticTag() != "ab:12") { return -1; }
+    if (DerivedWidget.DerivedTag != "dw" || WidgetBase.BaseStatic != 3) { return -2; }
+    if (w.BaseId != 10 || w.OwnField != 5 || w.OwnProp != 100 || captured != 8) { return -3; }
+    if (cs.X + cs.Y + CompactStruct.K + CompactStruct.S != 27) { return -4; }
+    return (int)(bf.Value * 2.0f);
+}
+
+public static BoxedFloatLike MakeBoxed() {
+    return new BoxedFloatLike(3.5f);
+}
+
+public static DerivedWidget MakeWidget() {
+    return new DerivedWidget();
+}
+)RS";
+
+    auto img = compileAndLink({{"instance_layout.rscript", src}});
+
+    // Verify lazy RSLB round-trip preserves instance-first layout
+    const auto lazyBlob = bytecode::encodeLazyBytecodeBundle(img->modules());
+    auto lazyBundle = std::make_shared<bytecode::LazyBytecodeBundle>();
+    diagnostics::DiagnosticBag lazyDiag;
+    require(bytecode::decodeLazyBytecodeBundleHeader(
+                lazyBlob.data(), lazyBlob.size(), *lazyBundle, true, lazyDiag),
+        "Lazy bundle decode failed");
+    runtime::RuntimeError linkErr;
+    auto lazyImgOpt = runtime::ProgramImage::linkLayered(lazyBundle, {}, linkErr, true);
+    require(lazyImgOpt.has_value(), "linkLayered failed: " + linkErr.message);
+    std::shared_ptr<const runtime::ProgramImage> lazyImg =
+        std::make_shared<const runtime::ProgramImage>(std::move(*lazyImgOpt));
+
+    const std::array<std::shared_ptr<const runtime::ProgramImage>, 2> imgs{img, lazyImg};
+    for (const auto& checkImg : imgs) {
+        auto heap = std::make_shared<runtime::ManagedHeap>();
+        runtime::Interpreter interp(checkImg, heap);
+        auto res = interp.invoke("Kernel.InstanceLayout::RunChecks");
+        std::int64_t out = 0;
+        require(res.succeeded && res.value.tryGetInt64(out) && out == 5,
+            "InstanceLayout RunChecks failed: " + res.error.message);
+
+        auto bfRes = interp.invoke("Kernel.InstanceLayout::MakeBoxed");
+        require(bfRes.succeeded && bfRes.value.rawTag() == runtime::ValueTag::ObjectRef,
+            "MakeBoxed failed");
+        const auto bfRef = std::get<runtime::ObjectRef>(bfRes.value);
+        const std::size_t bfBytes = heap->objectSizeBytes(bfRef).value_or(0u);
+        require(bfBytes == 48u,
+            "Expected BoxedFloatLike size == 48 B (32B slot + 16B float), got " + std::to_string(bfBytes));
+
+        auto wRes = interp.invoke("Kernel.InstanceLayout::MakeWidget");
+        require(wRes.succeeded && wRes.value.rawTag() == runtime::ValueTag::ObjectRef,
+            "MakeWidget failed");
+        const auto wRef = std::get<runtime::ObjectRef>(wRes.value);
+        // DerivedWidget has 4 instance fields: BaseId, OwnProp($OwnProp), OwnField, $event_Pinged_delegate
+        const std::size_t wBytes = heap->objectSizeBytes(wRef).value_or(0u);
+        require(wBytes == 32u + 4u * 16u,
+            "Expected DerivedWidget size == 96 B (32B + 4*16B), got " + std::to_string(wBytes));
+
+        const auto snap = heap->snapshot();
+        bool foundBf = false;
+        for (const auto& obj : snap.objects) {
+            if (obj.reference == bfRef) {
+                foundBf = true;
+                require(obj.valueCount == 1u,
+                    "Expected BoxedFloatLike valueCount == 1, got " + std::to_string(obj.valueCount));
+                require(obj.referenceFields.empty(),
+                    "Expected BoxedFloatLike referenceFields empty (static refs must be excluded)");
+            }
+        }
+        require(foundBf, "BoxedFloatLike missing from heap snapshot");
+    }
+}
+
+void testHybridRecordCompressionAccessDemotionGcAndDirty() {
+    const std::string src = R"RS(
+module Kernel.HybridRecordSuite;
+
+public enum DockMode {
+    None = 0,
+    Left = 1,
+    Fill = 2,
+}
+
+public class Tag {
+    public int Value;
+}
+
+public class WidgetLike {
+    public string Name;
+    public object Data;
+    public Tag Linked;
+    public bool Visible;
+    public byte Alpha;
+    public sbyte Layer;
+    public short OffsetX;
+    public ushort Flags;
+    public char Glyph;
+    public int Count;
+    public uint Mask;
+    public long Stamp;
+    public ulong Hash;
+    public float Opacity;
+    public double Width;
+    public DockMode Dock;
+    public int S0;
+    public int S1;
+    public int S2;
+    public int S3;
+    public float F0;
+    public float F1;
+    public bool B0;
+    public bool B1;
+
+    public int GetCount() { return Count; }
+    public void SetCount(int c) { Count = c; }
+}
+
+public WidgetLike MakeWidget(string label) {
+    WidgetLike w = new WidgetLike();
+    w.Name = label;
+    Tag t = new Tag();
+    t.Value = 77;
+    w.Data = t;
+    w.Linked = t;
+    w.Visible = true;
+    w.Alpha = 250;
+    w.Layer = (sbyte)(-12);
+    w.OffsetX = (short)(-320);
+    w.Flags = 51966;
+    w.Glyph = 'A';
+    w.Count = 42;
+    w.Mask = 3735928559u;
+    w.Stamp = 1234567890123l;
+    w.Hash = 9876543210987ul;
+    w.Opacity = 0.75f;
+    w.Width = 320.5;
+    w.Dock = DockMode.Fill;
+    w.S0 = 10;
+    w.S1 = 20;
+    w.S2 = 30;
+    w.S3 = 40;
+    w.F0 = 1.5f;
+    w.F1 = 2.5f;
+    w.B0 = true;
+    w.B1 = false;
+    return w;
+}
+
+public int ExerciseTrivialAndFields(WidgetLike w) {
+    w.SetCount(w.GetCount() + 8);
+    int sum = w.Count + w.S0 + w.S1 + w.S2 + w.S3;
+    if (w.Visible && w.B0 && !w.B1 && w.Dock == DockMode.Fill &&
+        w.Alpha == 250 && w.Layer == (sbyte)(-12) && w.OffsetX == (short)(-320) &&
+        w.Flags == 51966 && w.Glyph == 'A' && w.Mask == 3735928559u &&
+        w.Stamp == 1234567890123l && w.Hash == 9876543210987ul &&
+        w.Width > 320.0 && w.Opacity >= 0.5f && w.Name == "panel") {
+        Tag t = w.Data as Tag;
+        if (t != null) {
+            return sum + t.Value;
+        }
+    }
+    return -1;
+}
+
+public void RebindObjectField(WidgetLike w) {
+    Tag fresh = new Tag();
+    fresh.Value = 321;
+    w.Data = fresh;
+}
+
+public int ReadObjectFieldTag(WidgetLike w) {
+    Tag t = w.Data as Tag;
+    if (t != null) {
+        return t.Value;
+    }
+    return -1;
+}
+)RS";
+
+    auto img = compileAndLink({{"hybrid_record.rscript", src}}, optimization::Level::Aggressive);
+    auto heap = std::make_shared<runtime::ManagedHeap>();
+    runtime::Interpreter interp(img, heap);
+
+    // 1. Dirty callback setup
+    struct DirtyLog {
+        std::size_t count = 0;
+        std::size_t lastField = 0;
+        std::uint8_t lastBit = 0xFFu;
+    } dirtyLog;
+
+    const auto widgetTid = semantic::stableTypeId("Kernel.HybridRecordSuite::WidgetLike");
+    const auto* widgetType = img->resolveType(widgetTid);
+    require(widgetType != nullptr, "Missing WidgetLike type");
+
+    std::size_t countIdx = 0, nameIdx = 0, opacityIdx = 0;
+    for (const auto& f : widgetType->fields) {
+        if (f.name == "Count") countIdx = f.index;
+        if (f.name == "Name") nameIdx = f.index;
+        if (f.name == "Opacity") opacityIdx = f.index;
+    }
+    std::vector<std::uint8_t> dirtyMap(widgetType->fields.size(), 0xFFu);
+    dirtyMap[countIdx] = 3u;
+    dirtyMap[opacityIdx] = 7u;
+    heap->enableTypeDirtyTracking(widgetTid, std::move(dirtyMap));
+    heap->setFieldMutationCallback(
+        [](void* ud, runtime::ManagedHeap&, runtime::ObjectRef, std::size_t fIdx, std::uint8_t dBit) {
+            auto* log = static_cast<DirtyLog*>(ud);
+            ++log->count;
+            log->lastField = fIdx;
+            log->lastBit = dBit;
+        },
+        &dirtyLog);
+
+    // 2. Allocate & verify HybridRecord compression
+    const auto mk1 = interp.invoke("Kernel.HybridRecordSuite::MakeWidget", {runtime::Value{"panel"}});
+    require(mk1.succeeded && mk1.value.rawTag() == runtime::ValueTag::ObjectRef, "MakeWidget #1 failed");
+    const auto wRef = mk1.value.asObjectRefUnchecked();
+    const auto rootW1 = heap->retain(wRef);
+
+    const auto mk2 = interp.invoke("Kernel.HybridRecordSuite::MakeWidget", {runtime::Value{"other"}});
+    require(mk2.succeeded && mk2.value.rawTag() == runtime::ValueTag::ObjectRef, "MakeWidget #2 failed");
+    const auto wOther = mk2.value.asObjectRefUnchecked();
+    const auto rootW2 = heap->retain(wOther);
+
+    require(heap->isHybridRecordObject(wRef), "Expected WidgetLike to use SlotStorage::HybridRecord");
+    require(!heap->isInlineRecordObject(wRef), "Expected WidgetLike not to report SlabValues");
+    const std::size_t flatExpectedBytes = 32u + widgetType->fields.size() * sizeof(runtime::Value);
+    const std::size_t hybridBytes = heap->objectSizeBytes(wRef).value_or(0u);
+    require(hybridBytes > 32u && hybridBytes * 2u < flatExpectedBytes,
+        "Expected HybridRecord objectSizeBytes < 50% of flat layout (got " +
+            std::to_string(hybridBytes) + " vs flat " + std::to_string(flatExpectedBytes) + ")");
+
+    // 3. fieldGetFast vs fieldGetInto
+    require(heap->fieldGetFast(wRef, nameIdx) != nullptr,
+        "Expected fieldGetFast to return non-null for ValueSlot string field");
+    require(heap->fieldGetFast(wRef, countIdx) == nullptr,
+        "Expected fieldGetFast to return nullptr for packed scalar Count field");
+
+    runtime::Value intoVal{};
+    semantic::SymbolId outTid = 0;
+    require(heap->fieldGetInto(wRef, countIdx, intoVal, &outTid) && outTid == widgetTid,
+        "fieldGetInto failed on packed scalar Count");
+    std::int64_t iv = 0;
+    require(intoVal.tryGetInt64(iv) && iv == 42, "Unexpected Count from fieldGetInto");
+    require(heap->fieldGetInto(wRef, opacityIdx, intoVal) &&
+            intoVal.rawTag() == runtime::ValueTag::Float &&
+            intoVal.asFloatUnchecked() == 0.75f,
+        "Unexpected Opacity from fieldGetInto");
+
+    // 4. Dirty notification: unchanged scalar write does NOT fire; changed write DOES fire
+    dirtyLog = {};
+    require(heap->fieldSetFast(wRef, opacityIdx, runtime::Value{runtime::FloatValue{0.75f}}, widgetTid, semantic::PrimitiveType::Float),
+        "fieldSetFast unchanged failed");
+    require(dirtyLog.count == 0u, "Unchanged scalar write should not trigger dirty callback");
+    require(heap->fieldSetFast(wRef, opacityIdx, runtime::Value{runtime::FloatValue{0.5f}}, widgetTid, semantic::PrimitiveType::Float),
+        "fieldSetFast changed failed");
+    require(dirtyLog.count == 1u && dirtyLog.lastField == opacityIdx && dirtyLog.lastBit == 7u,
+        "Changed scalar write did not report expected dirty callback");
+
+    // 5. VM execution + trivial methods + field checks
+    dirtyLog = {};
+    const auto exRes = interp.invoke("Kernel.HybridRecordSuite::ExerciseTrivialAndFields", {runtime::Value{wRef}});
+    std::int64_t exInt = 0;
+    require(exRes.succeeded && exRes.value.tryGetInt64(exInt) && exInt == (50 + 10 + 20 + 30 + 40 + 77),
+        "ExerciseTrivialAndFields parity failed: " + exRes.error.message);
+    require(dirtyLog.count == 1u && dirtyLog.lastField == countIdx && dirtyLog.lastBit == 3u,
+        "VM trivial StoreThisFieldExact on HybridRecord missed dirty notification");
+
+    // 6. GC promotion to old-gen + write barrier + collectYoung + collectFull + snapshot/restore
+    heap->collectYoung(runtime::ShadowStack{});
+    require(interp.invoke("Kernel.HybridRecordSuite::RebindObjectField", {runtime::Value{wRef}}).succeeded,
+        "RebindObjectField failed");
+    heap->collectYoung(runtime::ShadowStack{});
+    heap->collectFull(runtime::ShadowStack{});
+    const auto tagRes = interp.invoke("Kernel.HybridRecordSuite::ReadObjectFieldTag", {runtime::Value{wRef}});
+    std::int64_t tagVal = 0;
+    require(tagRes.succeeded && tagRes.value.tryGetInt64(tagVal) && tagVal == 321,
+        "GC lost young object written into old-gen HybridRecord object field");
+
+    // 7. Lossless demotion on >32-bit int write while leaving sibling instances Hybrid
+    const std::int64_t wideVal = (std::int64_t{1} << 42) + 99;
+    require(heap->fieldSet(wRef, countIdx, runtime::Value{wideVal}),
+        "fieldSet >32-bit int on HybridRecord failed");
+    require(!heap->isHybridRecordObject(wRef),
+        "Expected single demoted instance to leave SlotStorage::HybridRecord");
+    require(heap->isHybridRecordObject(wOther),
+        "Expected sibling instance to remain SlotStorage::HybridRecord");
+    require(heap->fieldGetInto(wRef, countIdx, intoVal) &&
+            intoVal.tryGetInt64(iv) && iv == wideVal,
+        "Wide int value lost after Hybrid->HeapValues demotion");
+    require(heap->fieldGetInto(wRef, opacityIdx, intoVal) &&
+            intoVal.rawTag() == runtime::ValueTag::Float &&
+            intoVal.asFloatUnchecked() == 0.5f,
+        "Neighboring packed scalar corrupted during Hybrid->HeapValues demotion");
+
+    // 8. Snapshot + mutate + restore on the same heap
+    const auto snap = heap->snapshot();
+    require(heap->fieldSetFast(wOther, opacityIdx, runtime::Value{runtime::FloatValue{0.25f}}, widgetTid, semantic::PrimitiveType::Float),
+        "Pre-restore mutation failed");
+    runtime::RuntimeError restoreErr;
+    require(heap->restore(snap, &restoreErr),
+        "ManagedHeap::restore from HybridRecord snapshot failed: " + restoreErr.message);
+    runtime::Value restoredOpacity{};
+    require(heap->fieldGetInto(wOther, opacityIdx, restoredOpacity) &&
+            restoredOpacity.rawTag() == runtime::ValueTag::Float &&
+            restoredOpacity.asFloatUnchecked() == 0.75f,
+        "Restored HybridRecord Opacity mismatch");
+    (void)rootW1;
+    (void)rootW2;
+}
+
+void testCustomEventAccessorsZeroBackingFieldsAndInheritance() {
+    const std::string src = R"RS(
+module Kernel.CustomEvents;
+
+public delegate void IntChangedHandler(int delta);
+
+public class Store {
+    public event IntChangedHandler handler;
+    public void Fire(int d) { handler(d); }
+}
+
+public class Base {
+    private Store _store;
+    public int tag = 7;
+
+    public Base() {
+        _store = null;
+    }
+
+    public event IntChangedHandler Changed {
+        add {
+            if (_store == null) { _store = new Store(); }
+            _store.handler += value;
+        }
+        remove {
+            if (_store != null) { _store.handler -= value; }
+        }
+    }
+
+    public void Raise(int d) {
+        if (_store != null) {
+            _store.Fire(d);
+        }
+    }
+}
+
+public class Derived : Base {
+    public int extra = 3;
+    public Derived() : base() {}
+}
+
+public int RunScenario() {
+    var d = new Derived();
+    int total = 0;
+    IntChangedHandler h1 = (int v) => { total = total + v; };
+    IntChangedHandler h2 = (int v) => { total = total + v * 10; };
+    d.Changed += h1;
+    d.Changed += h2;
+    d.Raise(4);
+    d.Changed -= h1;
+    d.Raise(2);
+    return total + d.tag + d.extra;
+}
+)RS";
+
+    compiler::CompilationOptions opts;
+    opts.capturePrecompiledFrontend = true;
+    compiler::Compilation comp({compiler::SourceFile{"custom_events.rs", src}}, opts);
+    auto build = comp.build();
+    require(!build.diagnostics.hasErrors(), "Custom event compile failed:\n" + formatDiags(build.diagnostics));
+    require(build.precompiledFrontend != nullptr, "Expected precompiledFrontend pack");
+
+    const semantic::TypeSymbol* baseType = nullptr;
+    const semantic::TypeSymbol* derivedType = nullptr;
+    for (const auto& mod : build.modules) {
+        for (const auto& t : mod.types) {
+            if (t.name == "Base") baseType = &t;
+            else if (t.name == "Derived") derivedType = &t;
+        }
+    }
+    require(baseType != nullptr && derivedType != nullptr, "Missing Base/Derived types");
+    // Only _store and tag on Base; Derived adds extra -> no synthetic $event_Changed_delegate field.
+    require(baseType->fields.size() == 2u, "Expected Base to have 2 fields (zero event delegate field)");
+    require(derivedType->fields.size() == 3u, "Expected Derived to have 3 fields (zero event delegate field)");
+
+    auto prog = compileAndLink({{"custom_events.rs", src}});
+    auto heap = std::make_shared<runtime::ManagedHeap>();
+    runtime::Interpreter interp(prog, heap);
+    const auto res = interp.invoke("Kernel.CustomEvents::RunScenario", {});
+    std::int64_t val = 0;
+    // (4 + 40) + 20 + 7 + 3 = 74
+    require(res.succeeded && res.value.tryGetInt64(val) && val == 74,
+        "Custom event subscribe/raise/unsubscribe mismatch");
+
+    // Verify RS8316 when invoking a custom event directly from inside the declaring class.
+    const std::string badInvokeSrc = R"RS(
+module Kernel.CustomEventsBadInvoke;
+public delegate void PingHandler();
+public class Bad {
+    public event PingHandler Ping {
+        add { return; }
+        remove { return; }
+    }
+    public void Trigger() {
+        Ping();
+    }
+}
+)RS";
+    compiler::Compilation badComp({compiler::SourceFile{"bad_invoke.rs", badInvokeSrc}});
+    const auto badBuild = badComp.build();
+    require(badBuild.diagnostics.hasErrors(), "Expected direct custom event invocation to fail");
+    bool saw8316 = false;
+    for (const auto& d : badBuild.diagnostics.items()) {
+        if (d.code == "RS8316") { saw8316 = true; break; }
+    }
+    require(saw8316, "Expected RS8316 diagnostic for direct custom event invocation");
+
+    // Verify precompiled (.rsm) round-trip preserves custom event zero backing field for subclasses.
+    std::string rsmErr;
+    const auto rsmBytes = compiler::encodePrecompiledFrontendPack(*build.precompiledFrontend);
+    require(!rsmBytes.empty(), "encodePrecompiledFrontendPack failed");
+    compiler::PrecompiledFrontendPack decodedPack;
+    require(compiler::decodePrecompiledFrontendPack(rsmBytes, decodedPack, &rsmErr),
+        "decodePrecompiledFrontendPack failed: " + rsmErr);
+    decodedPack.materializeAllTypes();
+    const auto* decodedMod = decodedPack.findModule("Kernel.CustomEvents");
+    require(decodedMod != nullptr, "Missing decoded module in PrecompiledFrontendPack");
+    bool decodedCustomEventOk = false;
+    for (const auto& t : decodedMod->types) {
+        if (t.name == "Base") {
+            decodedCustomEventOk = (t.fields.size() == 2u && t.events.size() == 1u &&
+                t.events[0].hasCustomAccessors() && t.events[0].storageField.name.empty());
+        }
+    }
+    require(decodedCustomEventOk, "PrecompiledModule round-trip did not preserve custom event accessors");
+}
+
 } // namespace
 
 int main() {
@@ -2278,6 +2779,9 @@ int main() {
             {"FlatLoop IExecutionPolicy enforcement & new fast opcodes", testFlatLoopExecutionPolicyAndFastOpcodes},
             {"Waves 1-4 regression: Enum32, concurrent ExecutionMirror, 8-slot slabs & FNV-1a internedStrings", testWaveRegressionEnumMirrorSlabsAndStrings},
             {"Audit regression: incremental ConstantStringFast, intrinsic policy, restoreEpoch PIC & >2k QuatfArena", testAuditRegressionGcCachesAndQuatf},
+            {"Static and const fields excluded from instance object layout", testStaticAndConstFieldsExcludedFromInstanceLayout},
+            {"Phase 2.2: HybridRecord compression, scalar fast paths, GC, dirty tracking & demotion", testHybridRecordCompressionAccessDemotionGcAndDirty},
+            {"Phase 2.3: Custom event accessors (zero backing fields, inheritance & RSFP roundtrip)", testCustomEventAccessorsZeroBackingFieldsAndInheritance},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';

@@ -661,6 +661,7 @@ SemanticModel Binder::bind(const syntax::CompilationUnitSyntax& syntaxTree) {
                     addBinding(std::move(binding));
                 }
             }
+            compactTypeFieldsInstanceFirst(owner, &input.functionBindings);
             for (auto& type : input.types) {
                 if (type.id == owner.id) type = owner;
             }
@@ -805,7 +806,12 @@ void appendReferencedExternalTypes(
         }
         for (const auto& ev : cur.events) {
             if (!ev.delegateName.empty()) markName(ev.delegateName, cur.moduleName);
-            markTypeRef(ev.storageField.type, ev.storageField.typeName, cur.moduleName);
+            if (!ev.storageField.name.empty()) {
+                markTypeRef(ev.storageField.type, ev.storageField.typeName, cur.moduleName);
+            }
+            if (ev.hasCustomAccessors()) {
+                markTypeRef(PrimitiveType::Object, ev.delegateName, cur.moduleName);
+            }
             for (const auto& p : ev.parameters) {
                 markTypeRef(p.type, p.typeName, cur.moduleName);
             }

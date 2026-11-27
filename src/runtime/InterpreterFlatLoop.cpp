@@ -1791,7 +1791,7 @@ bool executeFunction(
                                     case detail::TrivialMethodKind::ReturnThisFieldExact: {
                                         const std::uint16_t f0 = calleeExec->trivialFieldIndex0;
                                         if (RS_FLAT_LIKELY(f0 < oce.view.fieldCount)) {
-                                            const Value& fv = oce.view.fields[f0];
+                                            const Value fv = detail::loadObjectFastViewField(oce.view, f0);
                                             if (RS_FLAT_LIKELY(static_cast<std::uint8_t>(fv.rawTag()) ==
                                                                calleeExec->trivialFieldTag0)) {
                                                 trivialOut = fv;
@@ -1806,8 +1806,12 @@ bool executeFunction(
                                         if (pIdx == 1 && ip->inlineArgCount >= 2u &&
                                             RS_FLAT_LIKELY(f0 < oce.view.fieldCount)) {
                                             const Value& rhs = frameBase[ip->src1Slot];
-                                            if (RS_FLAT_LIKELY(static_cast<std::uint8_t>(rhs.rawTag()) ==
-                                                               calleeExec->trivialFieldTag0)) {
+                                            if (RS_FLAT_LIKELY(
+                                                    static_cast<std::uint8_t>(rhs.rawTag()) ==
+                                                        calleeExec->trivialFieldTag0 &&
+                                                    (!oce.view.hybridLayout ||
+                                                     detail::canWriteHybridFieldLosslessly(
+                                                         oce.view.hybridLayout->fields[f0], rhs)))) {
                                                 doStoreField = true;
                                                 trivialHandled = true;
                                             }
@@ -1821,8 +1825,8 @@ bool executeFunction(
                                         std::int64_t a = 0, b = 0;
                                         if (RS_FLAT_LIKELY(f0 < oce.view.fieldCount &&
                                                            f1 < oce.view.fieldCount &&
-                                                           oce.view.fields[f0].tryGetInt64(a) &&
-                                                           oce.view.fields[f1].tryGetInt64(b))) {
+                                                           detail::loadObjectFastViewField(oce.view, f0).tryGetInt64(a) &&
+                                                           detail::loadObjectFastViewField(oce.view, f1).tryGetInt64(b))) {
                                             const std::int64_t r =
                                                 (tKind == detail::TrivialMethodKind::ReturnThisFieldAddField)
                                                     ? (a + b)
@@ -1843,7 +1847,7 @@ bool executeFunction(
                                         const std::uint16_t f0 = calleeExec->trivialFieldIndex0;
                                         std::int64_t a = 0;
                                         if (RS_FLAT_LIKELY(f0 < oce.view.fieldCount &&
-                                                           oce.view.fields[f0].tryGetInt64(a))) {
+                                                           detail::loadObjectFastViewField(oce.view, f0).tryGetInt64(a))) {
                                             const std::int64_t c =
                                                 calleeExec->trivialConstValue.asInt64Unchecked();
                                             std::int64_t r = 0;
@@ -1986,10 +1990,17 @@ bool executeFunction(
                                         if (doStoreField) {
                                             const std::uint16_t f0 = calleeExec->trivialFieldIndex0;
                                             const Value& rhs = frameBase[ip->src1Slot];
-                                            const bool changed =
-                                                RS_FLAT_UNLIKELY(oce.mayNotifyDirty) &&
-                                                !(oce.view.fields[f0] == rhs);
-                                            oce.view.fields[f0] = rhs;
+                                            bool changed = false;
+                                            if (RS_FLAT_LIKELY(!oce.view.hybridLayout)) {
+                                                changed =
+                                                    RS_FLAT_UNLIKELY(oce.mayNotifyDirty) &&
+                                                    !(oce.view.fields[f0] == rhs);
+                                                oce.view.fields[f0] = rhs;
+                                            } else {
+                                                const auto& desc = oce.view.hybridLayout->fields[f0];
+                                                (void)detail::tryWriteHybridFieldRaw(
+                                                    oce.view.fields, desc, rhs, oce.mayNotifyDirty, changed);
+                                            }
                                             if (RS_FLAT_UNLIKELY(changed)) {
                                                 state.heap->notifyFieldMutated(oce.ref, f0);
                                             }
@@ -2183,7 +2194,7 @@ bool executeFunction(
                         }
                         const std::uint16_t fIdx = ip->aux0Slot;
                         if (RS_FLAT_LIKELY(ownerOk && fIdx < oce.view.fieldCount)) {
-                            const Value& val = oce.view.fields[fIdx];
+                            const Value val = detail::loadObjectFastViewField(oce.view, fIdx);
                             const auto fk = static_cast<detail::FastFieldKind>(
                                 static_cast<std::uint8_t>(ip->binaryOpcode2));
                             if (RS_FLAT_LIKELY(fk == detail::FastFieldKind::ExactValueTag)) {
@@ -2302,16 +2313,31 @@ bool executeFunction(
                             if (RS_FLAT_LIKELY(fk == detail::FastFieldKind::ExactValueTag)) {
                                 if (RS_FLAT_LIKELY(static_cast<std::uint8_t>(rhs.rawTag()) ==
                                                    static_cast<std::uint8_t>(ip->binaryOpcode1))) {
+                                    if (oce.view.hybridLayout &&
+                                        RS_FLAT_UNLIKELY(!detail::canWriteHybridFieldLosslessly(
+                                            oce.view.hybridLayout->fields[fIdx], rhs))) {
+                                        goto L_FlatMathFallback;
+                                    }
                                     RS_FLAT_SPAN_CHECK();
                                     if (RS_FLAT_UNLIKELY(policyChecksSameHeapWrites) &&
                                         !checkFlatFieldWrite(ip, ref, expectedOwnerTid, fIdx, rhs)) {
                                         goto L_FlatError;
                                     }
                                     localExecuted += spanCost;
-                                    const bool changed =
-                                        RS_FLAT_UNLIKELY(oce.mayNotifyDirty) &&
-                                        !(oce.view.fields[fIdx] == rhs);
-                                    oce.view.fields[fIdx] = rhs;
+                                    bool changed = false;
+                                    if (RS_FLAT_LIKELY(!oce.view.hybridLayout)) {
+                                        changed =
+                                            RS_FLAT_UNLIKELY(oce.mayNotifyDirty) &&
+                                            !(oce.view.fields[fIdx] == rhs);
+                                        oce.view.fields[fIdx] = rhs;
+                                    } else {
+                                        (void)detail::tryWriteHybridFieldRaw(
+                                            oce.view.fields,
+                                            oce.view.hybridLayout->fields[fIdx],
+                                            rhs,
+                                            oce.mayNotifyDirty,
+                                            changed);
+                                    }
                                     if (RS_FLAT_UNLIKELY(changed)) {
                                         state.heap->notifyFieldMutated(ref, fIdx);
                                     }
@@ -2433,14 +2459,37 @@ bool executeFunction(
                                             oce.view.needsRememberedBarrier = false;
                                         }
                                         localExecuted += spanCost;
+                                        const std::size_t dstIdx = oce.view.hybridLayout
+                                            ? static_cast<std::size_t>(oce.view.hybridLayout->fields[fIdx].offsetOrSlot)
+                                            : static_cast<std::size_t>(fIdx);
                                         const bool changed =
                                             RS_FLAT_UNLIKELY(oce.mayNotifyDirty) &&
-                                            !(oce.view.fields[fIdx] == detached);
-                                        oce.view.fields[fIdx] = std::move(detached);
+                                            !(oce.view.fields[dstIdx] == detached);
+                                        oce.view.fields[dstIdx] = std::move(detached);
                                         if (RS_FLAT_UNLIKELY(changed)) {
                                             state.heap->notifyFieldMutated(ref, fIdx);
                                         }
                                         RS_FLAT_DISPATCH_NEXT();
+                                    }
+                                    if (oce.view.hybridLayout) {
+                                        const auto& desc = oce.view.hybridLayout->fields[fIdx];
+                                        if (desc.kind != detail::HybridScalarKind::ValueSlot) {
+                                            if (RS_FLAT_UNLIKELY(!detail::canWriteHybridFieldLosslessly(desc, rhs))) {
+                                                goto L_FlatMathFallback;
+                                            }
+                                            if (RS_FLAT_UNLIKELY(policyChecksSameHeapWrites) &&
+                                                !checkFlatFieldWrite(ip, ref, expectedOwnerTid, fIdx, rhs)) {
+                                                goto L_FlatError;
+                                            }
+                                            localExecuted += spanCost;
+                                            bool changed = false;
+                                            (void)detail::tryWriteHybridFieldRaw(
+                                                oce.view.fields, desc, rhs, oce.mayNotifyDirty, changed);
+                                            if (RS_FLAT_UNLIKELY(changed)) {
+                                                state.heap->notifyFieldMutated(ref, fIdx);
+                                            }
+                                            RS_FLAT_DISPATCH_NEXT();
+                                        }
                                     }
                                     if (RS_FLAT_UNLIKELY(policyChecksSameHeapWrites) &&
                                         !checkFlatFieldWrite(ip, ref, expectedOwnerTid, fIdx, rhs)) {
@@ -2453,10 +2502,13 @@ bool executeFunction(
                                         oce.view.needsRememberedBarrier = false;
                                     }
                                     localExecuted += spanCost;
+                                    const std::size_t dstIdx = oce.view.hybridLayout
+                                        ? static_cast<std::size_t>(oce.view.hybridLayout->fields[fIdx].offsetOrSlot)
+                                        : static_cast<std::size_t>(fIdx);
                                     const bool changed =
                                         RS_FLAT_UNLIKELY(oce.mayNotifyDirty) &&
-                                        !(oce.view.fields[fIdx] == rhs);
-                                    oce.view.fields[fIdx] = rhs;
+                                        !(oce.view.fields[dstIdx] == rhs);
+                                    oce.view.fields[dstIdx] = rhs;
                                     if (RS_FLAT_UNLIKELY(changed)) {
                                         state.heap->notifyFieldMutated(ref, fIdx);
                                     }
@@ -3961,9 +4013,10 @@ bool executeFunction(
                     goto L_FlatMathFallback;
                 }
                 semantic::SymbolId actualTid = 0;
-                const Value* fPtr = state.heap->fieldGetFast(*ref, 0, &actualTid);
+                Value f0Val{};
                 QuatValue qVal{};
-                if (RS_FLAT_UNLIKELY(!fPtr || !fPtr->tryGetQuat(qVal))) goto L_FlatMathFallback;
+                if (RS_FLAT_UNLIKELY(!state.heap->fieldGetInto(*ref, 0, f0Val, &actualTid) ||
+                                     !f0Val.tryGetQuat(qVal))) goto L_FlatMathFallback;
                 Vec3Value out{};
                 if (RS_FLAT_UNLIKELY(!fastQuatRotateVec3(qVal, *vPtr, out))) {
                     goto L_FlatMathFallback;
@@ -5461,7 +5514,11 @@ bool executeFunction(
                             tmpl.defaultFields.size(),
                             tmpl.referenceFields,
                             &allocErr,
-                            &slotsMoved);
+                            &slotsMoved,
+                            tmpl.hybridLayout,
+                            tmpl.defaultHybridBytes.empty()
+                                ? nullptr
+                                : tmpl.defaultHybridBytes.data());
                     });
                 if (RS_FLAT_LIKELY(ref.has_value())) {
                     if (RS_FLAT_UNLIKELY(slotsMoved || ranGc)) {
@@ -5502,7 +5559,7 @@ bool executeFunction(
                         }
                         const std::uint16_t fIdx = ip->aux0Slot;
                         if (RS_FLAT_LIKELY(ownerOk && fIdx < oce.view.fieldCount)) {
-                            const Value& val = oce.view.fields[fIdx];
+                            const Value val = detail::loadObjectFastViewField(oce.view, fIdx);
                             if (RS_FLAT_LIKELY(static_cast<std::uint8_t>(val.rawTag()) ==
                                                static_cast<std::uint8_t>(ip->binaryOpcode1))) {
                                 const std::uint64_t spanCost = ip->span;
@@ -5541,6 +5598,11 @@ bool executeFunction(
                             const Value& rhs = frameBase[ip->src1Slot];
                             if (RS_FLAT_LIKELY(static_cast<std::uint8_t>(rhs.rawTag()) ==
                                                static_cast<std::uint8_t>(ip->binaryOpcode1))) {
+                                if (oce.view.hybridLayout &&
+                                    RS_FLAT_UNLIKELY(!detail::canWriteHybridFieldLosslessly(
+                                        oce.view.hybridLayout->fields[fIdx], rhs))) {
+                                    goto L_FlatMathFallback;
+                                }
                                 const std::uint64_t spanCost = ip->span;
                                 if (RS_FLAT_UNLIKELY(localExecuted > budgetLimit || spanCost > budgetLimit - localExecuted)) {
                                     if (spanCost > 1u) goto L_FlatSuperFallback;
@@ -5551,10 +5613,20 @@ bool executeFunction(
                                     goto L_FlatError;
                                 }
                                 localExecuted += spanCost;
-                                const bool changed =
-                                    RS_FLAT_UNLIKELY(oce.mayNotifyDirty) &&
-                                    !(oce.view.fields[fIdx] == rhs);
-                                oce.view.fields[fIdx] = rhs;
+                                bool changed = false;
+                                if (RS_FLAT_LIKELY(!oce.view.hybridLayout)) {
+                                    changed =
+                                        RS_FLAT_UNLIKELY(oce.mayNotifyDirty) &&
+                                        !(oce.view.fields[fIdx] == rhs);
+                                    oce.view.fields[fIdx] = rhs;
+                                } else {
+                                    (void)detail::tryWriteHybridFieldRaw(
+                                        oce.view.fields,
+                                        oce.view.hybridLayout->fields[fIdx],
+                                        rhs,
+                                        oce.mayNotifyDirty,
+                                        changed);
+                                }
                                 if (RS_FLAT_UNLIKELY(changed)) {
                                     state.heap->notifyFieldMutated(ref, fIdx);
                                 }
@@ -6003,23 +6075,39 @@ bool executeFunction(
                         }
                         const std::uint16_t f0 = calleeExec->trivialFieldIndex0;
                         if (tKind == detail::TrivialMethodKind::ReturnThisFieldExact) {
-                            if (RS_FLAT_LIKELY(f0 < rOce.view.fieldCount &&
-                                               static_cast<std::uint8_t>(rOce.view.fields[f0].rawTag()) ==
+                            if (RS_FLAT_LIKELY(f0 < rOce.view.fieldCount)) {
+                                const Value fv = detail::loadObjectFastViewField(rOce.view, f0);
+                                if (RS_FLAT_LIKELY(static_cast<std::uint8_t>(fv.rawTag()) ==
                                                    calleeExec->trivialFieldTag0)) {
-                                outTrivialVal = rOce.view.fields[f0];
-                                handled = true;
+                                    outTrivialVal = fv;
+                                    handled = true;
+                                }
                             }
                         } else if (tKind == detail::TrivialMethodKind::StoreThisFieldExact) {
                             const std::uint16_t pIdx = calleeExec->trivialParamIndex;
                             if (pIdx >= bias && (pIdx - bias) < uCount &&
                                 RS_FLAT_LIKELY(f0 < rOce.view.fieldCount)) {
                                 const Value& rhs = userArgsPtr[pIdx - bias];
-                                if (RS_FLAT_LIKELY(static_cast<std::uint8_t>(rhs.rawTag()) ==
-                                                   calleeExec->trivialFieldTag0)) {
-                                    const bool changed =
-                                        RS_FLAT_UNLIKELY(rOce.mayNotifyDirty) &&
-                                        !(rOce.view.fields[f0] == rhs);
-                                    rOce.view.fields[f0] = rhs;
+                                if (RS_FLAT_LIKELY(
+                                        static_cast<std::uint8_t>(rhs.rawTag()) ==
+                                            calleeExec->trivialFieldTag0 &&
+                                        (!rOce.view.hybridLayout ||
+                                         detail::canWriteHybridFieldLosslessly(
+                                             rOce.view.hybridLayout->fields[f0], rhs)))) {
+                                    bool changed = false;
+                                    if (RS_FLAT_LIKELY(!rOce.view.hybridLayout)) {
+                                        changed =
+                                            RS_FLAT_UNLIKELY(rOce.mayNotifyDirty) &&
+                                            !(rOce.view.fields[f0] == rhs);
+                                        rOce.view.fields[f0] = rhs;
+                                    } else {
+                                        (void)detail::tryWriteHybridFieldRaw(
+                                            rOce.view.fields,
+                                            rOce.view.hybridLayout->fields[f0],
+                                            rhs,
+                                            rOce.mayNotifyDirty,
+                                            changed);
+                                    }
                                     if (RS_FLAT_UNLIKELY(changed)) {
                                         state.heap->notifyFieldMutated(leaf.receiverRef, f0);
                                     }
@@ -6032,8 +6120,8 @@ bool executeFunction(
                             std::int64_t a = 0, b = 0;
                             if (RS_FLAT_LIKELY(f0 < rOce.view.fieldCount &&
                                                f1 < rOce.view.fieldCount &&
-                                               rOce.view.fields[f0].tryGetInt64(a) &&
-                                               rOce.view.fields[f1].tryGetInt64(b))) {
+                                               detail::loadObjectFastViewField(rOce.view, f0).tryGetInt64(a) &&
+                                               detail::loadObjectFastViewField(rOce.view, f1).tryGetInt64(b))) {
                                 const std::int64_t r =
                                     (tKind == detail::TrivialMethodKind::ReturnThisFieldAddField)
                                         ? (a + b)
@@ -6049,7 +6137,7 @@ bool executeFunction(
                         } else {
                             std::int64_t a = 0;
                             if (RS_FLAT_LIKELY(f0 < rOce.view.fieldCount &&
-                                               rOce.view.fields[f0].tryGetInt64(a))) {
+                                               detail::loadObjectFastViewField(rOce.view, f0).tryGetInt64(a))) {
                                 const std::int64_t c = calleeExec->trivialConstValue.asInt64Unchecked();
                                 std::int64_t r = 0;
                                 bool ovf = false;

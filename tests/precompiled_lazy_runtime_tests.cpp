@@ -465,11 +465,16 @@ public int RunScenario() {
         "Eager vs lazy return value mismatch");
 
     const std::size_t afterExecCompiled = layeredImg->compiledLazyFunctionCount();
+    const std::size_t afterExecMaterialized = layeredImg->materializedExecutionFunctionCount();
     require(afterExecCompiled > 0u,
         "Expected some lazy base functions to be compiled after execution");
     require(afterExecCompiled < totalLazy,
         "Expected uncalled lazy base functions to remain uncompiled (compiled=" +
         std::to_string(afterExecCompiled) + ", total=" + std::to_string(totalLazy) + ")");
+    require(afterExecMaterialized > 0u && afterExecMaterialized < layeredImg->functionCount(),
+        "Expected unreferenced lazy base functions to remain unmaterialized (mat=" +
+        std::to_string(afterExecMaterialized) + ", total=" +
+        std::to_string(layeredImg->functionCount()) + ")");
 
     // Re-running on same interpreter + copied image should also return 234 identically
     auto lazyRes2 = lazyInterp.invoke("User.App::RunScenario");
@@ -618,6 +623,15 @@ public int measureMeter(IMeter m) {
 public int checkLazyExtra(int x) {
     return x * 3 + 7;
 }
+
+public int neverReferencedLazyHelper(int z) {
+    return z * 7 + 13;
+}
+
+public class NeverReferencedLazyClass {
+    public int v;
+    public int compute() { return v + 1; }
+}
 )RS";
 
     std::ostringstream userSrc;
@@ -696,26 +710,63 @@ public bool checkNullStringThrows() {
         "Poly base compile failed:\n" + formatDiagnostics(baseBuild.diagnostics));
     auto baseBc = lowerMirModules(baseBuild.modules);
 
-    const auto rslbV3 = bytecode::encodeLazyBytecodeBundle(baseBc, /*targetChunkBytes=*/0u);
-    auto v3Bundle = std::make_shared<bytecode::LazyBytecodeBundle>();
+    const auto rslbV4 = bytecode::encodeLazyBytecodeBundle(baseBc, /*targetChunkBytes=*/0u);
+    auto v4BundleZeroCopy = std::make_shared<bytecode::LazyBytecodeBundle>();
     diagnostics::DiagnosticBag diag;
     require(bytecode::decodeLazyBytecodeBundleHeader(
-                rslbV3.data(), rslbV3.size(), *v3Bundle, /*copyBlob=*/true, diag, /*skipChecksum=*/false),
-        "RSLB v3 header decode failed");
-    require(rslbV3.size() >= 8u &&
-            (static_cast<std::uint32_t>(rslbV3[4]) |
-             (static_cast<std::uint32_t>(rslbV3[5]) << 8u) |
-             (static_cast<std::uint32_t>(rslbV3[6]) << 16u) |
-             (static_cast<std::uint32_t>(rslbV3[7]) << 24u)) == 3u,
-        "Expected encodeLazyBytecodeBundle binary header version == 3u");
-    require(v3Bundle->sharedStrings.empty(),
-        "Expected RSLB v3 sharedStrings to remain empty");
-    require(!v3Bundle->flatStringSpans.empty() && !v3Bundle->flatStringData.empty(),
-        "Expected RSLB v3 flat string pool to be populated");
-    require(v3Bundle->stringViewAt(0) == v3Bundle->stringCopyAt(0),
-        "Expected stringViewAt and stringCopyAt parity on v3 bundle");
+                rslbV4.data(), rslbV4.size(), *v4BundleZeroCopy, /*copyBlob=*/false, diag, /*skipChecksum=*/false),
+        "RSLB v4 zero-copy header decode failed");
+    require(rslbV4.size() >= 8u &&
+            (static_cast<std::uint32_t>(rslbV4[4]) |
+             (static_cast<std::uint32_t>(rslbV4[5]) << 8u) |
+             (static_cast<std::uint32_t>(rslbV4[6]) << 16u) |
+             (static_cast<std::uint32_t>(rslbV4[7]) << 24u)) == 4u,
+        "Expected encodeLazyBytecodeBundle binary header version == 4u");
+    require(v4BundleZeroCopy->sharedStrings.empty() &&
+            v4BundleZeroCopy->flatStringSpans.empty() &&
+            v4BundleZeroCopy->flatStringData.empty() &&
+            v4BundleZeroCopy->functionLocs.empty(),
+        "Expected RSLB v4 zero-copy decode to skip heap string/loc vectors");
+    require(v4BundleZeroCopy->hasZeroCopyStrings() &&
+            v4BundleZeroCopy->hasZeroCopyFunctionLocs() &&
+            v4BundleZeroCopy->stringCount() > 0u &&
+            v4BundleZeroCopy->flatStringBytes() > 0u &&
+            v4BundleZeroCopy->functionLocCount() > 0u,
+        "Expected RSLB v4 zero-copy string pool and locator views to be active");
+    {
+        const auto strPtrAddr = reinterpret_cast<std::uintptr_t>(v4BundleZeroCopy->flatStringDataPtr());
+        const auto blobBeginAddr = reinterpret_cast<std::uintptr_t>(rslbV4.data());
+        const auto blobEndAddr = blobBeginAddr + rslbV4.size();
+        require(strPtrAddr >= blobBeginAddr && strPtrAddr < blobEndAddr,
+            "Expected copyBlob=false string view pointer inside caller blob");
+    }
+    require(v4BundleZeroCopy->stringViewAt(0) == v4BundleZeroCopy->stringCopyAt(0),
+        "Expected stringViewAt and stringCopyAt parity on v4 zero-copy bundle");
 
-    // 2. Verify RSLB v2 header backward compatibility
+    auto v4BundleOwned = std::make_shared<bytecode::LazyBytecodeBundle>();
+    require(bytecode::decodeLazyBytecodeBundleHeader(
+                rslbV4.data(), rslbV4.size(), *v4BundleOwned, /*copyBlob=*/true, diag, /*skipChecksum=*/false),
+        "RSLB v4 owned-blob header decode failed");
+    require(v4BundleOwned->hasZeroCopyStrings() && v4BundleOwned->hasZeroCopyFunctionLocs(),
+        "Expected copyBlob=true v4 bundle to use zero-copy views into ownedBlob");
+    {
+        const auto strPtrAddr = reinterpret_cast<std::uintptr_t>(v4BundleOwned->flatStringDataPtr());
+        const auto ownBeginAddr = reinterpret_cast<std::uintptr_t>(v4BundleOwned->ownedBlob.data());
+        const auto ownEndAddr = ownBeginAddr + v4BundleOwned->ownedBlob.size();
+        require(strPtrAddr >= ownBeginAddr && strPtrAddr < ownEndAddr,
+            "Expected copyBlob=true string view pointer inside ownedBlob");
+
+        bytecode::LazyBytecodeBundle v4Copied(*v4BundleOwned);
+        const auto copyStrAddr = reinterpret_cast<std::uintptr_t>(v4Copied.flatStringDataPtr());
+        const auto copyOwnBegin = reinterpret_cast<std::uintptr_t>(v4Copied.ownedBlob.data());
+        const auto copyOwnEnd = copyOwnBegin + v4Copied.ownedBlob.size();
+        require(copyStrAddr >= copyOwnBegin && copyStrAddr < copyOwnEnd,
+            "Expected copied LazyBytecodeBundle string view pointer inside copy.ownedBlob");
+        require(v4Copied.stringViewAt(0) == v4BundleOwned->stringViewAt(0),
+            "Expected copied v4 LazyBytecodeBundle stringViewAt parity");
+    }
+
+    // 2. Verify RSLB v2 and v3 header backward compatibility
     {
         std::vector<std::uint8_t> rawV2;
         appendU32Le(rawV2, 1u); // string count
@@ -732,7 +783,7 @@ public bool checkNullStringThrows() {
             "Failed to compress synthetic v2 header");
 
         std::vector<std::uint8_t> rslbV2;
-        rslbV2.insert(rslbV2.end(), rslbV3.begin(), rslbV3.begin() + 40);
+        rslbV2.insert(rslbV2.end(), rslbV4.begin(), rslbV4.begin() + 40);
         writeU32Le(rslbV2, 4u, 2u); // formatVersion = 2
         writeU32Le(rslbV2, 16u, 0u); // chunkCount = 0
         writeU32Le(rslbV2, 20u, 40u); // compHdrOffset = 40
@@ -747,9 +798,47 @@ public bool checkNullStringThrows() {
         require(bytecode::decodeLazyBytecodeBundleHeader(
                     rslbV2.data(), rslbV2.size(), v2Bundle, /*copyBlob=*/true, v2Diag, /*skipChecksum=*/true),
             "RSLB v2 compat decode failed: " + formatDiagnostics(v2Diag));
-        require(v2Bundle.flatStringSpans.empty(), "Expected v2 bundle flatStringSpans empty");
+        require(v2Bundle.flatStringSpans.empty() && !v2Bundle.hasZeroCopyStrings(),
+            "Expected v2 bundle flatStringSpans empty");
         require(v2Bundle.sharedStrings.size() == 1u && v2Bundle.stringViewAt(0) == "v2ok",
             "Expected v2 bundle stringViewAt(0) == v2ok");
+    }
+    {
+        std::vector<std::uint8_t> rawV3;
+        appendU32Le(rawV3, 1u); // string count
+        appendU32Le(rawV3, 4u); // total chars ("v3ok")
+        appendU32Le(rawV3, 4u); // len[0]
+        rawV3.push_back('v');
+        rawV3.push_back('3');
+        rawV3.push_back('o');
+        rawV3.push_back('k');
+        appendU32Le(rawV3, 0u); // moduleCount = 0
+        appendU32Le(rawV3, 0u); // locCount = 0
+
+        std::vector<std::uint8_t> compV3;
+        require(bytecode::lz4CompressBlock(rawV3.data(), rawV3.size(), compV3),
+            "Failed to compress synthetic v3 header");
+
+        std::vector<std::uint8_t> rslbV3Compat;
+        rslbV3Compat.insert(rslbV3Compat.end(), rslbV4.begin(), rslbV4.begin() + 40);
+        writeU32Le(rslbV3Compat, 4u, 3u); // formatVersion = 3
+        writeU32Le(rslbV3Compat, 16u, 0u); // chunkCount = 0
+        writeU32Le(rslbV3Compat, 20u, 40u); // compHdrOffset = 40
+        writeU32Le(rslbV3Compat, 24u, static_cast<std::uint32_t>(compV3.size()));
+        writeU32Le(rslbV3Compat, 28u, static_cast<std::uint32_t>(rawV3.size()));
+        writeU32Le(rslbV3Compat, 32u, 0u);
+        writeU32Le(rslbV3Compat, 36u, 0u);
+        rslbV3Compat.insert(rslbV3Compat.end(), compV3.begin(), compV3.end());
+
+        bytecode::LazyBytecodeBundle v3CompatBundle;
+        diagnostics::DiagnosticBag v3Diag;
+        require(bytecode::decodeLazyBytecodeBundleHeader(
+                    rslbV3Compat.data(), rslbV3Compat.size(), v3CompatBundle, /*copyBlob=*/true, v3Diag, /*skipChecksum=*/true),
+            "RSLB v3 compat decode failed: " + formatDiagnostics(v3Diag));
+        require(v3CompatBundle.sharedStrings.empty() &&
+                v3CompatBundle.flatStringSpans.size() == 1u &&
+                v3CompatBundle.stringViewAt(0) == "v3ok",
+            "Expected v3 compat bundle stringViewAt(0) == v3ok");
     }
 
     // 3. Compile user module against PolyBase sources & link layered
@@ -767,7 +856,7 @@ public bool checkNullStringThrows() {
     }
 
     runtime::RuntimeError linkErr;
-    auto layeredOpt = runtime::ProgramImage::linkLayered(v3Bundle, userOnlyBc, linkErr, true);
+    auto layeredOpt = runtime::ProgramImage::linkLayered(v4BundleOwned, userOnlyBc, linkErr, true);
     require(layeredOpt.has_value(), "M1 linkLayered failed: " + linkErr.message);
     auto img = std::make_shared<runtime::ProgramImage>(std::move(*layeredOpt));
 
@@ -851,9 +940,16 @@ public bool checkNullStringThrows() {
             "runManyNatives mismatch on round " + std::to_string(round) + ": " + natRes.error.message);
     }
 
-    std::cout << "  [M1Stats] rslbV3Bytes=" << rslbV3.size()
-              << " flatPoolBytes=" << v3Bundle->flatStringData.size()
-              << " flatStringCount=" << v3Bundle->flatStringSpans.size()
+    const std::size_t materializedBeforeExtra = img->materializedExecutionFunctionCount();
+    require(materializedBeforeExtra > 0u && materializedBeforeExtra < img->functionCount(),
+        "Expected on-demand ExecutionMirror to skip uncalled lazy functions (mat=" +
+        std::to_string(materializedBeforeExtra) + ", total=" +
+        std::to_string(img->functionCount()) + ")");
+
+    std::cout << "  [M1Stats] rslbV4Bytes=" << rslbV4.size()
+              << " flatPoolBytes=" << v4BundleZeroCopy->flatStringBytes()
+              << " flatStringCount=" << v4BundleZeroCopy->stringCount()
+              << " materializedExecFns=" << materializedBeforeExtra << "/" << img->functionCount()
               << " decodedChunksAfterRelease=" << img->decodedLazyChunkCacheSize()
               << "\n";
 }

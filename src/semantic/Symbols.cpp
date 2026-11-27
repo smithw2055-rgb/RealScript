@@ -576,6 +576,7 @@ bool populateFields(
             valid = false;
         }
     }
+    compactTypeFieldsInstanceFirst(type);
     return valid;
 }
 
@@ -820,6 +821,123 @@ void appendSyntaxParameters(
 }
 
 } // namespace
+
+void compactTypeFieldsInstanceFirst(
+    TypeSymbol& type,
+    std::vector<FunctionBindingInput>* optBindings) {
+    if ((type.kind != TypeKind::Class && type.kind != TypeKind::Struct) ||
+        type.fields.empty()) {
+        return;
+    }
+
+    const std::size_t oldCount = type.fields.size();
+    bool sawStaticOrConst = false;
+    bool needsReorder = false;
+    for (std::size_t i = 0; i < oldCount; ++i) {
+        const bool isStaticOrConst =
+            type.fields[i].staticField || type.fields[i].constField;
+        if (isStaticOrConst) {
+            sawStaticOrConst = true;
+        } else if (sawStaticOrConst) {
+            needsReorder = true;
+        }
+        if (type.fields[i].index != i) {
+            needsReorder = true;
+        }
+    }
+    if (!needsReorder) {
+        return;
+    }
+
+    std::vector<std::size_t> newOrder;
+    newOrder.reserve(oldCount);
+    for (std::size_t i = 0; i < oldCount; ++i) {
+        if (!type.fields[i].staticField && !type.fields[i].constField) {
+            newOrder.push_back(i);
+        }
+    }
+    for (std::size_t i = 0; i < oldCount; ++i) {
+        if (type.fields[i].staticField || type.fields[i].constField) {
+            newOrder.push_back(i);
+        }
+    }
+
+    std::vector<std::size_t> oldToNew(oldCount, std::numeric_limits<std::size_t>::max());
+    std::vector<FieldSymbol> compacted;
+    compacted.reserve(oldCount);
+    std::unordered_map<SymbolId, std::size_t> idToNew;
+    idToNew.reserve(oldCount);
+
+    for (std::size_t newIdx = 0; newIdx < oldCount; ++newIdx) {
+        const std::size_t oldIdx = newOrder[newIdx];
+        oldToNew[oldIdx] = newIdx;
+        FieldSymbol f = std::move(type.fields[oldIdx]);
+        f.index = newIdx;
+        if (f.id != 0) {
+            idToNew[f.id] = newIdx;
+        }
+        compacted.push_back(std::move(f));
+    }
+    type.fields = std::move(compacted);
+
+    auto remapField = [&](FieldSymbol& fs) {
+        if (fs.id != 0) {
+            const auto it = idToNew.find(fs.id);
+            if (it != idToNew.end()) {
+                fs.index = it->second;
+                return;
+            }
+        }
+        if ((fs.declaringTypeId == 0 || fs.declaringTypeId == type.id) &&
+            fs.index < oldToNew.size() &&
+            oldToNew[fs.index] != std::numeric_limits<std::size_t>::max()) {
+            fs.index = oldToNew[fs.index];
+        }
+    };
+
+    for (auto& prop : type.properties) {
+        if (prop.backingFieldIndex < oldToNew.size() &&
+            oldToNew[prop.backingFieldIndex] != std::numeric_limits<std::size_t>::max()) {
+            prop.backingFieldIndex = oldToNew[prop.backingFieldIndex];
+        }
+    }
+    for (auto& ev : type.events) {
+        if (!ev.storageField.name.empty()) {
+            remapField(ev.storageField);
+        }
+        for (auto& h : ev.handlers) {
+            if (!h.enabledField.name.empty()) remapField(h.enabledField);
+        }
+        for (auto& s : ev.subscriptions) {
+            if (!s.enabledField.name.empty()) remapField(s.enabledField);
+        }
+    }
+
+    if (optBindings != nullptr) {
+        for (auto& b : *optBindings) {
+            const SymbolId ownerId =
+                b.symbol.ownerTypeId != 0 ? b.symbol.ownerTypeId : b.symbol.declaringTypeId;
+            if (ownerId != type.id) continue;
+            if (!b.syntheticField.name.empty()) remapField(b.syntheticField);
+            if (!b.sequenceTargetField.name.empty()) remapField(b.sequenceTargetField);
+            if (!b.sequenceTimerField.name.empty()) remapField(b.sequenceTimerField);
+            if (!b.sequenceStateField.name.empty()) remapField(b.sequenceStateField);
+            if (!b.sequenceCompletedField.name.empty()) remapField(b.sequenceCompletedField);
+            if (!b.sequenceResultField.name.empty()) remapField(b.sequenceResultField);
+            for (auto& pf : b.sequenceParameterFields) {
+                if (!pf.second.name.empty()) remapField(pf.second);
+            }
+            for (auto& lf : b.sequenceLocalFields) {
+                if (!lf.second.name.empty()) remapField(lf.second);
+            }
+            for (auto& ff : b.sequenceForeachFields) {
+                if (!ff.collection.name.empty()) remapField(ff.collection);
+                if (!ff.index.name.empty()) remapField(ff.index);
+                if (!ff.iteration.name.empty()) remapField(ff.iteration);
+            }
+        }
+    }
+}
 
 namespace {
 

@@ -500,7 +500,56 @@ EventDeclarationSyntax Parser::parseEventDeclaration(
     result.eventKeyword = match(SyntaxKind::EventKeyword);
     result.delegateType = parseType();
     result.identifierToken = match(SyntaxKind::IdentifierToken);
-    result.semicolonToken = match(SyntaxKind::SemicolonToken);
+    if (current().kind == SyntaxKind::OpenBraceToken) {
+        result.openBraceToken = nextToken();
+        while (current().kind != SyntaxKind::CloseBraceToken &&
+               current().kind != SyntaxKind::EndOfFileToken) {
+            if (current().kind == SyntaxKind::IdentifierToken &&
+                (current().text == "add" || current().text == "remove")) {
+                auto accessor = std::make_unique<AccessorDeclarationSyntax>();
+                accessor->keyword = nextToken();
+                const bool isAdd = accessor->keyword.text == "add";
+                if (current().kind == SyntaxKind::ArrowToken) {
+                    const auto arrow = nextToken();
+                    auto block = std::make_unique<BlockStatementSyntax>();
+                    block->openBraceToken = {SyntaxKind::OpenBraceToken, arrow.span, "{", {}, true};
+                    if (current().kind == SyntaxKind::ThrowKeyword) {
+                        auto thr = parseThrowStatement();
+                        block->closeBraceToken = {SyntaxKind::CloseBraceToken, thr->span(), "}", {}, true};
+                        block->statements.push_back(std::move(thr));
+                    } else {
+                        auto exprStmt = std::make_unique<ExpressionStatementSyntax>();
+                        exprStmt->expression = parseExpression();
+                        exprStmt->semicolonToken = match(SyntaxKind::SemicolonToken);
+                        block->closeBraceToken = {SyntaxKind::CloseBraceToken, exprStmt->semicolonToken.span, "}", {}, true};
+                        block->statements.push_back(std::move(exprStmt));
+                    }
+                    accessor->body = std::move(block);
+                } else {
+                    accessor->body = std::make_unique<BlockStatementSyntax>(parseBlockStatement());
+                }
+                if (isAdd) {
+                    if (result.addAccessor) {
+                        diagnostics_.report("RS1104", "duplicate add accessor", accessor->keyword.span);
+                    } else {
+                        result.addAccessor = std::move(accessor);
+                    }
+                } else {
+                    if (result.removeAccessor) {
+                        diagnostics_.report("RS1105", "duplicate remove accessor", accessor->keyword.span);
+                    } else {
+                        result.removeAccessor = std::move(accessor);
+                    }
+                }
+            } else {
+                diagnostics_.report("RS1002", "expected 'add' or 'remove' event accessor", current().span);
+                nextToken();
+            }
+        }
+        result.closeBraceToken = match(SyntaxKind::CloseBraceToken);
+    } else {
+        result.semicolonToken = match(SyntaxKind::SemicolonToken);
+    }
     return result;
 }
 

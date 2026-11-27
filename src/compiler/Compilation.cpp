@@ -1122,6 +1122,13 @@ void pruneUnreachableAstDeclarations(
         return n;
     };
 
+    auto countEventAccessors = [](const syntax::EventDeclarationSyntax& e) -> std::size_t {
+        std::size_t n = 0;
+        if (e.addAccessor) ++n;
+        if (e.removeAccessor) ++n;
+        return n;
+    };
+
     for (auto* pu : prunableUnits) {
         const auto& st = *pu->syntaxTree;
         const std::string& modName = pu->moduleName;
@@ -1131,6 +1138,7 @@ void pruneUnreachableAstDeclarations(
                 unitHasPruned = true;
                 prunedFunctions += c.constructors.size() + c.methods.size() + c.sequences.size();
                 for (const auto& prop : c.properties) prunedFunctions += countPropertyAccessors(prop);
+                for (const auto& ev : c.events) prunedFunctions += countEventAccessors(ev);
             }
         }
         for (const auto& s : st.structs) {
@@ -1138,6 +1146,7 @@ void pruneUnreachableAstDeclarations(
                 unitHasPruned = true;
                 prunedFunctions += s.constructors.size() + s.methods.size() + s.sequences.size();
                 for (const auto& prop : s.properties) prunedFunctions += countPropertyAccessors(prop);
+                for (const auto& ev : s.events) prunedFunctions += countEventAccessors(ev);
             }
         }
         for (const auto& e : st.enums) {

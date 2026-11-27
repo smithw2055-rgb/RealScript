@@ -38,6 +38,10 @@ bool linkFailure(RuntimeError& error, std::string message) {
 semantic::SymbolId exactTypeId(
     semantic::PrimitiveType type,
     const std::string& typeName) noexcept {
+    if (type == semantic::PrimitiveType::Object &&
+        (typeName.empty() || typeName == "object")) {
+        return 0;
+    }
     return (semantic::isExactType(type) ||
             type == semantic::PrimitiveType::Handle) &&
             !typeName.empty()
@@ -327,14 +331,15 @@ bool validateObjectModel(
                 }
                 if (!visit(*found->second)) return false;
                 const auto& base = *found->second;
-                if (base.fields.size() > type.fields.size()) {
+                const std::size_t baseInstCount = semantic::requiredInstanceSlotCount(base.fields);
+                if (baseInstCount > type.fields.size()) {
                     return linkFailure(
                         error,
                         "derived type '" + semantic::canonicalTypeName(type) +
                             "' truncates its base field layout");
                 }
                 for (std::size_t index = 0;
-                     index < base.fields.size(); ++index) {
+                     index < baseInstCount; ++index) {
                     const auto& first = base.fields[index];
                     const auto& second = type.fields[index];
                     if (first.id != second.id || first.name != second.name ||
@@ -1480,7 +1485,8 @@ void linkSingleExecutionFunctionPass2(
                     inst.index < module.functionReferences.size()) {
                     const auto& ref = module.functionReferences[inst.index];
                     if (!ref.virtualDispatch && !ref.interfaceDispatch &&
-                        ref.name.rfind("__rs_native_", 0) == 0 &&
+                        (ref.name.rfind("__rs_native_", 0) == 0 ||
+                         ref.name.find("::__rs_native_") != std::string::npos) &&
                         functions.find(ref.symbolId) == functions.end() &&
                         inst.operands.size() == function.parameterTypes.size() &&
                         ref.parameterTypes == function.parameterTypes &&
@@ -1739,12 +1745,15 @@ bool tryBuildObjectAllocationTemplate(
     }
     ObjectAllocationTemplate tmpl;
     tmpl.typeId = type.id;
-    tmpl.defaultFields.reserve(type.fields.size());
+    const std::size_t instSlotCount = semantic::requiredInstanceSlotCount(type.fields);
+    tmpl.defaultFields.reserve(instSlotCount);
     std::vector<std::size_t> refIndices;
     bool allInlineSafe = true;
-    for (std::size_t fIdx = 0; fIdx < type.fields.size(); ++fIdx) {
-        const auto fType = type.fields[fIdx].type;
-        const auto fTid = exactTypeId(fType, type.fields[fIdx].typeName);
+    for (std::size_t fIdx = 0; fIdx < instSlotCount; ++fIdx) {
+        const auto& field = type.fields[fIdx];
+        const bool isStaticOrConst = field.staticField || field.constField;
+        const auto fType = field.type;
+        const auto fTid = exactTypeId(fType, field.typeName);
         Value defVal{};
         switch (fType) {
         case semantic::PrimitiveType::Bool: defVal = false; break;
@@ -1761,15 +1770,15 @@ bool tryBuildObjectAllocationTemplate(
         case semantic::PrimitiveType::Char: defVal = CharValue{}; break;
         case semantic::PrimitiveType::String:
             defVal = NullString{};
-            refIndices.push_back(fIdx);
+            if (!isStaticOrConst) refIndices.push_back(fIdx);
             break;
         case semantic::PrimitiveType::Object:
             defVal = NullObject{};
-            refIndices.push_back(fIdx);
+            if (!isStaticOrConst) refIndices.push_back(fIdx);
             break;
         case semantic::PrimitiveType::Array:
             defVal = NullArray{};
-            refIndices.push_back(fIdx);
+            if (!isStaticOrConst) refIndices.push_back(fIdx);
             break;
         case semantic::PrimitiveType::Enum:
             defVal = EnumValue{fTid, 0};
@@ -1802,6 +1811,147 @@ bool tryBuildObjectAllocationTemplate(
         return false;
     }
     tmpl.referenceFields = std::make_shared<const std::vector<std::size_t>>(std::move(refIndices));
+
+    // Phase 2.2: Build packed HybridRecord layout for classes exceeding SlabValues capacity (> 8 fields)
+    if (instSlotCount > 8u && instSlotCount <= 65535u) {
+        HybridRecordLayout hybrid;
+        hybrid.typeId = type.id;
+        hybrid.fieldCount = static_cast<std::uint32_t>(instSlotCount);
+        hybrid.fields.resize(instSlotCount);
+
+        std::uint16_t refSlotIdx = 0;
+        std::vector<std::size_t> align8Fields;
+        std::vector<std::size_t> align4Fields;
+        std::vector<std::size_t> align2Fields;
+        std::vector<std::size_t> align1Fields;
+        for (std::size_t fIdx = 0; fIdx < instSlotCount; ++fIdx) {
+            const auto& field = type.fields[fIdx];
+            const auto fType = field.type;
+            const auto fTid = exactTypeId(fType, field.typeName);
+            auto& desc = hybrid.fields[fIdx];
+            desc.valueTag = static_cast<std::uint8_t>(tmpl.defaultFields[fIdx].rawTag());
+            switch (fType) {
+            case semantic::PrimitiveType::Bool:
+                desc.kind = HybridScalarKind::Bool;
+                align1Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::Byte:
+                desc.kind = HybridScalarKind::Byte;
+                align1Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::SByte:
+                desc.kind = HybridScalarKind::SByte;
+                align1Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::Short:
+                desc.kind = HybridScalarKind::Short;
+                align2Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::UShort:
+                desc.kind = HybridScalarKind::UShort;
+                align2Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::Char:
+                desc.kind = HybridScalarKind::Char;
+                align2Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::Int:
+                desc.kind = HybridScalarKind::Int32;
+                align4Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::UInt:
+                desc.kind = HybridScalarKind::UInt32;
+                align4Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::Float:
+                desc.kind = HybridScalarKind::Float32;
+                align4Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::Enum:
+                desc.kind = HybridScalarKind::Enum32;
+                desc.enumTypeId = fTid;
+                align4Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::Long:
+                desc.kind = HybridScalarKind::Int64;
+                align8Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::ULong:
+                desc.kind = HybridScalarKind::UInt64;
+                align8Fields.push_back(fIdx);
+                break;
+            case semantic::PrimitiveType::Double:
+                desc.kind = HybridScalarKind::Float64;
+                align8Fields.push_back(fIdx);
+                break;
+            default:
+                desc.kind = HybridScalarKind::ValueSlot;
+                desc.offsetOrSlot = refSlotIdx++;
+                break;
+            }
+        }
+        const bool hasPackedScalar =
+            !align8Fields.empty() || !align4Fields.empty() ||
+            !align2Fields.empty() || !align1Fields.empty();
+        if (hasPackedScalar) {
+            hybrid.refSlotCount = refSlotIdx;
+            std::uint32_t cursor = static_cast<std::uint32_t>(refSlotIdx) * static_cast<std::uint32_t>(sizeof(Value));
+            hybrid.scalarOffsetBytes = cursor;
+            for (const auto fIdx : align8Fields) {
+                cursor = (cursor + 7u) & ~7u;
+                hybrid.fields[fIdx].offsetOrSlot = cursor;
+                cursor += 8u;
+            }
+            for (const auto fIdx : align4Fields) {
+                cursor = (cursor + 3u) & ~3u;
+                hybrid.fields[fIdx].offsetOrSlot = cursor;
+                cursor += 4u;
+            }
+            for (const auto fIdx : align2Fields) {
+                cursor = (cursor + 1u) & ~1u;
+                hybrid.fields[fIdx].offsetOrSlot = cursor;
+                cursor += 2u;
+            }
+            for (const auto fIdx : align1Fields) {
+                hybrid.fields[fIdx].offsetOrSlot = cursor;
+                cursor += 1u;
+            }
+            hybrid.totalBytes = (cursor + 7u) & ~7u;
+            const std::size_t flatBytes = instSlotCount * sizeof(Value);
+            if (hybrid.totalBytes > 0u &&
+                static_cast<std::size_t>(hybrid.totalBytes) < flatBytes) {
+                std::vector<std::uint8_t> packedDefaults(hybrid.totalBytes, 0u);
+                auto* payloadBase = reinterpret_cast<Value*>(packedDefaults.data());
+                bool packOk = true;
+                for (std::size_t fIdx = 0; fIdx < instSlotCount; ++fIdx) {
+                    const auto& desc = hybrid.fields[fIdx];
+                    if (desc.kind == HybridScalarKind::ValueSlot) {
+                        std::memcpy(
+                            payloadBase + desc.offsetOrSlot,
+                            &tmpl.defaultFields[fIdx],
+                            sizeof(Value));
+                    } else {
+                        bool dummyChanged = false;
+                        if (!tryWriteHybridFieldRaw(
+                                payloadBase,
+                                desc,
+                                tmpl.defaultFields[fIdx],
+                                false,
+                                dummyChanged)) {
+                            packOk = false;
+                            break;
+                        }
+                    }
+                }
+                if (packOk) {
+                    tmpl.hybridLayout =
+                        std::make_shared<const HybridRecordLayout>(std::move(hybrid));
+                    tmpl.defaultHybridBytes = std::move(packedDefaults);
+                }
+            }
+        }
+    }
+
     const auto tIdx = static_cast<std::uint16_t>(mirror.objectTemplates.size());
     mirror.objectTemplates.push_back(std::move(tmpl));
     ctx.objectTemplateByTypeId.emplace(type.id, tIdx);
@@ -1833,7 +1983,31 @@ void populateTypeDispatchAndFastTable(
         }
     }
 
-    if (!functions.empty()) {
+    if (lazyMode) {
+        if (!mirror.functions.empty()) {
+            std::size_t tableCap = 16u;
+            const std::size_t minCap = mirror.functions.size() * 2u;
+            while (tableCap < minCap) {
+                tableCap <<= 1u;
+            }
+            mirror.fastFunctionTable.resize(tableCap);
+            const std::size_t mask = tableCap - 1u;
+            for (const auto& [fnPtr, execFn] : mirror.functions) {
+                if (!fnPtr || fnPtr->symbolId == 0u) continue;
+                const auto fIt = functions.find(fnPtr->symbolId);
+                if (fIt == functions.end()) continue;
+                std::size_t slot = static_cast<std::size_t>(
+                    (fnPtr->symbolId ^ (fnPtr->symbolId >> 32u)) * 11400714819323198485ULL) & mask;
+                while (mirror.fastFunctionTable[slot].symbolId != 0u) {
+                    slot = (slot + 1u) & mask;
+                }
+                mirror.fastFunctionTable[slot] = FastFunctionDispatchEntry{
+                    fnPtr->symbolId,
+                    &fIt->second,
+                    &execFn};
+            }
+        }
+    } else if (!functions.empty()) {
         std::size_t tableCap = 16u;
         const std::size_t minCap = functions.size() * 2u;
         while (tableCap < minCap) {
@@ -1848,15 +2022,82 @@ void populateTypeDispatchAndFastTable(
             while (mirror.fastFunctionTable[slot].symbolId != 0u) {
                 slot = (slot + 1u) & mask;
             }
+            const auto execIt = loc.function ? mirror.functions.find(loc.function) : mirror.functions.end();
             mirror.fastFunctionTable[slot] = FastFunctionDispatchEntry{
                 symId,
                 &loc,
-                loc.function ? findExecutionFunction(mirror, *loc.function) : nullptr};
+                execIt != mirror.functions.end() ? &execIt->second : nullptr};
+        }
+    }
+}
+
+void shrinkCompiledExecutionFunction(ExecutionFunction& execFn) {
+    if (!execFn.compiled.load(std::memory_order_acquire)) {
+        return;
+    }
+    execFn.slotPayloadOffsets.shrink_to_fit();
+    execFn.slotStructSchemaIds.shrink_to_fit();
+    execFn.flatStream.shrink_to_fit();
+    execFn.flatCold.shrink_to_fit();
+    execFn.flatColdCalls.shrink_to_fit();
+    execFn.blockStreamOffsets.shrink_to_fit();
+    execFn.denseBlockIndices.shrink_to_fit();
+    execFn.blocks.shrink_to_fit();
+    if (!execFn.slowInstructionsOnce) {
+        for (auto& blk : execFn.blocks) {
+            blk.instructions.shrink_to_fit();
         }
     }
 }
 
 } // namespace
+
+const ExecutionFunction* findOrCreateLazyExecutionFunction(
+    const ExecutionMirror& mirror,
+    const bytecode::Function& function) noexcept {
+    auto* state = mirror.lazyState.get();
+    if (!state || !state->lazyFuncLocTable || !state->modules || !state->baseBundle) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(state->lazyExecMutex);
+    if (const auto it = state->lazyExecMap.find(&function); it != state->lazyExecMap.end()) {
+        return it->second;
+    }
+    const std::uint32_t locIdx = state->lazyFuncLocTable->find(*state->modules, &function);
+    if (locIdx == ProgramImage::LazyFunctionLocTable::InvalidIndex ||
+        locIdx >= state->baseBundle->functionLocCount()) {
+        return nullptr;
+    }
+    const auto& loc = state->baseBundle->functionLocAt(locIdx);
+    if (loc.moduleIndex >= state->modules->size()) {
+        return nullptr;
+    }
+    ExecutionFunction stub;
+    stub.ownerMirror = &mirror;
+    stub.bytecode = &function;
+    stub.module = &(*state->modules)[loc.moduleIndex];
+    stub.lazyLocIndex = locIdx;
+    const std::size_t idx = state->lazyExecStorage.size();
+    state->lazyExecStorage.push_back(std::move(stub));
+    const ExecutionFunction* ptr = &state->lazyExecStorage[idx];
+    state->lazyExecMap.emplace(&function, ptr);
+    return ptr;
+}
+
+const ExecutionFunction* findExistingExecutionFunction(
+    const ExecutionMirror& mirror,
+    const bytecode::Function& function) noexcept {
+    if (const auto found = mirror.functions.find(&function); found != mirror.functions.end()) {
+        return &found->second;
+    }
+    auto* state = mirror.lazyState.get();
+    if (!state) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(state->lazyExecMutex);
+    const auto it = state->lazyExecMap.find(&function);
+    return it == state->lazyExecMap.end() ? nullptr : it->second;
+}
 
 std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
     const std::vector<bytecode::Module>& modules,
@@ -1865,17 +2106,39 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
     const std::unordered_map<
         semantic::SymbolId, const semantic::TypeSymbol*>& types,
     const std::shared_ptr<const bytecode::LazyBytecodeBundle>& lazyBaseBundle,
-    const std::unordered_map<const bytecode::Function*, std::uint32_t>* lazyFuncLocIndex) {
+    const ProgramImage::LazyFunctionLocTable* lazyFuncLocTable) {
     auto mirror = std::make_shared<ExecutionMirror>();
     mirror->instanceId = nextExecutionMirrorId();
     auto ctxPtr = std::make_unique<LazyCompileState>();
-    LazyCompileState& ctx = *ctxPtr;
-    ctx.stringLiteralMap.reserve(256u);
-    ctx.fieldMetaMap.reserve(64u);
+    ctxPtr->stringLiteralMap.reserve(256u);
+    ctxPtr->fieldMetaMap.reserve(64u);
+    const bool lazyMode = (lazyBaseBundle != nullptr && lazyFuncLocTable != nullptr);
+    if (lazyMode) {
+        ctxPtr->baseBundle = lazyBaseBundle;
+        ctxPtr->modules = &modules;
+        ctxPtr->functions = &functions;
+        ctxPtr->types = &types;
+        ctxPtr->lazyFuncLocTable = lazyFuncLocTable;
+        ctxPtr->totalLazyCount = lazyFuncLocTable->count;
+        ctxPtr->decodedChunkLru.reserve(LazyCompileState::kMaxDecodedChunks);
+        mirror->lazyState = std::move(ctxPtr);
+    }
+    LazyCompileState& ctx = lazyMode ? *mirror->lazyState : *ctxPtr;
 
-    std::size_t functionCount = 0;
-    for (const auto& module : modules) functionCount += module.functions.size();
-    mirror->functions.reserve(functionCount);
+    std::size_t eagerFunctionCount = 0;
+    for (const auto& module : modules) {
+        if (lazyMode) {
+            for (const auto& function : module.functions) {
+                if (lazyFuncLocTable->find(modules, &function) ==
+                    ProgramImage::LazyFunctionLocTable::InvalidIndex) {
+                    ++eagerFunctionCount;
+                }
+            }
+        } else {
+            eagerFunctionCount += module.functions.size();
+        }
+    }
+    mirror->functions.reserve(eagerFunctionCount);
 
     for (const auto& module : modules) {
         if (!mirror->hasAsyncOperations) {
@@ -1889,33 +2152,25 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
             }
         }
         for (const auto& function : module.functions) {
+            if (lazyMode &&
+                lazyFuncLocTable->find(modules, &function) !=
+                    ProgramImage::LazyFunctionLocTable::InvalidIndex) {
+                continue;
+            }
             ExecutionFunction decoded;
             decoded.ownerMirror = mirror.get();
             decoded.bytecode = &function;
             decoded.module = &module;
-            if (lazyFuncLocIndex != nullptr) {
-                if (const auto it = lazyFuncLocIndex->find(&function);
-                    it != lazyFuncLocIndex->end()) {
-                    decoded.lazyLocIndex = it->second;
-                    ++ctx.totalLazyCount;
-                }
-            }
-            if (decoded.lazyLocIndex == InvalidStreamOffset) {
-                initSingleExecutionFunctionPass1(*mirror, module, function, decoded);
-            }
+            initSingleExecutionFunctionPass1(*mirror, module, function, decoded);
             mirror->functions.emplace(&function, std::move(decoded));
         }
     }
 
-    for (const auto& module : modules) {
-        for (const auto& function : module.functions) {
-            const auto decoded = mirror->functions.find(&function);
-            if (decoded == mirror->functions.end() ||
-                decoded->second.lazyLocIndex != InvalidStreamOffset) {
-                continue;
-            }
-            linkSingleExecutionFunctionPass2(*mirror, functions, module, function, decoded->second);
+    for (auto& [fnPtr, execFn] : mirror->functions) {
+        if (!fnPtr || !execFn.module) {
+            continue;
         }
+        linkSingleExecutionFunctionPass2(*mirror, functions, *execFn.module, *fnPtr, execFn);
     }
 
     const auto computeStraightLineCallMetrics = [](
@@ -2164,49 +2419,27 @@ std::shared_ptr<const ExecutionMirror> buildExecutionMirror(
     }
 
     // Pass 3: Compile non-lazy functions (user modules, or all modules in eager mode)
-    for (const auto& module : modules) {
-        for (const auto& function : module.functions) {
-            const auto found = mirror->functions.find(&function);
-            if (found == mirror->functions.end() ||
-                found->second.lazyLocIndex != InvalidStreamOffset) {
-                continue;
-            }
-            compileSingleExecutionFunctionPass3(
-                mirror.get(), ctx, functions, types, module, function, found->second);
+    for (auto& [fnPtr, execFn] : mirror->functions) {
+        if (!fnPtr || !execFn.module || execFn.lazyLocIndex != InvalidStreamOffset) {
+            continue;
         }
+        compileSingleExecutionFunctionPass3(
+            mirror.get(), ctx, functions, types, *execFn.module, *fnPtr, execFn);
     }
 
     // Pass 3b: Pre-link per-type virtual & interface dispatch tables (lazy when backed by bundle) + fast table
     populateTypeDispatchAndFastTable(*mirror, modules, functions, lazyBaseBundle != nullptr);
 
     // Pass 4: Unfold small-frame leaf script functions & thread Jump chains for non-lazy functions
-    for (const auto& module : modules) {
-        for (const auto& function : module.functions) {
-            const auto found = mirror->functions.find(&function);
-            if (found == mirror->functions.end() ||
-                found->second.lazyLocIndex != InvalidStreamOffset) {
-                continue;
-            }
-            optimizeSingleExecutionFunctionPass4(found->second);
-        }
-    }
-
     for (auto& [fnPtr, execFn] : mirror->functions) {
         (void)fnPtr;
         if (execFn.lazyLocIndex != InvalidStreamOffset) {
             continue;
         }
+        optimizeSingleExecutionFunctionPass4(execFn);
         finalizeCompiledExecutionFunction(execFn);
     }
 
-    if (lazyBaseBundle != nullptr) {
-        ctx.baseBundle = lazyBaseBundle;
-        ctx.modules = &modules;
-        ctx.functions = &functions;
-        ctx.types = &types;
-        ctx.decodedChunkLru.reserve(LazyCompileState::kMaxDecodedChunks);
-        mirror->lazyState = std::move(ctxPtr);
-    }
     return mirror;
 }
 
@@ -8530,10 +8763,10 @@ bool ensureFunctionCompiledSlow(
         return false;
     }
     const auto& bundle = *state->baseBundle;
-    if (execFn.lazyLocIndex >= bundle.functionLocs.size()) {
+    if (execFn.lazyLocIndex >= bundle.functionLocCount()) {
         return false;
     }
-    const auto& loc = bundle.functionLocs[execFn.lazyLocIndex];
+    const auto& loc = bundle.functionLocAt(execFn.lazyLocIndex);
     if (loc.chunkIndex >= bundle.chunks.size()) {
         return false;
     }
@@ -8620,9 +8853,22 @@ void ensureSlowInstructions(const ExecutionFunction& execFn) {
                     blk.instructions,
                     [&](semantic::SymbolId symId)
                         -> std::pair<const ProgramImage::FunctionLocation*, const ExecutionFunction*> {
-                        const auto* entry = execFn.ownerMirror->lookupFunctionFast(symId);
-                        if (!entry) return {nullptr, nullptr};
-                        return {entry->location, entry->execution};
+                        if (const auto* entry = execFn.ownerMirror->lookupFunctionFast(symId)) {
+                            const ExecutionFunction* targetExec = entry->execution;
+                            if (!targetExec && entry->location && entry->location->function) {
+                                targetExec = findExecutionFunction(*execFn.ownerMirror, *entry->location->function);
+                            }
+                            return {entry->location, targetExec};
+                        }
+                        if (const auto* st = execFn.ownerMirror->lazyState.get(); st && st->functions) {
+                            if (const auto it = st->functions->find(symId);
+                                it != st->functions->end() && it->second.function) {
+                                return {
+                                    &it->second,
+                                    findExecutionFunction(*execFn.ownerMirror, *it->second.function)};
+                            }
+                        }
+                        return {nullptr, nullptr};
                     });
             }
             blk.instructions.shrink_to_fit();
@@ -8640,7 +8886,7 @@ const ExecutionMirror& executionMirrorSlow(const ProgramImage& program) {
             program.functions_,
             program.types_,
             program.lazyBaseBundle_,
-            program.lazyBaseBundle_ ? &program.lazyFuncLocIndex_ : nullptr);
+            program.lazyBaseBundle_ ? &program.lazyFuncLocTable_ : nullptr);
         program.executionMirrorFast_.ptr.store(
             program.executionMirror_.get(), std::memory_order_release);
     });
@@ -8728,6 +8974,33 @@ bool validateLinkSymbolsAndObjectModel(
     return validateObjectModel(modules, error, baseModuleCount);
 }
 
+void populateLazyFuncLocTable(
+    ProgramImage::LazyFunctionLocTable& table,
+    const std::vector<bytecode::Module>& modules,
+    const bytecode::LazyBytecodeBundle& bundle,
+    std::size_t baseModuleCount) {
+    table.clear();
+    const std::size_t nMods = std::min(baseModuleCount, modules.size());
+    table.byModuleFunction.resize(nMods);
+    for (std::size_t m = 0u; m < nMods; ++m) {
+        table.byModuleFunction[m].assign(
+            modules[m].functions.size(),
+            ProgramImage::LazyFunctionLocTable::InvalidIndex);
+    }
+    const std::size_t locCount = bundle.functionLocCount();
+    for (std::uint32_t locIdx = 0u; locIdx < static_cast<std::uint32_t>(locCount); ++locIdx) {
+        const auto& loc = bundle.functionLocAt(locIdx);
+        if (loc.moduleIndex < nMods &&
+            loc.functionIndex < table.byModuleFunction[loc.moduleIndex].size()) {
+            auto& slot = table.byModuleFunction[loc.moduleIndex][loc.functionIndex];
+            if (slot == ProgramImage::LazyFunctionLocTable::InvalidIndex) {
+                ++table.count;
+            }
+            slot = locIdx;
+        }
+    }
+}
+
 } // namespace
 
 ProgramImage::ProgramImage(std::vector<bytecode::Module> modules)
@@ -8763,18 +9036,11 @@ ProgramImage::ProgramImage(const ProgramImage& other)
     if (other.lazyBaseBundle_) {
         lazyBaseBundle_ = other.lazyBaseBundle_;
         baseModuleCount_ = other.baseModuleCount_;
-        lazyFuncLocIndex_.reserve(lazyBaseBundle_->functionLocs.size());
-        for (std::uint32_t locIdx = 0;
-             locIdx < static_cast<std::uint32_t>(lazyBaseBundle_->functionLocs.size());
-             ++locIdx) {
-            const auto& loc = lazyBaseBundle_->functionLocs[locIdx];
-            if (loc.moduleIndex < modules_.size() &&
-                loc.functionIndex < modules_[loc.moduleIndex].functions.size()) {
-                lazyFuncLocIndex_.emplace(
-                    &modules_[loc.moduleIndex].functions[loc.functionIndex],
-                    locIdx);
-            }
-        }
+        populateLazyFuncLocTable(
+            lazyFuncLocTable_,
+            modules_,
+            *lazyBaseBundle_,
+            baseModuleCount_ > 0u ? baseModuleCount_ : modules_.size());
     }
 }
 
@@ -8851,18 +9117,11 @@ std::optional<ProgramImage> ProgramImage::linkLayered(
     ProgramImage image(std::move(combined));
     image.lazyBaseBundle_ = std::move(baseBundle);
     image.baseModuleCount_ = baseCount;
-    image.lazyFuncLocIndex_.reserve(image.lazyBaseBundle_->functionLocs.size());
-    for (std::uint32_t locIdx = 0;
-         locIdx < static_cast<std::uint32_t>(image.lazyBaseBundle_->functionLocs.size());
-         ++locIdx) {
-        const auto& loc = image.lazyBaseBundle_->functionLocs[locIdx];
-        if (loc.moduleIndex < image.modules_.size() &&
-            loc.functionIndex < image.modules_[loc.moduleIndex].functions.size()) {
-            image.lazyFuncLocIndex_.emplace(
-                &image.modules_[loc.moduleIndex].functions[loc.functionIndex],
-                locIdx);
-        }
-    }
+    populateLazyFuncLocTable(
+        image.lazyFuncLocTable_,
+        image.modules_,
+        *image.lazyBaseBundle_,
+        baseCount);
     return image;
 }
 
@@ -8907,18 +9166,11 @@ std::optional<ProgramImage> ProgramImage::linkLayeredConsumeHeader(
     ProgramImage image(std::move(combined));
     image.lazyBaseBundle_ = std::move(mutableBaseBundle);
     image.baseModuleCount_ = baseCount;
-    image.lazyFuncLocIndex_.reserve(image.lazyBaseBundle_->functionLocs.size());
-    for (std::uint32_t locIdx = 0;
-         locIdx < static_cast<std::uint32_t>(image.lazyBaseBundle_->functionLocs.size());
-         ++locIdx) {
-        const auto& loc = image.lazyBaseBundle_->functionLocs[locIdx];
-        if (loc.moduleIndex < image.modules_.size() &&
-            loc.functionIndex < image.modules_[loc.moduleIndex].functions.size()) {
-            image.lazyFuncLocIndex_.emplace(
-                &image.modules_[loc.moduleIndex].functions[loc.functionIndex],
-                locIdx);
-        }
-    }
+    populateLazyFuncLocTable(
+        image.lazyFuncLocTable_,
+        image.modules_,
+        *image.lazyBaseBundle_,
+        baseCount);
     return image;
 }
 
@@ -8935,9 +9187,16 @@ void ProgramImage::compactForRuntime() {
             module.functionReferences.shrink_to_fit();
             module.sourceFiles.shrink_to_fit();
         }
+        std::size_t totalTypes = 0u;
+        std::size_t totalFunctions = 0u;
+        for (const auto& module : modules_) {
+            totalTypes += module.types.size();
+            totalFunctions += module.functions.size();
+        }
         types_.clear();
         functions_.clear();
-        lazyFuncLocIndex_.clear();
+        types_.reserve(totalTypes);
+        functions_.reserve(totalFunctions);
         for (const auto& module : modules_) {
             for (const auto& type : module.types) {
                 const auto [it, inserted] = types_.emplace(type.id, &type);
@@ -8951,20 +9210,6 @@ void ProgramImage::compactForRuntime() {
                 functions_.emplace(
                     function.symbolId,
                     FunctionLocation{&module, &function, qualified});
-            }
-        }
-        if (lazyBaseBundle_) {
-            lazyFuncLocIndex_.reserve(lazyBaseBundle_->functionLocs.size());
-            for (std::uint32_t locIdx = 0;
-                 locIdx < static_cast<std::uint32_t>(lazyBaseBundle_->functionLocs.size());
-                 ++locIdx) {
-                const auto& loc = lazyBaseBundle_->functionLocs[locIdx];
-                if (loc.moduleIndex < modules_.size() &&
-                    loc.functionIndex < modules_[loc.moduleIndex].functions.size()) {
-                    lazyFuncLocIndex_.emplace(
-                        &modules_[loc.moduleIndex].functions[loc.functionIndex],
-                        locIdx);
-                }
             }
         }
     }
@@ -9002,6 +9247,14 @@ void ProgramImage::compactForRuntime() {
         auto& module = modules_[modIdx];
         const bool isBaseMod = (baseModuleCount_ > 0u && modIdx < baseModuleCount_);
         for (auto& type : module.types) {
+            if (isBaseMod) {
+                for (auto& f : type.fields) {
+                    std::string().swap(f.declaringTypeName);
+                    std::string().swap(f.sourceName);
+                    f.declarationSpan = {};
+                    std::vector<std::string>().swap(f.formerlySerializedAs);
+                }
+            }
             type.fields.shrink_to_fit();
             type.virtualDispatchTable.shrink_to_fit();
             type.interfaceDispatchMaps.shrink_to_fit();
@@ -9064,7 +9317,8 @@ void ProgramImage::compactForRuntime() {
             }
         }
         for (auto& fn : module.functions) {
-            if (lazyFuncLocIndex_.find(&fn) != lazyFuncLocIndex_.end() && fn.blocks.empty()) {
+            if (lazyFuncLocTable_.find(modules_, &fn) != LazyFunctionLocTable::InvalidIndex &&
+                fn.blocks.empty()) {
                 continue;
             }
             fn.parameterTypes.shrink_to_fit();
@@ -9094,18 +9348,15 @@ void ProgramImage::compactForRuntime() {
         mirror->invokeDelegateSites.shrink_to_fit();
         for (auto& [fnPtr, execFn] : mirror->functions) {
             (void)fnPtr;
-            if (!execFn.compiled.load(std::memory_order_acquire)) continue;
-            execFn.slotPayloadOffsets.shrink_to_fit();
-            execFn.slotStructSchemaIds.shrink_to_fit();
-            execFn.flatStream.shrink_to_fit();
-            execFn.flatCold.shrink_to_fit();
-            execFn.flatColdCalls.shrink_to_fit();
-            execFn.blockStreamOffsets.shrink_to_fit();
-            execFn.denseBlockIndices.shrink_to_fit();
-            execFn.blocks.shrink_to_fit();
-            if (!execFn.slowInstructionsOnce) {
-                for (auto& blk : execFn.blocks) {
-                    blk.instructions.shrink_to_fit();
+            detail::shrinkCompiledExecutionFunction(execFn);
+        }
+        if (mirror->lazyState) {
+            std::lock_guard<std::mutex> lock(mirror->lazyState->lazyExecMutex);
+            for (auto& [fnPtr, execFnConst] : mirror->lazyState->lazyExecMap) {
+                (void)fnPtr;
+                if (execFnConst) {
+                    detail::shrinkCompiledExecutionFunction(
+                        const_cast<detail::ExecutionFunction&>(*execFnConst));
                 }
             }
         }
@@ -9113,7 +9364,7 @@ void ProgramImage::compactForRuntime() {
 }
 
 std::size_t ProgramImage::totalLazyFunctionCount() const noexcept {
-    return lazyFuncLocIndex_.size();
+    return lazyFuncLocTable_.count;
 }
 
 std::size_t ProgramImage::compiledLazyFunctionCount() const noexcept {
@@ -9122,6 +9373,19 @@ std::size_t ProgramImage::compiledLazyFunctionCount() const noexcept {
         return 0u;
     }
     return cached->lazyState->compiledLazyCount.load(std::memory_order_acquire);
+}
+
+std::size_t ProgramImage::materializedExecutionFunctionCount() const noexcept {
+    const auto* cached = executionMirrorFast_.ptr.load(std::memory_order_acquire);
+    if (!cached) {
+        return 0u;
+    }
+    std::size_t count = cached->functions.size();
+    if (cached->lazyState) {
+        std::lock_guard<std::mutex> lock(cached->lazyState->lazyExecMutex);
+        count += cached->lazyState->lazyExecMap.size();
+    }
+    return count;
 }
 
 std::size_t ProgramImage::decodedLazyChunkCacheSize() const noexcept {

@@ -959,22 +959,33 @@ runtime::Value ExecutionContext::defaultValue(
         if (!descriptor || descriptor->kind != semantic::TypeKind::Struct) {
             return runtime::StructValue{};
         }
-        if (descriptor->fieldCount <= 8u) {
+        std::uint32_t instSlotCount = 0u;
+        for (std::uint32_t index = 0; index < descriptor->fieldCount; ++index) {
+            if (!descriptor->fields[index].staticField && !descriptor->fields[index].constField) {
+                instSlotCount = index + 1u;
+            }
+        }
+        if (instSlotCount <= 8u) {
             std::array<runtime::Value, 8> fields{};
-            for (std::uint32_t index = 0; index < descriptor->fieldCount; ++index) {
+            for (std::uint32_t index = 0; index < instSlotCount; ++index) {
                 const auto& field = descriptor->fields[index];
+                if (field.staticField || field.constField) continue;
                 fields[index] = defaultValue(
                     field.type,
                     field.typeId,
                     depth + 1);
             }
             return runtime::makeStructValueFromFields(
-                typeId, runtime::ValueSpan(fields.data(), descriptor->fieldCount));
+                typeId, runtime::ValueSpan(fields.data(), instSlotCount));
         }
         std::vector<runtime::Value> fields;
-        fields.reserve(descriptor->fieldCount);
-        for (std::uint32_t index = 0; index < descriptor->fieldCount; ++index) {
+        fields.reserve(instSlotCount);
+        for (std::uint32_t index = 0; index < instSlotCount; ++index) {
             const auto& field = descriptor->fields[index];
+            if (field.staticField || field.constField) {
+                fields.emplace_back();
+                continue;
+            }
             fields.push_back(defaultValue(
                 field.type,
                 field.typeId,
@@ -2951,13 +2962,23 @@ bool ExecutionContext::newObject(
                                        std::vector<std::size_t>& outRefs) {
         outFields.clear();
         outRefs.clear();
-        outFields.reserve(type->fieldCount);
+        std::uint32_t instSlotCount = 0u;
         for (std::uint32_t index = 0; index < type->fieldCount; ++index) {
+            if (!type->fields[index].staticField && !type->fields[index].constField) {
+                instSlotCount = index + 1u;
+            }
+        }
+        outFields.reserve(instSlotCount);
+        for (std::uint32_t index = 0; index < instSlotCount; ++index) {
             const auto& field = type->fields[index];
-            outFields.push_back(defaultValue(field.type, field.typeId));
-            if (semantic::isReferenceType(field.type) ||
-                (field.type == semantic::PrimitiveType::Struct &&
-                 !runtime::makeDefaultInlineStructValue(field.typeId).has_value())) {
+            const bool isStaticOrConst = field.staticField || field.constField;
+            outFields.push_back(isStaticOrConst
+                ? runtime::Value{}
+                : defaultValue(field.type, field.typeId));
+            if (!isStaticOrConst &&
+                (semantic::isReferenceType(field.type) ||
+                 (field.type == semantic::PrimitiveType::Struct &&
+                  !runtime::makeDefaultInlineStructValue(field.typeId).has_value()))) {
                 outRefs.push_back(index);
             }
         }

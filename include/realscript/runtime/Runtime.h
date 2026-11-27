@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <type_traits>
 #include <typeindex>
 #include <functional>
@@ -2404,6 +2405,356 @@ void registerBlittableStructTypes(
     const Value& rhs,
     bool& outNeedsDemote) noexcept;
 
+namespace detail {
+
+enum class HybridScalarKind : std::uint8_t {
+    ValueSlot = 0, // Stored in contiguous Value refSlots[offsetOrSlot]
+    Bool      = 1, // 1 byte (uint8_t)
+    Byte      = 2, // 1 byte (uint8_t)
+    SByte     = 3, // 1 byte (int8_t)
+    Short     = 4, // 2 bytes (int16_t)
+    UShort    = 5, // 2 bytes (uint16_t)
+    Char      = 6, // 2 bytes (char16_t)
+    Int32     = 7, // 4 bytes (int32_t -> Value(int64_t))
+    UInt32    = 8, // 4 bytes (uint32_t -> Value(UIntValue))
+    Float32   = 9, // 4 bytes (float -> Value(FloatValue))
+    Int64     = 10,// 8 bytes (int64_t -> Value(LongValue))
+    UInt64    = 11,// 8 bytes (uint64_t -> Value(ULongValue))
+    Float64   = 12,// 8 bytes (double -> Value(double))
+    Enum32    = 13,// 4 bytes (int32_t + enumTypeId -> Value(EnumValue))
+};
+
+struct HybridFieldDesc {
+    HybridScalarKind kind = HybridScalarKind::ValueSlot;
+    std::uint8_t valueTag = 0; // static_cast<uint8_t>(ValueTag)
+    std::uint16_t reserved = 0;
+    std::uint32_t offsetOrSlot = 0; // Value slot index if ValueSlot; byte offset otherwise
+    semantic::SymbolId enumTypeId = 0;
+};
+
+struct HybridRecordLayout {
+    semantic::SymbolId typeId = 0;
+    std::uint32_t fieldCount = 0;
+    std::uint16_t refSlotCount = 0;
+    std::uint32_t scalarOffsetBytes = 0; // == refSlotCount * sizeof(Value)
+    std::uint32_t totalBytes = 0;        // rounded up to 8B multiple
+    std::vector<HybridFieldDesc> fields; // indexed by logical fieldIndex
+};
+
+[[nodiscard]] inline Value readHybridFieldRaw(
+    const Value* payloadBase,
+    const HybridFieldDesc& desc) noexcept {
+    if (desc.kind == HybridScalarKind::ValueSlot) {
+        return payloadBase[desc.offsetOrSlot];
+    }
+    const auto* bytePtr =
+        reinterpret_cast<const std::uint8_t*>(payloadBase) + desc.offsetOrSlot;
+    Value out;
+    switch (desc.kind) {
+    case HybridScalarKind::Bool: {
+        std::uint8_t b = 0;
+        std::memcpy(&b, bytePtr, sizeof(b));
+        out.storeBool(b != 0);
+        return out;
+    }
+    case HybridScalarKind::Byte: {
+        std::uint8_t v = 0;
+        std::memcpy(&v, bytePtr, sizeof(v));
+        return Value{ByteValue{v}};
+    }
+    case HybridScalarKind::SByte: {
+        std::int8_t v = 0;
+        std::memcpy(&v, bytePtr, sizeof(v));
+        return Value{SByteValue{v}};
+    }
+    case HybridScalarKind::Short: {
+        std::int16_t v = 0;
+        std::memcpy(&v, bytePtr, sizeof(v));
+        return Value{ShortValue{v}};
+    }
+    case HybridScalarKind::UShort: {
+        std::uint16_t v = 0;
+        std::memcpy(&v, bytePtr, sizeof(v));
+        return Value{UShortValue{v}};
+    }
+    case HybridScalarKind::Char: {
+        char16_t v = 0;
+        std::memcpy(&v, bytePtr, sizeof(v));
+        return Value{CharValue{v}};
+    }
+    case HybridScalarKind::Int32: {
+        std::int32_t v = 0;
+        std::memcpy(&v, bytePtr, sizeof(v));
+        out.storeInt64(static_cast<std::int64_t>(v));
+        return out;
+    }
+    case HybridScalarKind::UInt32: {
+        std::uint32_t v = 0;
+        std::memcpy(&v, bytePtr, sizeof(v));
+        return Value{UIntValue{v}};
+    }
+    case HybridScalarKind::Float32: {
+        float v = 0.0f;
+        std::memcpy(&v, bytePtr, sizeof(v));
+        out.storeFloat(v);
+        return out;
+    }
+    case HybridScalarKind::Int64: {
+        std::int64_t v = 0;
+        std::memcpy(&v, bytePtr, sizeof(v));
+        out.storeLong(v);
+        return out;
+    }
+    case HybridScalarKind::UInt64: {
+        std::uint64_t v = 0;
+        std::memcpy(&v, bytePtr, sizeof(v));
+        return Value{ULongValue{v}};
+    }
+    case HybridScalarKind::Float64: {
+        double v = 0.0;
+        std::memcpy(&v, bytePtr, sizeof(v));
+        out.storeDouble(v);
+        return out;
+    }
+    case HybridScalarKind::Enum32: {
+        std::int32_t v = 0;
+        std::memcpy(&v, bytePtr, sizeof(v));
+        return Value{EnumValue{desc.enumTypeId, static_cast<std::int64_t>(v)}};
+    }
+    case HybridScalarKind::ValueSlot:
+        return payloadBase[desc.offsetOrSlot];
+    }
+    return out;
+}
+
+[[nodiscard]] inline bool canWriteHybridFieldLosslessly(
+    const HybridFieldDesc& desc,
+    const Value& rhs) noexcept {
+    if (desc.kind == HybridScalarKind::ValueSlot) {
+        return true;
+    }
+    const ValueTag vt = rhs.rawTag();
+    switch (desc.kind) {
+    case HybridScalarKind::Bool:
+        return vt == ValueTag::Bool;
+    case HybridScalarKind::Byte:
+        return vt == ValueTag::Byte;
+    case HybridScalarKind::SByte:
+        return vt == ValueTag::SByte;
+    case HybridScalarKind::Short:
+        return vt == ValueTag::Short;
+    case HybridScalarKind::UShort:
+        return vt == ValueTag::UShort;
+    case HybridScalarKind::Char:
+        return vt == ValueTag::Char;
+    case HybridScalarKind::Int32: {
+        if (vt != ValueTag::Int64) return false;
+        const std::int64_t v = rhs.u_.int64Cell.payload;
+        return v >= std::numeric_limits<std::int32_t>::min() &&
+            v <= std::numeric_limits<std::int32_t>::max();
+    }
+    case HybridScalarKind::UInt32:
+        return vt == ValueTag::UInt;
+    case HybridScalarKind::Float32:
+        return vt == ValueTag::Float;
+    case HybridScalarKind::Int64:
+        return vt == ValueTag::Long;
+    case HybridScalarKind::UInt64:
+        return vt == ValueTag::ULong;
+    case HybridScalarKind::Float64:
+        return vt == ValueTag::Double;
+    case HybridScalarKind::Enum32: {
+        EnumValue ev{};
+        return rhs.tryGetEnum(ev) &&
+            ev.typeId == desc.enumTypeId &&
+            ev.value >= std::numeric_limits<std::int32_t>::min() &&
+            ev.value <= std::numeric_limits<std::int32_t>::max();
+    }
+    case HybridScalarKind::ValueSlot:
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] inline bool tryWriteHybridFieldRaw(
+    Value* payloadBase,
+    const HybridFieldDesc& desc,
+    const Value& rhs,
+    bool checkChanged,
+    bool& outChanged) noexcept {
+    if (desc.kind == HybridScalarKind::ValueSlot) {
+        if (checkChanged) {
+            outChanged = !(payloadBase[desc.offsetOrSlot] == rhs);
+        }
+        payloadBase[desc.offsetOrSlot] = rhs;
+        return true;
+    }
+    auto* bytePtr =
+        reinterpret_cast<std::uint8_t*>(payloadBase) + desc.offsetOrSlot;
+    const ValueTag vt = rhs.rawTag();
+    switch (desc.kind) {
+    case HybridScalarKind::Bool: {
+        if (vt != ValueTag::Bool) return false;
+        const std::uint8_t nv = rhs.u_.boolCell.payload ? 1u : 0u;
+        if (checkChanged) {
+            std::uint8_t prev = 0;
+            std::memcpy(&prev, bytePtr, sizeof(prev));
+            outChanged = (prev != nv);
+        }
+        std::memcpy(bytePtr, &nv, sizeof(nv));
+        return true;
+    }
+    case HybridScalarKind::Byte: {
+        if (vt != ValueTag::Byte) return false;
+        const std::uint8_t nv = rhs.u_.byteCell.payload.value;
+        if (checkChanged) {
+            std::uint8_t prev = 0;
+            std::memcpy(&prev, bytePtr, sizeof(prev));
+            outChanged = (prev != nv);
+        }
+        std::memcpy(bytePtr, &nv, sizeof(nv));
+        return true;
+    }
+    case HybridScalarKind::SByte: {
+        if (vt != ValueTag::SByte) return false;
+        const std::int8_t nv = rhs.u_.sbyteCell.payload.value;
+        if (checkChanged) {
+            std::int8_t prev = 0;
+            std::memcpy(&prev, bytePtr, sizeof(prev));
+            outChanged = (prev != nv);
+        }
+        std::memcpy(bytePtr, &nv, sizeof(nv));
+        return true;
+    }
+    case HybridScalarKind::Short: {
+        if (vt != ValueTag::Short) return false;
+        const std::int16_t nv = rhs.u_.shortCell.payload.value;
+        if (checkChanged) {
+            std::int16_t prev = 0;
+            std::memcpy(&prev, bytePtr, sizeof(prev));
+            outChanged = (prev != nv);
+        }
+        std::memcpy(bytePtr, &nv, sizeof(nv));
+        return true;
+    }
+    case HybridScalarKind::UShort: {
+        if (vt != ValueTag::UShort) return false;
+        const std::uint16_t nv = rhs.u_.ushortCell.payload.value;
+        if (checkChanged) {
+            std::uint16_t prev = 0;
+            std::memcpy(&prev, bytePtr, sizeof(prev));
+            outChanged = (prev != nv);
+        }
+        std::memcpy(bytePtr, &nv, sizeof(nv));
+        return true;
+    }
+    case HybridScalarKind::Char: {
+        if (vt != ValueTag::Char) return false;
+        const char16_t nv = rhs.u_.charCell.payload.value;
+        if (checkChanged) {
+            char16_t prev = 0;
+            std::memcpy(&prev, bytePtr, sizeof(prev));
+            outChanged = (prev != nv);
+        }
+        std::memcpy(bytePtr, &nv, sizeof(nv));
+        return true;
+    }
+    case HybridScalarKind::Int32: {
+        if (vt != ValueTag::Int64) return false;
+        const std::int64_t raw64 = rhs.u_.int64Cell.payload;
+        if (raw64 < std::numeric_limits<std::int32_t>::min() ||
+            raw64 > std::numeric_limits<std::int32_t>::max()) {
+            return false;
+        }
+        const std::int32_t nv = static_cast<std::int32_t>(raw64);
+        if (checkChanged) {
+            std::int32_t prev = 0;
+            std::memcpy(&prev, bytePtr, sizeof(prev));
+            outChanged = (prev != nv);
+        }
+        std::memcpy(bytePtr, &nv, sizeof(nv));
+        return true;
+    }
+    case HybridScalarKind::UInt32: {
+        if (vt != ValueTag::UInt) return false;
+        const std::uint32_t nv = rhs.u_.uintCell.payload.value;
+        if (checkChanged) {
+            std::uint32_t prev = 0;
+            std::memcpy(&prev, bytePtr, sizeof(prev));
+            outChanged = (prev != nv);
+        }
+        std::memcpy(bytePtr, &nv, sizeof(nv));
+        return true;
+    }
+    case HybridScalarKind::Float32: {
+        if (vt != ValueTag::Float) return false;
+        const float nv = rhs.u_.floatCell.payload.value;
+        if (checkChanged) {
+            float prev = 0.0f;
+            std::memcpy(&prev, bytePtr, sizeof(prev));
+            outChanged = !(prev == nv);
+        }
+        std::memcpy(bytePtr, &nv, sizeof(nv));
+        return true;
+    }
+    case HybridScalarKind::Int64: {
+        if (vt != ValueTag::Long) return false;
+        const std::int64_t nv = rhs.u_.longCell.payload.value;
+        if (checkChanged) {
+            std::int64_t prev = 0;
+            std::memcpy(&prev, bytePtr, sizeof(prev));
+            outChanged = (prev != nv);
+        }
+        std::memcpy(bytePtr, &nv, sizeof(nv));
+        return true;
+    }
+    case HybridScalarKind::UInt64: {
+        if (vt != ValueTag::ULong) return false;
+        const std::uint64_t nv = rhs.u_.ulongCell.payload.value;
+        if (checkChanged) {
+            std::uint64_t prev = 0;
+            std::memcpy(&prev, bytePtr, sizeof(prev));
+            outChanged = (prev != nv);
+        }
+        std::memcpy(bytePtr, &nv, sizeof(nv));
+        return true;
+    }
+    case HybridScalarKind::Float64: {
+        if (vt != ValueTag::Double) return false;
+        const double nv = rhs.u_.doubleCell.payload;
+        if (checkChanged) {
+            double prev = 0.0;
+            std::memcpy(&prev, bytePtr, sizeof(prev));
+            outChanged = !(prev == nv);
+        }
+        std::memcpy(bytePtr, &nv, sizeof(nv));
+        return true;
+    }
+    case HybridScalarKind::Enum32: {
+        EnumValue ev{};
+        if (!rhs.tryGetEnum(ev) ||
+            ev.typeId != desc.enumTypeId ||
+            ev.value < std::numeric_limits<std::int32_t>::min() ||
+            ev.value > std::numeric_limits<std::int32_t>::max()) {
+            return false;
+        }
+        const std::int32_t nv = static_cast<std::int32_t>(ev.value);
+        if (checkChanged) {
+            std::int32_t prev = 0;
+            std::memcpy(&prev, bytePtr, sizeof(prev));
+            outChanged = (prev != nv);
+        }
+        std::memcpy(bytePtr, &nv, sizeof(nv));
+        return true;
+    }
+    case HybridScalarKind::ValueSlot:
+        return true;
+    }
+    return false;
+}
+
+} // namespace detail
+
 struct FlatStructArrayFastView {
     Value* data = nullptr;
     std::uint8_t* dirtyCards = nullptr;
@@ -2440,7 +2791,19 @@ struct ObjectFastView {
     std::uint32_t fieldCount = 0;
     semantic::SymbolId typeId = 0;
     bool needsRememberedBarrier = false;
+    const detail::HybridRecordLayout* hybridLayout = nullptr;
 };
+
+namespace detail {
+[[nodiscard]] inline Value loadObjectFastViewField(
+    const ObjectFastView& view,
+    std::size_t fieldIndex) noexcept {
+    if (!view.hybridLayout) {
+        return view.fields[fieldIndex];
+    }
+    return readHybridFieldRaw(view.fields, view.hybridLayout->fields[fieldIndex]);
+}
+} // namespace detail
 
 using RootSet = ShadowStack;
 
@@ -2636,7 +2999,9 @@ public:
         std::size_t fieldCount,
         const std::shared_ptr<const std::vector<std::size_t>>& referenceFields,
         RuntimeError* error = nullptr,
-        bool* outSlotsReallocated = nullptr);
+        bool* outSlotsReallocated = nullptr,
+        const std::shared_ptr<const detail::HybridRecordLayout>& hybridLayout = nullptr,
+        const std::uint8_t* defaultHybridBytes = nullptr);
 
     [[nodiscard]] bool isAlive(ObjectRef reference) const noexcept;
     [[nodiscard]] std::optional<std::string_view> stringView(ObjectRef reference) const;
@@ -2778,9 +3143,15 @@ public:
         RuntimeError* error = nullptr);
     [[nodiscard]] std::optional<std::size_t> fieldCount(ObjectRef reference) const;
     [[nodiscard]] bool isInlineRecordObject(ObjectRef reference) const noexcept;
+    [[nodiscard]] bool isHybridRecordObject(ObjectRef reference) const noexcept;
     [[nodiscard]] std::optional<semantic::SymbolId> objectTypeId(
         ObjectRef reference) const;
     [[nodiscard]] std::optional<Value> fieldGet(ObjectRef reference, std::size_t index) const;
+    [[nodiscard]] bool fieldGetInto(
+        ObjectRef reference,
+        std::size_t index,
+        Value& outValue,
+        semantic::SymbolId* outTypeId = nullptr) const noexcept;
     [[nodiscard]] const Value* fieldGetFast(
         ObjectRef reference,
         std::size_t index,
@@ -3872,8 +4243,50 @@ public:
     void compactForRuntime();
     void releaseTransientLazyCaches() const noexcept;
 
+    struct LazyFunctionLocTable {
+        static constexpr std::uint32_t InvalidIndex =
+            std::numeric_limits<std::uint32_t>::max();
+        std::vector<std::vector<std::uint32_t>> byModuleFunction;
+        std::size_t count = 0;
+
+        void clear() noexcept {
+            byModuleFunction.clear();
+            count = 0;
+        }
+
+        [[nodiscard]] std::uint32_t find(
+            const std::vector<bytecode::Module>& modules,
+            const bytecode::Function* fn) const noexcept {
+            if (!fn) {
+                return InvalidIndex;
+            }
+            const auto fnAddr = reinterpret_cast<std::uintptr_t>(fn);
+            const std::size_t nMods = std::min(byModuleFunction.size(), modules.size());
+            for (std::size_t m = 0u; m < nMods; ++m) {
+                const auto& fns = modules[m].functions;
+                if (fns.empty()) {
+                    continue;
+                }
+                const auto baseAddr = reinterpret_cast<std::uintptr_t>(fns.data());
+                const auto endAddr = reinterpret_cast<std::uintptr_t>(fns.data() + fns.size());
+                if (fnAddr >= baseAddr && fnAddr < endAddr) {
+                    const std::size_t byteOff = static_cast<std::size_t>(fnAddr - baseAddr);
+                    if ((byteOff % sizeof(bytecode::Function)) == 0u) {
+                        const std::size_t idx = byteOff / sizeof(bytecode::Function);
+                        if (idx < byModuleFunction[m].size()) {
+                            return byModuleFunction[m][idx];
+                        }
+                    }
+                    return InvalidIndex;
+                }
+            }
+            return InvalidIndex;
+        }
+    };
+
     [[nodiscard]] std::size_t totalLazyFunctionCount() const noexcept;
     [[nodiscard]] std::size_t compiledLazyFunctionCount() const noexcept;
+    [[nodiscard]] std::size_t materializedExecutionFunctionCount() const noexcept;
     [[nodiscard]] std::size_t decodedLazyChunkCacheSize() const noexcept;
     [[nodiscard]] std::size_t evictedLazyChunkCount() const noexcept;
 
@@ -3941,7 +4354,7 @@ private:
     std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*> types_;
     std::shared_ptr<const bytecode::LazyBytecodeBundle> lazyBaseBundle_;
     std::size_t baseModuleCount_ = 0;
-    std::unordered_map<const bytecode::Function*, std::uint32_t> lazyFuncLocIndex_;
+    LazyFunctionLocTable lazyFuncLocTable_;
     mutable std::shared_ptr<std::once_flag> executionMirrorOnce_ = std::make_shared<std::once_flag>();
     mutable std::shared_ptr<const detail::ExecutionMirror> executionMirror_;
     AtomicMirrorCache executionMirrorFast_{};

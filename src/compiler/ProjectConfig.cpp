@@ -1193,6 +1193,12 @@ public:
                             ev.attributes,
                             typeName + "." + ev.identifierToken.text,
                             ev.span());
+                        if (ev.addAccessor && ev.addAccessor->body) {
+                            visitStmt(ev.addAccessor->body.get(), ev.identifierToken.text);
+                        }
+                        if (ev.removeAccessor && ev.removeAccessor->body) {
+                            visitStmt(ev.removeAccessor->body.get(), ev.identifierToken.text);
+                        }
                     }
                     for (const auto& prop : rec.properties) {
                         emitAttrMacros(

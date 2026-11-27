@@ -10,12 +10,18 @@
 
 namespace realscript::aot {
 
+enum class AotEmitMode : std::uint8_t {
+    FullMultiTier = 0,
+    TrustedReleaseOnly = 1,
+};
+
 struct GenerationOptions {
     std::string programName = "RealScriptProgram";
     std::string cppNamespace = "realscript_generated";
     std::string querySymbol = "rs_module_query_v1";
     bool emitLineDirectives = true;
     bool trustedRelease = false;
+    AotEmitMode emitMode = AotEmitMode::FullMultiTier;
     bool enableSharedReferenceGenerics = true;
     bool emitHotPatchThunks = false;
     bool collectOptimizationRemarks = false;
@@ -57,6 +63,8 @@ struct GeneratedProgram {
     std::uint64_t contentHash = 0;
     std::size_t sharedGenericBodyCount = 0;
     std::size_t foldedGenericFunctionCount = 0;
+    std::size_t uniqueCallSignatureCount = 0;
+    std::size_t sharedPolyDispatchHelperCount = 0;
     std::vector<OptimizationRemark> optimizationRemarks;
 };
 

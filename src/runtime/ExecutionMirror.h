@@ -638,6 +638,8 @@ struct ObjectAllocationTemplate {
     semantic::SymbolId typeId = 0;
     std::vector<Value> defaultFields;
     std::shared_ptr<const std::vector<std::size_t>> referenceFields;
+    std::shared_ptr<const detail::HybridRecordLayout> hybridLayout;
+    std::vector<std::uint8_t> defaultHybridBytes;
 };
 
 enum class TrivialMethodKind : std::uint8_t {
@@ -859,6 +861,10 @@ struct LazyCompileState {
     const std::vector<bytecode::Module>* modules = nullptr;
     const std::unordered_map<semantic::SymbolId, ProgramImage::FunctionLocation>* functions = nullptr;
     const std::unordered_map<semantic::SymbolId, const semantic::TypeSymbol*>* types = nullptr;
+    const ProgramImage::LazyFunctionLocTable* lazyFuncLocTable = nullptr;
+    mutable std::mutex lazyExecMutex; // Leaf lock: never acquires mutex or typeDispatchMutex
+    StablePagedVector<ExecutionFunction, 64> lazyExecStorage;
+    std::unordered_map<const bytecode::Function*, const ExecutionFunction*> lazyExecMap;
     std::unordered_map<std::string, std::uint32_t> stringLiteralMap;
     std::unordered_map<semantic::SymbolId, std::uint16_t> objectTemplateByTypeId;
     std::unordered_map<
@@ -957,13 +963,27 @@ struct ExecutionMirror {
     const std::unordered_map<
         semantic::SymbolId, const semantic::TypeSymbol*>& types,
     const std::shared_ptr<const bytecode::LazyBytecodeBundle>& lazyBaseBundle = nullptr,
-    const std::unordered_map<const bytecode::Function*, std::uint32_t>* lazyFuncLocIndex = nullptr);
+    const ProgramImage::LazyFunctionLocTable* lazyFuncLocTable = nullptr);
+
+[[nodiscard]] const ExecutionFunction* findOrCreateLazyExecutionFunction(
+    const ExecutionMirror& mirror,
+    const bytecode::Function& function) noexcept;
+
+[[nodiscard]] const ExecutionFunction* findExistingExecutionFunction(
+    const ExecutionMirror& mirror,
+    const bytecode::Function& function) noexcept;
 
 [[nodiscard]] inline const ExecutionFunction* findExecutionFunction(
     const ExecutionMirror& mirror,
     const bytecode::Function& function) noexcept {
     const auto found = mirror.functions.find(&function);
-    return found == mirror.functions.end() ? nullptr : &found->second;
+    if (found != mirror.functions.end()) {
+        return &found->second;
+    }
+    if (mirror.lazyState != nullptr) {
+        return findOrCreateLazyExecutionFunction(mirror, function);
+    }
+    return nullptr;
 }
 
 [[nodiscard]] inline const ExecutionBlock* findExecutionBlock(

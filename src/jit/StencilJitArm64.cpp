@@ -1070,6 +1070,12 @@ private:
         case FO::CallDirectN:
         case FO::CallPolledFast:
         case FO::SuperCheckNotNullCallPolledFast:
+        case FO::IsTypeObjFast:
+        case FO::AsTypeObjFast:
+        case FO::NewDelegateFast:
+        case FO::CombineDelegateFast:
+        case FO::RemoveDelegateFast:
+        case FO::InvokeDelegateFast:
         case FO::GenericBytecode:
             emitHelperCallInline(&jitFlatStructAndStackRefHelper, i32Idx);
             break;

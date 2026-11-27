@@ -107,6 +107,7 @@ void usage() {
         << "  --no-line-directives\n"
         << "  --no-shared-generics\n"
         << "  --trusted-release\n"
+        << "  --emit-mode <full|trusted-release-only>\n"
         << "  --help\n"
         << "  --version\n";
 }
@@ -330,6 +331,17 @@ int main(int argc, char** argv) {
                 options.enableSharedReferenceGenerics = false;
             } else if (argument == "--trusted-release") {
                 options.trustedRelease = true;
+            } else if (argument == "--emit-mode" || argument.rfind("--emit-mode=", 0) == 0) {
+                const auto modeStr = (argument == "--emit-mode")
+                    ? requireValue("--emit-mode")
+                    : argument.substr(12);
+                if (modeStr == "full") {
+                    options.emitMode = realscript::aot::AotEmitMode::FullMultiTier;
+                } else if (modeStr == "trusted-release-only") {
+                    options.emitMode = realscript::aot::AotEmitMode::TrustedReleaseOnly;
+                } else {
+                    throw std::runtime_error("--emit-mode must be 'full' or 'trusted-release-only'");
+                }
             } else if (argument.rfind("--", 0) == 0) {
                 throw std::runtime_error("unknown option: " + argument);
             } else {

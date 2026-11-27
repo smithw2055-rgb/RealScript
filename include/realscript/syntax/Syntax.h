@@ -995,13 +995,26 @@ struct FieldDeclarationSyntax final : SyntaxNode {
 struct FunctionDeclarationSyntax;
 struct SequenceDeclarationSyntax;
 
+struct AccessorDeclarationSyntax final : SyntaxNode {
+    SyntaxToken keyword;
+    std::optional<SyntaxToken> semicolonToken;
+    std::unique_ptr<BlockStatementSyntax> body;
+
+    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::AccessorDeclaration; }
+    [[nodiscard]] text::TextSpan span() const noexcept override;
+};
+
 struct EventDeclarationSyntax final : SyntaxNode {
     std::vector<AttributeListSyntax> attributes;
     std::vector<SyntaxToken> modifiers;
     SyntaxToken eventKeyword;
     TypeSyntax delegateType;
     SyntaxToken identifierToken;
-    SyntaxToken semicolonToken;
+    std::optional<SyntaxToken> semicolonToken;
+    std::optional<SyntaxToken> openBraceToken;
+    std::unique_ptr<AccessorDeclarationSyntax> addAccessor;
+    std::unique_ptr<AccessorDeclarationSyntax> removeAccessor;
+    std::optional<SyntaxToken> closeBraceToken;
     std::string originSourceName;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override {
@@ -1029,15 +1042,6 @@ struct ConstructorDeclarationSyntax final : SyntaxNode {
     std::string originSourceName;
 
     [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::ConstructorDeclaration; }
-    [[nodiscard]] text::TextSpan span() const noexcept override;
-};
-
-struct AccessorDeclarationSyntax final : SyntaxNode {
-    SyntaxToken keyword;
-    std::optional<SyntaxToken> semicolonToken;
-    std::unique_ptr<BlockStatementSyntax> body;
-
-    [[nodiscard]] SyntaxKind kind() const noexcept override { return SyntaxKind::AccessorDeclaration; }
     [[nodiscard]] text::TextSpan span() const noexcept override;
 };
 
@@ -1462,6 +1466,7 @@ private:
 [[nodiscard]] BlockStatementSyntax cloneBlockStatementSyntax(const BlockStatementSyntax& value);
 [[nodiscard]] ParameterSyntax cloneParameterSyntax(const ParameterSyntax& value);
 [[nodiscard]] FieldDeclarationSyntax cloneFieldDeclarationSyntax(const FieldDeclarationSyntax& value);
+[[nodiscard]] EventDeclarationSyntax cloneEventDeclarationSyntax(const EventDeclarationSyntax& value);
 [[nodiscard]] ConstructorDeclarationSyntax cloneConstructorDeclarationSyntax(const ConstructorDeclarationSyntax& value);
 [[nodiscard]] PropertyDeclarationSyntax clonePropertyDeclarationSyntax(const PropertyDeclarationSyntax& value);
 [[nodiscard]] SequenceDeclarationSyntax cloneSequenceDeclarationSyntax(const SequenceDeclarationSyntax& value);

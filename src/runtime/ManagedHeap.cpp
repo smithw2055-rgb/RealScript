@@ -767,6 +767,7 @@ enum class SlotStorage : std::uint8_t {
     PackedI64    = 9,  // 8 bytes/element (long, ulong, double, wide-int/enum -> 2x compression)
     PackedStruct = 10, // Contiguous flat math vectors & blittable user structs (0 GC scan)
     FlatStruct   = 11, // Contiguous multi-Value-slot user structs (supports ObjectRef/String/Array + CardTable)
+    HybridRecord = 12, // Contiguous ref ValueSlots followed by tightly packed scalar primitives
 };
 
 [[nodiscard]] constexpr bool isPackedStorage(SlotStorage st) noexcept {
@@ -2422,6 +2423,7 @@ struct TypeLayoutEntry {
     std::vector<std::size_t> referenceFields;
     std::vector<std::uint8_t> flattenedFieldDirtyBits;
     std::vector<std::uint64_t> flattenedFieldDirtyMasks;
+    std::shared_ptr<const detail::HybridRecordLayout> hybridLayout;
 };
 
 struct ArrayLayoutKey {
@@ -2719,13 +2721,23 @@ public:
 
         void ensureZeroed(std::size_t byteSize) {
             if (byteSize == 0) return;
+            ensureCapacity(byteSize);
+            std::memset(ptr, 0, byteSize);
+        }
+
+        void ensureCopy(const void* src, std::size_t byteSize) {
+            if (byteSize == 0) return;
+            ensureCapacity(byteSize);
+            std::memcpy(ptr, src, byteSize);
+        }
+
+        void ensureCapacity(std::size_t byteSize) {
             if (cap < byteSize || cap > byteSize * 4u) {
                 reset();
                 ptr = static_cast<std::uint8_t*>(
                     ::operator new(byteSize, std::align_val_t{kAlignment}));
                 cap = byteSize;
             }
-            std::memset(ptr, 0, byteSize);
         }
 
         void reset() noexcept {
@@ -2751,6 +2763,27 @@ public:
             blocks_.emplace_back();
         }
         blocks_[id].ensureZeroed(byteSize);
+        outAlignedPtr = reinterpret_cast<Value*>(blocks_[id].ptr);
+        return id;
+    }
+
+    std::uint32_t acquireCopy(
+        const void* src,
+        std::size_t byteSize,
+        Value*& outAlignedPtr) {
+        if (byteSize == 0) {
+            outAlignedPtr = reinterpret_cast<Value*>(gEmptyPackedSentinel);
+            return CompactSlot::kInvalidHandle;
+        }
+        std::uint32_t id = 0;
+        if (!freeIds_.empty()) {
+            id = freeIds_.back();
+            freeIds_.pop_back();
+        } else {
+            id = static_cast<std::uint32_t>(blocks_.size());
+            blocks_.emplace_back();
+        }
+        blocks_[id].ensureCopy(src, byteSize);
         outAlignedPtr = reinterpret_cast<Value*>(blocks_[id].ptr);
         return id;
     }
@@ -3270,6 +3303,9 @@ struct ManagedHeap::Impl {
         outView.typeId = layout.typeId;
         outView.needsRememberedBarrier =
             (!slot->hasFlag(GcFlag::InNursery) && !slot->hasFlag(GcFlag::InRememberedSet));
+        outView.hybridLayout = (slot->storage() == SlotStorage::HybridRecord)
+            ? layout.hybridLayout.get()
+            : nullptr;
         outMayNotifyDirty = self->hasDirtyTrackingTypes &&
             (slot->hasFlag(GcFlag::HasObserver) ||
              layout.resolvedDirtyEpoch != self->dirtyConfigEpoch ||
@@ -3448,6 +3484,9 @@ struct ManagedHeap::Impl {
         if (st == SlotStorage::SlabValues || st == SlotStorage::HeapValues) {
             return slot.payload.s.length;
         }
+        if (st == SlotStorage::HybridRecord) {
+            return slot.auxMeta;
+        }
         if (st == SlotStorage::FlatStruct) {
             const auto* sc = getFlatStructSchema(slot.auxMeta);
             return sc ? static_cast<std::size_t>(slot.payload.s.length) * sc->flatSlotCount : 0u;
@@ -3478,6 +3517,8 @@ struct ManagedHeap::Impl {
         case SlotStorage::SlabValues:
         case SlotStorage::HeapValues:
             return BaseObjectSizeBytes + static_cast<std::size_t>(slot.payload.s.length) * sizeof(Value);
+        case SlotStorage::HybridRecord:
+            return BaseObjectSizeBytes + static_cast<std::size_t>(slot.payload.s.cardHandle);
         case SlotStorage::FlatStruct:
             return BaseObjectSizeBytes + slotValueCount(slot) * sizeof(Value);
         case SlotStorage::PackedB8:
@@ -3527,6 +3568,7 @@ struct ManagedHeap::Impl {
         case SlotStorage::PackedI32:
         case SlotStorage::PackedI64:
         case SlotStorage::PackedStruct:
+        case SlotStorage::HybridRecord:
             packedBuffers.release(slot.payload.s.handle);
             break;
         case SlotStorage::RawColumn:
@@ -3600,6 +3642,7 @@ struct ManagedHeap::Impl {
         const std::vector<std::size_t>& refFields) {
         const auto it = sharedRecordLayoutByTypeId.find(typeId);
         if (it != sharedRecordLayoutByTypeId.end() &&
+            typeLayouts[it->second].hybridLayout == nullptr &&
             typeLayouts[it->second].referenceFields == refFields) {
             lastRegisteredLayoutTypeId = typeId;
             lastRegisteredLayoutId = it->second;
@@ -3625,11 +3668,13 @@ struct ManagedHeap::Impl {
         const auto& wantedRefs = referenceFields ? *referenceFields : kEmptyRefs;
         if (typeId != 0) {
             if (typeId == lastRegisteredLayoutTypeId && lastRegisteredLayoutId != 0 &&
+                typeLayouts[lastRegisteredLayoutId].hybridLayout == nullptr &&
                 typeLayouts[lastRegisteredLayoutId].referenceFields == wantedRefs) {
                 return lastRegisteredLayoutId;
             }
             const auto it = sharedRecordLayoutByTypeId.find(typeId);
             if (it != sharedRecordLayoutByTypeId.end() &&
+                typeLayouts[it->second].hybridLayout == nullptr &&
                 typeLayouts[it->second].referenceFields == wantedRefs) {
                 lastRegisteredLayoutTypeId = typeId;
                 lastRegisteredLayoutId = it->second;
@@ -3650,6 +3695,35 @@ struct ManagedHeap::Impl {
         }
         lastRegisteredLayoutTypeId = typeId;
         lastRegisteredLayoutId = id;
+        return id;
+    }
+
+    std::uint32_t internHybridRecordLayout(
+        semantic::SymbolId typeId,
+        const std::shared_ptr<const std::vector<std::size_t>>& referenceFields,
+        const std::shared_ptr<const detail::HybridRecordLayout>& hybridLayout) {
+        const auto hIt = hybridRecordLayoutByPtr.find(hybridLayout.get());
+        if (hIt != hybridRecordLayoutByPtr.end()) {
+            const auto existingId = hIt->second;
+            if (existingId < typeLayouts.size() &&
+                typeLayouts[existingId].typeId == typeId &&
+                typeLayouts[existingId].hybridLayout.get() == hybridLayout.get()) {
+                return existingId;
+            }
+        }
+        static const std::vector<std::size_t> kEmptyRefs;
+        const auto& wantedRefs = referenceFields ? *referenceFields : kEmptyRefs;
+        TypeLayoutEntry entry;
+        entry.typeId = typeId;
+        if (!wantedRefs.empty()) {
+            entry.referenceFields = wantedRefs;
+            entry.mayContainReferences = true;
+        }
+        entry.hybridLayout = hybridLayout;
+        const auto id = static_cast<std::uint32_t>(typeLayouts.size());
+        typeLayouts.push_back(std::move(entry));
+        ensureLayoutDirtyMetadataUnlocked(typeLayouts.back());
+        hybridRecordLayoutByPtr[hybridLayout.get()] = id;
         return id;
     }
 
@@ -3712,6 +3786,7 @@ struct ManagedHeap::Impl {
 
     std::vector<TypeLayoutEntry> typeLayouts;
     std::unordered_map<semantic::SymbolId, std::uint32_t> sharedRecordLayoutByTypeId;
+    std::unordered_map<const detail::HybridRecordLayout*, std::uint32_t> hybridRecordLayoutByPtr;
     std::unordered_map<ArrayLayoutKey, std::uint32_t, ArrayLayoutKeyHash> arrayLayoutByKey;
     std::unordered_map<std::size_t, std::uint32_t> untypedDenseRecordLayouts;
     std::vector<std::uint32_t> untypedCustomRecordLayouts;
@@ -3898,6 +3973,15 @@ struct ManagedHeap::Impl {
                 return;
             }
             for (std::uint32_t i = 0; i < slot.payload.s.length; ++i) {
+                collectValueLifecycleValuesUnlocked(slot.payload.s.data[i]);
+            }
+            return;
+        }
+        if (st == SlotStorage::HybridRecord) {
+            if (!slot.payload.s.data) {
+                return;
+            }
+            for (std::uint16_t i = 0; i < slot.auxMeta; ++i) {
                 collectValueLifecycleValuesUnlocked(slot.payload.s.data[i]);
             }
             return;
@@ -5207,7 +5291,8 @@ struct ManagedHeap::Impl {
                 slot.generation,
                 ObjectKind::Record,
                 heapId);
-            for (std::uint32_t fi = 0; fi < slot.payload.s.length; ++fi) {
+            const std::size_t valCount = slotValueCount(slot);
+            for (std::size_t fi = 0; fi < valCount; ++fi) {
                 const auto& fv = slot.payload.s.data[fi];
                 if (const auto* nh = std::get_if<NativeHandle>(&fv); nh && nh->valid()) {
                     const bool duplicate = std::any_of(
@@ -5377,9 +5462,56 @@ struct ManagedHeap::Impl {
             for (std::size_t i = 0; i < count; ++i) markValue(data[i]);
             return;
         }
+        if (slot->storage() == SlotStorage::HybridRecord) {
+            for (std::size_t i = 0; i < count; ++i) markValue(data[i]);
+            return;
+        }
         for (const auto index : layout.referenceFields) {
             if (index < count) markValue(data[index]);
         }
+    }
+
+    bool demoteHybridToHeapValuesUnlocked(std::uint32_t slotIdx, CompactSlot& slot) noexcept {
+        if (slot.kind() != ObjectKind::Record ||
+            slot.storage() != SlotStorage::HybridRecord) {
+            return false;
+        }
+        const auto& layout = typeLayouts[slot.payload.s.layoutId];
+        const auto* hl = layout.hybridLayout.get();
+        if (!hl || hl->fieldCount != slot.payload.s.length) {
+            return false;
+        }
+        const std::size_t count = slot.payload.s.length;
+        std::vector<Value> unpacked(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            unpacked[i] = detail::readHybridFieldRaw(slot.payload.s.data, hl->fields[i]);
+        }
+        const std::size_t oldBytes = slotSizeBytes(slotIdx, slot);
+        const std::size_t newBytes = BaseObjectSizeBytes + count * sizeof(Value);
+        const std::uint32_t oldHandle = slot.payload.s.handle;
+        Value* newPtr = nullptr;
+        const std::uint32_t newHandle = largeBuffers.acquireMove(std::move(unpacked), newPtr);
+        packedBuffers.release(oldHandle);
+        slot.setKindAndStorage(ObjectKind::Record, SlotStorage::HeapValues);
+        slot.auxMeta = 0;
+        slot.payload.s.data = newPtr;
+        slot.payload.s.handle = newHandle;
+        slot.payload.s.cardHandle = CompactSlot::kInvalidHandle;
+        if (!slot.hasFlag(GcFlag::CustomSize)) {
+            if (newBytes >= oldBytes) {
+                const std::size_t delta = newBytes - oldBytes;
+                statistics.liveBytes += delta;
+                statistics.bytesAllocated += delta;
+                statistics.peakLiveBytes = std::max(statistics.peakLiveBytes, statistics.liveBytes);
+            } else {
+                const std::size_t delta = oldBytes - newBytes;
+                statistics.liveBytes = (statistics.liveBytes >= delta) ? (statistics.liveBytes - delta) : 0;
+                statistics.bytesReclaimed += delta;
+            }
+        }
+        gcAndLayoutEpoch.fetch_add(1, std::memory_order_release);
+        objectViewEpoch.fetch_add(1, std::memory_order_release);
+        return true;
     }
 
     void writeBarrierObject(ObjectRef owner, const Value& value) noexcept {
@@ -6233,23 +6365,54 @@ std::optional<ObjectRef> ManagedHeap::allocateObjectFromTemplate(
     std::size_t fieldCount,
     const std::shared_ptr<const std::vector<std::size_t>>& referenceFields,
     RuntimeError* error,
-    bool* outSlotsReallocated) {
+    bool* outSlotsReallocated,
+    const std::shared_ptr<const detail::HybridRecordLayout>& hybridLayout,
+    const std::uint8_t* defaultHybridBytes) {
     if (typeId == 0) {
         setHeapError(error, ErrorCode::InvalidArguments,
             "managed object type ID must be non-zero");
         return std::nullopt;
     }
-    const auto storage = estimateValueStorage(fieldCount);
+    const bool useHybrid =
+        hybridLayout != nullptr &&
+        defaultHybridBytes != nullptr &&
+        hybridLayout->totalBytes > 0u &&
+        hybridLayout->fieldCount == fieldCount;
+    const auto storage = useHybrid
+        ? static_cast<std::size_t>(hybridLayout->totalBytes)
+        : estimateValueStorage(fieldCount);
     if (storage == std::numeric_limits<std::size_t>::max()) {
         setHeapError(error, ErrorCode::OutOfMemory, "managed object is too large");
         return std::nullopt;
     }
     ScopedValuePoolDomain domainScope(impl_->valuePoolDomain.get());
     HeapSyncMutexGuard heapLock(impl_->syncState->mutex);
-    const std::uint32_t layoutId = impl_->internTemplateRecordLayout(typeId, referenceFields);
+    const std::uint32_t layoutId = useHybrid
+        ? impl_->internHybridRecordLayout(typeId, referenceFields, hybridLayout)
+        : impl_->internTemplateRecordLayout(typeId, referenceFields);
     const std::size_t sizeBytes = Impl::BaseObjectSizeBytes + storage;
     const auto slotIndex = impl_->acquireSlot(sizeBytes, error, outSlotsReallocated);
     if (!slotIndex) return std::nullopt;
+    if (useHybrid) {
+        const auto* defaultRefVals = reinterpret_cast<const Value*>(defaultHybridBytes);
+        for (std::uint16_t i = 0; i < hybridLayout->refSlotCount; ++i) {
+            impl_->pinHeapValueIfNeededUnlocked(defaultRefVals[i]);
+        }
+        auto& slot = impl_->slots[*slotIndex];
+        Value* ptr = nullptr;
+        const std::uint32_t handle =
+            impl_->packedBuffers.acquireCopy(defaultHybridBytes, hybridLayout->totalBytes, ptr);
+        slot.auxMeta = hybridLayout->refSlotCount;
+        slot.payload.s = {
+            layoutId,
+            static_cast<std::uint32_t>(fieldCount),
+            ptr,
+            handle,
+            hybridLayout->totalBytes,
+        };
+        return impl_->finalizeSlotAllocation(
+            *slotIndex, ObjectKind::Record, SlotStorage::HybridRecord, sizeBytes);
+    }
     for (std::size_t i = 0; i < fieldCount; ++i) {
         impl_->pinHeapValueIfNeededUnlocked(defaultFields[i]);
     }
@@ -7232,6 +7395,9 @@ bool ManagedHeap::tryBindObjectFastView(ObjectRef reference, ObjectFastView& out
     outView.typeId = layout.typeId;
     outView.needsRememberedBarrier =
         (!slot->hasFlag(GcFlag::InNursery) && !slot->hasFlag(GcFlag::InRememberedSet));
+    outView.hybridLayout = (slot->storage() == SlotStorage::HybridRecord)
+        ? layout.hybridLayout.get()
+        : nullptr;
     return true;
 }
 
@@ -8162,12 +8328,48 @@ bool ManagedHeap::isInlineRecordObject(ObjectRef reference) const noexcept {
         slot->storage() == SlotStorage::SlabValues;
 }
 
+bool ManagedHeap::isHybridRecordObject(ObjectRef reference) const noexcept {
+    HeapReadOrDisjointGuard heapLock(*impl_->syncState);
+    const auto* slot = impl_->getSlot(reference);
+    return slot && slot->kind() == ObjectKind::Record &&
+        slot->storage() == SlotStorage::HybridRecord;
+}
+
 std::optional<Value> ManagedHeap::fieldGet(ObjectRef reference, std::size_t index) const {
     HeapReadOrDisjointGuard heapLock(*impl_->syncState);
     const auto* slot = impl_->getSlot(reference);
     if (!slot || slot->kind() != ObjectKind::Record) return std::nullopt;
     if (index >= slot->payload.s.length) return std::nullopt;
+    if (slot->storage() == SlotStorage::HybridRecord) {
+        const auto* hl = impl_->typeLayouts[slot->payload.s.layoutId].hybridLayout.get();
+        if (!hl || index >= hl->fields.size()) return std::nullopt;
+        return detail::readHybridFieldRaw(slot->payload.s.data, hl->fields[index]);
+    }
     return slot->payload.s.data[index];
+}
+
+bool ManagedHeap::fieldGetInto(
+    ObjectRef reference,
+    std::size_t index,
+    Value& outValue,
+    semantic::SymbolId* outTypeId) const noexcept {
+    HeapReadOrDisjointGuard heapLock(*impl_->syncState);
+    const auto* slot = impl_->getSlot(reference);
+    if (!slot || slot->kind() != ObjectKind::Record ||
+        index >= slot->payload.s.length) {
+        return false;
+    }
+    const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+    if (layout.typeId == 0) return false;
+    if (outTypeId) *outTypeId = layout.typeId;
+    if (slot->storage() == SlotStorage::HybridRecord) {
+        const auto* hl = layout.hybridLayout.get();
+        if (!hl || index >= hl->fields.size()) return false;
+        outValue = detail::readHybridFieldRaw(slot->payload.s.data, hl->fields[index]);
+        return true;
+    }
+    outValue = slot->payload.s.data[index];
+    return true;
 }
 
 const Value* ManagedHeap::fieldGetFast(
@@ -8180,9 +8382,19 @@ const Value* ManagedHeap::fieldGetFast(
         index >= slot->payload.s.length) {
         return nullptr;
     }
-    const auto tid = impl_->typeLayouts[slot->payload.s.layoutId].typeId;
+    const auto& layout = impl_->typeLayouts[slot->payload.s.layoutId];
+    const auto tid = layout.typeId;
     if (tid == 0) return nullptr;
     if (outTypeId) *outTypeId = tid;
+    if (slot->storage() == SlotStorage::HybridRecord) {
+        const auto* hl = layout.hybridLayout.get();
+        if (!hl || index >= hl->fields.size()) return nullptr;
+        const auto& desc = hl->fields[index];
+        if (desc.kind != detail::HybridScalarKind::ValueSlot) {
+            return nullptr;
+        }
+        return &slot->payload.s.data[desc.offsetOrSlot];
+    }
     return &slot->payload.s.data[index];
 }
 
@@ -8212,16 +8424,51 @@ bool ManagedHeap::fieldSet(
         if (value.rawTag() == ValueTag::Struct && value.asStructUnchecked().isFrameSlice()) {
             value = detachFrameSliceValue(value);
         }
-        const auto& refFields = impl_->typeLayouts[slot->payload.s.layoutId].referenceFields;
+        const auto layoutId = slot->payload.s.layoutId;
+        const auto& refFields = impl_->typeLayouts[layoutId].referenceFields;
         const bool checkDirty = impl_->hasDirtyTrackingTypes;
-        const bool valueChanged = !checkDirty || !(slot->payload.s.data[index] == value);
-        if (Impl::valueMayContainReferences(value) &&
-            !refFields.empty() &&
-            std::binary_search(refFields.begin(), refFields.end(), index)) {
-            impl_->writeBarrierObject(reference, value);
+        bool valueChanged = true;
+        bool wroteHybrid = false;
+        if (slot->storage() == SlotStorage::HybridRecord) {
+            const auto* hl = impl_->typeLayouts[layoutId].hybridLayout.get();
+            if (hl && index < hl->fields.size()) {
+                const auto& desc = hl->fields[index];
+                if (desc.kind == detail::HybridScalarKind::ValueSlot) {
+                    if (checkDirty) {
+                        valueChanged = !(slot->payload.s.data[desc.offsetOrSlot] == value);
+                    }
+                    if (Impl::valueMayContainReferences(value) &&
+                        !refFields.empty() &&
+                        std::binary_search(refFields.begin(), refFields.end(), index)) {
+                        impl_->writeBarrierObject(reference, value);
+                    }
+                    impl_->pinHeapValueIfNeededUnlocked(value);
+                    slot->payload.s.data[desc.offsetOrSlot] = std::move(value);
+                    wroteHybrid = true;
+                } else if (detail::tryWriteHybridFieldRaw(
+                               slot->payload.s.data,
+                               desc,
+                               value,
+                               checkDirty,
+                               valueChanged)) {
+                    wroteHybrid = true;
+                } else {
+                    (void)impl_->demoteHybridToHeapValuesUnlocked(reference.slot, *slot);
+                }
+            } else {
+                (void)impl_->demoteHybridToHeapValuesUnlocked(reference.slot, *slot);
+            }
         }
-        impl_->pinHeapValueIfNeededUnlocked(value);
-        slot->payload.s.data[index] = std::move(value);
+        if (!wroteHybrid) {
+            valueChanged = !checkDirty || !(slot->payload.s.data[index] == value);
+            if (Impl::valueMayContainReferences(value) &&
+                !refFields.empty() &&
+                std::binary_search(refFields.begin(), refFields.end(), index)) {
+                impl_->writeBarrierObject(reference, value);
+            }
+            impl_->pinHeapValueIfNeededUnlocked(value);
+            slot->payload.s.data[index] = std::move(value);
+        }
         if (checkDirty && valueChanged) {
             dirtyBit = impl_->markDirtyFromLayoutUnlocked(
                 reference,
@@ -8272,17 +8519,51 @@ bool ManagedHeap::fieldSetFast(
             ? detachFrameSliceValue(value)
             : value;
         const bool checkDirty = impl_->hasDirtyTrackingTypes;
-        const bool valueChanged = !checkDirty || !(slot->payload.s.data[index] == stored);
-        if (Impl::valueMayContainReferences(stored) &&
-            !layout.referenceFields.empty() &&
-            std::binary_search(layout.referenceFields.begin(), layout.referenceFields.end(), index)) {
-            impl_->writeBarrierObject(reference, stored);
+        bool valueChanged = true;
+        bool wroteHybrid = false;
+        if (slot->storage() == SlotStorage::HybridRecord) {
+            const auto* hl = layout.hybridLayout.get();
+            if (hl && index < hl->fields.size()) {
+                const auto& desc = hl->fields[index];
+                if (desc.kind == detail::HybridScalarKind::ValueSlot) {
+                    if (checkDirty) {
+                        valueChanged = !(slot->payload.s.data[desc.offsetOrSlot] == stored);
+                    }
+                    if (Impl::valueMayContainReferences(stored) &&
+                        !layout.referenceFields.empty() &&
+                        std::binary_search(layout.referenceFields.begin(), layout.referenceFields.end(), index)) {
+                        impl_->writeBarrierObject(reference, stored);
+                    }
+                    impl_->pinHeapValueIfNeededUnlocked(stored);
+                    slot->payload.s.data[desc.offsetOrSlot] = stored;
+                    wroteHybrid = true;
+                } else if (detail::tryWriteHybridFieldRaw(
+                               slot->payload.s.data,
+                               desc,
+                               stored,
+                               checkDirty,
+                               valueChanged)) {
+                    wroteHybrid = true;
+                } else {
+                    (void)impl_->demoteHybridToHeapValuesUnlocked(reference.slot, *slot);
+                }
+            } else {
+                (void)impl_->demoteHybridToHeapValuesUnlocked(reference.slot, *slot);
+            }
         }
-        impl_->pinHeapValueIfNeededUnlocked(stored);
-        slot->payload.s.data[index] = stored;
+        if (!wroteHybrid) {
+            valueChanged = !checkDirty || !(slot->payload.s.data[index] == stored);
+            if (Impl::valueMayContainReferences(stored) &&
+                !layout.referenceFields.empty() &&
+                std::binary_search(layout.referenceFields.begin(), layout.referenceFields.end(), index)) {
+                impl_->writeBarrierObject(reference, stored);
+            }
+            impl_->pinHeapValueIfNeededUnlocked(stored);
+            slot->payload.s.data[index] = stored;
+        }
         if (checkDirty && valueChanged) {
             dirtyBit = impl_->markDirtyFromLayoutUnlocked(
-                reference, layout, slot, index, hasDirtyObjects_);
+                reference, impl_->typeLayouts[slot->payload.s.layoutId], slot, index, hasDirtyObjects_);
             if (impl_->fieldMutationCallback != nullptr &&
                 (dirtyBit != 0xFFu || slot->hasFlag(GcFlag::HasObserver))) {
                 fieldCb = impl_->fieldMutationCallback;
@@ -9705,6 +9986,8 @@ std::size_t ManagedHeap::collectYoung(
             for (std::size_t i = 0; i < count; ++i) {
                 markYoungValue(markYoungValue, data[i]);
             }
+        } else if (oldSlot->storage() == SlotStorage::HybridRecord) {
+            for (std::size_t i = 0; i < count; ++i) markYoungValue(markYoungValue, data[i]);
         } else {
             for (const auto idx : layout.referenceFields) {
                 if (idx < count) markYoungValue(markYoungValue, data[idx]);
@@ -9725,6 +10008,8 @@ std::size_t ManagedHeap::collectYoung(
                 if (layout.mayContainReferences) {
                     for (std::size_t i = 0; i < count; ++i) markYoungValue(markYoungValue, data[i]);
                 }
+            } else if (slot->storage() == SlotStorage::HybridRecord) {
+                for (std::size_t i = 0; i < count; ++i) markYoungValue(markYoungValue, data[i]);
             } else {
                 for (const auto idx : layout.referenceFields) {
                     if (idx < count) markYoungValue(markYoungValue, data[idx]);
@@ -10195,6 +10480,16 @@ HeapSnapshot ManagedHeap::Impl::snapshotUnlocked(const ShadowStack* shadowStack)
                             slot.payload.s.data + i * static_cast<std::size_t>(sc->flatSlotCount));
                     }
                 }
+            } else if (slot.storage() == SlotStorage::HybridRecord) {
+                const std::size_t totalFields = slot.payload.s.length;
+                info.valueCount = totalFields;
+                info.values.resize(totalFields);
+                if (const auto* hl = layout.hybridLayout.get()) {
+                    const std::size_t limit = std::min(totalFields, hl->fields.size());
+                    for (std::size_t i = 0; i < limit; ++i) {
+                        info.values[i] = detail::readHybridFieldRaw(slot.payload.s.data, hl->fields[i]);
+                    }
+                }
             } else {
                 const auto count = Impl::slotValueCount(slot);
                 info.valueCount = count;
@@ -10430,6 +10725,7 @@ bool ManagedHeap::restore(
     impl_->restoreEpoch.fetch_add(1, std::memory_order_release);
     impl_->typeLayouts.assign(1, TypeLayoutEntry{});
     impl_->sharedRecordLayoutByTypeId.clear();
+    impl_->hybridRecordLayoutByPtr.clear();
     impl_->arrayLayoutByKey.clear();
     impl_->untypedDenseRecordLayouts.clear();
     impl_->untypedCustomRecordLayouts.clear();
@@ -11937,7 +12233,20 @@ bool ManagedHeap::migrateTypeLayouts(
         }
 
         const Value* oldData = slot.payload.s.data;
-        const std::size_t oldCount = Impl::slotValueCount(slot);
+        std::size_t oldCount = Impl::slotValueCount(slot);
+        std::vector<Value> unpackedOld;
+        if (slot.storage() == SlotStorage::HybridRecord) {
+            const auto* hl = impl_->typeLayouts[slot.payload.s.layoutId].hybridLayout.get();
+            oldCount = slot.payload.s.length;
+            unpackedOld.resize(oldCount);
+            if (hl) {
+                const std::size_t limit = std::min(oldCount, hl->fields.size());
+                for (std::size_t i = 0; i < limit; ++i) {
+                    unpackedOld[i] = detail::readHybridFieldRaw(slot.payload.s.data, hl->fields[i]);
+                }
+            }
+            oldData = unpackedOld.data();
+        }
         std::vector<Value> remapped;
         remapped.reserve(mig.newFieldCount);
         for (std::size_t fi = 0; fi < mig.newFieldCount; ++fi) {
@@ -12000,6 +12309,7 @@ bool ManagedHeap::migrateTypeLayouts(
             canonicalId = sIt->second;
             impl_->typeLayouts[canonicalId].referenceFields = refs;
             impl_->typeLayouts[canonicalId].mayContainReferences = !refs.empty();
+            impl_->typeLayouts[canonicalId].hybridLayout.reset();
         } else if (forceCreate) {
             TypeLayoutEntry entry;
             entry.typeId = tid;
@@ -12017,6 +12327,7 @@ bool ManagedHeap::migrateTypeLayouts(
             if (entry.typeId == tid) {
                 entry.referenceFields = refs;
                 entry.mayContainReferences = !refs.empty();
+                entry.hybridLayout.reset();
                 if (canonicalId == 0) {
                     canonicalId = lid;
                     impl_->sharedRecordLayoutByTypeId[tid] = lid;
@@ -12109,6 +12420,9 @@ bool ManagedHeap::migrateTypeLayouts(
                 } else if (oldStorage == SlotStorage::HeapValues) {
                     impl_->largeBuffers.release(oldHandle);
                     ++localStats.heapToInlineTransitions;
+                } else if (oldStorage == SlotStorage::HybridRecord) {
+                    impl_->packedBuffers.release(oldHandle);
+                    ++localStats.heapToInlineTransitions;
                 }
                 if (slot.hasFlag(GcFlag::HasCardTable) &&
                     slot.payload.s.cardHandle != CompactSlot::kInvalidHandle) {
@@ -12134,6 +12448,8 @@ bool ManagedHeap::migrateTypeLayouts(
                 ++localStats.inlineToSlabOrHeapTransitions;
             } else if (oldStorage == SlotStorage::HeapValues) {
                 impl_->largeBuffers.release(oldHandle);
+            } else if (oldStorage == SlotStorage::HybridRecord) {
+                impl_->packedBuffers.release(oldHandle);
             }
             if (slot.hasFlag(GcFlag::HasCardTable) &&
                 slot.payload.s.cardHandle != CompactSlot::kInvalidHandle) {
@@ -12413,6 +12729,7 @@ bool ManagedHeap::migrateTypeLayouts(
             const auto& layout = impl_->typeLayouts[slot.payload.s.layoutId];
 
             if (slot.kind() == ObjectKind::Record &&
+                slot.storage() != SlotStorage::HybridRecord &&
                 count == 8u &&
                 !delegateUpdates.empty() &&
                 (delegateTypeIds.count(layout.typeId) != 0 ||

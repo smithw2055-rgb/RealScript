@@ -513,6 +513,124 @@ public int ComputeBase(int x) {
     std::filesystem::remove_all(workRoot, ec);
 }
 
+void testAnyObjectFieldsVerifierAndRoundTrip() {
+    const std::string src = R"RS(
+module Kernel.AnyObjectFieldSuite;
+
+public class Alpha {
+    public int Code;
+}
+
+public class Beta {
+    public string Label;
+}
+
+public class Carrier {
+    public object Data;
+    public object Extra;
+    public bool Flag;
+}
+
+public object MakeTemporaryBeta() {
+    Beta b = new Beta();
+    b.Label = "from-object-field";
+    return b;
+}
+
+public int ExerciseObjectFields() {
+    Carrier c = new Carrier();
+    Alpha a = new Alpha();
+    a.Code = 41;
+    c.Data = a;
+    c.Extra = MakeTemporaryBeta();
+    c.Flag = true;
+    int sum = 0;
+    if (c.Data is Alpha) {
+        Alpha a2 = c.Data as Alpha;
+        if (a2 != null) {
+            sum = sum + a2.Code;
+        }
+    }
+    Beta b2 = c.Extra as Beta;
+    if (b2 != null && b2.Label == "from-object-field" && c.Flag) {
+        sum = sum + 1;
+    }
+    c.Data = null;
+    if (c.Data == null) {
+        sum = sum + 100;
+    }
+    return sum;
+}
+)RS";
+
+    auto bundle = compileAndLink({{"any_object.rscript", src}}, optimization::Level::Aggressive);
+
+    // Negative verifier test: named missing PrimitiveType::Object field must still fail RS5151
+    {
+        bytecode::Module forged = bundle.bytecodeModules.front();
+        semantic::TypeSymbol badType;
+        badType.id = semantic::stableTypeId("Kernel.AnyObjectFieldSuite::ForgedBad");
+        badType.moduleName = "Kernel.AnyObjectFieldSuite";
+        badType.name = "ForgedBad";
+        badType.kind = semantic::TypeKind::Class;
+        semantic::FieldSymbol badField;
+        badField.id = semantic::stableTypeId("Kernel.AnyObjectFieldSuite::ForgedBad::Broken");
+        badField.name = "Broken";
+        badField.declaringTypeId = badType.id;
+        badField.declaringTypeName = "Kernel.AnyObjectFieldSuite::ForgedBad";
+        badField.type = semantic::PrimitiveType::Object;
+        badField.typeName = "Kernel.AnyObjectFieldSuite::DoesNotExist";
+        badField.index = 0;
+        badType.fields.push_back(std::move(badField));
+        forged.types.push_back(std::move(badType));
+        diagnostics::DiagnosticBag forgedDiag;
+        require(!bytecode::verifyModule(forged, forgedDiag) && hasDiagCode(forgedDiag, "RS5151"),
+            "Named unknown PrimitiveType::Object field should still fail RS5151");
+    }
+
+    // RSLB v4 round-trip + GC liveness through object fields
+    const auto lazyBlob = bytecode::encodeLazyBytecodeBundle(bundle.bytecodeModules);
+    auto lazyBundle = std::make_shared<bytecode::LazyBytecodeBundle>();
+    diagnostics::DiagnosticBag lazyDiag;
+    require(bytecode::decodeLazyBytecodeBundleHeader(
+                lazyBlob.data(), lazyBlob.size(), *lazyBundle, false, lazyDiag),
+        "Lazy bundle header decode failed for AnyObject module");
+    runtime::RuntimeError linkErr;
+    auto lazyImgOpt = runtime::ProgramImage::linkLayered(lazyBundle, {}, linkErr, true);
+    require(lazyImgOpt.has_value(), "linkLayered failed: " + linkErr.message);
+    auto lazyImg = std::make_shared<const runtime::ProgramImage>(std::move(*lazyImgOpt));
+
+    auto heap = std::make_shared<runtime::ManagedHeap>();
+    runtime::Interpreter interp(lazyImg, heap);
+    const auto runRes = interp.invoke("Kernel.AnyObjectFieldSuite::ExerciseObjectFields");
+    std::int64_t out = 0;
+    require(runRes.succeeded && runRes.value.tryGetInt64(out) && out == 142,
+        "ExerciseObjectFields returned unexpected result: " + runRes.error.message);
+
+    // Verify GC traces an object reachable ONLY through a Carrier.Data `object` field
+    const auto* carrierType = lazyImg->resolveType(
+        semantic::stableTypeId("Kernel.AnyObjectFieldSuite::Carrier"));
+    const auto* betaType = lazyImg->resolveType(
+        semantic::stableTypeId("Kernel.AnyObjectFieldSuite::Beta"));
+    require(carrierType != nullptr && betaType != nullptr, "Missing Carrier/Beta type descriptors");
+
+    auto carrierOpt = heap->allocateObject(carrierType->id, {runtime::NullObject{}, runtime::NullObject{}, false}, {0u, 1u});
+    require(carrierOpt.has_value(), "Failed to allocate Carrier");
+    const auto carrierRoot = heap->retain(*carrierOpt);
+    {
+        auto innerOpt = heap->allocateObject(betaType->id, {runtime::NullString{}}, {0u});
+        require(innerOpt.has_value(), "Failed to allocate Beta");
+        require(heap->fieldSet(*carrierOpt, 0u, runtime::Value{*innerOpt}), "Failed to set object field");
+        heap->collectFull(runtime::ShadowStack{});
+        runtime::Value readBack{};
+        require(heap->fieldGetInto(*carrierOpt, 0u, readBack) &&
+                readBack.rawTag() == runtime::ValueTag::ObjectRef &&
+                heap->isAlive(readBack.asObjectRefUnchecked()),
+            "object field child was prematurely collected by GC");
+    }
+    (void)carrierRoot;
+}
+
 } // namespace
 
 int main() {
@@ -522,6 +640,7 @@ int main() {
             {"Deterministic Record/Replay and determinismDigest", testDeterministicRecordReplayAndDigest},
             {"RSBC codec round-trip, RSLM #line trailer & verifier", testBytecodeCodecLineTrailerAndVerifier},
             {"ModuleBuildCache incremental hit/miss, healing, stubs & RSMR", testModuleBuildCacheAndRsmrLineRoundTrip},
+            {"Verified AnyObject (object) fields, RSLB v4 round-trip & GC trace", testAnyObjectFieldsVerifierAndRoundTrip},
         };
         for (const auto& [name, fn] : tests) {
             std::cout << "[RUN ] " << name << '\n';
